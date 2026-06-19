@@ -117,9 +117,12 @@ export class Identity {
     );
     const salt = crypto.getRandomValues(new Uint8Array(16));
     const iv = crypto.getRandomValues(new Uint8Array(12));
-    const key = await deriveKey(passphrase, salt);
+    const iters = KDF_ITERS;
+    const key = await deriveKey(passphrase, salt, iters);
     const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain));
-    return JSON.stringify({ v: 1, salt: b64(salt), iv: b64(iv), ct: b64(ct) });
+    // `iters` is stored so the count can be raised over time without breaking
+    // existing backups (import reads it; pre-v2 blobs default to the old count).
+    return JSON.stringify({ v: 2, iters, salt: b64(salt), iv: b64(iv), ct: b64(ct) });
   }
 
   // Ed25519 private keys generated as non-extractable can't be exported; we
@@ -129,8 +132,8 @@ export class Identity {
   }
 
   static async import(blob, passphrase) {
-    const { salt, iv, ct } = JSON.parse(blob);
-    const key = await deriveKey(passphrase, unb64(salt));
+    const { salt, iv, ct, iters } = JSON.parse(blob);
+    const key = await deriveKey(passphrase, unb64(salt), iters || 310000);
     let plain;
     try {
       plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(iv) }, key, unb64(ct));
@@ -179,10 +182,13 @@ export class Identity {
   }
 }
 
-async function deriveKey(passphrase, salt) {
+// PBKDF2-SHA256 work factor for identity-at-rest (OWASP 2023 guidance).
+const KDF_ITERS = 600000;
+
+async function deriveKey(passphrase, salt, iters = KDF_ITERS) {
   const base = await crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
   return crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt, iterations: 310000, hash: "SHA-256" },
+    { name: "PBKDF2", salt, iterations: iters, hash: "SHA-256" },
     base,
     { name: "AES-GCM", length: 256 },
     false,

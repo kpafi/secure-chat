@@ -21,8 +21,18 @@ from cryptography.hazmat.primitives import serialization  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from main import app  # noqa: E402
+import accounts  # noqa: E402
+import config  # noqa: E402
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _reset_api_limiter():
+    # Each test starts with a fresh rate-limit budget (TestClient shares one
+    # client host, so otherwise the bucket would deplete across the suite).
+    accounts._api_limiter._buckets.clear()
+    yield
 
 
 def _b64(b: bytes) -> str:
@@ -126,6 +136,45 @@ def test_challenge_is_one_time():
     # Replaying the same challenge must fail (consumed).
     second = client.post("/api/auth/verify", json={"username": "erin", "challenge": ch, "sig": sig})
     assert second.status_code == 400
+
+
+# ---- abuse / DoS bounds (M1) ---------------------------------------------
+
+def test_api_rate_limit(monkeypatch):
+    from relay import KeyedRateLimiter
+    # Tiny budget so the limit is deterministic: 3 allowed, then 429.
+    monkeypatch.setattr(accounts, "_api_limiter", KeyedRateLimiter(3, 0.001))
+    codes = [client.get("/api/users/whoever").status_code for _ in range(6)]
+    assert 429 in codes, codes
+    assert codes.count(429) >= 2, codes  # most of the burst past the cap is blocked
+
+
+def test_account_cap_enforced(monkeypatch):
+    monkeypatch.setattr(config, "MAX_ACCOUNTS", 0)  # directory "full"
+    priv, ed, mldsa = _new_identity()
+    sig = priv.sign(_register_message("capped.user", ed, mldsa))
+    resp = client.post("/api/register", json={"username": "capped.user", "ed": ed, "mldsa": mldsa, "sig": _b64(sig)})
+    assert resp.status_code == 503, resp.text
+
+
+def test_pending_challenge_cap_enforced(monkeypatch):
+    _register("chalcap")
+    accounts._challenges.clear()
+    monkeypatch.setattr(config, "MAX_PENDING_CHALLENGES", 1)
+    first = client.post("/api/auth/challenge", json={"username": "chalcap"})
+    assert first.status_code == 200
+    second = client.post("/api/auth/challenge", json={"username": "chalcap"})
+    assert second.status_code == 503, second.text
+
+
+def test_active_token_cap_enforced(monkeypatch):
+    priv, _, _, _ = _register("tokcap")
+    accounts._tokens.clear()
+    monkeypatch.setattr(config, "MAX_ACTIVE_TOKENS", 0)
+    ch = client.post("/api/auth/challenge", json={"username": "tokcap"}).json()["challenge"]
+    sig = _b64(priv.sign(base64.b64decode(ch)))
+    ver = client.post("/api/auth/verify", json={"username": "tokcap", "challenge": ch, "sig": sig})
+    assert ver.status_code == 503, ver.text
 
 
 def test_me_requires_valid_token():

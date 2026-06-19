@@ -45,12 +45,31 @@ RATE_REFILL_PER_SEC = 5.0  # sustained messages/second
 MAX_CONNECTIONS = 200
 
 # Idle read timeout (seconds). A connection that sends no frame within this
-# window is closed. This reaps half-open / zombie sockets and "connect but
-# never join" squatters. It is intentionally generous so a quiet but active
-# chat (two people reading) is not dropped; clients can reconnect transparently.
+# window is closed. This reaps half-open / zombie sockets. It is intentionally
+# generous so a quiet but active chat (two people reading) is not dropped;
+# clients can reconnect transparently.
 # NOTE: no per-connection lifetime frame cap is enforced — the token bucket
 # already bounds throughput, and a lifetime cap would penalise long sessions.
 IDLE_TIMEOUT_SEC = 900  # 15 minutes
+
+# Join deadline (seconds). A connection that has not sent a valid `join` within
+# this short window is closed. Distinct from IDLE_TIMEOUT_SEC: a pre-join socket
+# holds a connection slot while contributing nothing, so squatters are dropped
+# fast (whereas a joined, idle-but-reading peer gets the generous idle window).
+JOIN_TIMEOUT_SEC = 30
+
+# --- HTTP /api abuse bounds (account directory) ---------------------------
+# The /ws relay has its own token bucket; the HTTP account endpoints need their
+# own. Keyed per client host — behind Tor every request appears from loopback,
+# so this collapses to a single global throttle, which is exactly the meaningful
+# control there. Generous enough for normal register/login bursts.
+API_RATE_CAPACITY = 60        # burst allowance (requests)
+API_RATE_REFILL_PER_SEC = 5.0 # sustained requests/second
+
+# Hard caps so a flood cannot exhaust memory/disk even within TTL windows.
+MAX_ACCOUNTS = 100_000           # total rows in the directory
+MAX_PENDING_CHALLENGES = 10_000  # outstanding login challenges
+MAX_ACTIVE_TOKENS = 50_000       # outstanding session tokens
 
 # --- Static web client -----------------------------------------------------
 # Served same-origin so the page, the WebSocket, and the (future) .onion all

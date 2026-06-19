@@ -13,9 +13,24 @@ holds keys, never decrypts, and never stores or logs message content.
 
 ## Why this design
 A breach of the server should leak nothing readable. By keeping the server
-ignorant of keys and plaintext (end-to-end encryption), the worst an attacker
-who fully owns the server can obtain is ciphertext plus minimal routing
-metadata. The codebase is intentionally small so it can be audited end to end.
+ignorant of keys and plaintext (end-to-end encryption), the worst a *passive*
+attacker who reads everything the server stores or sees obtains is ciphertext
+plus minimal routing metadata. The codebase is intentionally small so it can be
+audited end to end.
+
+### Trust boundary of the web client (important)
+This guarantee covers **passive** compromise. It does **not** mean an *active*
+attacker who controls the server gets nothing: the same server also **serves the
+client JavaScript** (the crypto, the import map, the page), so a compromised
+server can ship backdoored code on the next load and exfiltrate plaintext or
+private keys. CSP does not prevent this (the attacker controls the page that
+declares the policy), and neither does SRI (it controls the hashes too). This is
+the unavoidable trust assumption of *any* web-delivered E2EE app: **you trust the
+server to serve honest code every time you load it.** Mitigations on the roadmap:
+the dedicated **Android app** (code not server-delivered) and serving over a
+hardened **`.onion`**; for the web, reproducible builds + out-of-band code-hash
+verification. Treat the web client as "secure against a passive/compromised
+*relay*", not against a server actively serving malicious code.
 
 ## Architecture (current)
 ```

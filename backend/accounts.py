@@ -29,12 +29,25 @@ import time
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 import config
+from relay import KeyedRateLimiter
 
-router = APIRouter(prefix="/api", tags=["accounts"])
+# Per-client-host rate limiter for the HTTP account endpoints. The /ws relay has
+# its own; these endpoints would otherwise be an unthrottled flood target.
+_api_limiter = KeyedRateLimiter(config.API_RATE_CAPACITY, config.API_RATE_REFILL_PER_SEC)
+
+
+def rate_limit(request: Request) -> None:
+    host = request.client.host if request.client else "unknown"
+    if not _api_limiter.allow(host):
+        raise HTTPException(status_code=429, detail="rate limited")
+
+
+# All /api routes share the rate-limit dependency.
+router = APIRouter(prefix="/api", tags=["accounts"], dependencies=[Depends(rate_limit)])
 
 _USERNAME_RE = re.compile(r"^[a-z0-9_.-]+$")
 _B64_RE = re.compile(r"^[A-Za-z0-9+/]*={0,2}$")
@@ -149,6 +162,10 @@ def register(req: RegisterReq) -> dict:
         raise HTTPException(status_code=400, detail="ownership signature invalid")
 
     with _db() as conn:
+        # Bound the directory size so a flood cannot exhaust disk.
+        count = conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+        if count >= config.MAX_ACCOUNTS:
+            raise HTTPException(status_code=503, detail="directory full")
         try:
             conn.execute(
                 "INSERT INTO accounts (username, ed_pub, mldsa_pub, created_at) VALUES (?,?,?,?)",
@@ -182,6 +199,8 @@ def auth_challenge(req: ChallengeReq) -> dict:
     if exists is None:
         raise HTTPException(status_code=404, detail="no such user")
     _prune(_challenges)
+    if len(_challenges) >= config.MAX_PENDING_CHALLENGES:
+        raise HTTPException(status_code=503, detail="too many pending challenges")
     challenge = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
     _challenges[challenge] = (req.username, time.monotonic() + config.CHALLENGE_TTL_SEC)
     return {"challenge": challenge}
@@ -208,6 +227,8 @@ def auth_verify(req: VerifyReq) -> dict:
         raise HTTPException(status_code=401, detail="challenge signature invalid")
 
     _prune(_tokens)
+    if len(_tokens) >= config.MAX_ACTIVE_TOKENS:
+        raise HTTPException(status_code=503, detail="too many active sessions")
     token = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
     _tokens[token] = (req.username, time.monotonic() + config.TOKEN_TTL_SEC)
     return {"token": token, "ttl": config.TOKEN_TTL_SEC}

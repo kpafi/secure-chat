@@ -127,14 +127,16 @@ async def ws_endpoint(ws: WebSocket) -> None:
     joined_room: str | None = None
     try:
         while True:
-            # Idle read timeout: reap half-open / zombie sockets and clients
-            # that connect but never speak. Bounds how long a slot is held.
+            # Read timeout: a short JOIN deadline before the socket has joined a
+            # room (drops "connect but never join" slot squatters fast), then the
+            # generous IDLE window once joined (so a quiet-but-reading peer is not
+            # dropped). Either way, half-open / zombie sockets are reaped.
+            timeout = config.IDLE_TIMEOUT_SEC if joined_room else config.JOIN_TIMEOUT_SEC
             try:
-                raw = await asyncio.wait_for(
-                    ws.receive_text(), timeout=config.IDLE_TIMEOUT_SEC
-                )
+                raw = await asyncio.wait_for(ws.receive_text(), timeout=timeout)
             except asyncio.TimeoutError:
-                await _safe_send(ws, '{"type":"error","reason":"idle timeout"}')
+                reason = "idle timeout" if joined_room else "join timeout"
+                await _safe_send(ws, '{"type":"error","reason":"' + reason + '"}')
                 await ws.close(code=1001)  # going away
                 break
 

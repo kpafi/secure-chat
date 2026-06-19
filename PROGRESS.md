@@ -273,6 +273,34 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   handshake completes, safety numbers match, and messages decrypt **both
   directions** — confirming the vendored ML-KEM loads under CSP + import map.
 
+### 2026-06-19 — security review + hardening (pentest follow-up) ✅
+Ran a white-box review + live attack probes. Fixed the actionable findings:
+- **M1 — `/api` abuse bounds.** Added a per-client-host token-bucket
+  (`KeyedRateLimiter` in relay.py; on Tor it collapses to one global throttle)
+  as a router-wide dependency on `/api` → floods now get `429` (confirmed live:
+  27/90 blocked; previously 0). Added hard caps: `MAX_ACCOUNTS` (register →
+  `503` when full), `MAX_PENDING_CHALLENGES`, `MAX_ACTIVE_TOKENS` (bounds the
+  in-memory auth stores so a flood can't exhaust memory even within the TTL).
+- **M2 — join deadline.** Split a short `JOIN_TIMEOUT_SEC` (30 s) for pre-join
+  sockets from the generous `IDLE_TIMEOUT_SEC` (15 min) for joined peers, so
+  "connect but never join" slot-squatters are dropped fast.
+- **L3 — KDF work factor.** PBKDF2-SHA256 raised 310k → **600k** (OWASP 2023)
+  for AES256 mode and identity-at-rest. Export blob is now `v:2` and stores
+  `iters`; import honours it and falls back to 310k for old `v:1` backups
+  (regression-tested).
+- **H1 — honest trust boundary.** README now scopes "server compromise → only
+  ciphertext" to *passive* compromise and documents that the web client trusts
+  the server to serve honest code each load (mitigations: Android app, `.onion`,
+  reproducible builds). Not a code change — a corrected security claim.
+- Tests: +5 backend (`api` rate limit, account/challenge/token caps, join
+  timeout) and +1 client (legacy-blob import). Server suite **47 passed**;
+  client crypto/identity + all integration suites green.
+- **Accepted / deferred (documented, not fixed):** L1 (ML-DSA pubkey ownership
+  not proven at registration — needs a native PQ verify; no impersonation
+  results since the in-person safety number is the trust root), L2 (room-slot
+  squatting if a 256-bit room id leaks), I1/I2 (username enumeration + access-log
+  metadata — inherent to a public directory; scrub logs on the `.onion`).
+
 ## TODO / NEXT (suggested order)
 - [x] **Initialize git** in `~/secure-chat` and make the first commit — DONE
       (repo initialized on `master`; initial commit covers backend, client, and

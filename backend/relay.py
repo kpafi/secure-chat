@@ -48,6 +48,42 @@ class TokenBucket:
         return False
 
 
+class KeyedRateLimiter:
+    """Per-key token-bucket rate limiter (e.g. one bucket per client host).
+
+    Behind Tor all requests share the loopback key, so this collapses to a
+    single global throttle — the meaningful control there. Off-Tor it limits
+    per source. Stale (full, untouched) buckets are pruned to bound memory.
+    """
+
+    def __init__(self, capacity: int, refill_per_sec: float) -> None:
+        self._capacity = capacity
+        self._refill = refill_per_sec
+        self._buckets: dict[str, TokenBucket] = {}
+        self._last_prune = time.monotonic()
+
+    def _prune(self) -> None:
+        now = time.monotonic()
+        if now - self._last_prune < 60.0:
+            return
+        self._last_prune = now
+        # Drop buckets that have fully refilled (idle long enough to be at cap).
+        stale = [
+            k for k, b in self._buckets.items()
+            if b.tokens >= b.capacity and now - b.last > 60.0
+        ]
+        for k in stale:
+            self._buckets.pop(k, None)
+
+    def allow(self, key: str) -> bool:
+        self._prune()
+        bucket = self._buckets.get(key)
+        if bucket is None:
+            bucket = TokenBucket(capacity=self._capacity, refill_per_sec=self._refill)
+            self._buckets[key] = bucket
+        return bucket.allow()
+
+
 @dataclass
 class ConnectionLimiter:
     """Bounds total concurrent connections (FD / memory DoS guard).

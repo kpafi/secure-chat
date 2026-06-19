@@ -96,7 +96,9 @@ class AesPassphrase {
       "raw", enc.encode(this.passphrase), "PBKDF2", false, ["deriveKey"],
     );
     this.key = await crypto.subtle.deriveKey(
-      { name: "PBKDF2", salt: enc.encode(this.roomId), iterations: 310000, hash: "SHA-256" },
+      // 600k PBKDF2-SHA256 iterations (OWASP 2023 guidance). Both peers run this
+      // same code, so the derived key matches without any negotiation.
+      { name: "PBKDF2", salt: enc.encode(this.roomId), iterations: 600000, hash: "SHA-256" },
       base,
       { name: "AES-GCM", length: 256 },
       false,

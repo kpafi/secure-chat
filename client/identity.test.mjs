@@ -8,7 +8,7 @@
 //
 // Run: node identity.test.mjs   (server not required)
 import assert from "node:assert";
-import { Identity } from "./identity.js";
+import { Identity, b64 } from "./identity.js";
 import { signHandshake, verifyHandshake } from "./auth.js";
 import { makeCipher, bufToB64 } from "./crypto.js";
 
@@ -73,6 +73,30 @@ async function testExportImport() {
   console.log("OK  identity encrypted export/import (PBKDF2 + AES-256-GCM)");
 }
 
+async function testLegacyBlobImport() {
+  // A pre-v2 backup (310k iterations, no `iters` field) must still import after
+  // the KDF work factor was raised — import falls back to 310k for old blobs.
+  const id = await Identity.generate();
+  const enc = new TextEncoder();
+  const edPkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", id._edPriv));
+  const plain = enc.encode(JSON.stringify({
+    edPriv: b64(edPkcs8), edPub: b64(id.edPubRaw),
+    mldsaSecret: b64(id._mldsaSecret), mldsaPub: b64(id.mldsaPub),
+  }));
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const base = await crypto.subtle.importKey("raw", enc.encode("pp"), "PBKDF2", false, ["deriveKey"]);
+  const key = await crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations: 310000, hash: "SHA-256" },
+    base, { name: "AES-GCM", length: 256 }, false, ["encrypt"],
+  );
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain));
+  const legacy = JSON.stringify({ v: 1, salt: b64(salt), iv: b64(iv), ct: b64(ct) }); // no `iters`
+  const back = await Identity.import(legacy, "pp");
+  assert.deepStrictEqual(back.publicBundle(), id.publicBundle(), "legacy v:1 blob imports via 310k fallback");
+  console.log("OK  legacy (v:1, 310k) identity backup still imports");
+}
+
 async function testMitmDefeated() {
   // Alice and Bob generated identities and verified each other IN PERSON:
   const alice = await Identity.generate();
@@ -124,5 +148,6 @@ async function testMitmDefeated() {
 await testIdentityBasics();
 await testFingerprints();
 await testExportImport();
+await testLegacyBlobImport();
 await testMitmDefeated();
 console.log("\nAll identity / authenticated-handshake checks passed.");

@@ -201,9 +201,23 @@ def test_connection_cap_refuses_when_full(monkeypatch):
 
 
 def test_idle_timeout_closes_silent_connection(monkeypatch):
+    # Generous JOIN window so this exercises the post-join IDLE path.
+    monkeypatch.setattr(config, "JOIN_TIMEOUT_SEC", 5)
     monkeypatch.setattr(config, "IDLE_TIMEOUT_SEC", 0.3)
     with client.websocket_connect("/ws") as ws:
-        # Send nothing: the server must time out, warn, and close.
+        assert _join(ws, _room())["type"] == "joined"
+        # Joined but then silent: the server times out, warns, and closes.
         assert _recv(ws) == {"type": "error", "reason": "idle timeout"}
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_text()
+
+
+def test_join_timeout_drops_unjoined_connection(monkeypatch):
+    # A connection that never joins must be dropped fast (slot-squat defence),
+    # on the short JOIN deadline rather than the generous idle window.
+    monkeypatch.setattr(config, "JOIN_TIMEOUT_SEC", 0.3)
+    monkeypatch.setattr(config, "IDLE_TIMEOUT_SEC", 999)
+    with client.websocket_connect("/ws") as ws:
+        assert _recv(ws) == {"type": "error", "reason": "join timeout"}
         with pytest.raises(WebSocketDisconnect):
             ws.receive_text()
