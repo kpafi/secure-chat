@@ -30,6 +30,19 @@
       <p class="hint" id="idFingerprint" hidden></p>
     </section>
 
+    <section class="panel" id="account" hidden>
+      <div class="row">
+        <label for="username">Username — claim it so contacts can look up your identity</label>
+        <div class="inline">
+          <input id="username" type="text" inputmode="latin" autocomplete="off"
+                 spellcheck="false" maxlength="32" placeholder="3–32 chars: a-z 0-9 _ . -" />
+          <button id="register" type="button">Register</button>
+          <button id="login" type="button">Log in</button>
+        </div>
+      </div>
+      <p class="hint" id="accountStatus"></p>
+    </section>
+
     <section class="panel" id="setup">
       <div class="row">
         <label for="room">Room id (64 hex chars)</label>
@@ -54,6 +67,12 @@
       <div class="row" id="passRow" hidden>
         <label for="pass">Shared passphrase</label>
         <input id="pass" type="password" autocomplete="off" placeholder="agree on this out of band" />
+      </div>
+
+      <div class="row" id="contactRow">
+        <label for="contact">Contact username (optional — fetch &amp; pin their identity)</label>
+        <input id="contact" type="text" inputmode="latin" autocomplete="off"
+               spellcheck="false" maxlength="32" placeholder="look up your contact from the directory" />
       </div>
 
       <div class="row">

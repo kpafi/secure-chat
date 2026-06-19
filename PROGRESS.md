@@ -223,14 +223,35 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
 - `backend/tests/test_ws.py` — +2 tests (cap refuses 3rd over a patched cap of
   2; silent socket is idle-timed-out and closed). Full server suite **42 passed**.
 
+### 2026-06-19 — browser account directory integration ✅
+- `client/identity.js` — added `signEd()` (classical-only Ed25519 signature) for
+  server account proofs; the directory is not the authenticity root, so the PQ
+  key isn't needed there.
+- `client/account.js` — new module wrapping the `/api` directory protocol:
+  `register` (Ed25519 proof binding username→bundle, byte-for-byte matching the
+  server's `_register_message`), `fetchBundle` (lookup by username; null on 404),
+  `login` (challenge → sign → token), `me`, and a shared username validator.
+- `client/app.js` + `index.html` — account panel (claim username / log in) that
+  appears once an identity is unlocked and remembers the username locally; an
+  optional **Contact username** field in setup (DHKE/RSA only). On connect the
+  client fetches that contact's bundle and uses it in the verification gate:
+  pins are now keyed `user:<name>` when a username is in play (else `room:<id>`),
+  and a live key that disagrees with the directory entry raises a loud mismatch
+  banner. The in-person safety number remains the trust anchor.
+- `client/accounts.integration.test.mjs` — drives account.js against the live
+  server: register→lookup→login→me round-trip, duplicate-username 409, and
+  wrong-key login rejection. All pass. (A static check also confirms every
+  element id app.js references exists in index.html.)
+- No CSP change needed (`connect-src 'self'` already covers the same-origin
+  `/api` fetches; account.js/identity.js load under `script-src 'self'`).
+
 ## TODO / NEXT (suggested order)
 - [x] **Initialize git** in `~/secure-chat` and make the first commit — DONE
       (repo initialized on `master`; initial commit covers backend, client, and
       tests; `.venv`/`node_modules`/DBs/logs ignored).
-- [ ] **Browser account integration** — call the existing `/api` register/login
-      endpoints from the web client, and optionally fetch a peer's bundle by
-      username to pre-fill pinning (still verified in person; the directory is a
-      convenience, not a trust root). Server already stores public keys only.
+- [x] **Browser account integration** — DONE (see dated entry above): register /
+      login / fetch-by-username with directory-aware pinning, plus an integration
+      test for the client directory protocol.
 - [x] **Abuse/DoS hardening** — DONE (see dated entry above): global connection
       cap + idle read timeout. Per-IP limits and lifetime frame caps were
       intentionally skipped (see rationale in the entry).

@@ -50,6 +50,8 @@ node ../client/crypto.test.mjs
 node ../client/integration.test.mjs
 # Authenticated-handshake integration test (server must be running):
 node ../client/auth.integration.test.mjs
+# Account directory integration test (server must be running):
+node ../client/accounts.integration.test.mjs
 
 # Legacy two-client smoke test (raw relay, no crypto):
 python tests/smoke_client.py
@@ -70,6 +72,16 @@ comparing a safety number. A hostile relay that swaps the ephemeral key cannot
 forge the signature; one that swaps the whole identity is caught because the two
 endpoints then compute different safety numbers. Identity private keys are
 passphrase-encrypted on the device and never sent to the server.
+
+## Accounts (optional directory)
+The server doubles as a passwordless **public-key directory** under `/api`. From
+the client you can claim a username (an Ed25519 signature binds it to your
+identity bundle), prove control of it by signing a server challenge, and look a
+contact up by username to pre-fill and pin their identity for the handshake. The
+server stores **only public keys** — never passwords, private keys, or
+plaintext. The directory is a convenience, not a trust root (it shares the
+relay's origin), so the in-person safety-number check still governs trust; a key
+that disagrees with the published one is flagged loudly.
 
 ## Wire protocol
 Client -> server JSON envelope:

@@ -87,6 +87,13 @@ export class Identity {
     return Identity.fingerprintOf(this.publicBundle());
   }
 
+  // Classical-only signature (base64 Ed25519). Used for server account proofs
+  // (registration binding, login challenge) where the server is a public-key
+  // directory, not the authenticity root — so only the classical key is needed.
+  async signEd(msgBytes) {
+    return b64(new Uint8Array(await crypto.subtle.sign({ name: "Ed25519" }, this._edPriv, msgBytes)));
+  }
+
   // Dual signature over a message: both schemes sign the same bytes.
   async sign(msgBytes) {
     const edSig = new Uint8Array(await crypto.subtle.sign({ name: "Ed25519" }, this._edPriv, msgBytes));
