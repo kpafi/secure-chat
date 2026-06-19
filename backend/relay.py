@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from fastapi import WebSocket
 
 from config import (
+    MAX_CONNECTIONS,
     MAX_ROOM_MEMBERS,
     MAX_ROOMS,
     RATE_BUCKET_CAPACITY,
@@ -45,6 +46,29 @@ class TokenBucket:
             self.tokens -= 1.0
             return True
         return False
+
+
+@dataclass
+class ConnectionLimiter:
+    """Bounds total concurrent connections (FD / memory DoS guard).
+
+    Single-event-loop use only: `try_acquire`/`release` mutate `active` without
+    awaiting, so there is no interleaving on asyncio's cooperative scheduler.
+    """
+
+    max_connections: int = MAX_CONNECTIONS
+    active: int = 0
+
+    def try_acquire(self) -> bool:
+        """Reserve a slot if one is free. Returns False when at capacity."""
+        if self.active >= self.max_connections:
+            return False
+        self.active += 1
+        return True
+
+    def release(self) -> None:
+        if self.active > 0:
+            self.active -= 1
 
 
 class RoomRegistry:

@@ -38,6 +38,20 @@ MAX_ROOMS = 1000
 RATE_BUCKET_CAPACITY = 20  # burst allowance (messages)
 RATE_REFILL_PER_SEC = 5.0  # sustained messages/second
 
+# --- Connection-level abuse / DoS bounds ----------------------------------
+# Hard ceiling on concurrent WebSocket connections, server-wide. Bounds file
+# descriptors and per-connection memory so a flood of idle sockets cannot
+# exhaust the host. New connections past the cap are refused at the handshake.
+MAX_CONNECTIONS = 200
+
+# Idle read timeout (seconds). A connection that sends no frame within this
+# window is closed. This reaps half-open / zombie sockets and "connect but
+# never join" squatters. It is intentionally generous so a quiet but active
+# chat (two people reading) is not dropped; clients can reconnect transparently.
+# NOTE: no per-connection lifetime frame cap is enforced — the token bucket
+# already bounds throughput, and a lifetime cap would penalise long sessions.
+IDLE_TIMEOUT_SEC = 900  # 15 minutes
+
 # --- Static web client -----------------------------------------------------
 # Served same-origin so the page, the WebSocket, and the (future) .onion all
 # share one origin. Set to None to run as a pure relay with no static files.

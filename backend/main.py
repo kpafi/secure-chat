@@ -9,11 +9,14 @@ Threat-model notes (see PROGRESS.md for the full list):
   * Untrusted client input -> strict pydantic validation, fail closed.
   * Memory-exhaustion DoS    -> frame/payload size caps, room/member caps.
   * Message-flood DoS        -> per-connection token-bucket rate limit.
+  * Connection-flood DoS     -> global concurrent-connection cap.
+  * Idle / zombie sockets    -> per-connection idle read timeout reaps them.
   * Plaintext/key exposure   -> server does no crypto; payloads are opaque.
   * Metadata leakage in logs -> payloads are never logged.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -28,7 +31,7 @@ from starlette.websockets import WebSocketState
 
 import accounts
 import config
-from relay import RoomRegistry, TokenBucket
+from relay import ConnectionLimiter, RoomRegistry, TokenBucket
 from validation import Envelope, MsgType, is_ascii_printable
 
 # Connection-lifecycle logging only. Message payloads are NEVER logged.
@@ -57,6 +60,7 @@ app.add_middleware(
 )
 
 registry = RoomRegistry()
+connections = ConnectionLimiter()
 
 # Account directory (passwordless, key-based). Public keys only — see accounts.py.
 accounts.init_db()
@@ -112,12 +116,27 @@ async def ws_endpoint(ws: WebSocket) -> None:
         await ws.close(code=1008)  # policy violation
         return
 
+    # Global connection cap: refuse before accepting so a flood of sockets
+    # cannot exhaust file descriptors / memory. 1013 = "try again later".
+    if not connections.try_acquire():
+        await ws.close(code=1013)
+        return
+
     await ws.accept()
     bucket = TokenBucket()
     joined_room: str | None = None
     try:
         while True:
-            raw = await ws.receive_text()
+            # Idle read timeout: reap half-open / zombie sockets and clients
+            # that connect but never speak. Bounds how long a slot is held.
+            try:
+                raw = await asyncio.wait_for(
+                    ws.receive_text(), timeout=config.IDLE_TIMEOUT_SEC
+                )
+            except asyncio.TimeoutError:
+                await _safe_send(ws, '{"type":"error","reason":"idle timeout"}')
+                await ws.close(code=1001)  # going away
+                break
 
             # 1) Hard size cap before any parsing or allocation.
             if len(raw.encode("utf-8", "ignore")) > config.MAX_FRAME_BYTES:
@@ -173,6 +192,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
     except Exception:  # noqa: BLE001 - never leak a stack trace to the client
         log.exception("unexpected error in ws loop")
     finally:
+        connections.release()
         if joined_room is not None:
             registry.leave(joined_room, ws)
 

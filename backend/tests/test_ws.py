@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
 import config  # noqa: E402
+import main  # noqa: E402
 from main import app  # noqa: E402
 
 client = TestClient(app)
@@ -181,3 +182,28 @@ def test_missing_origin_accepted():
     # Native/CLI clients send no Origin header and must be allowed.
     with client.websocket_connect("/ws") as ws:
         assert _join(ws, _room())["type"] == "joined"
+
+
+# ---- connection-level DoS bounds -----------------------------------------
+
+def test_connection_cap_refuses_when_full(monkeypatch):
+    monkeypatch.setattr(main.connections, "max_connections", 2)
+    main.connections.active = 0  # start from a clean count for this test
+    with client.websocket_connect("/ws") as a, client.websocket_connect("/ws") as b:
+        assert _join(a, _room())["type"] == "joined"
+        assert _join(b, _room())["type"] == "joined"
+        # Third connection is over the cap -> refused at the handshake.
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/ws"):
+                pass
+    # Slots are released as connections close.
+    assert main.connections.active == 0
+
+
+def test_idle_timeout_closes_silent_connection(monkeypatch):
+    monkeypatch.setattr(config, "IDLE_TIMEOUT_SEC", 0.3)
+    with client.websocket_connect("/ws") as ws:
+        # Send nothing: the server must time out, warn, and close.
+        assert _recv(ws) == {"type": "error", "reason": "idle timeout"}
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_text()

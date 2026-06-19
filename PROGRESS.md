@@ -47,6 +47,7 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
 - Frame size cap (64 KiB) checked before any parsing.
 - Payload size cap (~48 KiB) + base64-only payload.
 - Per-connection token-bucket rate limiting.
+- Global connection cap + per-connection idle read timeout (zombie reaper).
 - Global room cap + per-room member cap (DoS/memory bounds).
 - Rooms in-memory only; deleted when empty (no data at rest).
 - Message payloads never logged; no stack traces leaked to clients.
@@ -206,6 +207,22 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   close (which left the peer's socket hanging without a close frame). More
   correct relay behaviour and makes leave deterministically observable.
 
+### 2026-06-19 — connection-level abuse / DoS bounds ✅
+- `backend/config.py` — `MAX_CONNECTIONS` (global concurrent-socket cap) and
+  `IDLE_TIMEOUT_SEC` (per-connection idle read timeout, 15 min default).
+- `backend/relay.py` — `ConnectionLimiter` (`try_acquire`/`release`, single-
+  event-loop safe) bounding total concurrent connections.
+- `backend/main.py` — refuse over-cap connections at the handshake (close 1013)
+  before `accept()`; wrap each `receive_text` in `asyncio.wait_for(IDLE_TIMEOUT)`
+  to reap half-open/zombie sockets and connect-but-never-join squatters
+  (warn + close 1001); release the slot in `finally`.
+- Deliberately **did not** add a per-connection lifetime frame cap (the token
+  bucket already bounds throughput; a lifetime cap would punish long chats) or
+  per-IP limits (behind Tor all traffic appears from loopback, so per-IP is
+  meaningless on `.onion`). Both noted inline.
+- `backend/tests/test_ws.py` — +2 tests (cap refuses 3rd over a patched cap of
+  2; silent socket is idle-timed-out and closed). Full server suite **42 passed**.
+
 ## TODO / NEXT (suggested order)
 - [x] **Initialize git** in `~/secure-chat` and make the first commit — DONE
       (repo initialized on `master`; initial commit covers backend, client, and
@@ -214,9 +231,9 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
       endpoints from the web client, and optionally fetch a peer's bundle by
       username to pre-fill pinning (still verified in person; the directory is a
       convenience, not a trust root). Server already stores public keys only.
-- [ ] **Abuse/DoS hardening** — global connection cap, idle/handshake timeouts,
-      max frames-per-connection, optional per-IP limits (note: behind Tor all
-      traffic appears from loopback, so per-IP is mostly meaningless on .onion).
+- [x] **Abuse/DoS hardening** — DONE (see dated entry above): global connection
+      cap + idle read timeout. Per-IP limits and lifetime frame caps were
+      intentionally skipped (see rationale in the entry).
 - [ ] **OTP mode** (deferred) — pre-shared pad handling, pad consumption
       tracking, never-reuse enforcement (all client-side).
 - [ ] **Tor deployment** — hardened reverse setup, `.onion` service config,
