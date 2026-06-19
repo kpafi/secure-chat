@@ -207,8 +207,9 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   correct relay behaviour and makes leave deterministically observable.
 
 ## TODO / NEXT (suggested order)
-- [ ] **Initialize git** in `~/secure-chat` (still not a repo) and make the
-      first commit — none of the work so far is version-controlled.
+- [x] **Initialize git** in `~/secure-chat` and make the first commit — DONE
+      (repo initialized on `master`; initial commit covers backend, client, and
+      tests; `.venv`/`node_modules`/DBs/logs ignored).
 - [ ] **Browser account integration** — call the existing `/api` register/login
       endpoints from the web client, and optionally fetch a peer's bundle by
       username to pre-fill pinning (still verified in person; the directory is a
