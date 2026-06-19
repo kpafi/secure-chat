@@ -30,16 +30,17 @@ function makePeer(name, room, alg, identity, peerPinnedBundle, onText) {
   const cipher = makeCipher(alg, room, {});
   const myBundle = identity.publicBundle();
   const ws = new WebSocket(URL);
-  let myEph = null;
   const ready = {};
   const readyP = new Promise((r) => (ready.resolve = r));
+  const joined = {};
+  const joinedP = new Promise((r) => (joined.resolve = r));
 
+  // Computed fresh each call (no caching): PQKEM's offer and answer are
+  // different payloads and each needs its own signature.
   async function mine() {
-    if (myEph) return myEph;
     const pub = await cipher.handshakePayload();
     const sig = await signHandshake(identity, room, pub);
-    myEph = { pub, sig };
-    return myEph;
+    return { pub, sig };
   }
 
   ws.addEventListener("open", async () => {
@@ -50,6 +51,7 @@ function makePeer(name, room, alg, identity, peerPinnedBundle, onText) {
   ws.addEventListener("message", async (ev) => {
     const m = JSON.parse(ev.data);
     if (m.type === "joined") {
+      joined.resolve();
       const { pub, sig } = await mine();
       ws.send(JSON.stringify({ type: "key", room, alg, payload: packKey({ pub, reply: false, idb: myBundle, sig }) }));
     } else if (m.type === "key") {
@@ -75,7 +77,7 @@ function makePeer(name, room, alg, identity, peerPinnedBundle, onText) {
   });
 
   return {
-    name, ws, readyP,
+    name, ws, readyP, joinedP,
     async send(text) {
       ws.send(JSON.stringify({ type: "msg", room, payload: await cipher.encrypt(text), alg }));
     },
@@ -98,7 +100,9 @@ async function testAlg(alg) {
   const aGot = new Promise((r) => (got.a = r));
   const bGot = new Promise((r) => (got.b = r));
 
+  // Stagger so B is the sole late joiner (deterministic single-secret path).
   const A = makePeer("A", room, alg, alice, bob.publicBundle(), (t) => got.a(t));
+  await A.joinedP;
   const B = makePeer("B", room, alg, bob, alice.publicBundle(), (t) => got.b(t));
 
   const [snA, snB] = await Promise.all([A.readyP, B.readyP]);
@@ -115,5 +119,6 @@ async function testAlg(alg) {
 
 await testAlg("DHKE");
 await testAlg("RSA");
+await testAlg("PQKEM");
 console.log("\nAll authenticated-handshake integration checks passed.");
 process.exit(0);

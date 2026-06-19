@@ -18,6 +18,8 @@
 // validation. `msg` payloads are base64(JSON) so each mode can carry its own
 // small framing (iv, ciphertext, wrapped key) without a custom binary format.
 
+import { ml_kem768 } from "@noble/post-quantum/ml-kem.js";
+
 // ---- encoding helpers -----------------------------------------------------
 
 const enc = new TextEncoder();
@@ -207,10 +209,113 @@ class Rsa {
   }
 }
 
-// Algorithms not yet implemented. PQ KEM (ML-KEM) is not in Web Crypto yet and
-// needs a vetted WASM library; OTP (pre-shared pad) is deferred by design.
+// ---- PQKEM: hybrid ECDH P-256 + ML-KEM-768 -> AES-256-GCM -----------------
+// Post-quantum-secure session key. The AES key is derived (HKDF-SHA-256) from
+// BOTH a classical ECDH P-256 secret AND an ML-KEM-768 (FIPS-203) secret, so it
+// stays secret unless an attacker breaks BOTH — i.e. it resists "harvest now,
+// decrypt later" by a future quantum adversary, while remaining no weaker than
+// DHKE if ML-KEM were ever faulted. Authenticated by the same dual (Ed25519 +
+// ML-DSA-65) identity handshake as DHKE/RSA (see app.js / auth.js).
+//
+// The exchange is symmetric: each peer OFFERS an ML-KEM public key, the other
+// ENCAPSULATES to it, and the resulting shared secret(s) are folded in keyed by
+// a hash of the encapsulation key — so both sides combine the same secrets in
+// the same order. This tolerates the relay's join-order race (where both peers'
+// offers are delivered) with no role negotiation: in the common case exactly
+// one secret is established, in the race two, and both peers agree either way.
+
+function concatBytes(parts) {
+  let n = 0;
+  for (const p of parts) n += p.length;
+  const out = new Uint8Array(n);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out;
+}
+
+async function sha256Hex(bytes) {
+  const d = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return Array.from(d, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+class Pqkem {
+  constructor(roomId) {
+    this.roomId = roomId;
+    this.ecdh = null;          // ECDH P-256 keypair (deriveBits)
+    this.kem = null;           // my ML-KEM-768 keypair
+    this.peerEcdh = null;      // peer ECDH public key (base64), learned from any msg
+    this.secrets = new Map();  // tag (hex of SHA-256(ek)) -> ML-KEM shared secret
+    this.answer = null;        // our reply payload, set when we answer a peer offer
+    this.key = null;
+  }
+  get needsHandshake() {
+    return true;
+  }
+  get ready() {
+    return this.key !== null;
+  }
+  async init() {
+    this.ecdh = await crypto.subtle.generateKey(
+      { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"],
+    );
+    this.kem = ml_kem768.keygen();
+  }
+  async _ecdhPub() {
+    return bufToB64(await crypto.subtle.exportKey("raw", this.ecdh.publicKey));
+  }
+  // Re-derive the AES key from the ECDH secret plus every ML-KEM secret we hold,
+  // ordered by tag so both peers feed HKDF identical input.
+  async _derive() {
+    if (this.peerEcdh === null || this.secrets.size === 0) return;
+    const peer = await crypto.subtle.importKey(
+      "raw", b64ToBuf(this.peerEcdh), { name: "ECDH", namedCurve: "P-256" }, false, [],
+    );
+    const ecdhBits = new Uint8Array(
+      await crypto.subtle.deriveBits({ name: "ECDH", public: peer }, this.ecdh.privateKey, 256),
+    );
+    const tags = [...this.secrets.keys()].sort();
+    const ikm = concatBytes([ecdhBits, ...tags.map((t) => this.secrets.get(t))]);
+    const base = await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveKey"]);
+    this.key = await crypto.subtle.deriveKey(
+      { name: "HKDF", hash: "SHA-256", salt: enc.encode(this.roomId), info: enc.encode("secure-chat/pqkem/v1") },
+      base,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt", "decrypt"],
+    );
+  }
+  async handshakePayload() {
+    if (this.answer) return this.answer;                                    // reply to a peer offer
+    return packMsg({ e: await this._ecdhPub(), ek: bufToB64(this.kem.publicKey) }); // initial offer
+  }
+  async onPeerKey(b64) {
+    const m = unpackMsg(b64);
+    if (m.e) this.peerEcdh = m.e;
+    if (m.ek) {
+      // Peer offered a KEM key: encapsulate to it, answer with the ciphertext.
+      const ek = new Uint8Array(b64ToBuf(m.ek));
+      const { cipherText, sharedSecret } = ml_kem768.encapsulate(ek);
+      this.secrets.set(await sha256Hex(ek), sharedSecret);
+      this.answer = packMsg({ e: await this._ecdhPub(), ct: bufToB64(cipherText) });
+    } else if (m.ct) {
+      // Peer answered our offer: decapsulate with our KEM secret key.
+      const ss = ml_kem768.decapsulate(new Uint8Array(b64ToBuf(m.ct)), this.kem.secretKey);
+      this.secrets.set(await sha256Hex(this.kem.publicKey), ss);
+    } else {
+      throw new Error("malformed PQKEM handshake message");
+    }
+    await this._derive();
+  }
+  async encrypt(text) {
+    return packMsg(await gcmEncrypt(this.key, text));
+  }
+  async decrypt(b64) {
+    return gcmDecrypt(this.key, unpackMsg(b64));
+  }
+}
+
+// OTP (pre-shared pad) is deferred by design.
 export const UNAVAILABLE = {
-  PQKEM: "Post-quantum KEM needs a vetted WASM library (planned).",
   OTP: "One-time-pad mode is deferred (requires in-person pad exchange).",
 };
 
@@ -222,6 +327,8 @@ export function makeCipher(alg, roomId, opts = {}) {
       return new Dhke();
     case "RSA":
       return new Rsa();
+    case "PQKEM":
+      return new Pqkem(roomId);
     default:
       throw new Error(`unsupported or unavailable algorithm: ${alg}`);
   }

@@ -58,13 +58,20 @@ python tests/smoke_client.py
 ```
 
 ## Encryption modes (client-side)
-| Mode    | Key agreement                  | Message cipher      | Notes                                   |
-|---------|--------------------------------|---------------------|-----------------------------------------|
-| DHKE    | ephemeral ECDH P-256           | AES-256-GCM         | per-session; **identity-authenticated** |
-| AES256  | PBKDF2 from shared passphrase  | AES-256-GCM         | no key swap → not relay-MITM-able       |
-| RSA     | RSA-OAEP-2048 public-key swap  | hybrid AES-256-GCM  | **identity-authenticated**              |
-| PQKEM   | —                              | —                   | planned (needs vetted WASM ML-KEM)      |
-| OTP     | —                              | —                   | deferred (in-person pad exchange)       |
+| Mode    | Key agreement                       | Message cipher      | Notes                                       |
+|---------|-------------------------------------|---------------------|---------------------------------------------|
+| DHKE    | ephemeral ECDH P-256                | AES-256-GCM         | per-session; **identity-authenticated**     |
+| AES256  | PBKDF2 from shared passphrase       | AES-256-GCM         | no key swap → not relay-MITM-able           |
+| RSA     | RSA-OAEP-2048 public-key swap       | hybrid AES-256-GCM  | **identity-authenticated**                  |
+| PQKEM   | **hybrid ECDH P-256 + ML-KEM-768**  | AES-256-GCM         | post-quantum; **identity-authenticated**    |
+| OTP     | —                                   | —                   | deferred (in-person pad exchange)           |
+
+**PQKEM** derives the AES-256 key (via HKDF-SHA-256) from *both* a classical
+ECDH P-256 secret *and* an ML-KEM-768 (FIPS-203) secret, so the session stays
+confidential unless an attacker breaks **both** — defeating "harvest now,
+decrypt later" while remaining no weaker than DHKE if ML-KEM were faulted. It is
+authenticated by the same dual (Ed25519 + ML-DSA-65) identity handshake, so the
+*authentication* is also one-classical-one-post-quantum.
 
 DHKE and RSA handshakes are signed by a long-term identity (Ed25519 + ML-DSA-65)
 that each user generates locally and the other verifies **in person** by

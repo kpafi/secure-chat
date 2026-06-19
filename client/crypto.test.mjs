@@ -26,11 +26,19 @@ async function roundtripHandshake(alg) {
   await a.init();
   await b.init();
   assert.ok(a.needsHandshake, `${alg} needs handshake`);
-  // Swap public keys through the (simulated) relay.
-  const aPub = await a.handshakePayload();
-  const bPub = await b.handshakePayload();
-  await a.onPeerKey(bPub);
-  await b.onPeerKey(aPub);
+  // Two rounds through the (simulated) relay. For DHKE/RSA the second payload
+  // is the same idempotent public key; for PQKEM round 1 is the KEM offer and
+  // round 2 is the encapsulation answer. Exchanging both offers + both answers
+  // mirrors the relay's join-order race (both peers' offers delivered), which
+  // PQKEM must converge on.
+  const aOffer = await a.handshakePayload();
+  const bOffer = await b.handshakePayload();
+  await a.onPeerKey(bOffer);
+  await b.onPeerKey(aOffer);
+  const aAns = await a.handshakePayload();
+  const bAns = await b.handshakePayload();
+  await a.onPeerKey(bAns);
+  await b.onPeerKey(aAns);
   assert.ok(a.ready && b.ready, `${alg} ready after handshake`);
   assert.strictEqual(await b.decrypt(await a.encrypt(MSG)), MSG, `${alg} A->B`);
   assert.strictEqual(await a.decrypt(await b.encrypt(MSG)), MSG, `${alg} B->A`);
@@ -59,5 +67,6 @@ async function negativeChecks() {
 await roundtripShared();
 await roundtripHandshake("DHKE");
 await roundtripHandshake("RSA");
+await roundtripHandshake("PQKEM");
 await negativeChecks();
 console.log("\nAll crypto checks passed.");

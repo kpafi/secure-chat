@@ -62,7 +62,6 @@ let joined = false;
 
 let identity = null;       // unlocked Identity, or null
 let myBundle = null;       // identity.publicBundle(), or null
-let myEph = null;          // cached { pub, sig } for the current connection
 let peerBundle = null;     // the peer identity bundle we received this session
 
 let expectedPeerName = null;   // contact username we looked up (or null)
@@ -148,7 +147,7 @@ function wsUrl() {
 }
 
 function algNeedsIdentity(alg) {
-  return alg === "DHKE" || alg === "RSA";
+  return alg === "DHKE" || alg === "RSA" || alg === "PQKEM";
 }
 
 // ---- identity management --------------------------------------------------
@@ -349,7 +348,6 @@ async function connect() {
     return;
   }
 
-  myEph = null;
   peerBundle = null;
   setStatus("connecting…");
   els.connect.disabled = true;
@@ -373,13 +371,14 @@ async function connect() {
   ws.onerror = () => setStatus("connection error", "err");
 }
 
-// Build (once per connection) our signed ephemeral handshake material.
-async function myHandshake(room) {
-  if (myEph) return myEph;
+// Produce + sign the next handshake payload. Computed fresh each call (not
+// cached): for PQKEM the initial "offer" and the "answer" are different
+// payloads, and each must carry its own signature. For DHKE/RSA the payload is
+// idempotent, so re-signing the reply is just a negligible extra signature.
+async function signedHandshake(room) {
   const pub = await cipher.handshakePayload();
   const sig = await signHandshake(identity, room, pub);
-  myEph = { pub, sig };
-  return myEph;
+  return { pub, sig };
 }
 
 async function handleMessage(room, raw) {
@@ -398,7 +397,7 @@ async function handleMessage(room, raw) {
       setStatus("connected", "ok");
       addLine("sys", "", `joined room — encryption: ${els.alg.value}`);
       if (cipher.needsHandshake) {
-        const { pub, sig } = await myHandshake(room);
+        const { pub, sig } = await signedHandshake(room);
         ws.send(JSON.stringify({
           type: "key", room, alg: els.alg.value,
           payload: packKey({ pub, reply: false, idb: myBundle, sig }),
@@ -433,7 +432,7 @@ async function handleMessage(room, raw) {
 
         // Answer the initiator exactly once with our own signed key.
         if (!reply) {
-          const mine = await myHandshake(room);
+          const mine = await signedHandshake(room);
           ws.send(JSON.stringify({
             type: "key", room, alg: els.alg.value,
             payload: packKey({ pub: mine.pub, reply: true, idb: myBundle, sig: mine.sig }),

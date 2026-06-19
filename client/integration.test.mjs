@@ -24,6 +24,8 @@ function makePeer(name, room, alg, onText) {
   const ws = new WebSocket(URL);
   const ready = { resolve: null };
   const readyP = new Promise((r) => (ready.resolve = r));
+  const joined = { resolve: null };
+  const joinedP = new Promise((r) => (joined.resolve = r));
 
   ws.addEventListener("open", async () => {
     await cipher.init();
@@ -33,6 +35,7 @@ function makePeer(name, room, alg, onText) {
   ws.addEventListener("message", async (ev) => {
     const m = JSON.parse(ev.data);
     if (m.type === "joined") {
+      joined.resolve();
       if (cipher.needsHandshake) {
         const pub = await cipher.handshakePayload();
         ws.send(JSON.stringify({ type: "key", room, payload: packKey(pub, false), alg }));
@@ -55,7 +58,7 @@ function makePeer(name, room, alg, onText) {
   });
 
   return {
-    name, ws, readyP,
+    name, ws, readyP, joinedP,
     async send(text) {
       ws.send(JSON.stringify({ type: "msg", room, payload: await cipher.encrypt(text), alg }));
     },
@@ -74,7 +77,11 @@ async function testAlg(alg) {
   const aGot = new Promise((r) => (got.a = r));
   const bGot = new Promise((r) => (got.b = r));
 
+  // Stagger: A fully joins before B connects (the realistic order). This makes
+  // B the late joiner / sole offerer, so the handshake takes its deterministic
+  // single-secret path rather than the simultaneous-join race.
   const A = makePeer("A", room, alg, (t) => got.a(t));
+  await A.joinedP;
   const B = makePeer("B", room, alg, (t) => got.b(t));
 
   await Promise.all([A.readyP, B.readyP]);
@@ -91,5 +98,6 @@ async function testAlg(alg) {
 await testAlg("DHKE");
 await testAlg("AES256");
 await testAlg("RSA");
+await testAlg("PQKEM");
 console.log("\nAll integration checks passed.");
 process.exit(0);

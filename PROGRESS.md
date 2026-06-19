@@ -245,6 +245,34 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
 - No CSP change needed (`connect-src 'self'` already covers the same-origin
   `/api` fetches; account.js/identity.js load under `script-src 'self'`).
 
+### 2026-06-19 — post-quantum key exchange (PQKEM mode) ✅
+- Completes the original encryption menu: the **key exchange** is now post-
+  quantum too, not just the authentication. (Authentication was already
+  one-classical-one-PQ: Ed25519 + ML-DSA-65 dual signatures on the handshake.)
+- `client/crypto.js` — new `Pqkem` cipher: **hybrid ECDH P-256 + ML-KEM-768**,
+  combined via HKDF-SHA-256 (salt = room id, domain-separated info) into an
+  AES-256-GCM key. Secure unless BOTH primitives break ("harvest now, decrypt
+  later" resistance) and no weaker than DHKE if ML-KEM were faulted. Vendored
+  `@noble/post-quantum/ml-kem.js` (only new file; rest of the closure was shared
+  with ml-dsa → 13 vendored files; import map already covers it).
+- The exchange is **symmetric and join-order-race tolerant**: each peer offers a
+  KEM public key, the other encapsulates, and secrets are folded in keyed by
+  `SHA-256(ek)` so both sides combine the same secret(s) in the same order — one
+  secret in the normal (staggered-join) case, two in the simultaneous-join race,
+  converging either way. The brief two-step settling in the race is covered by
+  the manual safety-number gate (no message is sent until the user confirms,
+  seconds later, by which point the key is final).
+- `client/app.js` + `index.html` — PQKEM enabled in the menu and treated as
+  identity-required (authenticated handshake). Removed the per-connection
+  handshake-signature cache (`myEph`): PQKEM's offer and answer are distinct
+  payloads, each signed fresh; idempotent and harmless for DHKE/RSA.
+- Tests: PQKEM added to `crypto.test.mjs` (2-round = the race path, converges),
+  `integration.test.mjs`, and `auth.integration.test.mjs` (safety number
+  matched). Integration harnesses now **stagger** joins (the realistic order).
+  **Verified in a real browser** (Chromium via puppeteer): PQKEM selectable,
+  handshake completes, safety numbers match, and messages decrypt **both
+  directions** — confirming the vendored ML-KEM loads under CSP + import map.
+
 ## TODO / NEXT (suggested order)
 - [x] **Initialize git** in `~/secure-chat` and make the first commit — DONE
       (repo initialized on `master`; initial commit covers backend, client, and
