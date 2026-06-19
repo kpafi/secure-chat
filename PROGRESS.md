@@ -3,6 +3,27 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
+## ⮕ RESUME HERE (snapshot as of 2026-06-19)
+**Status:** backend relay + web client working locally; git repo on `master`,
+working tree clean, latest commit `1443534`. Backend `pytest` = **47 passed**;
+client offline suite (`npm test`) green; all 3 live integration suites green.
+
+**Done & verified end-to-end (incl. real-browser checks via puppeteer):**
+- Dumb-relay backend (strict validation, rate limit, connection cap, join +
+  idle timeouts) + passwordless account directory (`/api`, rate-limited + capped).
+- Web client: 4 working encryption modes — **AES256, DHKE, RSA, PQKEM**
+  (PQKEM = hybrid ECDH P-256 + ML-KEM-768). Identity = Ed25519 + ML-DSA-65,
+  passphrase-encrypted at rest (PBKDF2 600k).
+- **Authenticated handshake** (dual-sig) + in-person safety-number gate closes
+  the relay-MITM gap. Account register/login + fetch-by-username pinning.
+- Security review done; M1/M2/L3 fixed, H1 documented (see 2026-06-19 entry).
+
+**Next options (pick one):** (a) OTP mode; (b) Tor `.onion` deployment;
+(c) Android app; (d) close accepted-risk items L1 (server-side ML-DSA verify)
+/ I1 (kill username enumeration). Full open list in TODO at the bottom.
+
+**Run it:** see "How to run (quick ref)" at the bottom of this file.
+
 ## Project goal (from the user)
 - Website + server backend for **simple ASCII-only text chat**.
 - **Security is the #1 priority** in every design and code decision. Small,
