@@ -1,0 +1,478 @@
+// secure-chat web client controller.
+//
+// Wires the UI to the relay WebSocket and to the client-side ciphers. The
+// server only ever sees ciphertext; all encryption happens here. Rendering uses
+// textContent exclusively (never innerHTML), so message contents can never be
+// interpreted as markup.
+//
+// SECURITY — authenticated key exchange (closes the MITM gap):
+//   For the handshake modes (DHKE / RSA) the ephemeral/public key is signed by
+//   a long-term IDENTITY (Ed25519 + ML-DSA-65, see identity.js). The peer
+//   verifies that dual signature against the identity bundle that arrived, then
+//   the user confirms a SAFETY NUMBER in person. A relay that swaps the
+//   ephemeral key cannot forge the signature; a relay that swaps the whole
+//   identity is caught because the two endpoints then compute different safety
+//   numbers. AES256-passphrase mode exchanges no keys and needs no identity.
+
+import { makeCipher, isAscii, bufToB64, b64ToBuf } from "./crypto.js";
+import { Identity } from "./identity.js";
+import { signHandshake, verifyHandshake } from "./auth.js";
+
+const $ = (id) => document.getElementById(id);
+const els = {
+  // identity
+  idStatus: $("idStatus"), idPass: $("idPass"), idPassRow: $("idPassRow"),
+  idCreate: $("idCreate"), idUnlock: $("idUnlock"), idExport: $("idExport"),
+  idForget: $("idForget"), idFingerprint: $("idFingerprint"),
+  // setup
+  room: $("room"), gen: $("gen"), alg: $("alg"), pass: $("pass"),
+  passRow: $("passRow"), connect: $("connect"), status: $("status"),
+  setup: $("setup"),
+  // verification gate
+  verify: $("verify"), verifyTitle: $("verifyTitle"), verifyHint: $("verifyHint"),
+  safetyNumber: $("safetyNumber"), peerFingerprint: $("peerFingerprint"),
+  verifyOk: $("verifyOk"), verifyNo: $("verifyNo"),
+  // chat
+  chat: $("chat"), log: $("log"),
+  form: $("sendForm"), text: $("text"), send: $("send"), hint: $("hint"),
+};
+
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+const ROOM_RE = /^[0-9a-f]{64}$/;
+
+// localStorage keys. Private keys are stored only inside the passphrase-
+// encrypted identity blob; pins hold peers' PUBLIC bundles only.
+const LS_IDENTITY = "sc.identity.v1";
+const LS_PINS = "sc.pins.v1";
+
+let ws = null;
+let cipher = null;
+let joined = false;
+
+let identity = null;       // unlocked Identity, or null
+let myBundle = null;       // identity.publicBundle(), or null
+let myEph = null;          // cached { pub, sig } for the current connection
+let peerBundle = null;     // the peer identity bundle we received this session
+
+// ---- handshake payload framing -------------------------------------------
+// `key` messages carry base64(JSON({pub, reply, idb, sig})). `pub` is the
+// sender's ephemeral/public key; `idb`+`sig` authenticate it (DHKE/RSA). The
+// `reply` flag prevents an infinite key ping-pong: the later joiner sends
+// reply=false, the early joiner answers once with reply=true.
+
+function packKey(obj) {
+  return bufToB64(enc.encode(JSON.stringify(obj)));
+}
+function unpackKey(b64) {
+  return JSON.parse(dec.decode(b64ToBuf(b64)));
+}
+
+// ---- pin store (TOFU + change detection) ----------------------------------
+// We remember the peer identity bundle verified for a given room id, so a later
+// session warns loudly if the key changes (possible MITM or a reset device).
+
+function loadPins() {
+  try {
+    return JSON.parse(localStorage.getItem(LS_PINS) || "{}");
+  } catch {
+    return {};
+  }
+}
+function getPin(room) {
+  return loadPins()[room] || null;
+}
+function savePin(room, bundle) {
+  const pins = loadPins();
+  pins[room] = { ed: bundle.ed, mldsa: bundle.mldsa };
+  localStorage.setItem(LS_PINS, JSON.stringify(pins));
+}
+function sameBundle(a, b) {
+  return !!a && !!b && a.ed === b.ed && a.mldsa === b.mldsa;
+}
+
+// ---- UI helpers -----------------------------------------------------------
+
+function setStatus(text, cls = "") {
+  els.status.textContent = text;
+  els.status.className = "status" + (cls ? " " + cls : "");
+}
+
+function hint(text, isErr = false) {
+  els.hint.textContent = text;
+  els.hint.className = "hint" + (isErr ? " err" : "");
+}
+
+function addLine(kind, who, text) {
+  const li = document.createElement("li");
+  li.className = kind;
+  if (who) {
+    const w = document.createElement("span");
+    w.className = "who";
+    w.textContent = who;
+    li.appendChild(w);
+  }
+  li.appendChild(document.createTextNode(text)); // textContent path: no markup
+  els.log.appendChild(li);
+  els.log.scrollTop = els.log.scrollHeight;
+}
+
+function enableSend(on) {
+  els.text.disabled = !on;
+  els.send.disabled = !on;
+  if (on) els.text.focus();
+}
+
+function wsUrl() {
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  return `${scheme}://${location.host}/ws`;
+}
+
+function algNeedsIdentity(alg) {
+  return alg === "DHKE" || alg === "RSA";
+}
+
+// ---- identity management --------------------------------------------------
+
+function setIdentityStatus(text, cls = "") {
+  els.idStatus.textContent = text;
+  els.idStatus.className = "hint" + (cls ? " " + cls : "");
+}
+
+async function showIdentityUnlocked() {
+  myBundle = identity.publicBundle();
+  const fp = await identity.fingerprint();
+  setIdentityStatus("Identity unlocked. Your contact verifies this in person.", "ok");
+  els.idFingerprint.hidden = false;
+  els.idFingerprint.textContent = "Your fingerprint: " + fp;
+  els.idPassRow.hidden = true;
+  els.idCreate.hidden = true;
+  els.idUnlock.hidden = true;
+  els.idExport.hidden = false;
+  els.idForget.hidden = false;
+}
+
+function refreshIdentityUI() {
+  const stored = localStorage.getItem(LS_IDENTITY);
+  if (identity) {
+    showIdentityUnlocked();
+    return;
+  }
+  els.idFingerprint.hidden = true;
+  els.idExport.hidden = true;
+  els.idPassRow.hidden = false;
+  els.idCreate.hidden = !!stored;   // hide "Create" if one already exists
+  els.idUnlock.hidden = !stored;
+  els.idForget.hidden = !stored;
+  if (stored) {
+    setIdentityStatus("A locked identity is stored on this device. Enter its passphrase to unlock.");
+  } else {
+    setIdentityStatus("No identity on this device yet. Create one (needed for DHKE / RSA).");
+  }
+}
+
+async function createIdentity() {
+  const pass = els.idPass.value;
+  if (!pass) {
+    setIdentityStatus("Choose a passphrase first — it encrypts your private keys on this device.", "err");
+    return;
+  }
+  if (localStorage.getItem(LS_IDENTITY)) {
+    setIdentityStatus("An identity already exists here. Unlock it, or Forget it first.", "err");
+    return;
+  }
+  setIdentityStatus("Generating identity keys (Ed25519 + ML-DSA-65)…");
+  try {
+    identity = await Identity.generate();
+    const blob = await identity.export(pass);
+    localStorage.setItem(LS_IDENTITY, blob);
+    els.idPass.value = "";
+    await showIdentityUnlocked();
+  } catch (e) {
+    identity = null;
+    setIdentityStatus("Could not create identity: " + e.message, "err");
+  }
+}
+
+async function unlockIdentity() {
+  const pass = els.idPass.value;
+  const blob = localStorage.getItem(LS_IDENTITY);
+  if (!blob) {
+    setIdentityStatus("Nothing to unlock — create an identity first.", "err");
+    return;
+  }
+  if (!pass) {
+    setIdentityStatus("Enter your identity passphrase to unlock.", "err");
+    return;
+  }
+  setIdentityStatus("Unlocking…");
+  try {
+    identity = await Identity.import(blob, pass);
+    els.idPass.value = "";
+    await showIdentityUnlocked();
+  } catch (e) {
+    identity = null;
+    setIdentityStatus("Wrong passphrase or corrupted identity.", "err");
+  }
+}
+
+async function exportIdentity() {
+  const blob = localStorage.getItem(LS_IDENTITY);
+  if (!blob) return;
+  try {
+    await navigator.clipboard.writeText(blob);
+    setIdentityStatus("Encrypted backup copied to clipboard. Keep it safe — it is useless without your passphrase.", "ok");
+  } catch {
+    setIdentityStatus("Could not access the clipboard. Backup not copied.", "err");
+  }
+}
+
+function forgetIdentity() {
+  if (!confirm("Remove this identity from the device? Without a backup you cannot recover it, and contacts will need to re-verify you.")) {
+    return;
+  }
+  localStorage.removeItem(LS_IDENTITY);
+  identity = null;
+  myBundle = null;
+  refreshIdentityUI();
+}
+
+// ---- connection lifecycle -------------------------------------------------
+
+async function connect() {
+  const room = els.room.value.trim();
+  const alg = els.alg.value;
+  if (!ROOM_RE.test(room)) {
+    hint("Room id must be exactly 64 hex characters. Use Generate.", true);
+    return;
+  }
+  if (algNeedsIdentity(alg) && !identity) {
+    hint("Create or unlock your identity above — it authenticates the " + alg + " key exchange.", true);
+    return;
+  }
+
+  try {
+    cipher = makeCipher(alg, room, { passphrase: els.pass.value });
+    await cipher.init();
+  } catch (e) {
+    hint("Setup failed: " + e.message, true);
+    return;
+  }
+
+  myEph = null;
+  peerBundle = null;
+  setStatus("connecting…");
+  els.connect.disabled = true;
+  ws = new WebSocket(wsUrl());
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: "join", room }));
+  };
+
+  ws.onmessage = (ev) => handleMessage(room, ev.data);
+
+  ws.onclose = () => {
+    setStatus("disconnected", "err");
+    joined = false;
+    enableSend(false);
+    els.verify.hidden = true;
+    els.setup.hidden = false;
+    els.connect.disabled = false;
+  };
+
+  ws.onerror = () => setStatus("connection error", "err");
+}
+
+// Build (once per connection) our signed ephemeral handshake material.
+async function myHandshake(room) {
+  if (myEph) return myEph;
+  const pub = await cipher.handshakePayload();
+  const sig = await signHandshake(identity, room, pub);
+  myEph = { pub, sig };
+  return myEph;
+}
+
+async function handleMessage(room, raw) {
+  let m;
+  try {
+    m = JSON.parse(raw);
+  } catch {
+    return;
+  }
+
+  switch (m.type) {
+    case "joined": {
+      joined = true;
+      els.setup.hidden = true;
+      els.chat.hidden = false;
+      setStatus("connected", "ok");
+      addLine("sys", "", `joined room — encryption: ${els.alg.value}`);
+      if (cipher.needsHandshake) {
+        const { pub, sig } = await myHandshake(room);
+        ws.send(JSON.stringify({
+          type: "key", room, alg: els.alg.value,
+          payload: packKey({ pub, reply: false, idb: myBundle, sig }),
+        }));
+        hint("Waiting for the other party to join / exchange keys…");
+      } else if (cipher.ready) {
+        enableSend(true);
+        hint("Ready. Messages are end-to-end encrypted.");
+      }
+      break;
+    }
+
+    case "key": {
+      try {
+        const { pub, reply, idb, sig } = unpackKey(m.payload);
+
+        // Authenticated modes: the signed identity bundle is mandatory and must
+        // verify over THIS room + ephemeral key, or we refuse outright.
+        if (!idb || !sig) {
+          throw new Error("peer sent an unauthenticated handshake");
+        }
+        const ok = await verifyHandshake(idb, room, pub, sig);
+        if (!ok) {
+          addLine("sys", "", "[handshake signature INVALID — refusing to connect; a relay may be tampering with the key exchange]");
+          hint("Authentication failed — disconnecting. This is what a MITM attempt looks like.", true);
+          if (ws) ws.close();
+          return;
+        }
+
+        peerBundle = idb;
+        await cipher.onPeerKey(pub);
+
+        // Answer the initiator exactly once with our own signed key.
+        if (!reply) {
+          const mine = await myHandshake(room);
+          ws.send(JSON.stringify({
+            type: "key", room, alg: els.alg.value,
+            payload: packKey({ pub: mine.pub, reply: true, idb: myBundle, sig: mine.sig }),
+          }));
+        }
+
+        if (cipher.ready) {
+          await enterVerification(room);
+        }
+      } catch (e) {
+        hint("Key exchange failed: " + e.message, true);
+      }
+      break;
+    }
+
+    case "msg": {
+      try {
+        const text = await cipher.decrypt(m.payload);
+        addLine("peer", "peer", text);
+      } catch {
+        addLine("sys", "", "[undecryptable message — wrong key or tampered]");
+      }
+      break;
+    }
+
+    case "error":
+      hint("Server: " + (m.reason || "error"), true);
+      break;
+  }
+}
+
+// The in-person verification gate. The dual signature is already verified at
+// this point; this step defeats a relay that swaps the WHOLE identity (the two
+// honest endpoints would then see different safety numbers).
+async function enterVerification(room) {
+  const sn = await Identity.safetyNumber(myBundle, peerBundle);
+  const peerFp = await Identity.fingerprintOf(peerBundle);
+  els.safetyNumber.textContent = sn;
+  els.peerFingerprint.textContent = "Contact fingerprint: " + peerFp;
+
+  const pin = getPin(room);
+  if (sameBundle(pin, peerBundle)) {
+    // Seen and verified before for this room — accept without re-prompting.
+    addLine("sys", "", "contact identity matches your saved pin");
+    unlockMessaging();
+    return;
+  }
+
+  els.verify.hidden = false;
+  if (pin) {
+    // A pin exists but the key changed: loud warning, require re-verification.
+    els.verify.classList.add("changed");
+    els.verifyTitle.textContent = "⚠ Contact identity key CHANGED — re-verify in person";
+    els.verifyHint.textContent =
+      "The identity key for this room is different from the one you verified before. " +
+      "This happens if your contact reset their device — but it is also exactly what an " +
+      "interceptor looks like. Do NOT proceed until you have confirmed this safety number " +
+      "with them over a trusted channel.";
+    addLine("sys", "", "[pinned identity for this room CHANGED — verification required]");
+  } else {
+    els.verify.classList.remove("changed");
+    els.verifyTitle.textContent = "Verify your contact — in person";
+  }
+  hint("Confirm the safety number with your contact before messaging unlocks.");
+}
+
+function unlockMessaging() {
+  els.verify.hidden = true;
+  enableSend(true);
+  addLine("sys", "", "secure channel established");
+  hint("Verified. Messages are end-to-end encrypted.", false);
+  els.hint.className = "hint ok";
+}
+
+function onVerifyOk() {
+  if (!peerBundle) return;
+  savePin(els.room.value.trim(), peerBundle);
+  addLine("sys", "", "contact verified and pinned");
+  unlockMessaging();
+}
+
+function onVerifyNo() {
+  addLine("sys", "", "disconnected — contact not verified");
+  if (ws) ws.close();
+}
+
+async function sendText(e) {
+  e.preventDefault();
+  const text = els.text.value;
+  if (!text) return;
+  if (!isAscii(text)) {
+    hint("Only printable ASCII characters are allowed.", true);
+    return;
+  }
+  if (!cipher || !cipher.ready) {
+    hint("Secure channel not ready yet.", true);
+    return;
+  }
+  try {
+    const payload = await cipher.encrypt(text);
+    ws.send(JSON.stringify({ type: "msg", room: els.room.value.trim(), payload, alg: els.alg.value }));
+    addLine("me", "me", text);
+    els.text.value = "";
+    hint("");
+  } catch (err) {
+    hint("Encryption failed: " + err.message, true);
+  }
+}
+
+// ---- wiring ---------------------------------------------------------------
+
+els.idCreate.addEventListener("click", createIdentity);
+els.idUnlock.addEventListener("click", unlockIdentity);
+els.idExport.addEventListener("click", exportIdentity);
+els.idForget.addEventListener("click", forgetIdentity);
+
+els.gen.addEventListener("click", () => {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  els.room.value = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  hint("New 256-bit room id generated. Share it with exactly one person.");
+});
+
+els.alg.addEventListener("change", () => {
+  els.passRow.hidden = els.alg.value !== "AES256";
+});
+
+els.connect.addEventListener("click", connect);
+els.form.addEventListener("submit", sendText);
+els.verifyOk.addEventListener("click", onVerifyOk);
+els.verifyNo.addEventListener("click", onVerifyNo);
+
+refreshIdentityUI();

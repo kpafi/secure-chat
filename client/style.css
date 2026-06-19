@@ -1,0 +1,113 @@
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --fg: #c9d1d9;
+  --muted: #8b949e;
+  --accent: #2f81f7;
+  --ok: #3fb950;
+  --err: #f85149;
+  --border: #30363d;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  display: flex;
+  justify-content: center;
+  padding: 2rem 1rem;
+}
+
+main { width: 100%; max-width: 640px; }
+
+h1 { font-size: 1.4rem; margin: 0 0 1rem; }
+h1 .sub { font-size: 0.8rem; color: var(--muted); font-weight: normal; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.row { margin-bottom: 0.85rem; }
+.row:last-child { margin-bottom: 0; }
+
+label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 0.3rem; }
+
+input, select {
+  width: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.55rem 0.6rem;
+  font: inherit;
+}
+
+input:focus, select:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+
+.inline { display: flex; gap: 0.5rem; align-items: center; }
+.inline input { flex: 1; }
+
+button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 0.55rem 0.9rem;
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+button#gen { background: #21262d; color: var(--fg); border: 1px solid var(--border); }
+
+.status { font-size: 0.85rem; color: var(--muted); margin-left: 0.6rem; }
+.status.ok { color: var(--ok); }
+.status.err { color: var(--err); }
+
+#log {
+  list-style: none;
+  margin: 0 0 0.75rem;
+  padding: 0;
+  height: 340px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+}
+#log li { padding: 0.35rem 0.6rem; border-bottom: 1px solid var(--border); white-space: pre-wrap; word-break: break-word; }
+#log li.me  { color: var(--accent); }
+#log li.peer { color: var(--fg); }
+#log li.sys  { color: var(--muted); font-style: italic; }
+#log li .who { font-size: 0.72rem; color: var(--muted); margin-right: 0.4rem; }
+
+.hint { font-size: 0.78rem; color: var(--muted); margin: 0.5rem 0 0; min-height: 1em; }
+.hint.err { color: var(--err); }
+.hint.ok { color: var(--ok); }
+
+button.danger { background: var(--err); }
+button#idCreate, button#idUnlock { background: #21262d; color: var(--fg); border: 1px solid var(--border); }
+
+/* Safety number: large, grouped, easy to read aloud and compare in person. */
+.safety {
+  font-size: 1.05rem;
+  letter-spacing: 0.04em;
+  line-height: 1.7;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem;
+  margin: 0.25rem 0;
+  word-break: break-word;
+}
+
+/* Loud banner when a pinned contact's identity key has changed. */
+#verify.changed { border-color: var(--err); }
+#verify.changed #verifyTitle { color: var(--err); }

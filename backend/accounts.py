@@ -1,0 +1,230 @@
+"""Passwordless, key-based accounts.
+
+The server is a public-key DIRECTORY, not a trust root. It stores only public
+identity keys (Ed25519 + ML-DSA-65) keyed by username. Authenticity of those
+keys is established by the users IN PERSON (fingerprint / safety number); the
+server is assumed untrusted for key authenticity. What the server enforces:
+
+  * registration carries a valid Ed25519 signature binding (username, ed, mldsa)
+    -> proves the registrant holds the classical private key (anti-squatting,
+    key-binding integrity);
+  * login = sign a fresh random server challenge with the Ed25519 key
+    -> proves account control without any stored secret.
+
+It never stores passwords, private keys, or message content. A full DB leak
+yields only public keys, which are meant to be public.
+
+Note: the ML-DSA (post-quantum) signature is verified CLIENT-side during the
+authenticated handshake; the server only stores the PQ public key (verifying
+ML-DSA server-side would add a heavy native dependency for no extra trust,
+since the server is not the authenticity root).
+"""
+from __future__ import annotations
+
+import base64
+import re
+import secrets
+import sqlite3
+import time
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from fastapi import APIRouter, Depends, Header, HTTPException
+from pydantic import BaseModel, ConfigDict, Field
+
+import config
+
+router = APIRouter(prefix="/api", tags=["accounts"])
+
+_USERNAME_RE = re.compile(r"^[a-z0-9_.-]+$")
+_B64_RE = re.compile(r"^[A-Za-z0-9+/]*={0,2}$")
+
+# Domain-separated, canonical bytes the client signs at registration. Must be
+# reconstructed identically here. Newline-delimited, no ambiguity.
+_REGISTER_DOMAIN = b"secure-chat/register/v1"
+
+
+# --- low-level helpers -----------------------------------------------------
+
+def _b64decode_fixed(s: str, n: int) -> bytes:
+    """Strictly decode base64 to exactly n bytes, else raise 422."""
+    if not _B64_RE.match(s or ""):
+        raise HTTPException(status_code=422, detail="invalid base64")
+    try:
+        raw = base64.b64decode(s, validate=True)
+    except Exception:
+        raise HTTPException(status_code=422, detail="invalid base64")
+    if len(raw) != n:
+        raise HTTPException(status_code=422, detail="unexpected key/sig length")
+    return raw
+
+
+def _ed25519_verify(pub_raw: bytes, sig: bytes, msg: bytes) -> bool:
+    try:
+        Ed25519PublicKey.from_public_bytes(pub_raw).verify(sig, msg)
+        return True
+    except (InvalidSignature, ValueError):
+        return False
+
+
+def _register_message(username: str, ed: str, mldsa: str) -> bytes:
+    return b"\n".join(
+        [_REGISTER_DOMAIN, username.encode("ascii"), ed.encode("ascii"), mldsa.encode("ascii")]
+    )
+
+
+# --- storage ---------------------------------------------------------------
+
+def _db() -> sqlite3.Connection:
+    conn = sqlite3.connect(config.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def init_db() -> None:
+    with _db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS accounts (
+                username   TEXT PRIMARY KEY,
+                ed_pub     TEXT NOT NULL,
+                mldsa_pub  TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+
+
+# In-memory, expiring stores for login challenges and session tokens. These are
+# ephemeral by design (no persistence of auth state); they reset on restart.
+_challenges: dict[str, tuple[str, float]] = {}  # challenge_b64 -> (username, expiry)
+_tokens: dict[str, tuple[str, float]] = {}      # token -> (username, expiry)
+
+
+def _prune(store: dict[str, tuple[str, float]]) -> None:
+    now = time.monotonic()
+    for k in [k for k, (_, exp) in store.items() if exp < now]:
+        store.pop(k, None)
+
+
+# --- request/response models (strict) --------------------------------------
+
+class RegisterReq(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    username: str = Field(min_length=config.USERNAME_MIN, max_length=config.USERNAME_MAX)
+    ed: str
+    mldsa: str
+    sig: str
+
+
+class ChallengeReq(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    username: str = Field(min_length=config.USERNAME_MIN, max_length=config.USERNAME_MAX)
+
+
+class VerifyReq(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    username: str = Field(min_length=config.USERNAME_MIN, max_length=config.USERNAME_MAX)
+    challenge: str
+    sig: str
+
+
+def _check_username(u: str) -> None:
+    if not _USERNAME_RE.match(u):
+        raise HTTPException(status_code=422, detail="username must be [a-z0-9_.-]")
+
+
+# --- endpoints (sync defs run in a threadpool; sqlite stays off the loop) --
+
+@router.post("/register")
+def register(req: RegisterReq) -> dict:
+    _check_username(req.username)
+    ed_raw = _b64decode_fixed(req.ed, config.ED25519_PUB_BYTES)
+    _b64decode_fixed(req.mldsa, config.MLDSA65_PUB_BYTES)  # validate size only
+    sig_raw = _b64decode_fixed(req.sig, config.ED25519_SIG_BYTES)
+
+    # Prove the registrant controls the classical key for the bundle.
+    if not _ed25519_verify(ed_raw, sig_raw, _register_message(req.username, req.ed, req.mldsa)):
+        raise HTTPException(status_code=400, detail="ownership signature invalid")
+
+    with _db() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO accounts (username, ed_pub, mldsa_pub, created_at) VALUES (?,?,?,?)",
+                (req.username, req.ed, req.mldsa, int(time.time())),
+            )
+        except sqlite3.IntegrityError:
+            raise HTTPException(status_code=409, detail="username already taken")
+    return {"status": "registered", "username": req.username}
+
+
+@router.get("/users/{username}")
+def get_user(username: str) -> dict:
+    _check_username(username)
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT ed_pub, mldsa_pub FROM accounts WHERE username = ?", (username,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="no such user")
+    # The public identity bundle others will pin + verify in person.
+    return {"username": username, "ed": row["ed_pub"], "mldsa": row["mldsa_pub"]}
+
+
+@router.post("/auth/challenge")
+def auth_challenge(req: ChallengeReq) -> dict:
+    _check_username(req.username)
+    with _db() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM accounts WHERE username = ?", (req.username,)
+        ).fetchone()
+    if exists is None:
+        raise HTTPException(status_code=404, detail="no such user")
+    _prune(_challenges)
+    challenge = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+    _challenges[challenge] = (req.username, time.monotonic() + config.CHALLENGE_TTL_SEC)
+    return {"challenge": challenge}
+
+
+@router.post("/auth/verify")
+def auth_verify(req: VerifyReq) -> dict:
+    _check_username(req.username)
+    _prune(_challenges)
+    entry = _challenges.pop(req.challenge, None)  # one-time use
+    if entry is None or entry[0] != req.username:
+        raise HTTPException(status_code=400, detail="unknown or expired challenge")
+
+    challenge_raw = _b64decode_fixed(req.challenge, 32)
+    sig_raw = _b64decode_fixed(req.sig, config.ED25519_SIG_BYTES)
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT ed_pub FROM accounts WHERE username = ?", (req.username,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="no such user")
+    ed_raw = base64.b64decode(row["ed_pub"], validate=True)
+    if not _ed25519_verify(ed_raw, sig_raw, challenge_raw):
+        raise HTTPException(status_code=401, detail="challenge signature invalid")
+
+    _prune(_tokens)
+    token = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
+    _tokens[token] = (req.username, time.monotonic() + config.TOKEN_TTL_SEC)
+    return {"token": token, "ttl": config.TOKEN_TTL_SEC}
+
+
+def current_user(authorization: str | None = Header(default=None)) -> str:
+    """Resolve a Bearer token to a username, or 401."""
+    _prune(_tokens)
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    token = authorization[len("Bearer "):]
+    entry = _tokens.get(token)
+    if entry is None:
+        raise HTTPException(status_code=401, detail="invalid or expired token")
+    return entry[0]
+
+
+@router.get("/me")
+def me(username: str = Depends(current_user)) -> dict:
+    return {"username": username}

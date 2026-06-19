@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="referrer" content="no-referrer" />
+  <title>secure-chat</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main>
+    <h1>secure-chat <span class="sub">end-to-end encrypted relay</span></h1>
+
+    <section class="panel" id="identity">
+      <div class="row">
+        <label>Your identity (verified in person by your contact)</label>
+        <p class="hint" id="idStatus">Checking for an identity on this device…</p>
+      </div>
+      <div class="row" id="idPassRow">
+        <label for="idPass">Identity passphrase</label>
+        <input id="idPass" type="password" autocomplete="off"
+               placeholder="protects your private keys on this device" />
+      </div>
+      <div class="row inline">
+        <button id="idCreate" type="button">Create identity</button>
+        <button id="idUnlock" type="button">Unlock</button>
+        <button id="idExport" type="button" hidden>Copy backup</button>
+        <button id="idForget" type="button" hidden>Forget</button>
+      </div>
+      <p class="hint" id="idFingerprint" hidden></p>
+    </section>
+
+    <section class="panel" id="setup">
+      <div class="row">
+        <label for="room">Room id (64 hex chars)</label>
+        <div class="inline">
+          <input id="room" type="text" inputmode="latin" autocomplete="off"
+                 spellcheck="false" maxlength="64" placeholder="share this with one other person" />
+          <button id="gen" type="button">Generate</button>
+        </div>
+      </div>
+
+      <div class="row">
+        <label for="alg">Encryption</label>
+        <select id="alg">
+          <option value="DHKE">DHKE — ephemeral ECDH P-256 → AES-256-GCM (recommended)</option>
+          <option value="AES256">AES-256-GCM — shared passphrase</option>
+          <option value="RSA">RSA-2048-OAEP — hybrid (per-message AES-256)</option>
+          <option value="PQKEM" disabled>Post-quantum KEM — planned</option>
+          <option value="OTP" disabled>One-time pad — deferred</option>
+        </select>
+      </div>
+
+      <div class="row" id="passRow" hidden>
+        <label for="pass">Shared passphrase</label>
+        <input id="pass" type="password" autocomplete="off" placeholder="agree on this out of band" />
+      </div>
+
+      <div class="row">
+        <button id="connect" type="button">Connect</button>
+        <span id="status" class="status">disconnected</span>
+      </div>
+    </section>
+
+    <section class="panel" id="verify" hidden>
+      <div class="row">
+        <label id="verifyTitle">Verify your contact — in person</label>
+        <p class="hint" id="verifyHint">
+          Compare this safety number with your contact over a trusted channel
+          (in person, or a call where you recognise their voice). It must be
+          identical on both devices. If it differs, a relay may be intercepting
+          you — do not send anything.
+        </p>
+      </div>
+      <p class="safety" id="safetyNumber"></p>
+      <p class="hint" id="peerFingerprint"></p>
+      <div class="row inline">
+        <button id="verifyOk" type="button">It matches — unlock messaging</button>
+        <button id="verifyNo" type="button" class="danger">It differs — disconnect</button>
+      </div>
+    </section>
+
+    <section class="panel" id="chat" hidden>
+      <ul id="log" aria-live="polite"></ul>
+      <form id="sendForm" class="inline" autocomplete="off">
+        <input id="text" type="text" maxlength="2000" placeholder="ASCII only…" disabled />
+        <button id="send" type="submit" disabled>Send</button>
+      </form>
+      <p class="hint" id="hint"></p>
+    </section>
+  </main>
+
+  <script type="importmap">{"imports":{"@noble/post-quantum/":"./vendor/@noble/post-quantum/","@noble/hashes/":"./vendor/@noble/hashes/","@noble/curves/":"./vendor/@noble/curves/"}}</script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
