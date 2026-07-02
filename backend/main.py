@@ -12,7 +12,11 @@ Threat-model notes (see PROGRESS.md for the full list):
   * Connection-flood DoS     -> global concurrent-connection cap.
   * Idle / zombie sockets    -> per-connection idle read timeout reaps them.
   * Plaintext/key exposure   -> server does no crypto; payloads are opaque.
-  * Metadata leakage in logs -> payloads are never logged.
+  * Metadata leakage in logs -> payloads are never logged, AND per-request
+    access logging + per-connection lifecycle logging are disabled by default
+    (I2), so no who-connected-when / which-endpoint timing metadata is written
+    to disk. Only genuine, content-free error tracebacks are logged. Operators
+    MUST NOT re-enable access logging on the .onion.
 """
 from __future__ import annotations
 
@@ -34,9 +38,31 @@ import config
 from relay import ConnectionLimiter, RoomRegistry, TokenBucket
 from validation import Envelope, MsgType, is_ascii_printable
 
-# Connection-lifecycle logging only. Message payloads are NEVER logged.
+
+def _minimize_log_metadata() -> None:
+    """Silence request/connection metadata at rest (I2).
+
+    Uvicorn's access logger records every request line (method, path, status,
+    timing) and its error logger emits INFO connection-lifecycle lines
+    ("connection open/closed"). On a seized .onion host those logs are a
+    who-talked-when metadata trail. We disable the access log entirely and lift
+    the error logger to WARNING, so routine activity leaves no record while real
+    errors (never containing payloads or room ids) are still surfaced. Applied
+    here at import so it holds regardless of how the app is launched; the run.sh
+    launcher also passes the matching CLI flags.
+    """
+    access = logging.getLogger("uvicorn.access")
+    access.handlers.clear()
+    access.disabled = True
+    logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+
+
+_minimize_log_metadata()
+
+# Our own logger emits ONLY content-free error tracebacks (no payloads, no room
+# ids). Kept at WARNING so nothing routine is written to disk.
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("relay")
@@ -211,4 +237,13 @@ if __name__ == "__main__":
 
     # server_header=False strips uvicorn's `Server: uvicorn` fingerprint, which
     # is added below the ASGI layer and so cannot be removed by middleware.
-    uvicorn.run(app, host=config.HOST, port=config.PORT, server_header=False)
+    # access_log=False + log_level="warning": no request/connection metadata at
+    # rest (I2); see _minimize_log_metadata above.
+    uvicorn.run(
+        app,
+        host=config.HOST,
+        port=config.PORT,
+        server_header=False,
+        access_log=False,
+        log_level="warning",
+    )

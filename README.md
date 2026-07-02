@@ -146,3 +146,41 @@ Client -> server JSON envelope:
 
 Server -> client: `{"type":"joined"}`, relayed envelopes, or
 `{"type":"error","reason":"..."}`.
+
+## Metadata & residual risks
+
+**Logging (I2).** The relay writes **no** request or connection metadata to
+disk: uvicorn's access log is disabled and connection-lifecycle logging is
+lifted to WARNING, so there is no who-connected-when / which-endpoint trail for
+a seized `.onion` host to yield. Only genuine error tracebacks are logged, and
+those never contain payloads or room ids. `run.sh` carries the matching flags;
+a guard test (`tests/test_logging.py`) fails if either is dropped. **Do not
+re-enable access logging in production.**
+
+**Room ids are a bearer capability (L2).** A room is joined purely by knowing
+its 64-hex (256-bit) id — the relay is intentionally anonymous and performs no
+joiner authentication, which is what keeps who-talks-to-whom out of the server.
+A room id is therefore a secret: anyone who learns one can take a slot in that
+2-member room. The impact of a leaked id is deliberately bounded and does **not**
+include confidentiality or impersonation:
+- **No plaintext.** Everything the relay forwards is opaque ciphertext; a
+  squatter reads nothing.
+- **No impersonation.** For DHKE/RSA/PQKEM the key exchange is signed by a
+  long-term identity and gated by an in-person safety number, so a squatter
+  cannot pose as the real contact — the handshake fails and the UI says so. For
+  AES256 the passphrase (never sent) is the gate.
+- **Residual = availability + coarse metadata.** A squatter can occupy a slot
+  (a self-healing DoS: generate a fresh id and reconnect) and observe ciphertext
+  timing/sizes until the handshake fails.
+
+This is inherent to an anonymous, shared-capability relay; "fixing" it with
+relay-side admission control would mean binding identities to the relay and
+recording exactly the who-talks-to-whom metadata this design omits. The
+mitigations are structural and already in place: room ids are **high-entropy
+(256-bit, unguessable)** and **single-use/rotatable** (generate a fresh one per
+conversation), so treat a room id like a one-time secret and never reuse or
+expose one.
+
+**What the relay still sees.** Room id, message timing, and ciphertext sizes
+(length padding is a possible future addition). This is the minimal routing
+metadata a relay cannot avoid.

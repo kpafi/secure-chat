@@ -4,12 +4,15 @@ Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
 ## ⮕ RESUME HERE (snapshot as of 2026-07-02, second session)
-**Status:** backend relay + web client working locally; git repo on `master`,
-tree clean (latest commit 1703a19). Backend `pytest` = **53 passed**; client
-offline suite (`npm test`) green; all 3 live integration suites green;
-real-browser (puppeteer/Chromium) checks green for both the v2 handshake and
-the token-gated directory. NOTE: `pip install -r requirements.txt` now also
-pulls `dilithium-py`.
+**Status:** backend relay + web client working locally; git repo on `master`.
+Backend `pytest` = **56 passed**; client offline suite (`npm test`) green; all
+3 live integration suites green; real-browser (puppeteer/Chromium) checks green
+for both the v2 handshake and the token-gated directory. **All four
+2026-06-19-review accepted-risk items (L1, I1, L2, I2) are now CLOSED.**
+`pip install -r requirements.txt` now also pulls `dilithium-py`. Logging is
+minimized (no request/connection metadata at rest); `run.sh` must keep
+`--no-access-log --log-level warning`. Uncommitted at this point: the L2/I2
+closeout (verified & ready to commit).
 **2026-07-02 (second session), in order:**
 1. CLOSED Medium finding **cross-session handshake replay in a reused room** —
    handshake transcript bumped to v2, covers a fresh per-connection nonce from
@@ -61,6 +64,36 @@ Full open list in TODO at the bottom.
    The server's `alg` field is an advisory tag only and is never acted upon.
 
 ## DONE
+### 2026-07-02 — L2/I2 closeout: metadata-at-rest disabled + room-id guarantee ✅
+Closed the last two accepted-risk items from the 2026-06-19 review.
+- **I2 — no request/connection metadata at rest (code fix).** Uvicorn's access
+  log wrote every request line (method/path/status/timing) and its error logger
+  emitted INFO connection-lifecycle lines ("connection open/closed") — a
+  who-connected-when trail if a `.onion` host is seized. `main.py` now disables
+  the access logger and lifts `uvicorn.error` to WARNING at import
+  (`_minimize_log_metadata`), the `__main__`/`uvicorn.run` path passes
+  `access_log=False, log_level="warning"`, and `run.sh` carries
+  `--no-access-log --log-level warning`. Verified live: after healthz + `/api`
+  + a full WebSocket relay round-trip, the server log is EMPTY. Only genuine
+  error tracebacks (never payloads/room ids) are ever logged. Guard test
+  `tests/test_logging.py` (access logger disabled, error logger ≥ WARNING,
+  run.sh keeps the flags) fails loudly on regression.
+- **I2 does NOT change behavior** — purely removes logging; all suites still green.
+- **L2 — room-id bearer-capability risk: closed as a documented bounded
+  guarantee (no code change).** A room is joined by knowing its 256-bit id; the
+  relay is deliberately anonymous (no joiner auth) to keep who-talks-to-whom off
+  the server. A mechanism "fix" (relay-side admission control) would require
+  binding identities to the relay and recording exactly that metadata — a net
+  loss for the primary threat model. The impact of a leaked room id is already
+  bounded to **availability + coarse metadata, never confidentiality or
+  impersonation**: the relay forwards only opaque ciphertext, and the
+  authenticated + safety-number-gated handshake stops a squatter posing as the
+  real contact (AES256's unsent passphrase is its gate). Structural mitigations
+  already in place: room ids are high-entropy (256-bit) and single-use/rotatable
+  — treat one like a one-time secret. Documented precisely in README
+  ("Metadata & residual risks") and the relay/threat notes.
+- Backend `pytest` = **56 passed** (+3 logging guards).
+
 ### 2026-07-02 — accepted-risk closeout: L1 (PQ ownership proof) + I1 (enumeration) ✅
 Closed the two accepted-risk items from the 2026-06-19 security review.
 - **L1 — server-side ML-DSA-65 ownership proof at registration.** Registration
@@ -125,7 +158,9 @@ Closed the two accepted-risk items from the 2026-06-19 security review.
 - Global connection cap + per-connection idle read timeout (zombie reaper).
 - Global room cap + per-room member cap (DoS/memory bounds).
 - Rooms in-memory only; deleted when empty (no data at rest).
-- Message payloads never logged; no stack traces leaked to clients.
+- Message payloads never logged; no stack traces leaked to clients. Access log
+  + connection-lifecycle logging disabled (I2) — no request/timing metadata at
+  rest; only content-free error tracebacks are recorded.
 - CORS disabled; security headers (CSP `default-src 'none'`, nosniff, DENY,
   no-referrer); API docs/OpenAPI endpoints disabled; server header stripped.
 
@@ -389,8 +424,9 @@ Ran a white-box review + live attack probes. Fixed the actionable findings:
   results since the in-person safety number is the trust root), L2 (room-slot
   squatting if a 256-bit room id leaks), I1/I2 (username enumeration + access-log
   metadata — inherent to a public directory; scrub logs on the `.onion`).
-  **UPDATE 2026-07-02 (second session): L1 and I1 are now CLOSED** — see the
-  "accepted-risk closeout" dated entry below. (L2, I2 remain accepted.)
+  **UPDATE 2026-07-02 (second session): ALL FOUR now CLOSED** — L1/I1 in the
+  "accepted-risk closeout" entry; L2 (documented bounded guarantee) and I2
+  (access/connection logging disabled) in the "L2/I2 closeout" entry below.
 
 ### 2026-07-02 — RSA mode: per-message HMAC authentication (forgery fix) ✅
 - **Finding (code review):** RSA mode had NO message authenticity. Each message
