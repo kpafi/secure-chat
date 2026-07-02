@@ -9,7 +9,7 @@
 // Run: node identity.test.mjs   (server not required)
 import assert from "node:assert";
 import { Identity, b64 } from "./identity.js";
-import { signHandshake, verifyHandshake } from "./auth.js";
+import { signHandshake, verifyHandshake, freshNonce } from "./auth.js";
 import { makeCipher, bufToB64 } from "./crypto.js";
 
 const ROOM = "a".repeat(64);
@@ -107,10 +107,13 @@ async function testMitmDefeated() {
   // Mallory is the malicious relay with her own identity + ephemeral key.
   const mallory = await Identity.generate();
 
+  // Both peers contributed a fresh per-connection nonce (hello phase).
+  const nonces = [freshNonce(), freshNonce()];
+
   // Alice creates her ephemeral ECDH key and signs it with her identity.
   const aliceEph = makeCipher("DHKE", ROOM);
   const aliceEphPub = await ephemeralPub(aliceEph);
-  const aliceSig = await signHandshake(alice, ROOM, aliceEphPub);
+  const aliceSig = await signHandshake(alice, ROOM, nonces, aliceEphPub);
 
   // --- Attack: Mallory swaps Alice's ephemeral key for her own. ---
   const malloryEph = makeCipher("DHKE", ROOM);
@@ -124,25 +127,65 @@ async function testMitmDefeated() {
   // 2) Authenticated path: Bob verifies the signature over the ephemeral key
   //    against Alice's PINNED identity.
   //    a) Mallory forwards Alice's real signature but her OWN swapped key:
-  const forgedAccepted = await verifyHandshake(alicePinnedByBob, ROOM, malloryEphPub, aliceSig);
+  const forgedAccepted = await verifyHandshake(alicePinnedByBob, ROOM, nonces, malloryEphPub, aliceSig);
   assert.strictEqual(forgedAccepted, false, "swapped key with Alice's old sig -> REJECTED");
 
   //    b) Mallory signs her swapped key with her OWN identity (not Alice's):
-  const mallorySig = await signHandshake(mallory, ROOM, malloryEphPub);
-  const impostorAccepted = await verifyHandshake(alicePinnedByBob, ROOM, malloryEphPub, mallorySig);
+  const mallorySig = await signHandshake(mallory, ROOM, nonces, malloryEphPub);
+  const impostorAccepted = await verifyHandshake(alicePinnedByBob, ROOM, nonces, malloryEphPub, mallorySig);
   assert.strictEqual(impostorAccepted, false, "Mallory-signed key vs Alice's pin -> REJECTED");
 
   //    c) The genuine Alice key + signature is accepted:
-  const genuineAccepted = await verifyHandshake(alicePinnedByBob, ROOM, aliceEphPub, aliceSig);
+  const genuineAccepted = await verifyHandshake(alicePinnedByBob, ROOM, nonces, aliceEphPub, aliceSig);
   assert.strictEqual(genuineAccepted, true, "genuine signed key -> ACCEPTED");
+
+  //    d) The nonce fold is order-independent (both peers verify the same
+  //       transcript regardless of who contributed which nonce):
+  const swapped = await verifyHandshake(alicePinnedByBob, ROOM, [nonces[1], nonces[0]], aliceEphPub, aliceSig);
+  assert.strictEqual(swapped, true, "nonce order must not matter");
 
   // And cross-room replay of a genuine signature is rejected (transcript binds room).
   const otherRoom = "b".repeat(64);
-  const replay = await verifyHandshake(alicePinnedByBob, otherRoom, aliceEphPub, aliceSig);
+  const replay = await verifyHandshake(alicePinnedByBob, otherRoom, nonces, aliceEphPub, aliceSig);
   assert.strictEqual(replay, false, "cross-room replay -> REJECTED");
 
   void bobPinnedByAlice;
   console.log("OK  MITM relay DEFEATED by authenticated handshake (classical + PQ)");
+}
+
+async function testCrossSessionReplayDefeated() {
+  // The 2026-07-02 pentest finding: a relay replays Alice's validly-signed
+  // handshake from an OLD session into a NEW session that reuses the room id.
+  // Under the v1 transcript (room only) the signature still verified and the
+  // two honest peers silently desynced. Under v2 the transcript covers a
+  // fresh nonce from EACH connection, so the stale signature must fail.
+  const alice = await Identity.generate();
+  const alicePinnedByBob = alice.publicBundle();
+
+  // Session 1: genuine handshake, captured by the relay.
+  const oldNonces = [freshNonce(), freshNonce()];
+  const aliceEphPub = await ephemeralPub(makeCipher("DHKE", ROOM));
+  const capturedSig = await signHandshake(alice, ROOM, oldNonces, aliceEphPub);
+  assert.ok(await verifyHandshake(alicePinnedByBob, ROOM, oldNonces, aliceEphPub, capturedSig),
+    "sanity: captured handshake verified in its own session");
+
+  // Session 2: SAME room, but Bob generated a fresh nonce. The relay delivers
+  // the captured (validly-signed!) old handshake — with any nonce story it can
+  // tell: Alice's old nonce, or even both old nonces replayed via fake hellos.
+  const bobFresh = freshNonce();
+  const staleVsFresh = await verifyHandshake(
+    alicePinnedByBob, ROOM, [oldNonces[0], bobFresh], aliceEphPub, capturedSig);
+  assert.strictEqual(staleVsFresh, false,
+    "old signed handshake vs Bob's fresh nonce -> REJECTED");
+
+  // Even if the relay replays BOTH old hellos, Bob verifies against the nonce
+  // HE generated this connection (never one fed to him), so the pair can never
+  // be the old pair. Verify the exact old pair is the only accepting pair:
+  const freshPair = await verifyHandshake(
+    alicePinnedByBob, ROOM, [bobFresh, freshNonce()], aliceEphPub, capturedSig);
+  assert.strictEqual(freshPair, false, "old handshake vs fully fresh nonces -> REJECTED");
+
+  console.log("OK  cross-session handshake replay (reused room id) DEFEATED by session nonces");
 }
 
 await testIdentityBasics();
@@ -150,4 +193,5 @@ await testFingerprints();
 await testExportImport();
 await testLegacyBlobImport();
 await testMitmDefeated();
+await testCrossSessionReplayDefeated();
 console.log("\nAll identity / authenticated-handshake checks passed.");

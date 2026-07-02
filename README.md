@@ -92,8 +92,13 @@ DHKE and RSA handshakes are signed by a long-term identity (Ed25519 + ML-DSA-65)
 that each user generates locally and the other verifies **in person** by
 comparing a safety number. A hostile relay that swaps the ephemeral key cannot
 forge the signature; one that swaps the whole identity is caught because the two
-endpoints then compute different safety numbers. Identity private keys are
-passphrase-encrypted on the device and never sent to the server.
+endpoints then compute different safety numbers. The signed transcript also
+covers a fresh random nonce from **each** peer's current connection (exchanged
+in a plaintext hello before the handshake), so a captured, validly-signed
+handshake from an earlier session of the same room cannot be replayed into a
+new one — it can never cover the nonce the victim just generated. Identity
+private keys are passphrase-encrypted on the device and never sent to the
+server.
 
 **RSA mode** additionally authenticates every *message*: encrypting to a public
 key proves nothing about the sender, so without more, anyone who watched the

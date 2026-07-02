@@ -3,26 +3,18 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (snapshot as of 2026-07-02)
-**Status:** backend relay + web client working locally; git repo on `master`.
-Backend `pytest` = **47 passed**; client offline suite (`npm test`) green
-(incl. 4 new RSA attack tests); all 3 live integration suites green.
-**2026-07-02:** Security pass (all verified, incl. real-browser checks):
-(1) RSA per-message HMAC authentication; (2) verification gate now covers
-RECEIVING (inbound `msg` dropped until the safety number is confirmed);
-(3) reflection/replay CLOSED for AES256/DHKE/PQKEM via `AuthChannel`;
-(4) PQKEM handshake-replay key-desync fixed (first-write-wins); (5) DHKE key now
-HKDF-derived; (6) login challenge signature domain-separated; (7) CSP import-map
-hash guarded by a test. See dated entries. Client `npm test` + all 3 live
-integration suites green; backend `pytest` = **48 passed**. Uncommitted at
-session end — commit before continuing.
-
-**UNCOMMITTED files at session end (2026-07-02), all verified & ready to commit:**
-`PROGRESS.md`, `README.md`, `backend/accounts.py`, `backend/tests/test_accounts.py`,
-`client/account.js`, `client/app.js`, `client/auth.integration.test.mjs`,
-`client/crypto.js`, `client/crypto.test.mjs`, and new `backend/tests/test_csp_hash.py`.
-(README.md + auth.integration.test.mjs also carry earlier-in-day RSA-HMAC work.)
-Suggested one commit: "Close reflection/replay + receive-gate; crypto hardening".
+## ⮕ RESUME HERE (snapshot as of 2026-07-02, second session)
+**Status:** backend relay + web client working locally; git repo on `master`,
+tree clean (previous session's work committed as 6092b71). Backend `pytest` =
+**48 passed**; client offline suite (`npm test`) green; all 3 live integration
+suites green (auth suite now includes a live cross-session-replay attack
+regression); real-browser DHKE end-to-end check (puppeteer/Chromium) green.
+**2026-07-02 (second session):** CLOSED the Medium pentest finding
+**cross-session handshake replay in a reused room** — handshake transcript
+bumped to v2 and now covers a fresh random nonce from BOTH peers' current
+connections (plaintext `hello` exchange precedes the signed offer/answer;
+nonces folded order-independently). A captured validly-signed handshake from
+an old session can no longer verify in a new one. See dated entry.
 
 **Done & verified end-to-end (incl. real-browser checks via puppeteer):**
 - Dumb-relay backend (strict validation, rate limit, connection cap, join +
@@ -442,6 +434,40 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
   real browser (Chromium/puppeteer): DHKE handshake, receive-gate, and a two-way
   message exchange under the new framing all work. All suites green.
 
+### 2026-07-02 — cross-session handshake replay CLOSED (session nonces, transcript v2) ✅
+- **Finding (2026-07-02 pentest, Medium):** the signed handshake transcript
+  (`DOMAIN || roomId || ephemeralPayload`) had no per-connection freshness, so
+  a relay could replay a peer's validly-signed handshake from an OLD session
+  into a NEW session reusing the same room id → silent key desync with a
+  misleading "verified" UI (integrity/availability, not confidentiality).
+- **Fix (`client/auth.js` + `client/app.js`):** transcript bumped to
+  `secure-chat/handshake/v2` and now covers a fresh random 32-byte nonce from
+  BOTH peers' current connections. New plaintext `hello` phase inside the `key`
+  message (`{hello:true, n, reply}`): each peer announces its nonce on join;
+  the receiver of a reply:false hello answers once (reply:true) and then sends
+  the signed offer; the signed answer flows as before. Nonces are folded
+  order-independently (sort b64, concat bytes) so both sides sign/verify the
+  same transcript regardless of direction; peer nonce is first-write-wins.
+  Hellos are unauthenticated in flight but authenticated retroactively by the
+  signature that covers them — tampering only makes the handshake fail loudly
+  (a relay could always DoS). A stale signed handshake can never cover the
+  nonce the victim generated THIS connection → signature verification fails
+  instead of desyncing. The domain bump alone also invalidates all pre-v2
+  captured handshakes. Note the offer direction reversed in the staggered-join
+  case (the EARLY joiner now sends the first signed offer, since it learns both
+  nonces first); the ciphers' symmetric/race-tolerant design is direction-
+  agnostic, and the simultaneous-join race path is unchanged (dual offer +
+  dual answer, idempotent onPeerKey).
+- **Tests:** `identity.test.mjs` — new cross-session-replay rejection suite
+  (stale sig vs fresh nonce REJECTED, fresh-pair REJECTED, genuine ACCEPTED,
+  nonce-order independence). `auth.integration.test.mjs` — peers speak the new
+  hello+offer/answer protocol, PLUS a live PoC regression: session 1 captured
+  through the real relay, its validly-signed handshake replayed by a Mallory
+  client into session 2 (same room) → REJECTED. Verified in a real browser
+  (Chromium/puppeteer): two isolated contexts, DHKE staggered join, identical
+  safety numbers, two-way messages. All suites green: client `npm test`, all 3
+  live integration suites, backend `pytest` 48 passed.
+
 ## TODO / NEXT (suggested order)
 - [x] **Initialize git** in `~/secure-chat` and make the first commit — DONE
       (repo initialized on `master`; initial commit covers backend, client, and
@@ -460,27 +486,11 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
       tracking, never-reuse enforcement (all client-side).
 - [ ] **Tor deployment** — hardened reverse setup, `.onion` service config,
       bind notes; never expose uvicorn directly to a public interface.
-- [ ] **Handshake replay across sessions in a reused room (Medium, found
-      2026-07-02 pentest)** — `auth.js`'s signed transcript is
-      `DOMAIN || roomId || ephemeralPayload`, with no per-connection freshness
-      value. A malicious relay can replay a peer's OLD (but validly-signed)
-      handshake message from a past session into a NEW session that reuses the
-      same room id. The signature still verifies (room+domain match) and, if
-      the peer is already pinned, the safety-number gate auto-passes silently
-      — so the UI shows "verified" / "secure channel established" while the
-      two legitimate parties actually hold desynced session keys and real
-      messages fail to decrypt. DHKE's "first key wins" guard means the relay
-      doesn't even need to suppress the real handshake message, just deliver
-      the stale one first. Affects DHKE/RSA/PQKEM (all use the same transcript
-      via `signedHandshake`/`verifyHandshake`). Confirmed via PoC — reproduced
-      the desync; also confirmed (via a second PoC) that it does NOT allow
-      full session-key reuse or replay of old plaintext-equivalent ciphertext
-      into the new session, since each side still mixes in a fresh ephemeral
-      private key — impact is integrity/availability + a misleading "verified"
-      UI state, not confidentiality loss. Fix: fold a fresh per-connection
-      nonce (contributed by both peers, sorted/folded the way RSA/PQKEM already
-      fold multi-secret contributions) into the signed transcript, or treat
-      room ids as strictly single-use server-side.
+- [x] **Handshake replay across sessions in a reused room (Medium, found
+      2026-07-02 pentest)** — DONE (2026-07-02 second session, see dated
+      entry): transcript v2 folds a fresh per-connection nonce from both peers
+      (hello phase) into the signed handshake; live relay replay PoC now
+      REJECTED (regression test in `auth.integration.test.mjs`).
 - [ ] **AES256 cross-session replay (Low — already documented, re-confirmed
       2026-07-02)** — re-verified via PoC that a captured session-1 frame still
       decrypts again in a fresh session-2 using the same room id + passphrase,

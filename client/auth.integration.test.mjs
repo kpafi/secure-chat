@@ -12,7 +12,7 @@
 import assert from "node:assert";
 import { makeCipher, bufToB64, b64ToBuf } from "./crypto.js";
 import { Identity } from "./identity.js";
-import { signHandshake, verifyHandshake } from "./auth.js";
+import { signHandshake, verifyHandshake, freshNonce, isValidNonce } from "./auth.js";
 
 const URL = "ws://127.0.0.1:8000/ws";
 const enc = new TextEncoder();
@@ -25,7 +25,9 @@ function unpackKey(b64) {
   return JSON.parse(dec.decode(b64ToBuf(b64)));
 }
 
-// A peer that mirrors app.js's authenticated handshake for one algorithm.
+// A peer that mirrors app.js's authenticated handshake for one algorithm:
+// hello (fresh session nonce) first, then the signed offer/answer whose
+// transcript covers BOTH nonces (cross-session replay protection).
 function makePeer(name, room, alg, identity, peerPinnedBundle, onText) {
   const cipher = makeCipher(alg, room, {});
   const myBundle = identity.publicBundle();
@@ -35,12 +37,21 @@ function makePeer(name, room, alg, identity, peerPinnedBundle, onText) {
   const joined = {};
   const joinedP = new Promise((r) => (joined.resolve = r));
 
+  const myNonce = freshNonce();
+  let peerNonce = null;
+  let helloAnswered = false;
+
   // Computed fresh each call (no caching): PQKEM's and RSA's offer and answer
   // are different payloads and each needs its own signature.
   async function mine() {
     const pub = await cipher.handshakePayload();
-    const sig = await signHandshake(identity, room, pub);
+    const sig = await signHandshake(identity, room, [myNonce, peerNonce], pub);
     return { pub, sig };
+  }
+
+  async function sendSignedKey(reply) {
+    const { pub, sig } = await mine();
+    ws.send(JSON.stringify({ type: "key", room, alg, payload: packKey({ pub, reply, idb: myBundle, sig }) }));
   }
 
   ws.addEventListener("open", async () => {
@@ -52,18 +63,28 @@ function makePeer(name, room, alg, identity, peerPinnedBundle, onText) {
     const m = JSON.parse(ev.data);
     if (m.type === "joined") {
       joined.resolve();
-      const { pub, sig } = await mine();
-      ws.send(JSON.stringify({ type: "key", room, alg, payload: packKey({ pub, reply: false, idb: myBundle, sig }) }));
+      ws.send(JSON.stringify({ type: "key", room, alg, payload: packKey({ hello: true, n: myNonce, reply: false }) }));
     } else if (m.type === "key") {
-      const { pub, reply, idb, sig } = unpackKey(m.payload);
+      const p = unpackKey(m.payload);
+      if (p.hello) {
+        assert.ok(isValidNonce(p.n), `${name}: peer hello nonce must be well-formed`);
+        if (peerNonce === null) peerNonce = p.n;
+        if (!p.reply && !helloAnswered) {
+          helloAnswered = true;
+          ws.send(JSON.stringify({ type: "key", room, alg, payload: packKey({ hello: true, n: myNonce, reply: true }) }));
+          await sendSignedKey(false);
+        }
+        return;
+      }
+      const { pub, reply, idb, sig } = p;
+      assert.notStrictEqual(peerNonce, null, `${name}: handshake must not arrive before the nonce exchange`);
       // Verify against the bundle we pinned in person — not whatever arrives.
-      const ok = await verifyHandshake(peerPinnedBundle, room, pub, sig);
+      const ok = await verifyHandshake(peerPinnedBundle, room, [myNonce, peerNonce], pub, sig);
       assert.strictEqual(ok, true, `${name}: peer handshake signature must verify against the pin`);
       assert.deepStrictEqual(idb, peerPinnedBundle, `${name}: received bundle must equal the pinned bundle`);
       await cipher.onPeerKey(pub);
       if (!reply) {
-        const mk = await mine();
-        ws.send(JSON.stringify({ type: "key", room, alg, payload: packKey({ pub: mk.pub, reply: true, idb: myBundle, sig: mk.sig }) }));
+        await sendSignedKey(true);
       }
       if (cipher.ready) {
         const sn = await Identity.safetyNumber(myBundle, peerPinnedBundle);
@@ -117,8 +138,84 @@ async function testAlg(alg) {
   console.log(`OK  ${alg} authenticated handshake end-to-end through relay (safety number matched)`);
 }
 
+// Regression for the 2026-07-02 pentest finding: a malicious relay captures a
+// peer's validly-signed handshake in session 1 and replays it into a NEW
+// session that reuses the same room id. Under the v1 transcript (no freshness)
+// the signature still verified and the honest peers silently desynced; under
+// v2 the transcript covers a nonce the victim generated THIS connection, so
+// the stale handshake must fail signature verification.
+async function testCrossSessionReplayLive() {
+  const room = randomRoom();
+  const alice = await Identity.generate();
+  const bob = await Identity.generate();
+
+  // --- Session 1: honest A + B complete a handshake; "the relay" (us, via a
+  // tap on A's socket) captures every frame B sent: his hello + signed answer.
+  const captured = [];
+  const got = {};
+  const aGot = new Promise((r) => (got.a = r));
+  const A1 = makePeer("A1", room, "DHKE", alice, bob.publicBundle(), (t) => got.a(t));
+  A1.ws.addEventListener("message", (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.type === "key") captured.push(m.payload);
+  });
+  await A1.joinedP;
+  const B1 = makePeer("B1", room, "DHKE", bob, alice.publicBundle(), () => {});
+  await Promise.all([A1.readyP, B1.readyP]);
+  await B1.send("session 1 sanity");
+  assert.strictEqual(await aGot, "session 1 sanity");
+  A1.close();
+  B1.close();
+  const staleHello = captured.find((p) => unpackKey(p).hello);
+  const staleSigned = captured.find((p) => !unpackKey(p).hello);
+  assert.ok(staleHello && staleSigned, "captured B's hello and signed handshake");
+
+  // --- Session 2: same room. Honest Alice reconnects with a FRESH nonce;
+  // Mallory (the relay, played by a plain room member) replays B's captured,
+  // validly-signed session-1 frames. Alice must REJECT the stale handshake.
+  const myNonce = freshNonce();
+  let peerNonce = null;
+  const verdict = {};
+  const verdictP = new Promise((r) => (verdict.resolve = r));
+  const victim = new WebSocket(URL);
+  const victimJoined = new Promise((r) => {
+    victim.addEventListener("message", async (ev) => {
+      const m = JSON.parse(ev.data);
+      if (m.type === "joined") r();
+      if (m.type !== "key") return;
+      const p = unpackKey(m.payload);
+      if (p.hello) {
+        if (peerNonce === null) peerNonce = p.n;
+        return; // replayed hello is reply:false, but the victim needn't answer for this test
+      }
+      // The stale signed handshake arrives: verify exactly like app.js does.
+      verdict.resolve(await verifyHandshake(bob.publicBundle(), room, [myNonce, peerNonce], p.pub, p.sig));
+    });
+  });
+  victim.addEventListener("open", () => victim.send(JSON.stringify({ type: "join", room })));
+  await victimJoined;
+
+  const mallory = new WebSocket(URL);
+  await new Promise((r) => {
+    mallory.addEventListener("message", (ev) => {
+      if (JSON.parse(ev.data).type === "joined") r();
+    });
+    mallory.addEventListener("open", () => mallory.send(JSON.stringify({ type: "join", room })));
+  });
+  mallory.send(JSON.stringify({ type: "key", room, alg: "DHKE", payload: staleHello }));
+  mallory.send(JSON.stringify({ type: "key", room, alg: "DHKE", payload: staleSigned }));
+
+  const accepted = await verdictP;
+  assert.strictEqual(accepted, false,
+    "replayed session-1 handshake must FAIL verification in session 2 (fresh victim nonce)");
+  victim.close();
+  mallory.close();
+  console.log("OK  cross-session handshake replay through the live relay REJECTED (session nonces)");
+}
+
 await testAlg("DHKE");
 await testAlg("RSA");
 await testAlg("PQKEM");
+await testCrossSessionReplayLive();
 console.log("\nAll authenticated-handshake integration checks passed.");
 process.exit(0);

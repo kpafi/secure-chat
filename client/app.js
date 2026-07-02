@@ -20,7 +20,7 @@
 
 import { makeCipher, isAscii, bufToB64, b64ToBuf } from "./crypto.js";
 import { Identity } from "./identity.js";
-import { signHandshake, verifyHandshake } from "./auth.js";
+import { signHandshake, verifyHandshake, freshNonce, isValidNonce } from "./auth.js";
 import * as account from "./account.js";
 
 const $ = (id) => document.getElementById(id);
@@ -69,11 +69,22 @@ let expectedPeerName = null;   // contact username we looked up (or null)
 let expectedPeerBundle = null; // bundle fetched from the directory (or null)
 let currentPinKey = null;      // pin key for the active session
 
+// Per-connection handshake freshness (see auth.js). Each peer contributes a
+// fresh random nonce; the signed transcript covers BOTH, so a validly-signed
+// handshake from an earlier session of the same room cannot verify here.
+let myNonce = null;       // our fresh nonce for this connection
+let peerNonce = null;     // the peer's nonce (first-write-wins)
+let helloAnswered = false; // answered the peer's hello (and sent our offer) once
+
 // ---- handshake payload framing -------------------------------------------
-// `key` messages carry base64(JSON({pub, reply, idb, sig})). `pub` is the
-// sender's ephemeral/public key; `idb`+`sig` authenticate it (DHKE/RSA). The
-// `reply` flag prevents an infinite key ping-pong: the later joiner sends
-// reply=false, the early joiner answers once with reply=true.
+// `key` messages carry base64(JSON(...)) of one of two payload kinds:
+//   hello:     {hello: true, n, reply} — plaintext nonce exchange that seeds
+//              handshake freshness. Sent on join (reply=false); the receiver
+//              answers once (reply=true) and then sends its signed offer.
+//   handshake: {pub, reply, idb, sig} — `pub` is the sender's ephemeral/public
+//              key; `idb`+`sig` authenticate it over room + both nonces.
+// The `reply` flags prevent infinite ping-pong in both phases: the later
+// joiner initiates, the early joiner answers exactly once.
 
 function packKey(obj) {
   return bufToB64(enc.encode(JSON.stringify(obj)));
@@ -351,6 +362,9 @@ async function connect() {
 
   peerBundle = null;
   verified = false;
+  myNonce = freshNonce();
+  peerNonce = null;
+  helloAnswered = false;
   setStatus("connecting…");
   els.connect.disabled = true;
   ws = new WebSocket(wsUrl());
@@ -378,11 +392,22 @@ async function connect() {
 // cached): for PQKEM and RSA the initial "offer" and the "answer" are different
 // payloads (RSA's answer transports the wrapped MAC secret), and each must
 // carry its own signature. For DHKE the payload is idempotent, so re-signing
-// the reply is just a negligible extra signature.
+// the reply is just a negligible extra signature. The signature covers both
+// per-connection nonces, so it is only meaningful once the hello exchange
+// fixed them.
 async function signedHandshake(room) {
   const pub = await cipher.handshakePayload();
-  const sig = await signHandshake(identity, room, pub);
+  const sig = await signHandshake(identity, room, [myNonce, peerNonce], pub);
   return { pub, sig };
+}
+
+function sendSignedKey(room, reply) {
+  return signedHandshake(room).then(({ pub, sig }) => {
+    ws.send(JSON.stringify({
+      type: "key", room, alg: els.alg.value,
+      payload: packKey({ pub, reply, idb: myBundle, sig }),
+    }));
+  });
 }
 
 async function handleMessage(room, raw) {
@@ -401,10 +426,11 @@ async function handleMessage(room, raw) {
       setStatus("connected", "ok");
       addLine("sys", "", `joined room — encryption: ${els.alg.value}`);
       if (cipher.needsHandshake) {
-        const { pub, sig } = await signedHandshake(room);
+        // Phase 1: announce our fresh session nonce. The signed handshake
+        // follows only once we also know the peer's nonce.
         ws.send(JSON.stringify({
           type: "key", room, alg: els.alg.value,
-          payload: packKey({ pub, reply: false, idb: myBundle, sig }),
+          payload: packKey({ hello: true, n: myNonce, reply: false }),
         }));
         hint("Waiting for the other party to join / exchange keys…");
       } else if (cipher.ready) {
@@ -419,14 +445,42 @@ async function handleMessage(room, raw) {
 
     case "key": {
       try {
-        const { pub, reply, idb, sig } = unpackKey(m.payload);
+        const p = unpackKey(m.payload);
+
+        // Phase 1 — hello: record the peer's session nonce (first-write-wins,
+        // so a relay injecting extra hellos can't rotate it mid-handshake),
+        // answer the initiator's hello once, then send our signed offer.
+        if (p.hello) {
+          if (!isValidNonce(p.n)) {
+            throw new Error("peer sent a malformed session nonce");
+          }
+          if (peerNonce === null) peerNonce = p.n;
+          if (!p.reply && !helloAnswered) {
+            helloAnswered = true;
+            ws.send(JSON.stringify({
+              type: "key", room, alg: els.alg.value,
+              payload: packKey({ hello: true, n: myNonce, reply: true }),
+            }));
+            await sendSignedKey(room, false);
+          }
+          break;
+        }
+
+        // Phase 2 — signed handshake. Meaningless before the nonce exchange:
+        // without the peer's nonce we cannot check freshness, so refuse.
+        const { pub, reply, idb, sig } = p;
+        if (peerNonce === null) {
+          throw new Error("peer sent a handshake before the nonce exchange");
+        }
 
         // Authenticated modes: the signed identity bundle is mandatory and must
-        // verify over THIS room + ephemeral key, or we refuse outright.
+        // verify over THIS room + both session nonces + ephemeral key, or we
+        // refuse outright. A replayed handshake from an earlier session fails
+        // here: it cannot cover the nonce we generated for THIS connection.
         if (!idb || !sig) {
           throw new Error("peer sent an unauthenticated handshake");
         }
-        const ok = await verifyHandshake(idb, room, pub, sig);
+        const ok = await verifyHandshake(idb, room, [myNonce, peerNonce], pub, sig);
         if (!ok) {
           addLine("sys", "", "[handshake signature INVALID — refusing to connect; a relay may be tampering with the key exchange]");
           hint("Authentication failed — disconnecting. This is what a MITM attempt looks like.", true);
@@ -439,11 +493,7 @@ async function handleMessage(room, raw) {
 
         // Answer the initiator exactly once with our own signed key.
         if (!reply) {
-          const mine = await signedHandshake(room);
-          ws.send(JSON.stringify({
-            type: "key", room, alg: els.alg.value,
-            payload: packKey({ pub: mine.pub, reply: true, idb: myBundle, sig: mine.sig }),
-          }));
+          await sendSignedKey(room, true);
         }
 
         if (cipher.ready) {
