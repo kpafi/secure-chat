@@ -10,9 +10,10 @@
 // All proofs use the CLASSICAL (Ed25519) key only, matching the server, which
 // verifies ML-DSA client-side during the handshake rather than at the directory.
 
-import { unb64 } from "./identity.js";
+import { unb64, concat } from "./identity.js";
 
 const REGISTER_DOMAIN = "secure-chat/register/v1";
+const LOGIN_DOMAIN = "secure-chat/login/v1";
 const enc = new TextEncoder();
 const JSON_HEADERS = { "content-type": "application/json" };
 
@@ -77,7 +78,9 @@ export async function login(base, identity, username) {
   if (!cRes.ok) throw new Error("challenge failed: " + (await asError(cRes)));
   const { challenge } = await cRes.json();
 
-  const sig = await identity.signEd(unb64(challenge));
+  // Sign under the login domain prefix (matches accounts._login_message) so the
+  // signature is bound to the login protocol and can't be cross-used elsewhere.
+  const sig = await identity.signEd(concat(enc.encode(LOGIN_DOMAIN + "\n"), unb64(challenge)));
   const vRes = await fetch(base + "/api/auth/verify", {
     method: "POST",
     headers: JSON_HEADERS,

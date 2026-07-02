@@ -3,10 +3,26 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (snapshot as of 2026-06-19)
-**Status:** backend relay + web client working locally; git repo on `master`,
-working tree clean, latest commit `1443534`. Backend `pytest` = **47 passed**;
-client offline suite (`npm test`) green; all 3 live integration suites green.
+## ⮕ RESUME HERE (snapshot as of 2026-07-02)
+**Status:** backend relay + web client working locally; git repo on `master`.
+Backend `pytest` = **47 passed**; client offline suite (`npm test`) green
+(incl. 4 new RSA attack tests); all 3 live integration suites green.
+**2026-07-02:** Security pass (all verified, incl. real-browser checks):
+(1) RSA per-message HMAC authentication; (2) verification gate now covers
+RECEIVING (inbound `msg` dropped until the safety number is confirmed);
+(3) reflection/replay CLOSED for AES256/DHKE/PQKEM via `AuthChannel`;
+(4) PQKEM handshake-replay key-desync fixed (first-write-wins); (5) DHKE key now
+HKDF-derived; (6) login challenge signature domain-separated; (7) CSP import-map
+hash guarded by a test. See dated entries. Client `npm test` + all 3 live
+integration suites green; backend `pytest` = **48 passed**. Uncommitted at
+session end — commit before continuing.
+
+**UNCOMMITTED files at session end (2026-07-02), all verified & ready to commit:**
+`PROGRESS.md`, `README.md`, `backend/accounts.py`, `backend/tests/test_accounts.py`,
+`client/account.js`, `client/app.js`, `client/auth.integration.test.mjs`,
+`client/crypto.js`, `client/crypto.test.mjs`, and new `backend/tests/test_csp_hash.py`.
+(README.md + auth.integration.test.mjs also carry earlier-in-day RSA-HMAC work.)
+Suggested one commit: "Close reflection/replay + receive-gate; crypto hardening".
 
 **Done & verified end-to-end (incl. real-browser checks via puppeteer):**
 - Dumb-relay backend (strict validation, rate limit, connection cap, join +
@@ -20,7 +36,9 @@ client offline suite (`npm test`) green; all 3 live integration suites green.
 
 **Next options (pick one):** (a) OTP mode; (b) Tor `.onion` deployment;
 (c) Android app; (d) close accepted-risk items L1 (server-side ML-DSA verify)
-/ I1 (kill username enumeration). Full open list in TODO at the bottom.
+/ I1 (kill username enumeration); (e) forward secrecy / ratcheting for
+AES256/RSA (and to remove AES256's cross-session-replay residual). Full open
+list in TODO at the bottom.
 
 **Run it:** see "How to run (quick ref)" at the bottom of this file.
 
@@ -128,7 +146,21 @@ client offline suite (`npm test`) green; all 3 live integration suites green.
     it is not a trust root. Authenticity still comes from the in-person check.
 - **No forward secrecy in AES256/RSA modes** (static passphrase / long-lived
   RSA key). DHKE is ephemeral per session (good); could add ratcheting later.
-- **No replay/ordering protection** at the app layer yet (relay forwards as-is).
+- **AES256 passphrase is offline-attackable by the relay.** The room id (which
+  the relay routes on, so it always knows it) is the PBKDF2 salt, and the relay
+  sees the ciphertext — so a malicious/compromised relay can mount an offline
+  dictionary attack on the passphrase. 600k PBKDF2 iterations slow this, but a
+  low-entropy passphrase will fall: AES256 security rests entirely on passphrase
+  strength. Prefer a generated high-entropy passphrase, or use DHKE/PQKEM.
+- **Reflection/replay — CLOSED for all modes (2026-07-02).** Every mode now
+  authenticates the direction + ordering of each frame. RSA uses per-message
+  HMAC + sequence numbers; AES256/DHKE/PQKEM use `AuthChannel` (a random
+  per-session sender tag + a strictly-increasing sequence number, both bound
+  into the AES-GCM additional data), which rejects a relay reflecting your own
+  frame back and rejects replays. Residual: AES256's key is static
+  (passphrase-derived, no exchange), so it stops in-session reflection/replay
+  but NOT cross-session replay of a frame captured under the same passphrase +
+  room id; DHKE/PQKEM are ephemeral per session and have no such residual.
 - **Metadata:** relay sees room id + timing + ciphertext sizes (padding TBD).
 
 ### 2026-06-19 — identity keys + authenticated handshake (MITM gap closed in core) ✅
@@ -322,6 +354,94 @@ Ran a white-box review + live attack probes. Fixed the actionable findings:
   squatting if a 256-bit room id leaks), I1/I2 (username enumeration + access-log
   metadata — inherent to a public directory; scrub logs on the `.onion`).
 
+### 2026-07-02 — RSA mode: per-message HMAC authentication (forgery fix) ✅
+- **Finding (code review):** RSA mode had NO message authenticity. Each message
+  was a fresh AES key RSA-OAEP-wrapped to the recipient's public key — but that
+  key crosses the relay in the (unencrypted, only signed) handshake, so the
+  relay could wrap its own AES key and inject messages that decrypted cleanly
+  and rendered as "peer". Encrypting to a public key proves nothing about the
+  sender. (DHKE/PQKEM/AES256 don't have this: their GCM key is a shared secret
+  the relay never learns.)
+- **Fix (`client/crypto.js`, Rsa class):** the handshake answer now transports
+  a random 32-byte MAC secret, RSA-OAEP-encrypted to the offerer's public key
+  (`ws` field — covered by the existing identity signature over the whole
+  payload, so the relay can't strip/replace it). Both sides HKDF-SHA-256 the
+  secret (salt = room id) into TWO direction-separated HMAC-SHA-256 keys (info
+  binds the sender's public key). Every message now carries a strictly
+  increasing sequence number `n` and `mac = HMAC(sendKey,
+  domain|room|n|ek|iv|ct)`; receivers verify the MAC BEFORE any decryption and
+  reject stale `n`. Defeats: forgery (relay never learns the wrapped secret),
+  reflection (direction keys), replay (seq + per-session secret). Wrapped
+  secrets are folded into HKDF keyed by SHA-256(recipient pub), sorted — same
+  race-tolerant convergence pattern as PQKEM — and first-write-wins so a
+  replayed handshake frame can't diverge the keys.
+- RSA's offer/answer are now distinct payloads (like PQKEM); app.js already
+  handled that generically, so only comments changed there. `makeCipher` passes
+  the room id to `Rsa`. Shared byte helpers (`concatBytes`, `sha256Hex`) moved
+  above the RSA section (used by RSA + PQKEM).
+- **Tests:** `crypto.test.mjs` + `rsaAttackChecks()` — Mallory-as-relay
+  completes her own handshake from B's observed offer and injects a message
+  (the exact old attack): REJECTED; reflection of A's own frame: REJECTED;
+  replay of a genuine frame: REJECTED; tampered ciphertext: REJECTED (MAC
+  checked before decrypt). All suites green after the change: client offline
+  (`npm test`), both live integration suites (integration + auth, all algos),
+  backend `pytest` 47 passed.
+- **Still open (documented in KNOWN LIMITATIONS):** AES256/DHKE/PQKEM still
+  lack reflection/replay protection; porting this MAC construction (or an AD/
+  direction-key variant) to them is a natural next step.
+
+### 2026-07-02 — verification gate now covers receiving (pre-verify display fix) ✅
+- **Finding (code review):** the safety-number gate only blocked SENDING.
+  Inbound `msg` frames were decrypted and rendered as "peer" as soon as
+  `cipher.ready`, i.e. before the user confirmed the safety number. In the
+  exact threat the gate exists for — a relay swapping the whole identity and
+  running a MITM session — the swapped bundle carries a valid signature (the
+  relay's own key), so the handshake verifies and the attacker could display
+  messages as a trusted peer pre-verification (e.g. social-engineering the
+  user into clicking through the gate).
+- **Fix (`client/app.js`):** new `verified` flag, set only by
+  `unlockMessaging()` (pin match / user confirms) and by the AES256 no-gate
+  path (its passphrase IS the out-of-band verification); reset on connect and
+  on socket close. The `msg` handler drops frames (never decrypts, shows a
+  "[dropped]" sys line) while `verified` is false.
+- **Verified in a real browser** (Chromium via puppeteer-core, DHKE): a
+  Node-side authenticated peer completed the handshake and sent a message
+  while Alice's verify panel was open → dropped, not rendered, send still
+  locked; after clicking "it matches" a follow-up message rendered normally.
+  All existing suites still green (client offline `npm test`, all 3 live
+  integration suites, backend pytest 47 passed).
+
+### 2026-07-02 — reflection/replay closed everywhere + crypto hardening ✅
+Follow-up review after the receive-gate fix; fixed the remaining findings.
+- **Reflection/replay for AES256/DHKE/PQKEM (`client/crypto.js`).** New shared
+  `AuthChannel`: each frame carries a random per-session sender tag + a strictly
+  increasing sequence number, both folded into the AES-GCM additional data (so
+  a relay can't alter them without the key). Decrypt rejects a frame whose tag
+  is our own (reflection) or whose sequence isn't advancing (replay). AES256,
+  DHKE and PQKEM all route through it; RSA keeps its own HMAC construction.
+  Residual documented: AES256's static key still permits cross-session replay.
+- **PQKEM handshake-replay desync (confirmed bug).** A relay replaying a peer's
+  validly-signed PQKEM offer made the recipient re-encapsulate a fresh secret
+  and rotate the live session key (DoS). Fixed with first-write-wins per
+  encapsulation key + idempotent `_derive` (skips when inputs are unchanged, so
+  the channel and its replay counters survive a replay). DHKE made idempotent
+  too (`if (this.chan) return`).
+- **DHKE key derivation.** Was using the raw ECDH X-coordinate directly as the
+  AES key; now runs it through HKDF (room-id salt + domain tag), matching PQKEM.
+  `Dhke` now takes the room id; `makeCipher` passes it.
+- **Login challenge domain separation (`accounts.py` + `account.js`).** The
+  login signature now covers `secure-chat/login/v1\n` || nonce instead of a bare
+  nonce, so it can't be cross-used as any other protocol signature. Backend +
+  client updated in lockstep; `test_accounts.py` adjusted.
+- **CSP import-map hash guard.** New `backend/tests/test_csp_hash.py` recomputes
+  the SHA-256 of the inline importmap in index.html and asserts the served CSP
+  still pins it — so editing the import map without regenerating the hash fails
+  loudly instead of silently breaking the page.
+- **Tests:** `crypto.test.mjs` gained reflection/replay/tamper checks for
+  AES256/DHKE/PQKEM and a PQKEM replay-doesn't-desync regression. Verified in a
+  real browser (Chromium/puppeteer): DHKE handshake, receive-gate, and a two-way
+  message exchange under the new framing all work. All suites green.
+
 ## TODO / NEXT (suggested order)
 - [x] **Initialize git** in `~/secure-chat` and make the first commit — DONE
       (repo initialized on `master`; initial commit covers backend, client, and
@@ -332,10 +452,41 @@ Ran a white-box review + live attack probes. Fixed the actionable findings:
 - [x] **Abuse/DoS hardening** — DONE (see dated entry above): global connection
       cap + idle read timeout. Per-IP limits and lifetime frame caps were
       intentionally skipped (see rationale in the entry).
+- [x] **Reflection/replay protection for AES256/DHKE/PQKEM** — DONE (2026-07-02):
+      `AuthChannel` binds a per-session sender tag + sequence number into the GCM
+      additional data. AES256 has a documented cross-session-replay residual
+      (static key).
 - [ ] **OTP mode** (deferred) — pre-shared pad handling, pad consumption
       tracking, never-reuse enforcement (all client-side).
 - [ ] **Tor deployment** — hardened reverse setup, `.onion` service config,
       bind notes; never expose uvicorn directly to a public interface.
+- [ ] **Handshake replay across sessions in a reused room (Medium, found
+      2026-07-02 pentest)** — `auth.js`'s signed transcript is
+      `DOMAIN || roomId || ephemeralPayload`, with no per-connection freshness
+      value. A malicious relay can replay a peer's OLD (but validly-signed)
+      handshake message from a past session into a NEW session that reuses the
+      same room id. The signature still verifies (room+domain match) and, if
+      the peer is already pinned, the safety-number gate auto-passes silently
+      — so the UI shows "verified" / "secure channel established" while the
+      two legitimate parties actually hold desynced session keys and real
+      messages fail to decrypt. DHKE's "first key wins" guard means the relay
+      doesn't even need to suppress the real handshake message, just deliver
+      the stale one first. Affects DHKE/RSA/PQKEM (all use the same transcript
+      via `signedHandshake`/`verifyHandshake`). Confirmed via PoC — reproduced
+      the desync; also confirmed (via a second PoC) that it does NOT allow
+      full session-key reuse or replay of old plaintext-equivalent ciphertext
+      into the new session, since each side still mixes in a fresh ephemeral
+      private key — impact is integrity/availability + a misleading "verified"
+      UI state, not confidentiality loss. Fix: fold a fresh per-connection
+      nonce (contributed by both peers, sorted/folded the way RSA/PQKEM already
+      fold multi-secret contributions) into the signed transcript, or treat
+      room ids as strictly single-use server-side.
+- [ ] **AES256 cross-session replay (Low — already documented, re-confirmed
+      2026-07-02)** — re-verified via PoC that a captured session-1 frame still
+      decrypts again in a fresh session-2 using the same room id + passphrase,
+      because `AuthChannel`'s replay counter resets per session while the
+      AES256 key is static. Known/accepted residual (see KNOWN LIMITATIONS);
+      listed here only as a re-confirmation, not a new finding.
 
 DONE since this list was first written (pruned from the TODOs above): web client
 MVP with the WebCrypto encryption menu; the DHKE/RSA/PQ `key`-message handshake

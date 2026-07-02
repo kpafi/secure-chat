@@ -54,6 +54,11 @@ def _register_message(username, ed, mldsa):
     return b"\n".join([b"secure-chat/register/v1", username.encode(), ed.encode(), mldsa.encode()])
 
 
+def _login_message(challenge_b64):
+    # Mirror accounts._login_message: domain prefix + the raw challenge bytes.
+    return b"secure-chat/login/v1\n" + base64.b64decode(challenge_b64)
+
+
 def _register(username):
     priv, ed, mldsa = _new_identity()
     sig = priv.sign(_register_message(username, ed, mldsa))
@@ -108,7 +113,7 @@ def test_full_login_flow():
     ch = client.post("/api/auth/challenge", json={"username": "carol"})
     assert ch.status_code == 200
     challenge = ch.json()["challenge"]
-    sig = priv.sign(base64.b64decode(challenge))
+    sig = priv.sign(_login_message(challenge))
     ver = client.post("/api/auth/verify", json={"username": "carol", "challenge": challenge, "sig": _b64(sig)})
     assert ver.status_code == 200, ver.text
     token = ver.json()["token"]
@@ -122,7 +127,7 @@ def test_login_rejects_wrong_signature():
     _register("dave")
     other = Ed25519PrivateKey.generate()
     ch = client.post("/api/auth/challenge", json={"username": "dave"}).json()["challenge"]
-    sig = other.sign(base64.b64decode(ch))  # signed by the wrong key
+    sig = other.sign(_login_message(ch))  # signed by the wrong key
     ver = client.post("/api/auth/verify", json={"username": "dave", "challenge": ch, "sig": _b64(sig)})
     assert ver.status_code == 401
 
@@ -130,7 +135,7 @@ def test_login_rejects_wrong_signature():
 def test_challenge_is_one_time():
     priv, _, _, _ = _register("erin")
     ch = client.post("/api/auth/challenge", json={"username": "erin"}).json()["challenge"]
-    sig = _b64(priv.sign(base64.b64decode(ch)))
+    sig = _b64(priv.sign(_login_message(ch)))
     first = client.post("/api/auth/verify", json={"username": "erin", "challenge": ch, "sig": sig})
     assert first.status_code == 200
     # Replaying the same challenge must fail (consumed).
@@ -172,7 +177,7 @@ def test_active_token_cap_enforced(monkeypatch):
     accounts._tokens.clear()
     monkeypatch.setattr(config, "MAX_ACTIVE_TOKENS", 0)
     ch = client.post("/api/auth/challenge", json={"username": "tokcap"}).json()["challenge"]
-    sig = _b64(priv.sign(base64.b64decode(ch)))
+    sig = _b64(priv.sign(_login_message(ch)))
     ver = client.post("/api/auth/verify", json={"username": "tokcap", "challenge": ch, "sig": sig})
     assert ver.status_code == 503, ver.text
 

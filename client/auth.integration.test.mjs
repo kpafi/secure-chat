@@ -35,8 +35,8 @@ function makePeer(name, room, alg, identity, peerPinnedBundle, onText) {
   const joined = {};
   const joinedP = new Promise((r) => (joined.resolve = r));
 
-  // Computed fresh each call (no caching): PQKEM's offer and answer are
-  // different payloads and each needs its own signature.
+  // Computed fresh each call (no caching): PQKEM's and RSA's offer and answer
+  // are different payloads and each needs its own signature.
   async function mine() {
     const pub = await cipher.handshakePayload();
     const sig = await signHandshake(identity, room, pub);

@@ -56,6 +56,15 @@ _B64_RE = re.compile(r"^[A-Za-z0-9+/]*={0,2}$")
 # reconstructed identically here. Newline-delimited, no ambiguity.
 _REGISTER_DOMAIN = b"secure-chat/register/v1"
 
+# Login challenges are signed under their own domain prefix so a login signature
+# can never be mistaken for (or replayed as) a signature of any other protocol
+# message. The client prepends the same prefix before signing the raw nonce.
+_LOGIN_DOMAIN = b"secure-chat/login/v1"
+
+
+def _login_message(challenge_raw: bytes) -> bytes:
+    return _LOGIN_DOMAIN + b"\n" + challenge_raw
+
 
 # --- low-level helpers -----------------------------------------------------
 
@@ -223,7 +232,7 @@ def auth_verify(req: VerifyReq) -> dict:
     if row is None:
         raise HTTPException(status_code=404, detail="no such user")
     ed_raw = base64.b64decode(row["ed_pub"], validate=True)
-    if not _ed25519_verify(ed_raw, sig_raw, challenge_raw):
+    if not _ed25519_verify(ed_raw, sig_raw, _login_message(challenge_raw)):
         raise HTTPException(status_code=401, detail="challenge signature invalid")
 
     _prune(_tokens)

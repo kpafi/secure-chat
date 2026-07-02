@@ -59,6 +59,7 @@ const LS_USERNAME = "sc.username.v1";
 let ws = null;
 let cipher = null;
 let joined = false;
+let verified = false; // in-person gate passed; gates RECEIVING as well as sending
 
 let identity = null;       // unlocked Identity, or null
 let myBundle = null;       // identity.publicBundle(), or null
@@ -349,6 +350,7 @@ async function connect() {
   }
 
   peerBundle = null;
+  verified = false;
   setStatus("connecting…");
   els.connect.disabled = true;
   ws = new WebSocket(wsUrl());
@@ -362,6 +364,7 @@ async function connect() {
   ws.onclose = () => {
     setStatus("disconnected", "err");
     joined = false;
+    verified = false;
     enableSend(false);
     els.verify.hidden = true;
     els.setup.hidden = false;
@@ -372,9 +375,10 @@ async function connect() {
 }
 
 // Produce + sign the next handshake payload. Computed fresh each call (not
-// cached): for PQKEM the initial "offer" and the "answer" are different
-// payloads, and each must carry its own signature. For DHKE/RSA the payload is
-// idempotent, so re-signing the reply is just a negligible extra signature.
+// cached): for PQKEM and RSA the initial "offer" and the "answer" are different
+// payloads (RSA's answer transports the wrapped MAC secret), and each must
+// carry its own signature. For DHKE the payload is idempotent, so re-signing
+// the reply is just a negligible extra signature.
 async function signedHandshake(room) {
   const pub = await cipher.handshakePayload();
   const sig = await signHandshake(identity, room, pub);
@@ -404,6 +408,9 @@ async function handleMessage(room, raw) {
         }));
         hint("Waiting for the other party to join / exchange keys…");
       } else if (cipher.ready) {
+        // AES256: no key exchange, no identity gate — the shared passphrase is
+        // the (out-of-band) verification, so receiving unlocks with sending.
+        verified = true;
         enableSend(true);
         hint("Ready. Messages are end-to-end encrypted.");
       }
@@ -449,6 +456,14 @@ async function handleMessage(room, raw) {
     }
 
     case "msg": {
+      // The in-person gate covers RECEIVING too: a relay running a MITM session
+      // passes signature verification (with its own identity), so anything it
+      // sends before the user confirms the safety number would render as a
+      // trusted "peer" line. Drop such frames — never decrypt or display them.
+      if (!verified) {
+        addLine("sys", "", "[message arrived before you verified the safety number — dropped]");
+        break;
+      }
       try {
         const text = await cipher.decrypt(m.payload);
         addLine("peer", "peer", text);
@@ -520,6 +535,7 @@ async function enterVerification(room) {
 }
 
 function unlockMessaging() {
+  verified = true;
   els.verify.hidden = true;
   enableSend(true);
   addLine("sys", "", "secure channel established");

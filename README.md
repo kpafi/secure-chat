@@ -77,7 +77,7 @@ python tests/smoke_client.py
 |---------|-------------------------------------|---------------------|---------------------------------------------|
 | DHKE    | ephemeral ECDH P-256                | AES-256-GCM         | per-session; **identity-authenticated**     |
 | AES256  | PBKDF2 from shared passphrase       | AES-256-GCM         | no key swap → not relay-MITM-able           |
-| RSA     | RSA-OAEP-2048 public-key swap       | hybrid AES-256-GCM  | **identity-authenticated**                  |
+| RSA     | RSA-OAEP-2048 public-key swap       | hybrid AES-256-GCM + HMAC | **identity-authenticated**, per-message MAC |
 | PQKEM   | **hybrid ECDH P-256 + ML-KEM-768**  | AES-256-GCM         | post-quantum; **identity-authenticated**    |
 | OTP     | —                                   | —                   | deferred (in-person pad exchange)           |
 
@@ -94,6 +94,16 @@ comparing a safety number. A hostile relay that swaps the ephemeral key cannot
 forge the signature; one that swaps the whole identity is caught because the two
 endpoints then compute different safety numbers. Identity private keys are
 passphrase-encrypted on the device and never sent to the server.
+
+**RSA mode** additionally authenticates every *message*: encrypting to a public
+key proves nothing about the sender, so without more, anyone who watched the
+public key cross the relay could inject valid-looking ciphertext. The handshake
+answer therefore transports an RSA-OAEP-wrapped MAC secret; both sides derive
+direction-separated HMAC-SHA-256 keys from it (HKDF), and each message carries
+a MAC over `domain|room|seq|ek|iv|ct` plus a strictly increasing sequence
+number — rejecting forgery, reflection, and replay. (The other modes get
+forgery protection implicitly: their AES-GCM key is a shared secret the relay
+never learns.)
 
 ## Accounts (optional directory)
 The server doubles as a passwordless **public-key directory** under `/api`. From
