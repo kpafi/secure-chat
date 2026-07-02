@@ -1,8 +1,9 @@
 """Tests for the passwordless account directory.
 
-Uses a throwaway SQLite DB and real Ed25519 keys (via `cryptography`) to sign
-the registration proof and the login challenge, exercising the happy paths and
-the security-relevant rejections.
+Uses a throwaway SQLite DB and real keys — Ed25519 via `cryptography` and
+ML-DSA-65 via `dilithium_py` — to sign the registration proof (both keys) and
+the login challenge, exercising the happy paths and the security-relevant
+rejections, including L1 (dual ownership proof) and I1 (no enumeration).
 """
 import base64
 import os
@@ -18,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pytest  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
 from cryptography.hazmat.primitives import serialization  # noqa: E402
+from dilithium_py.ml_dsa import ML_DSA_65  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from main import app  # noqa: E402
@@ -30,8 +32,9 @@ client = TestClient(app)
 @pytest.fixture(autouse=True)
 def _reset_api_limiter():
     # Each test starts with a fresh rate-limit budget (TestClient shares one
-    # client host, so otherwise the bucket would deplete across the suite).
+    # client host, so otherwise the buckets would deplete across the suite).
     accounts._api_limiter._buckets.clear()
+    accounts._lookup_limiter._buckets.clear()
     yield
 
 
@@ -40,14 +43,14 @@ def _b64(b: bytes) -> str:
 
 
 def _new_identity():
-    """Return (ed_priv, ed_pub_b64, fake_mldsa_pub_b64). PQ key is opaque to
-    the server, so a correctly sized random blob stands in for it here."""
-    priv = Ed25519PrivateKey.generate()
-    pub = priv.public_key().public_bytes(
+    """Return (ed_priv, ed_pub_b64, mldsa_pub_b64, mldsa_secret) with real keys
+    for BOTH schemes — the server now verifies both at registration (L1)."""
+    ed_priv = Ed25519PrivateKey.generate()
+    ed_pub = ed_priv.public_key().public_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw
     )
-    mldsa = os.urandom(1952)
-    return priv, _b64(pub), _b64(mldsa)
+    mldsa_pub, mldsa_secret = ML_DSA_65.keygen()
+    return ed_priv, _b64(ed_pub), _b64(mldsa_pub), mldsa_secret
 
 
 def _register_message(username, ed, mldsa):
@@ -59,61 +62,133 @@ def _login_message(challenge_b64):
     return b"secure-chat/login/v1\n" + base64.b64decode(challenge_b64)
 
 
+def _register_body(username, ident):
+    """Fully signed, valid register body for an identity (dual signature)."""
+    ed_priv, ed, mldsa, mldsa_secret = ident
+    msg = _register_message(username, ed, mldsa)
+    return {
+        "username": username,
+        "ed": ed,
+        "mldsa": mldsa,
+        "sig": _b64(ed_priv.sign(msg)),
+        "mldsa_sig": _b64(ML_DSA_65.sign(mldsa_secret, msg)),
+    }
+
+
 def _register(username):
-    priv, ed, mldsa = _new_identity()
-    sig = priv.sign(_register_message(username, ed, mldsa))
-    resp = client.post("/api/register", json={"username": username, "ed": ed, "mldsa": mldsa, "sig": _b64(sig)})
-    return priv, ed, mldsa, resp
+    ident = _new_identity()
+    resp = client.post("/api/register", json=_register_body(username, ident))
+    return ident, resp
+
+
+def _lookup(username, token):
+    return client.get(f"/api/users/{username}", params={"t": token})
 
 
 def test_register_and_lookup():
-    priv, ed, mldsa, resp = _register("alice")
+    ident, resp = _register("alice")
     assert resp.status_code == 200, resp.text
-    got = client.get("/api/users/alice")
+    token = resp.json()["lookup_token"]
+    assert token, "registration returns a lookup token"
+    # Lookup requires the token; with it, we get exactly the bundle to pin.
+    got = _lookup("alice", token)
     assert got.status_code == 200
-    assert got.json() == {"username": "alice", "ed": ed, "mldsa": mldsa}
+    assert got.json() == {"username": "alice", "ed": ident[1], "mldsa": ident[2]}
 
 
 def test_register_rejects_bad_signature():
-    _, ed, mldsa = _new_identity()[0:3] if False else (None, *_new_identity()[1:])
-    # Sign with a DIFFERENT key than the ed we submit.
+    ident = _new_identity()
+    body = _register_body("mallory", ident)
+    # Replace the Ed25519 signature with one from a DIFFERENT key.
     wrong = Ed25519PrivateKey.generate()
-    sig = wrong.sign(_register_message("mallory", ed, mldsa))
-    resp = client.post("/api/register", json={"username": "mallory", "ed": ed, "mldsa": mldsa, "sig": _b64(sig)})
+    body["sig"] = _b64(wrong.sign(_register_message("mallory", ident[1], ident[2])))
+    resp = client.post("/api/register", json=body)
     assert resp.status_code == 400
+
+
+def test_register_rejects_bad_mldsa_signature():
+    # L1: a valid Ed25519 proof but an ML-DSA signature from a DIFFERENT PQ key
+    # (i.e. binding a PQ pubkey the registrant does not control) must be refused.
+    ident = _new_identity()
+    body = _register_body("pqmallory", ident)
+    _, _, _, other_secret = _new_identity()
+    body["mldsa_sig"] = _b64(ML_DSA_65.sign(other_secret, _register_message("pqmallory", ident[1], ident[2])))
+    resp = client.post("/api/register", json=body)
+    assert resp.status_code == 400, resp.text
+    assert "post-quantum" in resp.json()["detail"]
 
 
 def test_register_rejects_duplicate_username():
     _register("bob")
-    _, _, _, resp = _register("bob")
+    _, resp = _register("bob")
     assert resp.status_code == 409
 
 
 def test_register_rejects_bad_username():
-    priv, ed, mldsa = _new_identity()
-    sig = priv.sign(_register_message("Bad Name!", ed, mldsa))
-    resp = client.post("/api/register", json={"username": "Bad Name!", "ed": ed, "mldsa": mldsa, "sig": _b64(sig)})
+    ident = _new_identity()
+    resp = client.post("/api/register", json=_register_body("Bad Name!", ident))
     assert resp.status_code == 422
 
 
 def test_register_rejects_wrong_key_size():
-    priv, ed, mldsa = _new_identity()
-    short = _b64(b"too short")
-    sig = priv.sign(_register_message("shorty", short, mldsa))
-    resp = client.post("/api/register", json={"username": "shorty", "ed": short, "mldsa": mldsa, "sig": _b64(sig)})
+    ident = _new_identity()
+    body = _register_body("shorty", ident)
+    body["ed"] = _b64(b"too short")  # wrong ed size; sig no longer matches either
+    resp = client.post("/api/register", json=body)
     assert resp.status_code == 422
 
 
-def test_lookup_unknown_user():
+def test_register_requires_mldsa_sig_field():
+    ident = _new_identity()
+    body = _register_body("noproof", ident)
+    del body["mldsa_sig"]
+    resp = client.post("/api/register", json=body)
+    assert resp.status_code == 422  # pydantic: missing required field
+
+
+# ---- anti-enumeration: token-gated lookup (I1) ---------------------------
+
+def test_lookup_without_token_is_404():
+    _, resp = _register("hidden")
+    assert resp.status_code == 200
+    # No token at all, and a WRONG token, both look identical to a missing user.
+    assert client.get("/api/users/hidden").status_code == 404
+    assert _lookup("hidden", "wrongtoken").status_code == 404
+
+
+def test_lookup_unknown_user_is_404():
+    # A well-formed username that was never registered: identical 404, so a
+    # probe cannot distinguish "exists but wrong token" from "does not exist".
+    assert _lookup("nobody", "anything").status_code == 404
     assert client.get("/api/users/nobody").status_code == 404
 
 
+# ---- anti-enumeration: challenge/verify are not oracles (I1) -------------
+
+def test_challenge_does_not_reveal_existence():
+    # A challenge is issued for a NONEXISTENT username just the same as a real
+    # one (200) — the endpoint no longer leaks who exists.
+    assert client.post("/api/auth/challenge", json={"username": "ghostuser"}).status_code == 200
+
+
+def test_verify_unknown_user_is_401_not_404():
+    # Unknown user and bad signature are indistinguishable at verify (both 401).
+    ch = client.post("/api/auth/challenge", json={"username": "ghostuser2"}).json()["challenge"]
+    other = Ed25519PrivateKey.generate()
+    ver = client.post(
+        "/api/auth/verify",
+        json={"username": "ghostuser2", "challenge": ch, "sig": _b64(other.sign(_login_message(ch)))},
+    )
+    assert ver.status_code == 401
+
+
 def test_full_login_flow():
-    priv, _, _, _ = _register("carol")
+    ident, _ = _register("carol")
+    ed_priv = ident[0]
     ch = client.post("/api/auth/challenge", json={"username": "carol"})
     assert ch.status_code == 200
     challenge = ch.json()["challenge"]
-    sig = priv.sign(_login_message(challenge))
+    sig = ed_priv.sign(_login_message(challenge))
     ver = client.post("/api/auth/verify", json={"username": "carol", "challenge": challenge, "sig": _b64(sig)})
     assert ver.status_code == 200, ver.text
     token = ver.json()["token"]
@@ -133,9 +208,10 @@ def test_login_rejects_wrong_signature():
 
 
 def test_challenge_is_one_time():
-    priv, _, _, _ = _register("erin")
+    ident, _ = _register("erin")
+    ed_priv = ident[0]
     ch = client.post("/api/auth/challenge", json={"username": "erin"}).json()["challenge"]
-    sig = _b64(priv.sign(_login_message(ch)))
+    sig = _b64(ed_priv.sign(_login_message(ch)))
     first = client.post("/api/auth/verify", json={"username": "erin", "challenge": ch, "sig": sig})
     assert first.status_code == 200
     # Replaying the same challenge must fail (consumed).
@@ -149,16 +225,24 @@ def test_api_rate_limit(monkeypatch):
     from relay import KeyedRateLimiter
     # Tiny budget so the limit is deterministic: 3 allowed, then 429.
     monkeypatch.setattr(accounts, "_api_limiter", KeyedRateLimiter(3, 0.001))
-    codes = [client.get("/api/users/whoever").status_code for _ in range(6)]
+    codes = [client.post("/api/auth/challenge", json={"username": "whoever"}).status_code for _ in range(6)]
     assert 429 in codes, codes
     assert codes.count(429) >= 2, codes  # most of the burst past the cap is blocked
 
 
+def test_lookup_rate_limit(monkeypatch):
+    from relay import KeyedRateLimiter
+    # The lookup path has its own, stricter bucket (anti-enumeration).
+    monkeypatch.setattr(accounts, "_lookup_limiter", KeyedRateLimiter(3, 0.001))
+    codes = [client.get("/api/users/whoever", params={"t": "x"}).status_code for _ in range(6)]
+    assert 429 in codes, codes
+    assert codes.count(429) >= 2, codes
+
+
 def test_account_cap_enforced(monkeypatch):
     monkeypatch.setattr(config, "MAX_ACCOUNTS", 0)  # directory "full"
-    priv, ed, mldsa = _new_identity()
-    sig = priv.sign(_register_message("capped.user", ed, mldsa))
-    resp = client.post("/api/register", json={"username": "capped.user", "ed": ed, "mldsa": mldsa, "sig": _b64(sig)})
+    ident = _new_identity()
+    resp = client.post("/api/register", json=_register_body("capped.user", ident))
     assert resp.status_code == 503, resp.text
 
 
@@ -173,11 +257,12 @@ def test_pending_challenge_cap_enforced(monkeypatch):
 
 
 def test_active_token_cap_enforced(monkeypatch):
-    priv, _, _, _ = _register("tokcap")
+    ident, _ = _register("tokcap")
+    ed_priv = ident[0]
     accounts._tokens.clear()
     monkeypatch.setattr(config, "MAX_ACTIVE_TOKENS", 0)
     ch = client.post("/api/auth/challenge", json={"username": "tokcap"}).json()["challenge"]
-    sig = _b64(priv.sign(_login_message(ch)))
+    sig = _b64(ed_priv.sign(_login_message(ch)))
     ver = client.post("/api/auth/verify", json={"username": "tokcap", "challenge": ch, "sig": sig})
     assert ver.status_code == 503, ver.text
 
@@ -187,15 +272,9 @@ def test_me_requires_valid_token():
     assert client.get("/api/me", headers={"Authorization": "Bearer nope"}).status_code == 401
 
 
-def test_challenge_unknown_user():
-    assert client.post("/api/auth/challenge", json={"username": "ghost"}).status_code == 404
-
-
 def test_register_forbids_extra_fields():
-    priv, ed, mldsa = _new_identity()
-    sig = _b64(priv.sign(_register_message("frank", ed, mldsa)))
-    resp = client.post(
-        "/api/register",
-        json={"username": "frank", "ed": ed, "mldsa": mldsa, "sig": sig, "admin": True},
-    )
+    ident = _new_identity()
+    body = _register_body("frank", ident)
+    body["admin"] = True
+    resp = client.post("/api/register", json=body)
     assert resp.status_code == 422

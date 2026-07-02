@@ -4,17 +4,29 @@ Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
 ## ⮕ RESUME HERE (snapshot as of 2026-07-02, second session)
-**Status:** backend relay + web client working locally; git repo on `master`,
-tree clean (previous session's work committed as 6092b71). Backend `pytest` =
-**48 passed**; client offline suite (`npm test`) green; all 3 live integration
-suites green (auth suite now includes a live cross-session-replay attack
-regression); real-browser DHKE end-to-end check (puppeteer/Chromium) green.
-**2026-07-02 (second session):** CLOSED the Medium pentest finding
-**cross-session handshake replay in a reused room** — handshake transcript
-bumped to v2 and now covers a fresh random nonce from BOTH peers' current
-connections (plaintext `hello` exchange precedes the signed offer/answer;
-nonces folded order-independently). A captured validly-signed handshake from
-an old session can no longer verify in a new one. See dated entry.
+**Status:** backend relay + web client working locally; git repo on `master`.
+Backend `pytest` = **53 passed**; client offline suite (`npm test`) green; all
+3 live integration suites green; real-browser (puppeteer/Chromium) checks green
+for both the v2 handshake and the token-gated directory. **Uncommitted at this
+point** — the L1/I1 closeout (below) is verified and ready to commit; the
+cross-session-replay fix before it was already committed (c756cf9).
+**2026-07-02 (second session), in order:**
+1. CLOSED Medium finding **cross-session handshake replay in a reused room** —
+   handshake transcript bumped to v2, covers a fresh per-connection nonce from
+   BOTH peers (plaintext `hello` before the signed offer/answer, folded
+   order-independently). Committed as c756cf9.
+2. CLOSED accepted-risk **L1** (server-side ML-DSA-65 dual ownership proof at
+   registration, via `dilithium-py`) and **I1** (username namespace made
+   non-enumerable: token-gated `username#token` lookup + removed the
+   challenge/verify existence oracles + dedicated lookup rate limit). See the
+   "accepted-risk closeout" dated entry. NEW backend dep: `dilithium-py`.
+
+**Uncommitted files (L1/I1 closeout), all verified & ready to commit:**
+`PROGRESS.md`, `README.md`, `backend/config.py`, `backend/accounts.py`,
+`backend/requirements.txt`, `backend/tests/test_accounts.py`,
+`client/account.js`, `client/app.js`, `client/index.html`,
+`client/accounts.integration.test.mjs`. Suggested commit:
+"Close L1 (PQ ownership proof) + I1 (non-enumerable directory)".
 
 **Done & verified end-to-end (incl. real-browser checks via puppeteer):**
 - Dumb-relay backend (strict validation, rate limit, connection cap, join +
@@ -27,10 +39,9 @@ an old session can no longer verify in a new one. See dated entry.
 - Security review done; M1/M2/L3 fixed, H1 documented (see 2026-06-19 entry).
 
 **Next options (pick one):** (a) OTP mode; (b) Tor `.onion` deployment;
-(c) Android app; (d) close accepted-risk items L1 (server-side ML-DSA verify)
-/ I1 (kill username enumeration); (e) forward secrecy / ratcheting for
-AES256/RSA (and to remove AES256's cross-session-replay residual). Full open
-list in TODO at the bottom.
+(c) Android app; (d) forward secrecy / ratcheting for AES256/RSA (and to remove
+AES256's cross-session-replay residual). (L1/I1 now CLOSED — see dated entry.)
+Full open list in TODO at the bottom.
 
 **Run it:** see "How to run (quick ref)" at the bottom of this file.
 
@@ -55,6 +66,44 @@ list in TODO at the bottom.
    The server's `alg` field is an advisory tag only and is never acted upon.
 
 ## DONE
+### 2026-07-02 — accepted-risk closeout: L1 (PQ ownership proof) + I1 (enumeration) ✅
+Closed the two accepted-risk items from the 2026-06-19 security review.
+- **L1 — server-side ML-DSA-65 ownership proof at registration.** Registration
+  now requires a dual signature over the bundle: the server verifies BOTH the
+  Ed25519 proof (as before, via `cryptography`) AND an ML-DSA-65 proof (new,
+  via `dilithium-py` — a pure-Python verifier, cross-checked against the
+  client's `@noble/post-quantum` signer). A registrant can no longer bind a PQ
+  public key they don't control. `RegisterReq` gains `mldsa_sig`; `account.js`
+  now signs the register message with `identity.sign()` (dual) instead of
+  `signEd()`. New dep: `dilithium-py==1.4.*` (verify only; the server is still
+  not the authenticity root — the in-person safety number is).
+- **I1 — username namespace made non-enumerable (token-gated lookup + oracle
+  removal).** Registration mints a random per-account lookup token
+  (`config.LOOKUP_TOKEN_BYTES=18`, ~144 bits); the shareable identifier is now
+  the HANDLE `username#token`. `GET /api/users/{name}?t=<token>` returns an
+  IDENTICAL 404 for a missing user OR a wrong token (constant-time compare
+  against a decoy for missing users), so a bare/guessed username reveals
+  nothing. `POST /api/auth/challenge` now issues a challenge for ANY well-formed
+  username (no existence 404) and `POST /api/auth/verify` returns 401 for
+  unknown-user and bad-sig alike — neither is an existence oracle anymore. A
+  dedicated stricter per-host rate limit (`_lookup_limiter`) bounds the lookup
+  path. Client: `account.parseHandle`, handle-based `fetchBundle`, register
+  stores + displays the handle, the contact field takes a handle. Residual
+  (documented, inherent): registering a taken name still 409s — but each probe
+  costs a full dual-signed proof and is rate-limited, and enumeration of the
+  bundle-fetch path is closed.
+- **DB:** `accounts` table gains `lookup_token` (with an ALTER-based migration
+  for pre-token DBs).
+- **Tests:** `test_accounts.py` rewritten to sign with real ML-DSA (dilithium)
+  and cover the new behavior: bad-PQ-sig rejection, missing `mldsa_sig`,
+  token-gated lookup (no/wrong token → 404), challenge-doesn't-reveal-existence,
+  verify-unknown-user-is-401, and a dedicated lookup rate-limit test. Backend
+  `pytest` = **53 passed**. `accounts.integration.test.mjs` updated for the
+  handle flow (incl. wrong-token → null). Verified in a real browser
+  (Chromium/puppeteer): Alice registers → handle shown; Bob's WRONG token fails
+  to resolve; Bob's correct handle → directory lookup, matching safety number,
+  message delivered. All offline + live suites green.
+
 ### 2026-06-19 — backend v0 (local relay)
 - Created project at `~/secure-chat`.
 - `backend/config.py` — all hard limits in one auditable place (frame size,
@@ -345,6 +394,8 @@ Ran a white-box review + live attack probes. Fixed the actionable findings:
   results since the in-person safety number is the trust root), L2 (room-slot
   squatting if a 256-bit room id leaks), I1/I2 (username enumeration + access-log
   metadata — inherent to a public directory; scrub logs on the `.onion`).
+  **UPDATE 2026-07-02 (second session): L1 and I1 are now CLOSED** — see the
+  "accepted-risk closeout" dated entry below. (L2, I2 remain accepted.)
 
 ### 2026-07-02 — RSA mode: per-message HMAC authentication (forgery fix) ✅
 - **Finding (code review):** RSA mode had NO message authenticity. Each message

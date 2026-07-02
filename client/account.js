@@ -7,8 +7,13 @@
 // still comes from the in-person safety-number check — looking a contact up by
 // username only saves you from pasting a raw key bundle.
 //
-// All proofs use the CLASSICAL (Ed25519) key only, matching the server, which
-// verifies ML-DSA client-side during the handshake rather than at the directory.
+// Registration proves control of BOTH identity keys: the server verifies the
+// Ed25519 AND the ML-DSA-65 signature over the bundle (L1). Login uses the
+// classical key only (a signed server challenge).
+//
+// Anti-enumeration (I1): the directory is not enumerable. Registration returns
+// a random lookup token; a contact fetches your bundle with the HANDLE
+// `username#token`, so a bare username reveals nothing.
 
 import { unb64, concat } from "./identity.js";
 
@@ -19,9 +24,17 @@ const JSON_HEADERS = { "content-type": "application/json" };
 
 // Username rules mirror the server (config.USERNAME_MIN/MAX + the charset).
 const USERNAME_RE = /^[a-z0-9_.-]{3,32}$/;
+// A shareable handle is `username#token`; the token is url-safe base64 (no pad).
+const HANDLE_RE = /^([a-z0-9_.-]{3,32})#([A-Za-z0-9_-]{1,64})$/;
 
 export function isValidUsername(u) {
   return USERNAME_RE.test(u);
+}
+
+// Parse a `username#token` handle into its parts, or null if malformed.
+export function parseHandle(handle) {
+  const m = HANDLE_RE.exec((handle || "").trim());
+  return m ? { username: m[1], token: m[2] } : null;
 }
 
 // Exact bytes the server reconstructs in accounts._register_message:
@@ -41,15 +54,16 @@ async function asError(res) {
   return detail;
 }
 
-// Claim a username and bind it to this identity's public bundle. The Ed25519
-// signature proves control of the classical key (anti-squatting + key binding).
+// Claim a username and bind it to this identity's public bundle. The DUAL
+// signature (Ed25519 + ML-DSA-65) proves control of BOTH keys (anti-squatting
+// + key binding + PQ ownership). Returns { username, lookup_token }.
 export async function register(base, identity, username) {
   const bundle = identity.publicBundle();
-  const sig = await identity.signEd(registerMessageBytes(username, bundle));
+  const { ed: sig, mldsa: mldsa_sig } = await identity.sign(registerMessageBytes(username, bundle));
   const res = await fetch(base + "/api/register", {
     method: "POST",
     headers: JSON_HEADERS,
-    body: JSON.stringify({ username, ed: bundle.ed, mldsa: bundle.mldsa, sig }),
+    body: JSON.stringify({ username, ed: bundle.ed, mldsa: bundle.mldsa, sig, mldsa_sig }),
   });
   if (!res.ok) {
     const err = new Error(await asError(res));
@@ -59,13 +73,19 @@ export async function register(base, identity, username) {
   return res.json();
 }
 
-// Fetch a peer's public identity bundle by username. Returns null for 404.
-export async function fetchBundle(base, username) {
-  const res = await fetch(base + "/api/users/" + encodeURIComponent(username));
+// Fetch a peer's public identity bundle from a `username#token` handle. Returns
+// null when the handle is unknown OR the token is wrong (the server makes the
+// two indistinguishable, so callers just see "no such contact").
+export async function fetchBundle(base, handle) {
+  const parsed = parseHandle(handle);
+  if (!parsed) throw new Error("expected a contact handle of the form username#token");
+  const res = await fetch(
+    base + "/api/users/" + encodeURIComponent(parsed.username) + "?t=" + encodeURIComponent(parsed.token),
+  );
   if (res.status === 404) return null;
   if (!res.ok) throw new Error("lookup failed: " + (await asError(res)));
   const d = await res.json();
-  return { ed: d.ed, mldsa: d.mldsa };
+  return { username: parsed.username, ed: d.ed, mldsa: d.mldsa };
 }
 
 // Prove account control: sign a fresh server challenge, receive a bearer token.

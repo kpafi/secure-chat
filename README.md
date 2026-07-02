@@ -112,13 +112,28 @@ never learns.)
 
 ## Accounts (optional directory)
 The server doubles as a passwordless **public-key directory** under `/api`. From
-the client you can claim a username (an Ed25519 signature binds it to your
-identity bundle), prove control of it by signing a server challenge, and look a
-contact up by username to pre-fill and pin their identity for the handshake. The
-server stores **only public keys** — never passwords, private keys, or
-plaintext. The directory is a convenience, not a trust root (it shares the
-relay's origin), so the in-person safety-number check still governs trust; a key
-that disagrees with the published one is flagged loudly.
+the client you can claim a username, prove control of it by signing a server
+challenge, and look a contact up to pre-fill and pin their identity for the
+handshake. The server stores **only public keys** — never passwords, private
+keys, or plaintext. The directory is a convenience, not a trust root (it shares
+the relay's origin), so the in-person safety-number check still governs trust; a
+key that disagrees with the published one is flagged loudly.
+
+**Dual ownership proof at registration.** Claiming a username requires a
+signature from **both** identity keys over the bundle — Ed25519 (verified
+server-side via `cryptography`) *and* ML-DSA-65 (verified server-side via
+`dilithium-py`). This stops a squatter from binding a post-quantum public key
+they do not actually control into their directory entry.
+
+**The username namespace is not enumerable.** Registration mints a random
+per-account lookup token; a contact fetches your bundle with the **handle**
+`username#token`, not the bare username. A lookup with a missing user or a
+wrong token returns an identical `404`, and the login challenge/verify
+endpoints no longer reveal whether a username exists — so the directory cannot
+be walked to harvest who has an account. A dedicated, stricter rate limit
+bounds the lookup path on top of the shared `/api` limiter. (Registering a
+name that is taken still returns `409` — inherent to a unique namespace — but
+each probe costs a full dual-signed proof and is rate-limited.)
 
 ## Wire protocol
 Client -> server JSON envelope:

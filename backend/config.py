@@ -100,6 +100,22 @@ USERNAME_MAX = 32
 ED25519_PUB_BYTES = 32
 ED25519_SIG_BYTES = 64
 MLDSA65_PUB_BYTES = 1952
+MLDSA65_SIG_BYTES = 3309     # ML-DSA-65 (Dilithium) signature length
 
 CHALLENGE_TTL_SEC = 120      # login challenge lifetime
 TOKEN_TTL_SEC = 3600         # issued session-token lifetime
+
+# --- Anti-enumeration: token-gated lookup (I1) ----------------------------
+# Registration mints a random, unguessable lookup token. A contact fetches a
+# bundle by username AND token (the shareable handle is `username#token`), so
+# guessing a username without the token yields an indistinguishable 404 — the
+# username namespace is not enumerable. 18 bytes = 24 base64url chars (~144
+# bits), far beyond brute force under the lookup rate limit below.
+LOOKUP_TOKEN_BYTES = 18
+
+# The public bundle lookup is the one endpoint whose existence answer is
+# security-relevant, so it gets its own, stricter per-host token bucket on top
+# of the shared /api limiter. Behind Tor this collapses to a single global
+# throttle (see KeyedRateLimiter), which is the meaningful control there.
+LOOKUP_RATE_CAPACITY = 10        # burst allowance (lookups)
+LOOKUP_RATE_REFILL_PER_SEC = 0.5 # sustained lookups/second

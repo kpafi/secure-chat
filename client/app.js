@@ -55,6 +55,7 @@ const API_BASE = ""; // same-origin
 const LS_IDENTITY = "sc.identity.v1";
 const LS_PINS = "sc.pins.v1";
 const LS_USERNAME = "sc.username.v1";
+const LS_LOOKUP_TOKEN = "sc.lookuptoken.v1"; // our directory lookup token
 
 let ws = null;
 let cipher = null;
@@ -183,9 +184,13 @@ async function showIdentityUnlocked() {
   // The account directory is only meaningful once we hold an identity to bind.
   els.account.hidden = false;
   const savedName = localStorage.getItem(LS_USERNAME);
-  if (savedName) {
+  const savedToken = localStorage.getItem(LS_LOOKUP_TOKEN);
+  if (savedName && savedToken) {
     els.username.value = savedName;
-    accountStatus(`Saved username: ${savedName}. Register (once) or log in to prove control.`);
+    accountStatus(`Your contact handle: ${savedName}#${savedToken} — share it so contacts can look you up. Log in to prove control.`);
+  } else if (savedName) {
+    els.username.value = savedName;
+    accountStatus(`Saved username: ${savedName}. Register (once) to get your shareable handle, or log in to prove control.`);
   } else {
     accountStatus("Optional: claim a username so contacts can look up this identity.");
   }
@@ -288,9 +293,10 @@ async function registerAccount() {
   }
   accountStatus("Registering…");
   try {
-    await account.register(API_BASE, identity, username);
+    const { lookup_token } = await account.register(API_BASE, identity, username);
     localStorage.setItem(LS_USERNAME, username);
-    accountStatus(`Registered as "${username}". Contacts can now look up your identity.`, "ok");
+    localStorage.setItem(LS_LOOKUP_TOKEN, lookup_token);
+    accountStatus(`Registered. Your contact handle is ${username}#${lookup_token} — share it (username alone will not resolve).`, "ok");
   } catch (e) {
     if (e.status === 409) {
       accountStatus(`"${username}" is already taken. Pick another (or log in if it is yours).`, "err");
@@ -331,11 +337,17 @@ async function connect() {
     return;
   }
 
-  // Optional directory pre-fetch of the contact's identity bundle.
+  // Optional directory pre-fetch of the contact's identity bundle, keyed by
+  // their `username#token` handle (a bare username no longer resolves).
   expectedPeerName = null;
   expectedPeerBundle = null;
   const contact = els.contact.value.trim();
   if (algNeedsIdentity(alg) && contact) {
+    const parsed = account.parseHandle(contact);
+    if (!parsed) {
+      hint("Contact handle must look like username#token (as your contact shared it), or leave it blank to verify by safety number.", true);
+      return;
+    }
     setStatus("looking up contact…");
     try {
       expectedPeerBundle = await account.fetchBundle(API_BASE, contact);
@@ -345,11 +357,11 @@ async function connect() {
       return;
     }
     if (!expectedPeerBundle) {
-      hint(`No directory entry for "${contact}". Check the name, or leave it blank to verify by safety number.`, true);
+      hint(`No directory entry for "${parsed.username}" with that token. Check the handle, or leave it blank to verify by safety number.`, true);
       setStatus("disconnected", "err");
       return;
     }
-    expectedPeerName = contact;
+    expectedPeerName = parsed.username;
   }
 
   try {

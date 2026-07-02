@@ -12,16 +12,25 @@ server is assumed untrusted for key authenticity. What the server enforces:
     -> proves account control without any stored secret.
 
 It never stores passwords, private keys, or message content. A full DB leak
-yields only public keys, which are meant to be public.
+yields only public keys (which are meant to be public) plus lookup tokens
+(which merely gate remote fetching of those same public bundles — so leaking
+them alongside the bundles they gate discloses nothing extra).
 
-Note: the ML-DSA (post-quantum) signature is verified CLIENT-side during the
-authenticated handshake; the server only stores the PQ public key (verifying
-ML-DSA server-side would add a heavy native dependency for no extra trust,
-since the server is not the authenticity root).
+Ownership proof at registration (L1): the registrant signs the bundle with
+BOTH identity keys and the server verifies BOTH — Ed25519 via `cryptography`
+and ML-DSA-65 via `dilithium-py` — so a bundle cannot be registered with a PQ
+public key the registrant does not control. (Authenticity of the keys to a
+human still comes from the in-person safety number; this only stops a squatter
+binding someone else's PQ key into their own directory entry.)
+
+Anti-enumeration (I1): the username namespace is NOT enumerable. Lookups are
+gated by a per-account random token (`username#token` handle); challenge/verify
+no longer reveal whether a username exists. See `get_user` / `auth_*`.
 """
 from __future__ import annotations
 
 import base64
+import hmac
 import re
 import secrets
 import sqlite3
@@ -29,7 +38,8 @@ import time
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from dilithium_py.ml_dsa import ML_DSA_65
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 import config
@@ -39,10 +49,21 @@ from relay import KeyedRateLimiter
 # its own; these endpoints would otherwise be an unthrottled flood target.
 _api_limiter = KeyedRateLimiter(config.API_RATE_CAPACITY, config.API_RATE_REFILL_PER_SEC)
 
+# A second, stricter bucket dedicated to the bundle lookup — the one endpoint
+# whose existence answer is security-relevant (anti-enumeration). Even with a
+# valid token, this bounds how fast the namespace can be probed.
+_lookup_limiter = KeyedRateLimiter(config.LOOKUP_RATE_CAPACITY, config.LOOKUP_RATE_REFILL_PER_SEC)
+
 
 def rate_limit(request: Request) -> None:
     host = request.client.host if request.client else "unknown"
     if not _api_limiter.allow(host):
+        raise HTTPException(status_code=429, detail="rate limited")
+
+
+def lookup_rate_limit(request: Request) -> None:
+    host = request.client.host if request.client else "unknown"
+    if not _lookup_limiter.allow(host):
         raise HTTPException(status_code=429, detail="rate limited")
 
 
@@ -89,6 +110,14 @@ def _ed25519_verify(pub_raw: bytes, sig: bytes, msg: bytes) -> bool:
         return False
 
 
+def _mldsa65_verify(pub_raw: bytes, sig: bytes, msg: bytes) -> bool:
+    try:
+        return bool(ML_DSA_65.verify(pub_raw, msg, sig))
+    except Exception:
+        # A malformed key/sig must fail closed, never raise past the handler.
+        return False
+
+
 def _register_message(username: str, ed: str, mldsa: str) -> bytes:
     return b"\n".join(
         [_REGISTER_DOMAIN, username.encode("ascii"), ed.encode("ascii"), mldsa.encode("ascii")]
@@ -109,13 +138,18 @@ def init_db() -> None:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS accounts (
-                username   TEXT PRIMARY KEY,
-                ed_pub     TEXT NOT NULL,
-                mldsa_pub  TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                username     TEXT PRIMARY KEY,
+                ed_pub       TEXT NOT NULL,
+                mldsa_pub    TEXT NOT NULL,
+                lookup_token TEXT NOT NULL,
+                created_at   INTEGER NOT NULL
             )
             """
         )
+        # Migrate pre-token directories: add the column if an older DB lacks it.
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(accounts)")}
+        if "lookup_token" not in cols:
+            conn.execute("ALTER TABLE accounts ADD COLUMN lookup_token TEXT NOT NULL DEFAULT ''")
 
 
 # In-memory, expiring stores for login challenges and session tokens. These are
@@ -137,7 +171,8 @@ class RegisterReq(BaseModel):
     username: str = Field(min_length=config.USERNAME_MIN, max_length=config.USERNAME_MAX)
     ed: str
     mldsa: str
-    sig: str
+    sig: str        # Ed25519 signature over the register message
+    mldsa_sig: str  # ML-DSA-65 signature over the same message (PQ ownership proof)
 
 
 class ChallengeReq(BaseModel):
@@ -163,13 +198,21 @@ def _check_username(u: str) -> None:
 def register(req: RegisterReq) -> dict:
     _check_username(req.username)
     ed_raw = _b64decode_fixed(req.ed, config.ED25519_PUB_BYTES)
-    _b64decode_fixed(req.mldsa, config.MLDSA65_PUB_BYTES)  # validate size only
+    mldsa_raw = _b64decode_fixed(req.mldsa, config.MLDSA65_PUB_BYTES)
     sig_raw = _b64decode_fixed(req.sig, config.ED25519_SIG_BYTES)
+    mldsa_sig_raw = _b64decode_fixed(req.mldsa_sig, config.MLDSA65_SIG_BYTES)
 
-    # Prove the registrant controls the classical key for the bundle.
-    if not _ed25519_verify(ed_raw, sig_raw, _register_message(req.username, req.ed, req.mldsa)):
+    # Prove the registrant controls BOTH keys in the bundle (L1). The Ed25519
+    # proof binds the classical key + the whole bundle (anti-squatting); the
+    # ML-DSA proof stops binding a PQ public key the registrant does not hold.
+    msg = _register_message(req.username, req.ed, req.mldsa)
+    if not _ed25519_verify(ed_raw, sig_raw, msg):
         raise HTTPException(status_code=400, detail="ownership signature invalid")
+    if not _mldsa65_verify(mldsa_raw, mldsa_sig_raw, msg):
+        raise HTTPException(status_code=400, detail="post-quantum ownership signature invalid")
 
+    # Random, unguessable capability token so the username is not enumerable.
+    token = base64.urlsafe_b64encode(secrets.token_bytes(config.LOOKUP_TOKEN_BYTES)).decode("ascii").rstrip("=")
     with _db() as conn:
         # Bound the directory size so a flood cannot exhaust disk.
         count = conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
@@ -177,22 +220,29 @@ def register(req: RegisterReq) -> dict:
             raise HTTPException(status_code=503, detail="directory full")
         try:
             conn.execute(
-                "INSERT INTO accounts (username, ed_pub, mldsa_pub, created_at) VALUES (?,?,?,?)",
-                (req.username, req.ed, req.mldsa, int(time.time())),
+                "INSERT INTO accounts (username, ed_pub, mldsa_pub, lookup_token, created_at) VALUES (?,?,?,?,?)",
+                (req.username, req.ed, req.mldsa, token, int(time.time())),
             )
         except sqlite3.IntegrityError:
             raise HTTPException(status_code=409, detail="username already taken")
-    return {"status": "registered", "username": req.username}
+    # The registrant shares `username#lookup_token` with contacts.
+    return {"status": "registered", "username": req.username, "lookup_token": token}
 
 
-@router.get("/users/{username}")
-def get_user(username: str) -> dict:
+@router.get("/users/{username}", dependencies=[Depends(lookup_rate_limit)])
+def get_user(username: str, t: str = Query(default="", max_length=64)) -> dict:
+    # Anti-enumeration (I1): a lookup must present the per-account token. A
+    # missing user AND a wrong token return an IDENTICAL 404, so probing a
+    # username without its token reveals nothing about whether it exists. The
+    # token is compared in constant time (against a decoy for missing users so
+    # the comparison happens either way).
     _check_username(username)
     with _db() as conn:
         row = conn.execute(
-            "SELECT ed_pub, mldsa_pub FROM accounts WHERE username = ?", (username,)
+            "SELECT ed_pub, mldsa_pub, lookup_token FROM accounts WHERE username = ?", (username,)
         ).fetchone()
-    if row is None:
+    stored = row["lookup_token"] if row is not None else secrets.token_urlsafe(config.LOOKUP_TOKEN_BYTES)
+    if not hmac.compare_digest(t, stored) or row is None:
         raise HTTPException(status_code=404, detail="no such user")
     # The public identity bundle others will pin + verify in person.
     return {"username": username, "ed": row["ed_pub"], "mldsa": row["mldsa_pub"]}
@@ -200,13 +250,10 @@ def get_user(username: str) -> dict:
 
 @router.post("/auth/challenge")
 def auth_challenge(req: ChallengeReq) -> dict:
+    # Anti-enumeration (I1): issue a challenge for ANY well-formed username,
+    # whether or not it exists. A nonexistent account simply cannot produce a
+    # valid signature at verify time, so this endpoint reveals nothing.
     _check_username(req.username)
-    with _db() as conn:
-        exists = conn.execute(
-            "SELECT 1 FROM accounts WHERE username = ?", (req.username,)
-        ).fetchone()
-    if exists is None:
-        raise HTTPException(status_code=404, detail="no such user")
     _prune(_challenges)
     if len(_challenges) >= config.MAX_PENDING_CHALLENGES:
         raise HTTPException(status_code=503, detail="too many pending challenges")
@@ -229,8 +276,10 @@ def auth_verify(req: VerifyReq) -> dict:
         row = conn.execute(
             "SELECT ed_pub FROM accounts WHERE username = ?", (req.username,)
         ).fetchone()
+    # Unknown user and bad signature are indistinguishable (both 401), so verify
+    # is not an existence oracle either (I1).
     if row is None:
-        raise HTTPException(status_code=404, detail="no such user")
+        raise HTTPException(status_code=401, detail="challenge signature invalid")
     ed_raw = base64.b64decode(row["ed_pub"], validate=True)
     if not _ed25519_verify(ed_raw, sig_raw, _login_message(challenge_raw)):
         raise HTTPException(status_code=401, detail="challenge signature invalid")

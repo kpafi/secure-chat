@@ -23,13 +23,18 @@ async function testRegisterLookupLogin() {
 
   const reg = await account.register(BASE, id, username);
   assert.strictEqual(reg.username, username, "register echoes the username");
+  assert.ok(reg.lookup_token, "register returns a lookup token");
+  const handle = `${username}#${reg.lookup_token}`;
 
-  // Directory returns exactly the bundle a contact would pin.
-  const fetched = await account.fetchBundle(BASE, username);
-  assert.deepStrictEqual(fetched, id.publicBundle(), "fetched bundle equals our public bundle");
+  // Directory returns exactly the bundle a contact would pin (via the handle).
+  const fetched = await account.fetchBundle(BASE, handle);
+  assert.strictEqual(fetched.ed, id.publicBundle().ed, "fetched ed key matches");
+  assert.strictEqual(fetched.mldsa, id.publicBundle().mldsa, "fetched mldsa key matches");
 
-  // Unknown user -> null (404).
-  assert.strictEqual(await account.fetchBundle(BASE, uniqueName("ghost")), null, "missing user -> null");
+  // Anti-enumeration (I1): the right username with the WRONG token -> null,
+  // and an unknown username -> null. The two are indistinguishable.
+  assert.strictEqual(await account.fetchBundle(BASE, `${username}#wrongtoken`), null, "wrong token -> null");
+  assert.strictEqual(await account.fetchBundle(BASE, `${uniqueName("ghost")}#faketoken`), null, "missing user -> null");
 
   // Login (challenge-signature) yields a usable bearer token.
   const { token, ttl } = await account.login(BASE, id, username);
