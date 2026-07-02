@@ -11,8 +11,7 @@ for both the v2 handshake and the token-gated directory. **All four
 2026-06-19-review accepted-risk items (L1, I1, L2, I2) are now CLOSED.**
 `pip install -r requirements.txt` now also pulls `dilithium-py`. Logging is
 minimized (no request/connection metadata at rest); `run.sh` must keep
-`--no-access-log --log-level warning`. Uncommitted at this point: the L2/I2
-closeout (verified & ready to commit).
+`--no-access-log --log-level warning`. Tree clean; latest commit eaed6b8.
 **2026-07-02 (second session), in order:**
 1. CLOSED Medium finding **cross-session handshake replay in a reused room** —
    handshake transcript bumped to v2, covers a fresh per-connection nonce from
