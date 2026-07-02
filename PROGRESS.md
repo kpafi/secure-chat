@@ -4,12 +4,12 @@ Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
 ## ⮕ RESUME HERE (snapshot as of 2026-07-02, second session)
-**Status:** backend relay + web client working locally; git repo on `master`.
-Backend `pytest` = **53 passed**; client offline suite (`npm test`) green; all
-3 live integration suites green; real-browser (puppeteer/Chromium) checks green
-for both the v2 handshake and the token-gated directory. **Uncommitted at this
-point** — the L1/I1 closeout (below) is verified and ready to commit; the
-cross-session-replay fix before it was already committed (c756cf9).
+**Status:** backend relay + web client working locally; git repo on `master`,
+tree clean (latest commit 1703a19). Backend `pytest` = **53 passed**; client
+offline suite (`npm test`) green; all 3 live integration suites green;
+real-browser (puppeteer/Chromium) checks green for both the v2 handshake and
+the token-gated directory. NOTE: `pip install -r requirements.txt` now also
+pulls `dilithium-py`.
 **2026-07-02 (second session), in order:**
 1. CLOSED Medium finding **cross-session handshake replay in a reused room** —
    handshake transcript bumped to v2, covers a fresh per-connection nonce from
@@ -21,12 +21,7 @@ cross-session-replay fix before it was already committed (c756cf9).
    challenge/verify existence oracles + dedicated lookup rate limit). See the
    "accepted-risk closeout" dated entry. NEW backend dep: `dilithium-py`.
 
-**Uncommitted files (L1/I1 closeout), all verified & ready to commit:**
-`PROGRESS.md`, `README.md`, `backend/config.py`, `backend/accounts.py`,
-`backend/requirements.txt`, `backend/tests/test_accounts.py`,
-`client/account.js`, `client/app.js`, `client/index.html`,
-`client/accounts.integration.test.mjs`. Suggested commit:
-"Close L1 (PQ ownership proof) + I1 (non-enumerable directory)".
+Both were committed this session (c756cf9 = handshake replay; 1703a19 = L1/I1).
 
 **Done & verified end-to-end (incl. real-browser checks via puppeteer):**
 - Dumb-relay backend (strict validation, rate limit, connection cap, join +
