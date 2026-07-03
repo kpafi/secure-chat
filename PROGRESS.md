@@ -3,15 +3,27 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (snapshot as of 2026-07-02, second session)
+## ⮕ RESUME HERE (snapshot as of 2026-07-03)
 **Status:** backend relay + web client working locally; git repo on `master`.
 Backend `pytest` = **56 passed**; client offline suite (`npm test`) green; all
 3 live integration suites green; real-browser (puppeteer/Chromium) checks green
-for both the v2 handshake and the token-gated directory. **All four
-2026-06-19-review accepted-risk items (L1, I1, L2, I2) are now CLOSED.**
-`pip install -r requirements.txt` now also pulls `dilithium-py`. Logging is
+(v2 handshake, token-gated directory, and the new RSA ratchet). **All four
+2026-06-19-review accepted-risk items (L1, I1, L2, I2) are CLOSED.**
+`pip install -r requirements.txt` also pulls `dilithium-py`. Logging is
 minimized (no request/connection metadata at rest); `run.sh` must keep
-`--no-access-log --log-level warning`. Tree clean; latest commit eaed6b8.
+`--no-access-log --log-level warning`.
+**2026-07-03:** TODO item (d) fully closed — ratcheting for RSA **and** AES256.
+1. RSA mode is now **forward-secret** — RSA key transport + a one-way HMAC
+   ratchet with one-time AES-GCM message keys; root secret and RSA private key
+   are erased once traffic starts (see dated entry). RSA `msg` frames are
+   `rsa-msg/v2`; handshake format unchanged.
+2. AES256 mode now runs the same ratchet (shared `RatchetChannel`), rooted in
+   the passphrase **plus both peers' fresh session nonces** (new plaintext
+   hello exchange for AES256, reusing the app's existing hello phase) — this
+   **CLOSES the AES256 cross-session-replay residual**. AES256 frames are
+   `aes-msg/v2`; `AuthChannel` now serves only DHKE/PQKEM. FS for AES256 is
+   honestly limited (passphrase = master secret; see dated entry).
+Both committed together in a single commit on top of d5e2f68.
 **2026-07-02 (second session), in order:**
 1. CLOSED Medium finding **cross-session handshake replay in a reused room** —
    handshake transcript bumped to v2, covers a fresh per-connection nonce from
@@ -36,9 +48,9 @@ Both were committed this session (c756cf9 = handshake replay; 1703a19 = L1/I1).
 - Security review done; M1/M2/L3 fixed, H1 documented (see 2026-06-19 entry).
 
 **Next options (pick one):** (a) OTP mode; (b) Tor `.onion` deployment;
-(c) Android app; (d) forward secrecy / ratcheting for AES256/RSA (and to remove
-AES256's cross-session-replay residual). (L1/I1 now CLOSED — see dated entry.)
-Full open list in TODO at the bottom.
+(c) Android app. (Forward secrecy / ratcheting for RSA **and** AES256 both
+DONE 2026-07-03, incl. the AES256 cross-session-replay closure.) Full open
+list in TODO at the bottom.
 
 **Run it:** see "How to run (quick ref)" at the bottom of this file.
 
@@ -63,6 +75,98 @@ Full open list in TODO at the bottom.
    The server's `alg` field is an advisory tag only and is never acted upon.
 
 ## DONE
+### 2026-07-03 — AES256 ratchet: cross-session replay CLOSED + honest FS ✅
+Second half of TODO item (d), building directly on the RSA ratchet (below).
+- **Refactor first:** RSA's ratchet framing was extracted into a shared
+  `RatchetChannel` (`client/crypto.js`): direction-separated one-way
+  HMAC-SHA-256 chains, one-time AES-256-GCM message keys, strictly increasing
+  `n`, skip-with-discard bounded by `RATCHET_MAX_SKIP=1024`, scratch-head
+  stepping committed only after AEAD success. `Rsa` now delegates to it
+  (unchanged wire format/behavior, all RSA FS tests still green); `AuthChannel`
+  now serves only DHKE/PQKEM.
+- **AES256 redesign.** The mode still puts NO key material on the wire, but the
+  ratchet chains are no longer derived from the passphrase alone: on join both
+  peers exchange fresh random 32-byte session nonces via the app's existing
+  plaintext `hello` phase (previously handshake-modes-only; AES256 has no
+  identity requirement, so its hello is unauthenticated — tampering only
+  desyncs keys, a loud DoS the relay could always cause). Chains =
+  HKDF(PBKDF2-600k(passphrase), salt = room|sorted-nonces, info =
+  `secure-chat/aes-fs/v1|` + sender's nonce); frames are `aes-msg/v2`.
+  **Your own nonce is fresh and never attacker-controlled, so a frame captured
+  in an earlier session (same room + passphrase) can never authenticate in a
+  new one — the documented AES256 cross-session-replay residual is CLOSED**
+  (relay-forced replay of an old peer nonce just desyncs loudly; it cannot make
+  the victim re-derive an old key). Erasure: the cipher's passphrase copy is
+  dropped at `init()`, the derived HKDF base right after chain derivation.
+- **Honest FS limit (documented in README + KNOWN LIMITATIONS):** captured
+  ratchet STATE can't decrypt earlier traffic, but the passphrase is a
+  long-term secret outside the code and the nonces are public — passphrase
+  compromise + recorded ciphertext still re-derives every session. Inherent to
+  passphrase-only; real FS = DHKE/PQKEM/RSA.
+- **app.js:** the hello phase now runs for every mode (`joined` sends it
+  unconditionally); on hello, AES256 (`cipher.usesNonces`) derives via
+  `cipher.setNonces(myNonce, peerNonce)` and unlocks (the passphrase is the
+  out-of-band verification — no identity gate, as before, but send/receive now
+  unlock only after the peer joins). A phase-2 signed-handshake frame arriving
+  in AES256 mode is refused (`!cipher.needsHandshake` guard) — it could only be
+  relay-injected.
+- **Tests:** `crypto.test.mjs` — AES256 paths now exchange nonces; new
+  `aesRatchetChecks`: **cross-session replay REJECTED** (fresh-receiver variant
+  too, so it's the key, not the counter, doing the rejecting), passphrase/base
+  erasure, skipped-frame-unrecoverable. `integration.test.mjs` harness speaks
+  the AES256 hello. All offline suites green; all 3 live integration suites
+  green; backend pytest 56 passed. **Verified in a real browser**
+  (Chromium/puppeteer, two contexts): send locked before the peer joins,
+  unlocks after the nonce exchange, 5 messages both directions, zero
+  dropped/undecryptable frames; RSA browser check re-run green (regression, since
+  the joined/hello path changed for all modes).
+
+### 2026-07-03 — RSA mode: forward secrecy (key transport + one-way ratchet) ✅
+Closed TODO item (d) for RSA. Previously every RSA message's AES key was
+RSA-OAEP-wrapped to the peer's session-long RSA key, and the HMAC root secret +
+RSA private key lived for the whole session — so state compromise at any point
+(or later, with a recorded transcript) decrypted the ENTIRE session. That
+per-message wrapping was inherently incompatible with forward secrecy and was
+removed.
+- **New design (`client/crypto.js`, Rsa class).** The handshake is unchanged on
+  the wire (offer `{pub}`, answer `{pub, ws}` with the OAEP-wrapped 32-byte
+  root secret; race-tolerant sorted-tag folding; first-write-wins). From the
+  root, HKDF derives two direction-separated **HMAC-SHA-256 chain keys** (info
+  binds the sender's pub, salt = room id, domain `secure-chat/rsa-fs/v1`). Each
+  message uses a **one-time AES-256-GCM key**: `msgKey = HMAC(chain, 0x01)`,
+  then `chain = HMAC(chain, 0x02)` — one-way, consumed keys erased (raw bytes
+  zeroed after import, keys non-extractable). Frames are `{iv, ct, n}` with AD
+  `secure-chat/rsa-msg/v2|room|n` (v1 frames are thus invalid). A gap in `n`
+  fast-forwards the chain and DISCARDS the skipped keys (bounded by
+  `RSA_MAX_SKIP=1024` against hostile-relay CPU burn); the receive step is
+  committed only after the AEAD authenticates, so a garbage frame can't wedge
+  the channel or burn keys.
+- **Sealing.** On the first real message (either direction) `_seal()` erases
+  the root secrets AND drops the RSA private key (+ peer wrap key) — the two
+  things that could replay the whole key schedule from a recorded transcript.
+  Post-seal handshake frames are ignored (a replayed offer can't desync or
+  resurrect state). Sealing at first traffic is safe because messaging sits
+  behind the safety-number gate, seconds after the handshake settles; a relay
+  withholding a race answer past that point could only cause a loud decrypt
+  failure (= DoS it could do anyway). Same documented race window as PQKEM.
+- **Properties:** forgery still fails (relay never learns the root → no valid
+  AEAD); reflection fails (direction chains); replay fails (strictly increasing
+  `n` + one-time keys); **in-session forward secrecy** (state at time T can't
+  decrypt before T); cross-session FS was already given by per-session RSA keys.
+  NOT provided (out of scope): post-compromise/break-in recovery — that needs a
+  DH-style ratchet, pointless to fake with RSA.
+- **Tests:** `crypto.test.mjs` — `rsaAttackChecks` updated (forgery/reflection/
+  replay/tamper still rejected; + channel survives a rejected frame). New
+  `rsaForwardSecrecyChecks`: seal erases kp/secrets on first send AND first
+  receive; skipped frame's key unrecoverable while later frames decrypt;
+  post-seal replayed offer ignored; far-future `n` rejected. All offline suites
+  green; all 3 live integration suites green; backend pytest 56 passed.
+  **Verified in a real browser** (Chromium/puppeteer, two isolated contexts):
+  RSA staggered join, matching safety numbers, 5 messages both directions
+  (ratchet advancing), zero dropped/undecryptable frames.
+- app.js unchanged except a comment (generic cipher interface held); README
+  encryption-modes table + RSA paragraph rewritten.
+
 ### 2026-07-02 — L2/I2 closeout: metadata-at-rest disabled + room-id guarantee ✅
 Closed the last two accepted-risk items from the 2026-06-19 review.
 - **I2 — no request/connection metadata at rest (code fix).** Uvicorn's access
@@ -214,23 +318,34 @@ Closed the two accepted-risk items from the 2026-06-19 security review.
     "it matches" without checking reduces this to trust-on-first-use.
   - The account directory (`/api`) is only a convenience for *fetching* a bundle;
     it is not a trust root. Authenticity still comes from the in-person check.
-- **No forward secrecy in AES256/RSA modes** (static passphrase / long-lived
-  RSA key). DHKE is ephemeral per session (good); could add ratcheting later.
+- **AES256 forward secrecy is honest-but-limited (2026-07-03).** AES256 now
+  ratchets too (one-time message keys; passphrase copy + derived base erased
+  after chain derivation), and its session chains bind BOTH peers' fresh
+  session nonces — so captured ratchet STATE can't decrypt earlier traffic and
+  cross-session replay is closed. But the passphrase itself is a long-term
+  secret outside the code (user's head, input field) and the nonces cross the
+  relay in the clear: passphrase compromise + recorded ciphertext still
+  decrypts every session, past and future. Inherent to a passphrase-only mode;
+  real FS = DHKE/PQKEM/RSA (RSA forward-secret since 2026-07-03 — one-way
+  ratchet + erasure of the root secret and per-session RSA private key once
+  traffic starts; DHKE/PQKEM ephemeral per session).
 - **AES256 passphrase is offline-attackable by the relay.** The room id (which
   the relay routes on, so it always knows it) is the PBKDF2 salt, and the relay
   sees the ciphertext — so a malicious/compromised relay can mount an offline
   dictionary attack on the passphrase. 600k PBKDF2 iterations slow this, but a
   low-entropy passphrase will fall: AES256 security rests entirely on passphrase
   strength. Prefer a generated high-entropy passphrase, or use DHKE/PQKEM.
-- **Reflection/replay — CLOSED for all modes (2026-07-02).** Every mode now
-  authenticates the direction + ordering of each frame. RSA uses per-message
-  HMAC + sequence numbers; AES256/DHKE/PQKEM use `AuthChannel` (a random
-  per-session sender tag + a strictly-increasing sequence number, both bound
-  into the AES-GCM additional data), which rejects a relay reflecting your own
-  frame back and rejects replays. Residual: AES256's key is static
-  (passphrase-derived, no exchange), so it stops in-session reflection/replay
-  but NOT cross-session replay of a frame captured under the same passphrase +
-  room id; DHKE/PQKEM are ephemeral per session and have no such residual.
+- **Reflection/replay — CLOSED for all modes, incl. cross-session
+  (2026-07-02, completed 2026-07-03).** Every mode authenticates the direction
+  + ordering of each frame. AES256 and RSA use direction-separated ratchet
+  chains + one-time message keys + sequence numbers (`RatchetChannel`);
+  DHKE/PQKEM use `AuthChannel` (a random per-session sender tag + a
+  strictly-increasing sequence number, both bound into the AES-GCM additional
+  data). The old AES256 residual — cross-session replay of a frame captured
+  under the same passphrase + room id — is CLOSED since 2026-07-03: the
+  session chains bind a fresh random nonce from BOTH peers, so an old frame
+  can never authenticate in a new session. DHKE/PQKEM are ephemeral per
+  session and never had the residual.
 - **Metadata:** relay sees room id + timing + ciphertext sizes (padding TBD).
 
 ### 2026-06-19 — identity keys + authenticated handshake (MITM gap closed in core) ✅
@@ -563,6 +678,13 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
       `AuthChannel` binds a per-session sender tag + sequence number into the GCM
       additional data. AES256 has a documented cross-session-replay residual
       (static key).
+- [x] **Forward secrecy for RSA mode** — DONE (2026-07-03, see dated entry):
+      RSA key transport + one-way HMAC ratchet with one-time AES-GCM message
+      keys; root secret + RSA private key erased once traffic starts.
+- [x] **AES256 ratchet** — DONE (2026-07-03, see dated entry): shared
+      `RatchetChannel`, chains rooted in passphrase + both peers' fresh session
+      nonces (new AES256 hello exchange). Closes the cross-session-replay
+      residual; FS honestly limited by the passphrase being a long-term secret.
 - [ ] **OTP mode** (deferred) — pre-shared pad handling, pad consumption
       tracking, never-reuse enforcement (all client-side).
 - [ ] **Tor deployment** — hardened reverse setup, `.onion` service config,
@@ -572,12 +694,12 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
       entry): transcript v2 folds a fresh per-connection nonce from both peers
       (hello phase) into the signed handshake; live relay replay PoC now
       REJECTED (regression test in `auth.integration.test.mjs`).
-- [ ] **AES256 cross-session replay (Low — already documented, re-confirmed
-      2026-07-02)** — re-verified via PoC that a captured session-1 frame still
-      decrypts again in a fresh session-2 using the same room id + passphrase,
-      because `AuthChannel`'s replay counter resets per session while the
-      AES256 key is static. Known/accepted residual (see KNOWN LIMITATIONS);
-      listed here only as a re-confirmation, not a new finding.
+- [x] **AES256 cross-session replay (Low, re-confirmed 2026-07-02)** — CLOSED
+      2026-07-03 by the AES256 ratchet: session chains bind both peers' fresh
+      session nonces, so a captured session-1 frame can no longer authenticate
+      in session-2 (regression test `aesRatchetChecks` in `crypto.test.mjs`,
+      incl. a fresh-receiver variant proving the key — not the replay counter —
+      rejects it).
 
 DONE since this list was first written (pruned from the TODOs above): web client
 MVP with the WebCrypto encryption menu; the DHKE/RSA/PQ `key`-message handshake

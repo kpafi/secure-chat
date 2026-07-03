@@ -402,7 +402,7 @@ async function connect() {
 
 // Produce + sign the next handshake payload. Computed fresh each call (not
 // cached): for PQKEM and RSA the initial "offer" and the "answer" are different
-// payloads (RSA's answer transports the wrapped MAC secret), and each must
+// payloads (RSA's answer transports the wrapped root secret), and each must
 // carry its own signature. For DHKE the payload is idempotent, so re-signing
 // the reply is just a negligible extra signature. The signature covers both
 // per-connection nonces, so it is only meaningful once the hello exchange
@@ -437,21 +437,15 @@ async function handleMessage(room, raw) {
       els.chat.hidden = false;
       setStatus("connected", "ok");
       addLine("sys", "", `joined room — encryption: ${els.alg.value}`);
-      if (cipher.needsHandshake) {
-        // Phase 1: announce our fresh session nonce. The signed handshake
-        // follows only once we also know the peer's nonce.
-        ws.send(JSON.stringify({
-          type: "key", room, alg: els.alg.value,
-          payload: packKey({ hello: true, n: myNonce, reply: false }),
-        }));
-        hint("Waiting for the other party to join / exchange keys…");
-      } else if (cipher.ready) {
-        // AES256: no key exchange, no identity gate — the shared passphrase is
-        // the (out-of-band) verification, so receiving unlocks with sending.
-        verified = true;
-        enableSend(true);
-        hint("Ready. Messages are end-to-end encrypted.");
-      }
+      // Phase 1: announce our fresh session nonce. For handshake modes the
+      // signed handshake follows once we also know the peer's nonce; for
+      // AES256 (usesNonces, no key material on the wire) the nonces alone fix
+      // the session's ratchet chains, closing cross-session frame replay.
+      ws.send(JSON.stringify({
+        type: "key", room, alg: els.alg.value,
+        payload: packKey({ hello: true, n: myNonce, reply: false }),
+      }));
+      hint("Waiting for the other party to join / exchange keys…");
       break;
     }
 
@@ -473,13 +467,26 @@ async function handleMessage(room, raw) {
               type: "key", room, alg: els.alg.value,
               payload: packKey({ hello: true, n: myNonce, reply: true }),
             }));
-            await sendSignedKey(room, false);
+            if (cipher.needsHandshake) await sendSignedKey(room, false);
+          }
+          // AES256: both nonces known — derive the session's ratchet chains
+          // and unlock. No identity gate here: the shared passphrase IS the
+          // out-of-band verification, so receiving unlocks with sending.
+          if (cipher.usesNonces && !cipher.ready) {
+            await cipher.setNonces(myNonce, peerNonce);
+            verified = true;
+            enableSend(true);
+            hint("Ready. Messages are end-to-end encrypted.");
           }
           break;
         }
 
-        // Phase 2 — signed handshake. Meaningless before the nonce exchange:
-        // without the peer's nonce we cannot check freshness, so refuse.
+        // Phase 2 — signed handshake. AES256 exchanges no key material, so a
+        // handshake frame in that mode can only be relay-injected: refuse. For
+        // the rest it is meaningless before the nonce exchange (no freshness).
+        if (!cipher.needsHandshake) {
+          throw new Error("unexpected key-exchange message for this mode");
+        }
         const { pub, reply, idb, sig } = p;
         if (peerNonce === null) {
           throw new Error("peer sent a handshake before the nonce exchange");

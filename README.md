@@ -76,8 +76,8 @@ python tests/smoke_client.py
 | Mode    | Key agreement                       | Message cipher      | Notes                                       |
 |---------|-------------------------------------|---------------------|---------------------------------------------|
 | DHKE    | ephemeral ECDH P-256                | AES-256-GCM         | per-session; **identity-authenticated**     |
-| AES256  | PBKDF2 from shared passphrase       | AES-256-GCM         | no key swap → not relay-MITM-able           |
-| RSA     | RSA-OAEP-2048 public-key swap       | hybrid AES-256-GCM + HMAC | **identity-authenticated**, per-message MAC |
+| AES256  | PBKDF2 from shared passphrase + session nonces | ratcheted AES-256-GCM (one-time keys) | no key swap → not relay-MITM-able |
+| RSA     | RSA-OAEP-2048 key transport         | ratcheted AES-256-GCM (one-time keys) | **identity-authenticated**, **forward-secret** |
 | PQKEM   | **hybrid ECDH P-256 + ML-KEM-768**  | AES-256-GCM         | post-quantum; **identity-authenticated**    |
 | OTP     | —                                   | —                   | deferred (in-person pad exchange)           |
 
@@ -100,15 +100,31 @@ new one — it can never cover the nonce the victim just generated. Identity
 private keys are passphrase-encrypted on the device and never sent to the
 server.
 
-**RSA mode** additionally authenticates every *message*: encrypting to a public
-key proves nothing about the sender, so without more, anyone who watched the
-public key cross the relay could inject valid-looking ciphertext. The handshake
-answer therefore transports an RSA-OAEP-wrapped MAC secret; both sides derive
-direction-separated HMAC-SHA-256 keys from it (HKDF), and each message carries
-a MAC over `domain|room|seq|ek|iv|ct` plus a strictly increasing sequence
-number — rejecting forgery, reflection, and replay. (The other modes get
-forgery protection implicitly: their AES-GCM key is a shared secret the relay
-never learns.)
+**RSA mode** is RSA *key transport* plus a forward-secret symmetric ratchet.
+The handshake answer transports an RSA-OAEP-wrapped 32-byte root secret; both
+sides HKDF it into two direction-separated HMAC-SHA-256 *chain* keys, and every
+message is encrypted with a **one-time AES-256-GCM key** drawn from the
+sender's chain (`msgKey = HMAC(chain, 0x01)`, `chain' = HMAC(chain, 0x02)`).
+The chain only steps forward and consumed keys are deleted, and the moment real
+traffic starts the client erases the root secret *and* the per-session RSA
+private key — so compromising a device mid-conversation reveals nothing about
+earlier messages (**forward secrecy**), and past sessions are never affected.
+Authenticity comes with it: the relay never learns the wrapped root, so forged
+frames fail AEAD authentication; direction-separated chains reject reflection;
+strictly increasing sequence numbers plus one-time keys reject replay. (The
+other modes get forgery protection implicitly: their AES-GCM key is a shared
+secret the relay never learns.)
+
+**AES256 mode** runs the same ratchet, rooted in the PBKDF2-derived passphrase
+secret **plus a fresh random session nonce from each peer** (exchanged in a
+plaintext hello when both join). Your own nonce is fresh every connection, so a
+frame captured in an earlier session under the same room + passphrase can never
+authenticate in a new one — closing what used to be a documented cross-session
+replay residual. Honest limit: the passphrase is a long-term secret that lives
+outside the code (your head, the input field), so an attacker who learns *it*
+and recorded the ciphertext can still derive every session's keys — the
+ratchet's forward secrecy protects only against captured ratchet *state*. For
+real forward secrecy use DHKE, PQKEM, or RSA.
 
 ## Accounts (optional directory)
 The server doubles as a passwordless **public-key directory** under `/api`. From

@@ -11,8 +11,8 @@ const URL = "ws://127.0.0.1:8000/ws";
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-function packKey(pub, reply) {
-  return bufToB64(enc.encode(JSON.stringify({ pub, reply })));
+function packKey(obj) {
+  return bufToB64(enc.encode(JSON.stringify(obj)));
 }
 function unpackKey(b64) {
   return JSON.parse(dec.decode(b64ToBuf(b64)));
@@ -26,6 +26,9 @@ function makePeer(name, room, alg, onText) {
   const readyP = new Promise((r) => (ready.resolve = r));
   const joined = { resolve: null };
   const joinedP = new Promise((r) => (joined.resolve = r));
+  const myNonce = bufToB64(crypto.getRandomValues(new Uint8Array(32)));
+  let peerNonce = null;
+  let helloAnswered = false;
 
   ws.addEventListener("open", async () => {
     await cipher.init();
@@ -38,16 +41,29 @@ function makePeer(name, room, alg, onText) {
       joined.resolve();
       if (cipher.needsHandshake) {
         const pub = await cipher.handshakePayload();
-        ws.send(JSON.stringify({ type: "key", room, payload: packKey(pub, false), alg }));
-      } else if (cipher.ready) {
-        ready.resolve();
+        ws.send(JSON.stringify({ type: "key", room, payload: packKey({ pub, reply: false }), alg }));
+      } else if (cipher.usesNonces) {
+        // AES256: mirror app.js's plaintext hello (session-nonce) exchange.
+        ws.send(JSON.stringify({ type: "key", room, payload: packKey({ hello: true, n: myNonce, reply: false }), alg }));
       }
     } else if (m.type === "key") {
-      const { pub, reply } = unpackKey(m.payload);
-      await cipher.onPeerKey(pub);
-      if (!reply) {
+      const p = unpackKey(m.payload);
+      if (p.hello) {
+        if (peerNonce === null) peerNonce = p.n;
+        if (!p.reply && !helloAnswered) {
+          helloAnswered = true;
+          ws.send(JSON.stringify({ type: "key", room, payload: packKey({ hello: true, n: myNonce, reply: true }), alg }));
+        }
+        if (cipher.usesNonces && !cipher.ready) {
+          await cipher.setNonces(myNonce, peerNonce);
+          if (cipher.ready) ready.resolve();
+        }
+        return;
+      }
+      await cipher.onPeerKey(p.pub);
+      if (!p.reply) {
         const mine = await cipher.handshakePayload();
-        ws.send(JSON.stringify({ type: "key", room, payload: packKey(mine, true), alg }));
+        ws.send(JSON.stringify({ type: "key", room, payload: packKey({ pub: mine, reply: true }), alg }));
       }
       if (cipher.ready) ready.resolve();
     } else if (m.type === "msg") {
