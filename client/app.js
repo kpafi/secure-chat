@@ -388,7 +388,24 @@ async function connect() {
   helloAnswered = false;
   setStatus("connecting…");
   els.connect.disabled = true;
-  ws = new WebSocket(wsUrl());
+  try {
+    // Constructing a WebSocket can throw synchronously — most importantly a
+    // SecurityError when a secure page (the Android app's https asset origin)
+    // tries to open an insecure ws:// relay (browser Mixed-Content rule). Catch
+    // it so the UI reports the cause instead of hanging on "connecting…".
+    ws = new WebSocket(wsUrl());
+  } catch (e) {
+    setStatus("connection blocked", "err");
+    hint(
+      "Could not open the relay connection: " + e.message +
+      " — from the app's secure page the relay must be reachable over a trusted " +
+      "transport: wss:// (TLS), a loopback address (127.0.0.1/localhost), or an " +
+      ".onion. A plain ws:// host is blocked by the browser.",
+      true,
+    );
+    els.connect.disabled = false;
+    return;
+  }
 
   ws.onopen = () => {
     ws.send(JSON.stringify({ type: "join", room }));

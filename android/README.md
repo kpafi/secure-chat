@@ -22,8 +22,15 @@ ciphertext.
      `connect-src` pinned to exactly the configured relay origin (http + ws),
      `script-src` still pinning the import-map hash. Nothing else is reachable.
 - The relay address is entered once (menu → **Relay settings**), stored in
-  `SharedPreferences`, and validated to an http(s) **origin** (no path). It can
-  be a LAN dev relay, a clearnet TLS host, or an `.onion` via Orbot.
+  `SharedPreferences`, and validated to an http(s) **origin** (no path).
+- **Transport constraint (important):** the client page is a *secure* origin
+  (https, required for `crypto.subtle`), so the browser's Mixed-Content rule
+  forbids opening an insecure `ws://` from it. The relay must therefore be a
+  *potentially-trustworthy* origin: **wss://** (TLS), a **loopback** address
+  (`127.0.0.1`/`localhost`), or a **.onion** (Tor treats it as trustworthy). A
+  plain `http://192.168.x.x` LAN relay will NOT connect — the app shows a clear
+  error. For local testing against a host relay, use `adb reverse tcp:8000
+  tcp:8000` and set the relay to `http://127.0.0.1:8000`.
 - Identity keys and pins live in the WebView's `localStorage` (managed by the
   bundled client), exactly as on the web. The app persists only the relay URL.
 
@@ -44,12 +51,20 @@ The bundled web client is **generated at build time** from `../client` by the
 `syncWebClient` Gradle task (so it can never drift from the reviewed source);
 `assets/web/` is gitignored.
 
-## Verification status (2026-07-07)
+## Verification status (2026-07-08)
 - Debug APK builds clean from source; all 21 client files packaged.
-- The app's cross-origin mechanism is verified in a real browser (Chromium):
-  bundled client on one origin, relay on another, relay config injected before
-  scripts, the app CSP applied — a full DHKE handshake (matching safety
-  numbers), two-way messages, and a cross-origin `/api` register all succeed.
-- Not yet run **on a device/emulator** (none available in the build env). The
-  WebView glue (asset loader, document-start injection, menu) compiles and
-  packages but has not been exercised on-device. That is the next step.
+- Cross-origin mechanism verified in a real browser (Chromium): bundled client
+  on one origin, relay on another, relay config injected before scripts, app CSP
+  applied — full DHKE handshake (matching safety numbers), two-way messages, and
+  a cross-origin `/api` register all succeed.
+- **Verified ON-DEVICE** (Android 14 emulator, `google_apis;x86_64`, KVM): app
+  installs and renders the full UI in the real WebView; the relay config is
+  injected before page scripts (`addDocumentStartJavaScript` works on WebView
+  113); driven via CDP against a host-side AES256 peer over the relay (through
+  `adb reverse` loopback), the on-device WebSocket reached the relay, the AES256
+  nonce exchange completed, and messages decrypted **both directions** on the
+  device. This is what surfaced the Mixed-Content transport constraint above
+  (a `ws://10.0.2.2` relay was blocked; `127.0.0.1` via `adb reverse` works).
+- Remaining polish: app icon, a release-signing config, and an on-device pass of
+  the identity + safety-number gate (DHKE/RSA/PQKEM) — only AES256 was driven
+  end-to-end on-device so far (the handshake modes are covered in-browser).

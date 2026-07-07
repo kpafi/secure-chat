@@ -1,12 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Cleartext is permitted because the relay may be reached over plain HTTP/WS:
-    * a LAN dev relay (http://192.168.x.x:8000), or
-    * a Tor .onion via Orbot (the Tor circuit provides transport encryption).
-  This is NOT a downgrade of the chat's security: all message confidentiality
-  and authenticity is end-to-end inside the bundled client (see crypto.js), and
-  the relay only ever sees opaque ciphertext. For a clearnet production relay,
-  front it with TLS and the WebSocket becomes wss:// automatically.
+  Cleartext is permitted so the relay can be reached over plain HTTP/WS in the
+  two cases the browser still allows it from the app's secure (https) page:
+    * a LOOPBACK relay (http://127.0.0.1:8000, e.g. `adb reverse` in dev, or a
+      local Orbot SOCKS/relay), which Chromium treats as potentially trustworthy;
+    * a Tor .onion (also potentially trustworthy; the Tor circuit encrypts it).
+  A plain http:// LAN host (192.168.x.x) is NOT one of these — the browser's
+  Mixed-Content rule blocks an insecure ws:// from an https page regardless of
+  this setting, so such a relay simply will not connect (the app shows a clear
+  error). For a clearnet production relay, front it with TLS: the page then uses
+  wss:// and no cleartext is involved.
+  This does NOT affect chat security either way: all confidentiality/authenticity
+  is end-to-end inside the bundled client; the relay only sees opaque ciphertext.
 -->
 <network-security-config>
     <base-config cleartextTrafficPermitted="true" />

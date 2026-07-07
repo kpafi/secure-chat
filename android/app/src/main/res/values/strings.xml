@@ -1,8 +1,8 @@
 <resources>
     <string name="app_name">secure-chat</string>
     <string name="relay_dialog_title">Relay address</string>
-    <string name="relay_dialog_msg">Enter the relay this app should connect to (e.g. https://relay.example.com, http://192.168.1.5:8000, or an .onion via Orbot). Only opaque ciphertext ever reaches it.</string>
-    <string name="relay_hint">https://host or http://host:port</string>
+    <string name="relay_dialog_msg">Enter the relay this app connects to. The app page is secure (https), so the relay must use a trusted transport: https/wss (TLS), an .onion, or a loopback address (127.0.0.1) for local testing. A plain http:// LAN host is blocked by the browser. Only opaque ciphertext ever reaches the relay.</string>
+    <string name="relay_hint">https://host, http://127.0.0.1:8000, or an .onion</string>
     <string name="menu_relay">Relay settings</string>
     <string name="menu_reload">Reload</string>
     <string name="save">Save</string>

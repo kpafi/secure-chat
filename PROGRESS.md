@@ -16,10 +16,12 @@ minimized (no request/connection metadata at rest); `run.sh` must keep
 **2026-07-07 (four entries, newest first):**
 0. **Android app (new `android/` module):** thin Kotlin/WebView shell that
    BUNDLES the audited web client in the APK (closes web-only trust gap H1) and
-   points at a remote relay. Debug APK builds clean; cross-origin mechanism
-   verified in a real browser (relay config injection + app CSP + WS + `/api`
-   CORS). Not yet run on-device. Backend gained a single allow-listed app
-   origin (WS + CORS) and env-var extra origins. See dated entry.
+   points at a remote relay. Debug APK builds clean; verified in a real browser
+   AND **on-device** (Android 14 emulator — AES256 end-to-end through the relay,
+   both directions). Found + fixed a Mixed-Content constraint: the relay must be
+   wss/loopback/.onion (a plain-http LAN relay is browser-blocked); app.js now
+   reports it clearly. Backend gained a single allow-listed app origin (WS +
+   CORS) and `SECURE_CHAT_EXTRA_ORIGINS`. See the two dated entries.
 1. **Ratchet unification:** DHKE + PQKEM ported onto `RatchetChannel`
    (in-session forward secrecy for every mode; `AuthChannel` deleted); DHKE
    drops its private key at derivation, PQKEM seals like RSA on first
@@ -97,6 +99,39 @@ at the bottom.
    The server's `alg` field is an advisory tag only and is never acted upon.
 
 ## DONE
+### 2026-07-08 — Android app verified ON-DEVICE + Mixed-Content fix ✅
+Installed the emulator (Android 14 `google_apis;x86_64`, KVM-accelerated) and
+ran the app on a real WebView. Findings + fixes:
+- **Works on-device.** App installs, renders the full UI in the WebView, and the
+  relay config is injected before page scripts (`addDocumentStartJavaScript`
+  works on WebView 113). Drove the real app via Chrome DevTools Protocol (over
+  the adb-forwarded devtools socket) against a host-side AES256 peer through the
+  relay: the on-device WebSocket reached the relay, the AES256 nonce exchange
+  completed, and messages decrypted BOTH directions on the device.
+- **Real bug found: Mixed-Content transport constraint.** The client page is a
+  secure origin (https asset loader — required for `crypto.subtle`), so the
+  browser blocks opening an INSECURE `ws://` from it. `ws://10.0.2.2:8000` was
+  refused with a SecurityError; the relay must be a *potentially-trustworthy*
+  origin — **wss://** (TLS), **loopback** (`127.0.0.1`/`localhost`), or a
+  **.onion**. This corrected a wrong doc claim (a plain `http://192.168.x.x`
+  LAN relay does NOT work). Emulator test uses `adb reverse tcp:8000 tcp:8000`
+  + relay `http://127.0.0.1:8000` (loopback is Mixed-Content-exempt).
+- **Fix (`client/app.js`):** `new WebSocket()` throws synchronously on the
+  Mixed-Content block, which previously left the UI stuck on "connecting…"
+  forever. Now wrapped in try/catch → status "connection blocked" + an
+  actionable hint (needs wss/loopback/.onion) + Connect re-enabled. Verified
+  on-device: pointing at `http://192.168.50.50:8000` shows the clear error
+  instead of hanging. (Web client unaffected — it is same-origin, never
+  Mixed-Content.)
+- **Docs corrected:** relay-settings dialog text, `network_security_config`
+  comment, and `android/README.md` now state the trusted-transport requirement.
+- **Regression:** offline `npm test`, all 3 live suites, backend `pytest` 56 —
+  all green after the app.js change. APK rebuilt + reinstalled; on-device happy
+  path re-passed.
+- Remaining app polish: icon, release-signing config, and an on-device pass of
+  the identity + safety-number gate (only AES256 driven on-device; DHKE/RSA/
+  PQKEM handshakes are covered in-browser).
+
 ### 2026-07-07 — Android app: WebView shell bundling the audited client ✅
 New `android/` Gradle module. Rationale: the web deployment's one honest trust
 gap (H1) is that a browser re-fetches the JS from the server each load, so a
@@ -876,12 +911,14 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
       chain sequentially), plus app.js disables Send while a send is in flight.
       Verified live in a real browser: double-click Send delivers exactly once
       and the channel keeps working.
-- [~] **Android app** — IN PROGRESS (2026-07-07, see dated entry): `android/`
-      WebView shell bundling the audited client; debug APK builds clean;
-      cross-origin mechanism verified in a real browser. REMAINING: run on a
-      real device/emulator (none in this build env) to smoke-test the WebView
-      glue (asset loader, document-start relay injection, relay-settings menu),
-      then add an app icon + a release-signing config.
+- [~] **Android app** — IN PROGRESS (2026-07-07/08, see dated entries):
+      `android/` WebView shell bundling the audited client; debug APK builds
+      clean; verified in a real browser AND ON-DEVICE (Android 14 emulator —
+      AES256 end-to-end through the relay, both directions). Surfaced + fixed
+      the Mixed-Content transport constraint (relay must be wss/loopback/.onion).
+      REMAINING: app icon, release-signing config, and an on-device pass of the
+      identity + safety-number gate (DHKE/RSA/PQKEM; only AES256 driven on-device
+      so far).
 - [ ] **OTP mode** (deferred) — pre-shared pad handling, pad consumption
       tracking, never-reuse enforcement (all client-side).
 - [ ] **Tor deployment** — hardened reverse setup, `.onion` service config,
