@@ -3,15 +3,29 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (snapshot as of 2026-07-03)
+## ⮕ RESUME HERE (snapshot as of 2026-07-07)
 **Status:** backend relay + web client working locally; git repo on `master`.
 Backend `pytest` = **56 passed**; client offline suite (`npm test`) green; all
 3 live integration suites green; real-browser (puppeteer/Chromium) checks green
-(v2 handshake, token-gated directory, and the new RSA ratchet). **All four
-2026-06-19-review accepted-risk items (L1, I1, L2, I2) are CLOSED.**
+(v2 handshake, token-gated directory, RSA ratchet, and the double-click send
+regression). **All four 2026-06-19-review accepted-risk items (L1, I1, L2, I2)
+are CLOSED.**
 `pip install -r requirements.txt` also pulls `dilithium-py`. Logging is
 minimized (no request/connection metadata at rest); `run.sh` must keep
 `--no-access-log --log-level warning`.
+**2026-07-07 (three entries, newest first):**
+1. **Ratchet unification:** DHKE + PQKEM ported onto `RatchetChannel`
+   (in-session forward secrecy for every mode; `AuthChannel` deleted); DHKE
+   drops its private key at derivation, PQKEM seals like RSA on first
+   traffic; reflected handshake keys + reflected hellos now refused in all
+   modes. DHKE/PQKEM `msg` frames are `dhke-msg/v2`/`pqkem-msg/v2`.
+2. **Final crypto review** of the whole stack: no High/Medium findings; full
+   verification matrix green incl. a 4-mode real-browser end-to-end run.
+3. **Both 2026-07-03 pentest concurrency bugs FIXED** (High: racing decrypts
+   could roll the replay counter back; Medium: overlapping encrypts consumed
+   the same one-time key and killed the ratchet): all channel encrypt/decrypt
+   calls are serialized through a per-instance FIFO `CallQueue`, plus a
+   Send-in-flight guard in app.js as defense in depth. See dated entries.
 **2026-07-03:** TODO item (d) fully closed — ratcheting for RSA **and** AES256.
 1. RSA mode is now **forward-secret** — RSA key transport + a one-way HMAC
    ratchet with one-time AES-GCM message keys; root secret and RSA private key
@@ -75,6 +89,115 @@ list in TODO at the bottom.
    The server's `alg` field is an advisory tag only and is never acted upon.
 
 ## DONE
+### 2026-07-07 — DHKE/PQKEM in-session FS + reflection guards (ratchet unification) ✅
+Closed the main informational finding from the same-day review (below): DHKE
+and PQKEM kept one static AES-GCM session key (`AuthChannel`), so state
+compromise mid-session decrypted that entire session. Now ALL FOUR modes run
+the same forward-secret `RatchetChannel`; `AuthChannel` is DELETED.
+- **DHKE (`crypto.js`):** the ECDH secret is HKDF'd into two direction-
+  separated chain heads (info binds each chain to its sender's raw pub, salt =
+  room id, domain `secure-chat/dhke-fs/v1`); frames are `dhke-msg/v2`. Exactly
+  one derivation ever happens (first key wins), so the ECDH private key is
+  dropped the moment the chains exist — in-session FS from the first message.
+  `myPub` is cached at init so a (replayed-offer) `handshakePayload()` still
+  answers after the keypair is gone.
+- **PQKEM (`crypto.js`):** same chains rooted in the hybrid ECDH+ML-KEM ikm
+  (info binds the sender's ECDH pub, domain `secure-chat/pqkem-fs/v1`); frames
+  are `pqkem-msg/v2`. Seals like RSA on first real traffic (`_seal` zeroes the
+  KEM secret key + raw shared secrets, drops the ECDH keypair; post-seal
+  handshake frames ignored) — the race path may deliver a second root secret
+  until then, and messaging sits behind the safety-number gate so the race has
+  settled by first traffic. `ecdhBits`/`ikm` intermediates are zeroed right
+  after HKDF import (they weren't before; DHKE's too).
+- **Reflection guards (all handshake modes + hello):** an offer/answer carrying
+  OUR OWN public key (DHKE pub / RSA pub / PQKEM ECDH or KEM pub) is refused
+  outright — never legitimate, and identical pubs would collapse the direction
+  separation of the chains. Previously only the human safety-number comparison
+  caught a relay echoing someone's own identity back. Likewise app.js now
+  refuses a hello carrying OUR OWN nonce (a reflected hello used to wedge the
+  handshake via first-write-wins; now the slot stays open for the real peer).
+- **Wire format:** DHKE/PQKEM `msg` frames changed (`{iv,ct,n}` ratchet frames
+  under new domains; the old `secure-chat/msg/v1` AuthChannel framing is gone).
+  Handshake payloads unchanged. Both ends always run the same served code, so
+  no compatibility shim.
+- **Tests:** new `handshakeRatchetChecks` in `crypto.test.mjs` — DHKE keypair
+  dropped at derivation; PQKEM material held until traffic then sealed on
+  first encrypt AND first decrypt; skipped-frame keys unrecoverable (both);
+  replayed offers ignored post-establishment/post-seal; reflected handshakes
+  rejected (DHKE/PQKEM/RSA). Existing reflection/replay/tamper + concurrency
+  checks now exercise `RatchetChannel` in all 4 modes.
+- **Verified:** client offline `npm test` green; backend pytest 56 passed; all
+  3 live integration suites green; real-browser matrix (Chromium/puppeteer,
+  two isolated contexts per mode) green for ALL 4 MODES — identities, matching
+  safety numbers, two-way traffic, zero undecryptable/dropped frames — plus
+  the double-click regression; server log still 0 bytes after all traffic.
+- Deliberately NOT fixed (still informational): backend token-lookup timing
+  (256-bit random tokens), relay per-peer send stall, verify-panel replay
+  cosmetics. Post-compromise recovery (DH ratchet) remains out of scope.
+
+### 2026-07-07 — final crypto review + full verification matrix ✅
+White-box review of the whole client crypto stack (crypto.js, auth.js,
+identity.js, account.js, app.js flow) + backend front door (validation.py,
+relay.py, accounts.py, main.py). **No new High/Medium findings.** Verified
+green across the board: client offline `npm test` (32 OK), backend `pytest`
+56 passed, all 3 live integration suites, real-browser matrix
+(Chromium/puppeteer, two isolated contexts per mode): ALL 4 MODES end-to-end —
+identity creation, staggered join, matching safety numbers (handshake modes),
+4 two-way messages, zero undecryptable/dropped frames — plus the double-click
+regression check; server log EMPTY after all traffic (I2 holds).
+Informational notes (as found; the first three were FIXED the same day — see
+the ratchet-unification entry above):
+- **DHKE/PQKEM have no in-session FS** — CLOSED same day (all modes now run
+  `RatchetChannel`; `AuthChannel` deleted).
+- Key-material hygiene (`ecdhBits`/`ikm` not zeroed) — CLOSED same day.
+- A relay reflecting a peer's OWN hello back wedged the handshake until
+  reconnect — CLOSED same day (reflected hello + reflected handshake keys now
+  refused in all modes).
+- A relay replaying a signed offer FROM THE CURRENT session verifies (same
+  nonces) and can re-trigger `enterVerification` — ciphers are idempotent so
+  no desync; worst case a duplicate sys line / re-shown verify panel (pin
+  short-circuits it after first confirm). Cosmetic; left as is.
+- Backend nits (left as is): bearer-token dict lookup isn't constant-time
+  (256-bit random tokens — negligible); relay fan-out send has no per-peer
+  timeout (a stalled peer only stalls its own room's sender).
+
+### 2026-07-07 — cipher-call serialization: both 2026-07-03 pentest races CLOSED ✅
+Fixed the two open concurrency findings (High + Medium) in one change; shared
+root cause was that `AuthChannel`/`RatchetChannel` update their anti-replay
+state (sequence counters, chain heads) across awaited WebCrypto calls while
+their callers don't serialize (`ws.onmessage` fires handlers back-to-back; the
+UI could fire overlapping sends).
+- **Fix (`client/crypto.js`):** new `CallQueue` — a per-channel FIFO promise
+  queue; both channel classes now route the public `encrypt()`/`decrypt()`
+  through it into the (renamed) `_encrypt`/`_decrypt`. One call runs at a time,
+  in arrival order; a rejected call propagates to its caller but never blocks
+  the queue. Covers all 4 modes (AES256/RSA via `RatchetChannel`, DHKE/PQKEM
+  via `AuthChannel`) with no wire-format or interface change.
+  - Kills the **High** (racing decrypts of already-observed frames could
+    commit out of order, roll the replay counter back, and re-accept a message
+    the user already saw) and the **Medium** (two overlapping encrypts read the
+    same chain head, consumed the same one-time key, and permanently desynced
+    the ratchet — the peer saw an undecryptable frame and all later messages
+    silently vanished).
+- **Defense in depth (`client/app.js`):** `sendText` now has a `sending`
+  in-flight flag and disables the Send button while an encrypt is pending
+  (re-enabled only if the gate still allows messaging), so a double-click /
+  Enter-repeat can't even queue a duplicate send. A disabled default submit
+  button also blocks implicit (Enter) form submission per spec.
+- **Tests (`crypto.test.mjs`, new `concurrencyChecks`, run for all 4 modes):**
+  overlapping unawaited encrypts → both frames decrypt + channel intact after;
+  3 concurrent decrypts of the SAME frame → accepted exactly once; the exact
+  pentest rollback scenario (two different frames delivered concurrently, then
+  both replayed) → both replays rejected. Confirmed the suite CATCHES the bug:
+  against the pre-fix `crypto.js` (git stash) it fails at the overlapping-
+  encrypt check with the ratchet-desync AEAD failure.
+- **Verified:** client offline `npm test` green; backend `pytest` 56 passed;
+  all 3 live integration suites green; **real-browser regression check**
+  (Chromium/puppeteer, two isolated contexts, AES256): Alice double-clicks
+  Send in the same tick → message delivered exactly once, zero undecryptable
+  frames, ordinary follow-up messages flow both directions afterwards (the
+  pre-fix behavior was a corrupted second frame and a permanently dead channel).
+
 ### 2026-07-03 — AES256 ratchet: cross-session replay CLOSED + honest FS ✅
 Second half of TODO item (d), building directly on the RSA ratchet (below).
 - **Refactor first:** RSA's ratchet framing was extracted into a shared
@@ -326,9 +449,10 @@ Closed the two accepted-risk items from the 2026-06-19 security review.
   secret outside the code (user's head, input field) and the nonces cross the
   relay in the clear: passphrase compromise + recorded ciphertext still
   decrypts every session, past and future. Inherent to a passphrase-only mode;
-  real FS = DHKE/PQKEM/RSA (RSA forward-secret since 2026-07-03 — one-way
-  ratchet + erasure of the root secret and per-session RSA private key once
-  traffic starts; DHKE/PQKEM ephemeral per session).
+  real FS = DHKE/PQKEM/RSA — all three ratchet per message AND erase their
+  handshake material (RSA/PQKEM seal on first traffic, DHKE drops its private
+  key at derivation; since 2026-07-03/2026-07-07), on top of per-session
+  ephemeral keys.
 - **AES256 passphrase is offline-attackable by the relay.** The room id (which
   the relay routes on, so it always knows it) is the PBKDF2 salt, and the relay
   sees the ciphertext — so a malicious/compromised relay can mount an offline
@@ -336,16 +460,15 @@ Closed the two accepted-risk items from the 2026-06-19 security review.
   low-entropy passphrase will fall: AES256 security rests entirely on passphrase
   strength. Prefer a generated high-entropy passphrase, or use DHKE/PQKEM.
 - **Reflection/replay — CLOSED for all modes, incl. cross-session
-  (2026-07-02, completed 2026-07-03).** Every mode authenticates the direction
-  + ordering of each frame. AES256 and RSA use direction-separated ratchet
-  chains + one-time message keys + sequence numbers (`RatchetChannel`);
-  DHKE/PQKEM use `AuthChannel` (a random per-session sender tag + a
-  strictly-increasing sequence number, both bound into the AES-GCM additional
-  data). The old AES256 residual — cross-session replay of a frame captured
-  under the same passphrase + room id — is CLOSED since 2026-07-03: the
-  session chains bind a fresh random nonce from BOTH peers, so an old frame
-  can never authenticate in a new session. DHKE/PQKEM are ephemeral per
-  session and never had the residual.
+  (2026-07-02, completed 2026-07-03; unified 2026-07-07).** ALL FOUR modes now
+  use the same `RatchetChannel`: direction-separated one-way chains + one-time
+  message keys + strictly increasing sequence numbers. Reflected handshake
+  keys and reflected hellos are additionally refused outright (2026-07-07).
+  The old AES256 residual — cross-session replay of a frame captured under the
+  same passphrase + room id — is CLOSED since 2026-07-03: the session chains
+  bind a fresh random nonce from BOTH peers, so an old frame can never
+  authenticate in a new session. DHKE/PQKEM are ephemeral per session and
+  never had the residual.
 - **Metadata:** relay sees room id + timing + ciphertext sizes (padding TBD).
 
 ### 2026-06-19 — identity keys + authenticated handshake (MITM gap closed in core) ✅
@@ -685,6 +808,18 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
       `RatchetChannel`, chains rooted in passphrase + both peers' fresh session
       nonces (new AES256 hello exchange). Closes the cross-session-replay
       residual; FS honestly limited by the passphrase being a long-term secret.
+- [x] **Concurrent decrypt() reopens replay acceptance (High, found 2026-07-03
+      pentest, all 4 modes)** — FIXED 2026-07-07 (see dated entry): per-channel
+      `CallQueue` serializes all encrypt/decrypt calls, so the replay counter
+      can no longer be read before a prior call commits it. Regression tests
+      (`concurrencyChecks` in `crypto.test.mjs`, all 4 modes) cover concurrent
+      duplicates and the counter-rollback replay scenario.
+- [x] **Concurrent encrypt() permanently kills the ratchet channel (Medium,
+      found 2026-07-03 pentest, AES256/RSA)** — FIXED 2026-07-07 (see dated
+      entry): same `CallQueue` serialization (overlapping encrypts now step the
+      chain sequentially), plus app.js disables Send while a send is in flight.
+      Verified live in a real browser: double-click Send delivers exactly once
+      and the channel keeps working.
 - [ ] **OTP mode** (deferred) — pre-shared pad handling, pad consumption
       tracking, never-reuse enforcement (all client-side).
 - [ ] **Tor deployment** — hardened reverse setup, `.onion` service config,

@@ -58,62 +58,31 @@ function unpackMsg(b64) {
   return JSON.parse(dec.decode(b64ToBuf(b64)));
 }
 
-// ---- authenticated symmetric framing (DHKE / PQKEM) ------------------------
-// These two modes end up with a SINGLE AES-256-GCM key shared in both
-// directions. That key by itself lets a malicious relay REFLECT your own
-// ciphertext back at you (it would decrypt and render as "peer") or REPLAY an
-// old frame. We close both by binding every frame to its SENDER and to a
-// per-session SEQUENCE number inside the GCM additional data — AEAD-
-// authenticated, so a relay cannot alter either without the key — then reject:
-//   * reflection — a frame whose sender tag equals our own random session tag;
-//   * replay     — a frame whose sequence number is not strictly increasing
-//                  for that sender.
-// Both modes' keys are ephemeral per session, so there is no cross-session
-// residual here. (AES256 and RSA use the forward-secret RatchetChannel below.)
+// ---- per-channel call serialization ----------------------------------------
+// The framing channel below updates its anti-replay state (sequence
+// counters, chain heads) across `await`ed WebCrypto calls, and its callers do
+// not naturally serialize: ws.onmessage fires handlers without awaiting the
+// previous one, and the UI can fire overlapping sends. Two interleaved calls
+// then read state the other has not committed yet (2026-07-03 pentest): an
+// overlapping decrypt() can roll the replay counter back and re-accept an
+// already-delivered frame; an overlapping ratchet encrypt() consumes the same
+// one-time key twice and permanently desyncs the chain. Every channel
+// therefore funnels encrypt/decrypt through a private FIFO queue — one call at
+// a time, in arrival order; a rejected call never blocks the queue.
 
-const MSG_DOMAIN = "secure-chat/msg/v1";
-
-class AuthChannel {
-  constructor(roomId, key) {
-    this.roomId = roomId;
-    this.key = key;
-    this.myTag = bufToB64(crypto.getRandomValues(new Uint8Array(16)));
-    this.sendSeq = 0;
-    this.recvSeq = new Map(); // sender tag -> highest sequence number accepted
+class CallQueue {
+  constructor() {
+    this._tail = Promise.resolve();
   }
-  // Canonical additional data: all parts are base64/int, so "|" is unambiguous.
-  _ad(tag, n) {
-    return enc.encode([MSG_DOMAIN, this.roomId, tag, n].join("|"));
-  }
-  async encrypt(text) {
-    const iv = randomIv();
-    const n = ++this.sendSeq;
-    const ct = await crypto.subtle.encrypt(
-      { name: "AES-GCM", iv, additionalData: this._ad(this.myTag, n) },
-      this.key,
-      enc.encode(text),
-    );
-    return packMsg({ iv: bufToB64(iv), ct: bufToB64(ct), tag: this.myTag, n });
-  }
-  async decrypt(b64) {
-    const m = unpackMsg(b64);
-    if (typeof m.tag !== "string" || !Number.isInteger(m.n)) throw new Error("malformed frame");
-    if (m.tag === this.myTag) throw new Error("reflected frame rejected");
-    if (m.n <= (this.recvSeq.get(m.tag) || 0)) throw new Error("replayed frame rejected");
-    // The tag + sequence are in the additional data, so GCM authenticates them
-    // as it decrypts: a relay that rewrote either would make this throw.
-    const pt = await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: new Uint8Array(b64ToBuf(m.iv)), additionalData: this._ad(m.tag, m.n) },
-      this.key,
-      b64ToBuf(m.ct),
-    );
-    this.recvSeq.set(m.tag, m.n); // advance only after successful authentication
-    return dec.decode(pt);
+  run(fn) {
+    const p = this._tail.then(fn);
+    this._tail = p.then(() => {}, () => {}); // keep the queue alive on rejection
+    return p;
   }
 }
 
-// ---- forward-secret ratchet framing (AES256 / RSA) --------------------------
-// AES256 and RSA frame their messages through a pair of direction-separated
+// ---- forward-secret ratchet framing (all modes) -----------------------------
+// Every mode frames its messages through a pair of direction-separated
 // ONE-WAY HMAC-SHA-256 chains. Every message is encrypted with a one-time
 // AES-256-GCM key drawn from the sender's chain:
 //
@@ -161,13 +130,20 @@ class RatchetChannel {
     this.recvChain = recvChain;
     this.sendSeq = 0;
     this.recvSeq = 0;
+    this._q = new CallQueue(); // serializes encrypt/decrypt (see CallQueue)
   }
   // Canonical additional data: all parts are base64/int, so "|" is unambiguous.
   // Direction is bound by the chain itself (each is derived from its sender).
   _ad(n) {
     return enc.encode([this.domain, this.roomId, n].join("|"));
   }
-  async encrypt(text) {
+  encrypt(text) {
+    return this._q.run(() => this._encrypt(text));
+  }
+  decrypt(b64) {
+    return this._q.run(() => this._decrypt(b64));
+  }
+  async _encrypt(text) {
     const step = await chainAdvance(this.sendChain, 1, "encrypt");
     this.sendChain = step.chain; // the key we are about to use is now history
     const n = ++this.sendSeq;
@@ -179,7 +155,7 @@ class RatchetChannel {
     );
     return packMsg({ iv: bufToB64(iv), ct: bufToB64(ct), n });
   }
-  async decrypt(b64) {
+  async _decrypt(b64) {
     const m = unpackMsg(b64);
     if (!Number.isInteger(m.n) || m.n <= this.recvSeq) throw new Error("replayed frame rejected");
     const steps = m.n - this.recvSeq;
@@ -292,15 +268,27 @@ class AesPassphrase {
   }
 }
 
-// ---- DHKE: ephemeral ECDH (P-256) -> AES-256-GCM --------------------------
-// Each peer makes an ephemeral keypair, swaps public keys via the relay, and
-// derives a shared AES-256 key. Ephemeral keys give per-session secrecy and
-// the private key is non-extractable.
+// ---- DHKE: ephemeral ECDH (P-256) -> forward-secret symmetric ratchet ------
+// Each peer makes an ephemeral keypair, swaps public keys via the relay
+// (identity-signed at the app layer), and HKDFs the ECDH secret into the two
+// direction-separated chain heads of a RatchetChannel (the HKDF info binds
+// each chain to its sender's public key). The exchange is symmetric: both
+// sides compute the same shared secret whichever offer arrives first, so
+// exactly one derivation ever happens (first key wins).
+//
+// FORWARD SECRECY: the ephemeral keypair gives cross-session secrecy; the
+// ratchet (one-time keys, erased as the chain steps) gives IN-SESSION secrecy
+// too. The private key and the raw shared-secret bytes are dropped the moment
+// the chains exist — nothing retained can reconstruct earlier message keys.
+
+const DHKE_CHAIN_INFO = "secure-chat/dhke-fs/v1|";
+const DHKE_MSG_DOMAIN = "secure-chat/dhke-msg/v2";
 
 class Dhke {
   constructor(roomId) {
     this.roomId = roomId;
     this.kp = null;
+    this.myPub = null; // my raw ECDH public key (base64), kept after kp is dropped
     this.chan = null;
   }
   get needsHandshake() {
@@ -315,34 +303,46 @@ class Dhke {
       false, // private key non-extractable
       ["deriveBits"],
     );
+    this.myPub = bufToB64(await crypto.subtle.exportKey("raw", this.kp.publicKey));
   }
   async handshakePayload() {
-    const raw = await crypto.subtle.exportKey("raw", this.kp.publicKey);
-    return bufToB64(raw);
+    return this.myPub;
   }
   async onPeerKey(b64) {
+    // Our own key echoed back can only be relay mischief: honest peers never
+    // share a keypair, and identical pubs would collapse the direction chains.
+    if (b64 === this.myPub) throw new Error("reflected handshake rejected");
     if (this.chan) return; // first key wins: ignore replays of the peer's key
     const peer = await crypto.subtle.importKey(
       "raw", b64ToBuf(b64), { name: "ECDH", namedCurve: "P-256" }, false, [],
     );
     // Run the raw ECDH secret (the shared point's X coordinate) through HKDF
-    // rather than using it directly as the AES key: proper key separation, with
-    // the room id as salt and a domain tag — mirrors PQKEM's derivation.
-    const ecdhBits = await crypto.subtle.deriveBits({ name: "ECDH", public: peer }, this.kp.privateKey, 256);
-    const base = await crypto.subtle.importKey("raw", ecdhBits, "HKDF", false, ["deriveKey"]);
-    const key = await crypto.subtle.deriveKey(
-      { name: "HKDF", hash: "SHA-256", salt: enc.encode(this.roomId), info: enc.encode("secure-chat/dhke/v1") },
-      base,
-      { name: "AES-GCM", length: 256 },
-      false,
-      ["encrypt", "decrypt"],
+    // rather than using it directly: proper key separation, with the room id
+    // as salt and per-sender chain info — mirrors the other modes.
+    const ecdhBits = new Uint8Array(
+      await crypto.subtle.deriveBits({ name: "ECDH", public: peer }, this.kp.privateKey, 256),
     );
-    this.chan = new AuthChannel(this.roomId, key);
+    const base = await crypto.subtle.importKey("raw", ecdhBits, "HKDF", false, ["deriveKey"]);
+    ecdhBits.fill(0);
+    const chain = (senderPubB64) =>
+      crypto.subtle.deriveKey(
+        { name: "HKDF", hash: "SHA-256", salt: enc.encode(this.roomId), info: enc.encode(DHKE_CHAIN_INFO + senderPubB64) },
+        base,
+        HMAC_CHAIN,
+        false,
+        ["sign"],
+      );
+    this.chan = new RatchetChannel(this.roomId, DHKE_MSG_DOMAIN, await chain(this.myPub), await chain(b64));
+    // Only one derivation ever happens (first key wins), so the private key is
+    // done the moment the chains exist — drop it for in-session FS.
+    this.kp = null;
   }
   async encrypt(text) {
+    if (!this.chan) throw new Error("handshake not complete");
     return this.chan.encrypt(text);
   }
   async decrypt(b64) {
+    if (!this.chan) throw new Error("handshake not complete");
     return this.chan.decrypt(b64);
   }
 }
@@ -424,6 +424,9 @@ class Rsa {
     // handshake frame can only be relay mischief, so ignore it (never desync).
     if (this.sealed) return;
     const m = unpackMsg(b64);
+    // Our own key echoed back can only be relay mischief: honest peers never
+    // share a keypair, and identical pubs would collapse the direction chains.
+    if (m.pub === this.myPub) throw new Error("reflected handshake rejected");
     if (m.pub && this.peerPubB64 === null) { // first key wins
       this.peerPub = await crypto.subtle.importKey(
         "spki", b64ToBuf(m.pub), { name: "RSA-OAEP", hash: "SHA-256" }, false, ["encrypt"],
@@ -502,13 +505,14 @@ class Rsa {
   }
 }
 
-// ---- PQKEM: hybrid ECDH P-256 + ML-KEM-768 -> AES-256-GCM -----------------
-// Post-quantum-secure session key. The AES key is derived (HKDF-SHA-256) from
-// BOTH a classical ECDH P-256 secret AND an ML-KEM-768 (FIPS-203) secret, so it
-// stays secret unless an attacker breaks BOTH — i.e. it resists "harvest now,
-// decrypt later" by a future quantum adversary, while remaining no weaker than
-// DHKE if ML-KEM were ever faulted. Authenticated by the same dual (Ed25519 +
-// ML-DSA-65) identity handshake as DHKE/RSA (see app.js / auth.js).
+// ---- PQKEM: hybrid ECDH P-256 + ML-KEM-768 -> forward-secret ratchet -------
+// Post-quantum-secure session root. The ratchet chains are derived
+// (HKDF-SHA-256) from BOTH a classical ECDH P-256 secret AND an ML-KEM-768
+// (FIPS-203) secret, so they stay secret unless an attacker breaks BOTH —
+// i.e. it resists "harvest now, decrypt later" by a future quantum adversary,
+// while remaining no weaker than DHKE if ML-KEM were ever faulted.
+// Authenticated by the same dual (Ed25519 + ML-DSA-65) identity handshake as
+// DHKE/RSA (see app.js / auth.js).
 //
 // The exchange is symmetric: each peer OFFERS an ML-KEM public key, the other
 // ENCAPSULATES to it, and the resulting shared secret(s) are folded in keyed by
@@ -516,17 +520,33 @@ class Rsa {
 // the same order. This tolerates the relay's join-order race (where both peers'
 // offers are delivered) with no role negotiation: in the common case exactly
 // one secret is established, in the race two, and both peers agree either way.
+//
+// FORWARD SECRECY: like RSA, the handshake material that could replay the key
+// schedule from a recorded transcript — the ECDH private key, the KEM secret
+// key, and the raw shared secrets — is erased (`_seal`) the moment the first
+// real message is sent or received (messaging sits behind the safety-number
+// gate, so the race has settled by then; a relay withholding a race answer
+// past that point could only cause a loud decrypt failure, which it can
+// anyway). From there only the forward-stepping chains remain: state captured
+// at time T cannot decrypt traffic from before T, and past sessions were
+// always safe (all key material is per-session).
+
+const PQKEM_CHAIN_INFO = "secure-chat/pqkem-fs/v1|";
+const PQKEM_MSG_DOMAIN = "secure-chat/pqkem-msg/v2";
 
 class Pqkem {
   constructor(roomId) {
     this.roomId = roomId;
     this.ecdh = null;          // ECDH P-256 keypair (deriveBits)
+    this.myEcdhPub = null;     // my raw ECDH public key (base64), kept after seal
     this.kem = null;           // my ML-KEM-768 keypair
+    this.myKemPub = null;      // my KEM public key (base64), for reflection checks
     this.peerEcdh = null;      // peer ECDH public key (base64), learned from any msg
     this.secrets = new Map();  // tag (hex of SHA-256(ek)) -> ML-KEM shared secret
     this.answer = null;        // our reply payload, set when we answer a peer offer
     this.chan = null;
-    this._derivedFrom = null;  // signature of the inputs the current key was derived from
+    this.sealed = false;       // handshake material erased; ratchet-only from here
+    this._derivedFrom = null;  // signature of the inputs the current chains came from
   }
   get needsHandshake() {
     return true;
@@ -538,15 +558,15 @@ class Pqkem {
     this.ecdh = await crypto.subtle.generateKey(
       { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"],
     );
+    this.myEcdhPub = bufToB64(await crypto.subtle.exportKey("raw", this.ecdh.publicKey));
     this.kem = ml_kem768.keygen();
+    this.myKemPub = bufToB64(this.kem.publicKey);
   }
-  async _ecdhPub() {
-    return bufToB64(await crypto.subtle.exportKey("raw", this.ecdh.publicKey));
-  }
-  // Re-derive the AES key from the ECDH secret plus every ML-KEM secret we hold,
-  // ordered by tag so both peers feed HKDF identical input. Idempotent: if the
-  // inputs are unchanged (e.g. a relay replayed a handshake frame) the existing
-  // channel — and its replay counters — are kept intact.
+  // (Re)derive the direction-separated chain heads from the ECDH secret plus
+  // every ML-KEM secret we hold, ordered by tag so both peers feed HKDF
+  // identical input. Idempotent: if the inputs are unchanged (e.g. a relay
+  // replayed a handshake frame) the existing chains — and their positions —
+  // are kept intact.
   async _derive() {
     if (this.peerEcdh === null || this.secrets.size === 0) return;
     const tags = [...this.secrets.keys()].sort();
@@ -561,21 +581,32 @@ class Pqkem {
     );
     const ikm = concatBytes([ecdhBits, ...tags.map((t) => this.secrets.get(t))]);
     const base = await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveKey"]);
-    const key = await crypto.subtle.deriveKey(
-      { name: "HKDF", hash: "SHA-256", salt: enc.encode(this.roomId), info: enc.encode("secure-chat/pqkem/v1") },
-      base,
-      { name: "AES-GCM", length: 256 },
-      false,
-      ["encrypt", "decrypt"],
-    );
-    this.chan = new AuthChannel(this.roomId, key);
+    ecdhBits.fill(0);
+    ikm.fill(0);
+    const chain = (senderPubB64) =>
+      crypto.subtle.deriveKey(
+        { name: "HKDF", hash: "SHA-256", salt: enc.encode(this.roomId), info: enc.encode(PQKEM_CHAIN_INFO + senderPubB64) },
+        base,
+        HMAC_CHAIN,
+        false,
+        ["sign"],
+      );
+    this.chan = new RatchetChannel(this.roomId, PQKEM_MSG_DOMAIN, await chain(this.myEcdhPub), await chain(this.peerEcdh));
   }
   async handshakePayload() {
-    if (this.answer) return this.answer;                                    // reply to a peer offer
-    return packMsg({ e: await this._ecdhPub(), ek: bufToB64(this.kem.publicKey) }); // initial offer
+    if (this.answer) return this.answer;                        // reply to a peer offer
+    return packMsg({ e: this.myEcdhPub, ek: this.myKemPub });   // initial offer
   }
   async onPeerKey(b64) {
+    // Post-seal the chains are final and the decapsulation material is gone; a
+    // late handshake frame can only be relay mischief, so ignore it.
+    if (this.sealed) return;
     const m = unpackMsg(b64);
+    // Our own keys echoed back can only be relay mischief: honest peers never
+    // share keypairs, and identical pubs would collapse the direction chains.
+    if (m.e === this.myEcdhPub || m.ek === this.myKemPub) {
+      throw new Error("reflected handshake rejected");
+    }
     if (m.e && this.peerEcdh === null) this.peerEcdh = m.e; // first ECDH pub wins
     if (m.ek) {
       // Peer offered a KEM key: encapsulate to it, answer with the ciphertext.
@@ -586,7 +617,7 @@ class Pqkem {
       if (!this.secrets.has(tag)) {
         const { cipherText, sharedSecret } = ml_kem768.encapsulate(ek);
         this.secrets.set(tag, sharedSecret);
-        this.answer = packMsg({ e: await this._ecdhPub(), ct: bufToB64(cipherText) });
+        this.answer = packMsg({ e: this.myEcdhPub, ct: bufToB64(cipherText) });
       }
     } else if (m.ct) {
       // Peer answered our offer: decapsulate with our KEM secret key (once).
@@ -600,11 +631,30 @@ class Pqkem {
     }
     await this._derive();
   }
+  // Erase everything that could reconstruct the chains from a recorded
+  // transcript: the ECDH private key, the KEM secret key, and the raw shared
+  // secrets. From here only the forward-stepping chain heads remain. Runs on
+  // the first real message in either direction.
+  _seal() {
+    for (const s of this.secrets.values()) s.fill(0);
+    this.secrets.clear();
+    this.kem.secretKey.fill(0);
+    this.kem = null;
+    this.ecdh = null; // non-extractable; dropping the reference is all JS allows
+    this.answer = null;
+    this._derivedFrom = null;
+    this.sealed = true;
+  }
   async encrypt(text) {
+    if (!this.chan) throw new Error("handshake not complete");
+    if (!this.sealed) this._seal();
     return this.chan.encrypt(text);
   }
   async decrypt(b64) {
-    return this.chan.decrypt(b64);
+    if (!this.chan) throw new Error("handshake not complete");
+    const pt = await this.chan.decrypt(b64);
+    if (!this.sealed) this._seal();
+    return pt;
   }
 }
 

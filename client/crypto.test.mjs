@@ -293,6 +293,157 @@ async function aesRatchetChecks() {
   console.log("OK  AES256 skipped frame unrecoverable (keys deleted as the chain steps)");
 }
 
+// In-session forward secrecy for the DHKE/PQKEM ratchets (mirrors the RSA
+// checks): white-box proof that the handshake material really is erased and
+// that skipped one-time keys are gone. Plus the reflection guard shared by all
+// handshake modes: a peer "offer" carrying OUR OWN public key can only be a
+// relay echoing us back, and must be refused outright (identical pubs would
+// collapse the direction separation of the chains).
+async function handshakeRatchetChecks() {
+  const rejects = async (p, what) => {
+    let failed = false;
+    try {
+      await p();
+    } catch {
+      failed = true;
+    }
+    assert.ok(failed, what);
+  };
+
+  // DHKE: exactly one derivation ever happens, so the private key is dropped
+  // the moment the chains exist — even before any traffic.
+  {
+    const a = makeCipher("DHKE", ROOM);
+    const b = makeCipher("DHKE", ROOM);
+    await a.init();
+    await b.init();
+    await rejects(async () => a.onPeerKey(await a.handshakePayload()), "DHKE reflected handshake must be rejected");
+    const bOffer = await b.handshakePayload();
+    await a.onPeerKey(bOffer);
+    await b.onPeerKey(await a.handshakePayload());
+    assert.ok(a.kp === null && b.kp === null, "DHKE private keys dropped at derivation");
+    const w1 = await a.encrypt("one (lost in flight)");
+    const w2 = await a.encrypt("two");
+    assert.strictEqual(await b.decrypt(w2), "two", "DHKE gap tolerated");
+    await rejects(async () => b.decrypt(w1), "DHKE skipped frame's key must be unrecoverable");
+    await a.onPeerKey(bOffer); // replayed offer after establishment: ignored
+    assert.strictEqual(await b.decrypt(await a.encrypt("still here")), "still here",
+      "DHKE session survives a replayed offer");
+    console.log("OK  DHKE in-session forward secrecy (private key dropped, one-way chains) + reflection guard");
+  }
+
+  // PQKEM: seals on first traffic, like RSA (the join-order race means a
+  // second root secret may still arrive until then).
+  {
+    const a = makeCipher("PQKEM", ROOM);
+    const b = makeCipher("PQKEM", ROOM);
+    await a.init();
+    await b.init();
+    await rejects(async () => a.onPeerKey(await a.handshakePayload()), "PQKEM reflected handshake must be rejected");
+    const bOffer = await b.handshakePayload();
+    await a.onPeerKey(bOffer);
+    await b.onPeerKey(await a.handshakePayload());
+    assert.ok(a.kem !== null && a.ecdh !== null && a.secrets.size > 0,
+      "PQKEM handshake material held until traffic starts");
+    const w1 = await a.encrypt("one");
+    assert.ok(a.sealed && a.kem === null && a.ecdh === null && a.secrets.size === 0,
+      "PQKEM sender sealed on first encrypt");
+    assert.strictEqual(await b.decrypt(w1), "one");
+    assert.ok(b.sealed && b.kem === null && b.ecdh === null && b.secrets.size === 0,
+      "PQKEM receiver sealed on first decrypt");
+    const w2 = await a.encrypt("two (lost in flight)");
+    const w3 = await a.encrypt("three");
+    assert.strictEqual(await b.decrypt(w3), "three", "PQKEM gap tolerated");
+    await rejects(async () => b.decrypt(w2), "PQKEM skipped frame's key must be unrecoverable");
+    await a.onPeerKey(bOffer); // post-seal: ignored, no desync or resurrection
+    assert.ok(a.sealed && a.secrets.size === 0, "PQKEM sealed state untouched by late handshake frame");
+    assert.strictEqual(await b.decrypt(await a.encrypt("still here")), "still here",
+      "PQKEM session survives a replayed offer");
+    console.log("OK  PQKEM in-session forward secrecy (seal on first traffic, one-way chains) + reflection guard");
+  }
+
+  // RSA got the same reflection guard.
+  {
+    const a = makeCipher("RSA", ROOM);
+    await a.init();
+    await rejects(async () => a.onPeerKey(await a.handshakePayload()), "RSA reflected handshake must be rejected");
+    console.log("OK  RSA reflection guard (own key echoed back refused)");
+  }
+}
+
+// Concurrency races (2026-07-03 pentest). The channels update their
+// anti-replay state across awaited WebCrypto calls, and their real callers do
+// not serialize (ws.onmessage fires handlers back-to-back; the UI can fire
+// overlapping sends). These checks fire deliberately OVERLAPPING calls — no
+// await between starting them — and must hold for every mode.
+async function concurrencyChecks(alg) {
+  const mk = () => makeCipher(alg, ROOM, { passphrase: "correct horse battery staple" });
+  const pair = async () => {
+    const a = mk();
+    const b = mk();
+    await a.init();
+    await b.init();
+    if (a.needsHandshake) {
+      const bOffer = await b.handshakePayload();
+      await a.onPeerKey(bOffer);
+      await b.onPeerKey(await a.handshakePayload());
+    } else if (a.usesNonces) {
+      await exchangeNonces(a, b);
+    }
+    return [a, b];
+  };
+
+  // OVERLAPPING ENCRYPTS (the ratchet-killer): two unawaited encrypts used to
+  // read the same chain head and consume the same one-time key — the second
+  // frame was garbage and the chain never recovered. Both frames must decrypt,
+  // and the channel must still work afterwards.
+  {
+    const [a, b] = await pair();
+    const [w1, w2] = await Promise.all([a.encrypt("first"), a.encrypt("second")]);
+    assert.strictEqual(await b.decrypt(w1), "first", `${alg} overlapping encrypt #1`);
+    assert.strictEqual(await b.decrypt(w2), "second", `${alg} overlapping encrypt #2`);
+    assert.strictEqual(await b.decrypt(await a.encrypt("third")), "third",
+      `${alg} channel intact after overlapping encrypts`);
+  }
+
+  // OVERLAPPING DECRYPTS of the SAME frame: both used to read the replay
+  // counter before either committed it, so both could succeed. Exactly one
+  // may be accepted.
+  {
+    const [a, b] = await pair();
+    const wire = await a.encrypt("only once");
+    const results = await Promise.allSettled([b.decrypt(wire), b.decrypt(wire), b.decrypt(wire)]);
+    const accepted = results.filter((r) => r.status === "fulfilled");
+    assert.strictEqual(accepted.length, 1, `${alg} concurrent duplicate accepted exactly once`);
+    assert.strictEqual(accepted[0].value, "only once", `${alg} the one acceptance is genuine`);
+    assert.strictEqual(await b.decrypt(await a.encrypt("still alive")), "still alive",
+      `${alg} channel intact after concurrent duplicates`);
+  }
+
+  // COUNTER ROLLBACK (the exact pentest replay): two DIFFERENT frames delivered
+  // concurrently could commit out of order, rolling the counter back so a
+  // frame the user already saw was accepted a second time. Both replays must
+  // now be rejected.
+  {
+    const [a, b] = await pair();
+    const w1 = await a.encrypt("one");
+    const w2 = await a.encrypt("two");
+    const delivered = await Promise.allSettled([b.decrypt(w1), b.decrypt(w2)]);
+    assert.ok(delivered.every((r) => r.status === "fulfilled"),
+      `${alg} concurrent in-order frames both accepted`);
+    for (const replay of [w1, w2]) {
+      let failed = false;
+      try {
+        await b.decrypt(replay);
+      } catch {
+        failed = true;
+      }
+      assert.ok(failed, `${alg} replay after concurrent delivery must be rejected`);
+    }
+  }
+  console.log(`OK  ${alg} overlapping encrypt/decrypt serialized (replay + desync races closed)`);
+}
+
 // A replayed handshake frame must NOT rotate an established key (relay DoS).
 async function pqkemReplayDoesNotDesync() {
   const a = makeCipher("PQKEM", ROOM);
@@ -322,4 +473,9 @@ await symmetricAttackChecks("AES256");
 await symmetricAttackChecks("DHKE");
 await symmetricAttackChecks("PQKEM");
 await pqkemReplayDoesNotDesync();
+await handshakeRatchetChecks();
+await concurrencyChecks("AES256");
+await concurrencyChecks("DHKE");
+await concurrencyChecks("RSA");
+await concurrencyChecks("PQKEM");
 console.log("\nAll crypto checks passed.");

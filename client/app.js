@@ -460,6 +460,13 @@ async function handleMessage(room, raw) {
           if (!isValidNonce(p.n)) {
             throw new Error("peer sent a malformed session nonce");
           }
+          // Our own 256-bit nonce coming back can only be a relay reflecting
+          // our hello. Accepting it as the "peer" nonce would wedge the
+          // handshake (first-write-wins would hold the bogus value); refusing
+          // it keeps the slot open for the real peer's hello.
+          if (p.n === myNonce) {
+            throw new Error("reflected hello rejected");
+          }
           if (peerNonce === null) peerNonce = p.n;
           if (!p.reply && !helloAnswered) {
             helloAnswered = true;
@@ -624,8 +631,15 @@ function onVerifyNo() {
   if (ws) ws.close();
 }
 
+// One send at a time. The ciphers serialize concurrent encrypt/decrypt calls
+// internally (see crypto.js CallQueue), so an overlapping send could no longer
+// desync a ratchet — but a double-click/Enter-repeat should still not queue the
+// same message twice, so the Send path is guarded here as defense in depth.
+let sending = false;
+
 async function sendText(e) {
   e.preventDefault();
+  if (sending) return;
   const text = els.text.value;
   if (!text) return;
   if (!isAscii(text)) {
@@ -636,6 +650,8 @@ async function sendText(e) {
     hint("Secure channel not ready yet.", true);
     return;
   }
+  sending = true;
+  els.send.disabled = true;
   try {
     const payload = await cipher.encrypt(text);
     ws.send(JSON.stringify({ type: "msg", room: els.room.value.trim(), payload, alg: els.alg.value }));
@@ -644,6 +660,11 @@ async function sendText(e) {
     hint("");
   } catch (err) {
     hint("Encryption failed: " + err.message, true);
+  } finally {
+    sending = false;
+    // Re-enable only if the gate still allows messaging (the socket may have
+    // closed while the encrypt was in flight, which disables the form).
+    if (verified) els.send.disabled = false;
   }
 }
 

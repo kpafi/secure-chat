@@ -5,11 +5,11 @@ A deliberately tiny, security-first text chat. ASCII only. The server is a
 forwards opaque ciphertext between two parties in a room. The server never
 holds keys, never decrypts, and never stores or logs message content.
 
-> Status: **backend relay + web client working locally**, three encryption
-> modes verified end-to-end (DHKE, AES-256, RSA). The DHKE/RSA key exchange is
-> now **authenticated in the browser client** with long-term identity keys
-> (Ed25519 + ML-DSA-65) and an in-person safety-number check, closing the
-> relay-MITM gap. See `PROGRESS.md`.
+> Status: **backend relay + web client working locally**, four encryption
+> modes verified end-to-end (DHKE, AES-256, RSA, PQKEM), all forward-secret
+> ratchets. The DHKE/RSA/PQKEM key exchange is **authenticated in the browser
+> client** with long-term identity keys (Ed25519 + ML-DSA-65) and an in-person
+> safety-number check, closing the relay-MITM gap. See `PROGRESS.md`.
 
 ## Why this design
 A breach of the server should leak nothing readable. By keeping the server
@@ -75,18 +75,28 @@ python tests/smoke_client.py
 ## Encryption modes (client-side)
 | Mode    | Key agreement                       | Message cipher      | Notes                                       |
 |---------|-------------------------------------|---------------------|---------------------------------------------|
-| DHKE    | ephemeral ECDH P-256                | AES-256-GCM         | per-session; **identity-authenticated**     |
+| DHKE    | ephemeral ECDH P-256                | ratcheted AES-256-GCM (one-time keys) | **identity-authenticated**, **forward-secret** |
 | AES256  | PBKDF2 from shared passphrase + session nonces | ratcheted AES-256-GCM (one-time keys) | no key swap → not relay-MITM-able |
 | RSA     | RSA-OAEP-2048 key transport         | ratcheted AES-256-GCM (one-time keys) | **identity-authenticated**, **forward-secret** |
-| PQKEM   | **hybrid ECDH P-256 + ML-KEM-768**  | AES-256-GCM         | post-quantum; **identity-authenticated**    |
+| PQKEM   | **hybrid ECDH P-256 + ML-KEM-768**  | ratcheted AES-256-GCM (one-time keys) | post-quantum; **identity-authenticated**, **forward-secret** |
 | OTP     | —                                   | —                   | deferred (in-person pad exchange)           |
 
-**PQKEM** derives the AES-256 key (via HKDF-SHA-256) from *both* a classical
-ECDH P-256 secret *and* an ML-KEM-768 (FIPS-203) secret, so the session stays
+Every mode frames its messages through the same **forward-secret ratchet**:
+two direction-separated one-way HMAC-SHA-256 chains, a one-time AES-256-GCM
+key per message (consumed keys deleted), and strictly increasing sequence
+numbers. What differs per mode is only where the chains' root comes from.
+
+**PQKEM** roots the chains (via HKDF-SHA-256) in *both* a classical ECDH P-256
+secret *and* an ML-KEM-768 (FIPS-203) secret, so the session stays
 confidential unless an attacker breaks **both** — defeating "harvest now,
 decrypt later" while remaining no weaker than DHKE if ML-KEM were faulted. It is
 authenticated by the same dual (Ed25519 + ML-DSA-65) identity handshake, so the
-*authentication* is also one-classical-one-post-quantum.
+*authentication* is also one-classical-one-post-quantum. Like RSA, it erases
+its handshake material (ECDH private key, KEM secret key, raw shared secrets)
+the moment real traffic starts; **DHKE** drops its private key even earlier, as
+soon as the chains are derived. So all three handshake modes have in-session
+*and* cross-session forward secrecy: state captured at time T decrypts nothing
+from before T, and never another session.
 
 DHKE and RSA handshakes are signed by a long-term identity (Ed25519 + ML-DSA-65)
 that each user generates locally and the other verifies **in person** by
