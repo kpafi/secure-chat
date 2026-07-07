@@ -48,7 +48,15 @@ const els = {
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 const ROOM_RE = /^[0-9a-f]{64}$/;
-const API_BASE = ""; // same-origin
+
+// Relay location. The web client is served BY the relay, so it talks to it
+// same-origin (empty API base, ws:// to location.host). The Android app has no
+// server origin — it serves this exact code from bundled assets and points at a
+// REMOTE relay — so it sets `window.__SECURE_CHAT_RELAY__ = {api, ws}` before
+// this module loads. When that global is absent, behaviour is byte-identical to
+// the original same-origin web client.
+const RELAY = (typeof window !== "undefined" && window.__SECURE_CHAT_RELAY__) || null;
+const API_BASE = RELAY ? RELAY.api : ""; // same-origin unless the host app overrides
 
 // localStorage keys. Private keys live only inside the passphrase-encrypted
 // identity blob; pins hold peers' PUBLIC bundles only.
@@ -155,6 +163,7 @@ function enableSend(on) {
 }
 
 function wsUrl() {
+  if (RELAY) return RELAY.ws;
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   return `${scheme}://${location.host}/ws`;
 }

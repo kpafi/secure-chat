@@ -76,13 +76,17 @@ app = FastAPI(
     openapi_url=None,
 )
 
-# CORS locked shut. The browser client is served same-origin (via the .onion),
-# so no cross-origin access is ever required.
+# CORS is shut for the web client (served same-origin via the .onion) and opened
+# to exactly one extra origin: the Android app's bundled-client origin, whose
+# /api directory fetches are cross-origin. Only GET/POST + the two headers the
+# client actually sends are allowed; no credentials mode (auth is an explicit
+# Bearer token, never a cookie). The WS handshake is guarded separately by the
+# origin allow-list in ws_endpoint.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[],
-    allow_methods=[],
-    allow_headers=[],
+    allow_origins=config.ALLOWED_HTTP_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["content-type", "authorization"],
 )
 
 registry = RoomRegistry()

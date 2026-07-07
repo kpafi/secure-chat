@@ -13,7 +13,13 @@ are CLOSED.**
 `pip install -r requirements.txt` also pulls `dilithium-py`. Logging is
 minimized (no request/connection metadata at rest); `run.sh` must keep
 `--no-access-log --log-level warning`.
-**2026-07-07 (three entries, newest first):**
+**2026-07-07 (four entries, newest first):**
+0. **Android app (new `android/` module):** thin Kotlin/WebView shell that
+   BUNDLES the audited web client in the APK (closes web-only trust gap H1) and
+   points at a remote relay. Debug APK builds clean; cross-origin mechanism
+   verified in a real browser (relay config injection + app CSP + WS + `/api`
+   CORS). Not yet run on-device. Backend gained a single allow-listed app
+   origin (WS + CORS) and env-var extra origins. See dated entry.
 1. **Ratchet unification:** DHKE + PQKEM ported onto `RatchetChannel`
    (in-session forward secrecy for every mode; `AuthChannel` deleted); DHKE
    drops its private key at derivation, PQKEM seals like RSA on first
@@ -61,10 +67,12 @@ Both were committed this session (c756cf9 = handshake replay; 1703a19 = L1/I1).
   the relay-MITM gap. Account register/login + fetch-by-username pinning.
 - Security review done; M1/M2/L3 fixed, H1 documented (see 2026-06-19 entry).
 
-**Next options (pick one):** (a) OTP mode; (b) Tor `.onion` deployment;
-(c) Android app. (Forward secrecy / ratcheting for RSA **and** AES256 both
-DONE 2026-07-03, incl. the AES256 cross-session-replay closure.) Full open
-list in TODO at the bottom.
+**Next options (pick one):** (a) on-device smoke test of the new Android app
+(build + cross-origin browser verification DONE 2026-07-07; needs a real
+device/emulator to exercise the WebView glue); (b) Tor `.onion` deployment
+(pairs naturally with the app — set the relay to the `.onion` and add its
+origin via `SECURE_CHAT_EXTRA_ORIGINS`); (c) OTP mode. Full open list in TODO
+at the bottom.
 
 **Run it:** see "How to run (quick ref)" at the bottom of this file.
 
@@ -89,6 +97,54 @@ list in TODO at the bottom.
    The server's `alg` field is an advisory tag only and is never acted upon.
 
 ## DONE
+### 2026-07-07 — Android app: WebView shell bundling the audited client ✅
+New `android/` Gradle module. Rationale: the web deployment's one honest trust
+gap (H1) is that a browser re-fetches the JS from the server each load, so a
+compromised server could serve malicious crypto. The app removes that by
+shipping the exact reviewed client INSIDE the APK and using the relay only as a
+dumb ciphertext carrier.
+- **Design (thin shell, one codebase):** `MainActivity` serves bundled
+  `assets/web/` to a WebView from the local secure origin
+  `https://appassets.androidplatform.net` (WebViewAssetLoader — secure context,
+  so `crypto.subtle` works). The relay is remote, so the app supplies what the
+  same-origin web build got for free: (1) the relay location, injected as
+  `window.__SECURE_CHAT_RELAY__ = {api, ws}` via `addDocumentStartJavaScript`
+  BEFORE any page script; (2) the CSP, stamped as a response header on
+  index.html with `connect-src` pinned to exactly the configured relay origin.
+  The relay address is entered once (menu → Relay settings), stored in
+  SharedPreferences, validated to an http(s) origin (`RelayUrls`). Identity/pins
+  stay in the WebView localStorage as on the web.
+- **Client change (backward-compatible, keeps ONE codebase):** `app.js` reads
+  `window.__SECURE_CHAT_RELAY__` for the ws URL + API base if present, else the
+  original same-origin behavior (RELAY null path). Web behavior byte-identical;
+  verified by re-running the same-origin 4-mode browser matrix + all 3 live
+  suites green.
+- **Backend change (deliberate, documented):** the app's origin differs from
+  the relay's, so `APP_WEBVIEW_ORIGIN` (`https://appassets.androidplatform.net`)
+  is added to `ALLOWED_WS_ORIGINS` (else the relay 1008-rejects the WS) and to a
+  new `/api` CORS allow-list (`ALLOWED_HTTP_ORIGINS`, methods GET/POST, no
+  credentials — endpoints carry no cookies, only explicit Bearer tokens). It is
+  one fixed origin, not a wildcard. New `SECURE_CHAT_EXTRA_ORIGINS` env var adds
+  more origins (e.g. the prod `.onion`) at deploy time without editing code.
+  Backend `pytest` still 56 passed.
+- **Bundle = single source of truth:** the `syncWebClient` Gradle task copies
+  `../client` into `assets/web` at build time (excludes tests/manifests), so the
+  APK can never drift from the reviewed client; the copy is gitignored.
+- **Build:** needs a full JDK 21 *with jlink* (the distro's openjdk-21 here was
+  JRE-only — used a self-contained Temurin 21) + Android SDK platform-34 /
+  build-tools-34. `./gradlew assembleDebug` → 5.7 MB debug APK,
+  `org.securechat.app`, minSdk 26 / target 34. Clean build from source verified
+  (assets auto-synced, 21 web files packaged).
+- **Verified (real browser, Chromium/puppeteer — the WebView IS Chromium):**
+  reproduced the app's exact cross-origin setup (bundled client on origin A,
+  relay on origin B, relay config injected before scripts, app CSP applied):
+  relay config visible to the page; cross-origin `/api` register succeeded
+  (CORS); cross-origin WS DHKE handshake with MATCHING safety numbers; two-way
+  messages delivered. This exercises the whole app code path except the Kotlin
+  glue (asset loader / document-start injection / menu), which compiles +
+  packages but is **NOT yet run on a device/emulator** (none in the build env).
+  On-device smoke test is the remaining step.
+
 ### 2026-07-07 — DHKE/PQKEM in-session FS + reflection guards (ratchet unification) ✅
 Closed the main informational finding from the same-day review (below): DHKE
 and PQKEM kept one static AES-GCM session key (`AuthChannel`), so state
@@ -820,10 +876,18 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
       chain sequentially), plus app.js disables Send while a send is in flight.
       Verified live in a real browser: double-click Send delivers exactly once
       and the channel keeps working.
+- [~] **Android app** — IN PROGRESS (2026-07-07, see dated entry): `android/`
+      WebView shell bundling the audited client; debug APK builds clean;
+      cross-origin mechanism verified in a real browser. REMAINING: run on a
+      real device/emulator (none in this build env) to smoke-test the WebView
+      glue (asset loader, document-start relay injection, relay-settings menu),
+      then add an app icon + a release-signing config.
 - [ ] **OTP mode** (deferred) — pre-shared pad handling, pad consumption
       tracking, never-reuse enforcement (all client-side).
 - [ ] **Tor deployment** — hardened reverse setup, `.onion` service config,
-      bind notes; never expose uvicorn directly to a public interface.
+      bind notes; never expose uvicorn directly to a public interface. Pairs
+      with the app: point the relay at the `.onion`, add its origin via
+      `SECURE_CHAT_EXTRA_ORIGINS`.
 - [x] **Handshake replay across sessions in a reused room (Medium, found
       2026-07-02 pentest)** — DONE (2026-07-02 second session, see dated
       entry): transcript v2 folds a fresh per-connection nonce from both peers

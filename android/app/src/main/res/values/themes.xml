@@ -1,0 +1,5 @@
+<resources>
+    <style name="Theme.SecureChat" parent="Theme.Material3.DayNight">
+        <item name="android:statusBarColor">?attr/colorSurface</item>
+    </style>
+</resources>

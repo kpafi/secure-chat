@@ -76,15 +76,40 @@ MAX_ACTIVE_TOKENS = 50_000       # outstanding session tokens
 # share one origin. Set to None to run as a pure relay with no static files.
 CLIENT_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "client"))
 
+# Origin of the Android app's bundled web client. The app serves the exact same
+# client from a local secure origin (WebViewAssetLoader) and reaches this relay
+# cross-origin, so its Origin must be allow-listed for both the WS handshake and
+# CORS below. It is a single fixed value, not a wildcard, so allow-listing it
+# does not open the relay to arbitrary web pages.
+APP_WEBVIEW_ORIGIN = "https://appassets.androidplatform.net"
+
 # --- WebSocket origin allow-list (CSWSH protection) -----------------------
 # Browsers send an Origin header on the WS handshake. We reject any *present*
 # origin not in this set, which blocks Cross-Site WebSocket Hijacking. A
 # missing Origin (native app / CLI client) is allowed through. Add the .onion
 # origin here at deploy time.
+# Extra origins can be added at deploy time WITHOUT editing this file, via
+# SECURE_CHAT_EXTRA_ORIGINS (comma-separated) — e.g. the production .onion
+# origin. They are added to both the WS allow-list and the HTTP CORS list.
+_EXTRA_ORIGINS = [o.strip() for o in os.environ.get("SECURE_CHAT_EXTRA_ORIGINS", "").split(",") if o.strip()]
+
 ALLOWED_WS_ORIGINS = {
     "http://127.0.0.1:8000",
     "http://localhost:8000",
+    APP_WEBVIEW_ORIGIN,
+    *_EXTRA_ORIGINS,
 }
+
+# Cross-origin allow-list for the HTTP /api account directory. Empty for the
+# same-origin web client; the Android app's fixed origin is included so its
+# (optional) directory lookups work cross-origin. The relay endpoints carry no
+# cookies / ambient credentials (auth is an explicit Bearer token), so exposing
+# them to this single extra origin discloses only what /api already returns:
+# public keys, gated by the per-account lookup token and the rate limiter.
+ALLOWED_HTTP_ORIGINS = [
+    APP_WEBVIEW_ORIGIN,
+    *_EXTRA_ORIGINS,
+]
 
 # --- Accounts (passwordless, key-based) -----------------------------------
 # The server stores ONLY public identity keys (Ed25519 + ML-DSA-65) keyed by

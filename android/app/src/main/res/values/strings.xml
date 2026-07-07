@@ -1,0 +1,11 @@
+<resources>
+    <string name="app_name">secure-chat</string>
+    <string name="relay_dialog_title">Relay address</string>
+    <string name="relay_dialog_msg">Enter the relay this app should connect to (e.g. https://relay.example.com, http://192.168.1.5:8000, or an .onion via Orbot). Only opaque ciphertext ever reaches it.</string>
+    <string name="relay_hint">https://host or http://host:port</string>
+    <string name="menu_relay">Relay settings</string>
+    <string name="menu_reload">Reload</string>
+    <string name="save">Save</string>
+    <string name="cancel">Cancel</string>
+    <string name="bad_relay">Enter a valid http:// or https:// address (host only, no path).</string>
+</resources>
