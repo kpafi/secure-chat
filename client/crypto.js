@@ -658,10 +658,146 @@ class Pqkem {
   }
 }
 
-// OTP (pre-shared pad) is deferred by design.
-export const UNAVAILABLE = {
-  OTP: "One-time-pad mode is deferred (requires in-person pad exchange).",
-};
+// ---- OTP: pre-shared one-time pad (true XOR) --------------------------------
+// A one-time pad shared IN PERSON (generated on one device, exported as an
+// encrypted file, imported on the other — see otp.js). This is a genuine XOR
+// one-time pad: each plaintext byte is XORed with a fresh pad byte that is never
+// reused, so the CONFIDENTIALITY of the content is information-theoretic to the
+// extent the pad is truly random. (The pad is generated from the OS CSPRNG,
+// hardened with user-drawn entropy, not a certified hardware TRNG, so in
+// practice treat it as "at least as strong as the CSPRNG.")
+//
+// XOR alone has NO integrity — a relay could flip ciphertext bits and flip the
+// plaintext bit-for-bit. So each message is authenticated with an HMAC-SHA-256
+// tag under a ONE-TIME key also drawn fresh from the pad. That authenticator is
+// COMPUTATIONAL, not information-theoretic (an information-theoretic one-time MAC
+// would be hand-rolled crypto, which this project forbids); it is the honest,
+// documented limit of OTP mode's integrity guarantee.
+//
+// Two-region split (no reuse across the two senders): the pad is split in half.
+// The peer with role 0 sends from region 0 and receives from region 1; role 1 is
+// the mirror. Each sender advances a strictly increasing offset in its own
+// region, so no pad byte is ever used to encrypt twice. Consumed bytes are
+// zeroed as they are used (forward secrecy: device capture at time T cannot
+// decrypt earlier traffic — those pad bytes are gone). The receiver only accepts
+// a strictly forward offset, which rejects replays and cross-session replays
+// (offsets persist per pad, never rewind). Roles/offsets live in the pad record
+// (otp.js), which app.js persists after every message.
+//
+// Per message at region offset o for an L-byte plaintext:
+//   macKey    = pad[o .. o+32]            (one-time HMAC key)
+//   keystream = pad[o+32 .. o+32+L]
+//   ct        = plaintext XOR keystream
+//   tag       = HMAC(macKey, domain|room|role|o|L | ct)   (binds position+room)
+//   consume 32+L bytes; next offset = o + 32 + L
+const OTP_MSG_DOMAIN = "secure-chat/otp-msg/v1";
+const OTP_MAC_BYTES = 32;
+
+class OtpPad {
+  constructor(roomId, pad) {
+    if (!pad || !(pad.bytes instanceof Uint8Array)) {
+      throw new Error("OTP mode requires a loaded pad");
+    }
+    if (pad.role !== 0 && pad.role !== 1) throw new Error("OTP pad role must be 0 or 1");
+    if (!Number.isInteger(pad.regionSize) || pad.regionSize <= OTP_MAC_BYTES) {
+      throw new Error("OTP pad region too small");
+    }
+    if (pad.bytes.length !== 2 * pad.regionSize) throw new Error("OTP pad length mismatch");
+    this.roomId = roomId;
+    this.pad = pad.bytes;          // shared reference: app.js persists it (zeroed as consumed)
+    this.role = pad.role;
+    this.regionSize = pad.regionSize;
+    this.sendOffset = pad.sendOffset | 0;       // our position in our send region
+    this.recvHighWater = pad.recvHighWater | 0; // highest consumed offset in the peer's region
+    this._q = new CallQueue();
+  }
+  get needsHandshake() { return false; } // the pad is the shared secret; nothing crosses the wire
+  get usesNonces() { return false; }
+  get ready() { return this.pad !== null; }
+  async init() {}
+  handshakePayload() { return null; }
+  async onPeerKey() {}
+
+  // Bytes of send region still usable (each message costs 32 + its length).
+  get remainingSend() { return this.regionSize - this.sendOffset; }
+
+  async _mac(keyBytes, role, o, len, ct, usage) {
+    const key = await crypto.subtle.importKey(
+      "raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, [usage],
+    );
+    const header = enc.encode(`${OTP_MSG_DOMAIN}|${this.roomId}|${role}|${o}|${len}|`);
+    return { key, ad: concatBytes([header, ct]) };
+  }
+
+  encrypt(text) { return this._q.run(() => this._encrypt(text)); }
+  async _encrypt(text) {
+    const pt = enc.encode(text);
+    const len = pt.length;
+    const need = OTP_MAC_BYTES + len;
+    if (this.sendOffset + need > this.regionSize) {
+      throw new Error("one-time pad exhausted for sending — exchange a new pad in person");
+    }
+    const o = this.sendOffset;
+    const base = this.role * this.regionSize;
+    const abs = base + o;
+    const macKeyBytes = this.pad.slice(abs, abs + OTP_MAC_BYTES); // copy (independent of zeroing)
+    const ks = this.pad.subarray(abs + OTP_MAC_BYTES, abs + need); // live view, read before zeroing
+    const ct = new Uint8Array(len);
+    for (let i = 0; i < len; i++) ct[i] = pt[i] ^ ks[i];
+    const { key, ad } = await this._mac(macKeyBytes, this.role, o, len, ct, "sign");
+    const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, ad));
+    // Consume: zero the used pad span + local copies (forward secrecy).
+    this.pad.fill(0, abs, abs + need);
+    macKeyBytes.fill(0);
+    pt.fill(0);
+    this.sendOffset += need;
+    return packMsg({ r: this.role, o, ct: bufToB64(ct), mac: bufToB64(mac) });
+  }
+
+  decrypt(b64) { return this._q.run(() => this._decrypt(b64)); }
+  async _decrypt(b64) {
+    const p = unpackMsg(b64);
+    const peerRegion = 1 - this.role;
+    if (p.r !== peerRegion) {
+      // Our own region coming back is a relay reflecting our frame; a wrong value
+      // is malformed. Either way it is not a genuine peer frame.
+      throw new Error("frame from the wrong pad region (reflected or malformed)");
+    }
+    if (!Number.isInteger(p.o) || p.o < 0) throw new Error("bad pad offset");
+    const ct = new Uint8Array(b64ToBuf(p.ct));
+    const len = ct.length;
+    const need = OTP_MAC_BYTES + len;
+    // Strictly forward: rejects replays, overlaps, and cross-session replays
+    // (recvHighWater persists per pad and never rewinds).
+    if (p.o < this.recvHighWater) throw new Error("pad offset already consumed (replay)");
+    if (p.o + need > this.regionSize) throw new Error("pad offset out of range");
+    const base = peerRegion * this.regionSize;
+    const abs = base + p.o;
+    const macKeyBytes = this.pad.slice(abs, abs + OTP_MAC_BYTES);
+    const { key, ad } = await this._mac(macKeyBytes, p.r, p.o, len, ct, "verify");
+    const ok = await crypto.subtle.verify("HMAC", key, b64ToBuf(p.mac), ad);
+    macKeyBytes.fill(0);
+    // Auth failure consumes NOTHING (a hostile relay cannot burn pad with forged
+    // frames, and a genuine frame is idempotently retryable up to the highwater).
+    if (!ok) throw new Error("authentication failed (tampered or forged)");
+    const ks = this.pad.subarray(abs + OTP_MAC_BYTES, abs + need);
+    const out = new Uint8Array(len);
+    for (let i = 0; i < len; i++) out[i] = ct[i] ^ ks[i];
+    const text = dec.decode(out);
+    out.fill(0);
+    if (!isAscii(text)) throw new Error("decrypted content is not ASCII");
+    // Consume through this frame, including any skipped gap (dropped/rejected
+    // frames), zeroing it for forward secrecy. Gap bytes are unusable anyway
+    // once the highwater passes them.
+    this.pad.fill(0, base + this.recvHighWater, abs + need);
+    this.recvHighWater = p.o + need;
+    return text;
+  }
+}
+
+// OTP is now available (see OtpPad). Kept as an (empty) export for callers that
+// import it; a mode listed here would be UI-disabled with the given reason.
+export const UNAVAILABLE = {};
 
 export function makeCipher(alg, roomId, opts = {}) {
   switch (alg) {
@@ -673,6 +809,8 @@ export function makeCipher(alg, roomId, opts = {}) {
       return new Rsa(roomId);
     case "PQKEM":
       return new Pqkem(roomId);
+    case "OTP":
+      return new OtpPad(roomId, opts.pad);
     default:
       throw new Error(`unsupported or unavailable algorithm: ${alg}`);
   }

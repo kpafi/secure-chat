@@ -66,6 +66,13 @@ JOIN_TIMEOUT_SEC = 30
 API_RATE_CAPACITY = 60        # burst allowance (requests)
 API_RATE_REFILL_PER_SEC = 5.0 # sustained requests/second
 
+# Dedicated, stricter bucket for the login CHALLENGE endpoint (M-03). A
+# challenge is cheap for us but seeds pending state, so cap the mint rate well
+# below the general /api limiter. Keyed per client host (one global bucket
+# behind Tor, which is the meaningful control there).
+CHALLENGE_RATE_CAPACITY = 10        # burst allowance (challenges)
+CHALLENGE_RATE_REFILL_PER_SEC = 0.5 # sustained challenges/second
+
 # Hard caps so a flood cannot exhaust memory/disk even within TTL windows.
 MAX_ACCOUNTS = 100_000           # total rows in the directory
 MAX_PENDING_CHALLENGES = 10_000  # outstanding login challenges
@@ -79,9 +86,15 @@ CLIENT_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "cli
 # Origin of the Android app's bundled web client. The app serves the exact same
 # client from a local secure origin (WebViewAssetLoader) and reaches this relay
 # cross-origin, so its Origin must be allow-listed for both the WS handshake and
-# CORS below. It is a single fixed value, not a wildcard, so allow-listing it
-# does not open the relay to arbitrary web pages.
-APP_WEBVIEW_ORIGIN = "https://appassets.androidplatform.net"
+# CORS below. The app pins this via WebViewAssetLoader.setDomain(), so it is an
+# app-specific virtual origin — NOT androidx.webkit's shared DEFAULT_DOMAIN
+# ("appassets.androidplatform.net"), which any default WebViewAssetLoader app
+# would also present. It is a single fixed value, not a wildcard. Note that CORS
+# and the WS Origin check only bind browser/WebView-enforced requests; native
+# code can always reach /api directly, and /api is designed to expose nothing
+# sensitive to an unauthenticated caller (token-gated lookup, no existence
+# oracles), so this allow-list is a defense-in-depth boundary, not the trust root.
+APP_WEBVIEW_ORIGIN = "https://secure-chat.internal"
 
 # --- WebSocket origin allow-list (CSWSH protection) -----------------------
 # Browsers send an Origin header on the WS handshake. We reject any *present*
@@ -126,9 +139,36 @@ ED25519_PUB_BYTES = 32
 ED25519_SIG_BYTES = 64
 MLDSA65_PUB_BYTES = 1952
 MLDSA65_SIG_BYTES = 3309     # ML-DSA-65 (Dilithium) signature length
+# Bundle v2 encryption keys (async sealed envelope). The server stores them
+# and binds them via the dual registration signature; it cannot (and need not)
+# verify possession — an unusable key only breaks the registrant's own inbox.
+ECDH_PUB_BYTES = 65          # P-256 uncompressed point
+MLKEM768_PUB_BYTES = 1184    # ML-KEM-768 encapsulation key
 
 CHALLENGE_TTL_SEC = 120      # login challenge lifetime
 TOKEN_TTL_SEC = 3600         # issued session-token lifetime
+
+# --- Mailbox (store-and-forward for sealed messages) -----------------------
+# The server stores ONLY (recipient, opaque envelope, arrival time). The
+# sender is sealed INSIDE the envelope; the server never learns it. Posting is
+# gated by the recipient's lookup token (spam needs the handle, and the
+# endpoint is not an existence oracle); fetching requires the recipient's
+# session token and DELETES what it returns. Everything is bounded.
+MAX_ENVELOPE_BYTES = 64 * 1024        # one sealed envelope (matches WS frame cap)
+MAX_MAILBOX_PER_RECIPIENT = 200       # queued envelopes per inbox
+MAX_MAILBOX_TOTAL = 100_000           # queued envelopes server-wide
+MAILBOX_TTL_SEC = 14 * 24 * 3600      # unfetched mail expires
+MAILBOX_RATE_CAPACITY = 30            # burst posts per host
+MAILBOX_RATE_REFILL_PER_SEC = 1.0     # sustained posts/second per host
+
+# --- Web-of-trust vouches --------------------------------------------------
+# A vouch is a dual-signed public statement "voucher has verified target's
+# bundle". The server verifies both signatures before storing (no junk), but
+# is still NOT the trust root: clients recheck every signature against their
+# OWN pinned copy of the voucher's keys. Bounds only.
+MAX_VOUCHES_PER_VOUCHER = 200   # statements one account may publish
+MAX_VOUCHES_TOTAL = 200_000     # global table bound
+MAX_VOUCHES_RETURNED = 50       # per lookup response
 
 # --- Anti-enumeration: token-gated lookup (I1) ----------------------------
 # Registration mints a random, unguessable lookup token. A contact fetches a

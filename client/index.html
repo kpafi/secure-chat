@@ -9,104 +9,301 @@
 </head>
 <body>
   <main>
-    <h1>secure-chat <span class="sub">end-to-end encrypted relay</span></h1>
+    <header class="apphead">
+      <button id="menuBtn" type="button" class="ghost" aria-label="menu">☰</button>
+      <h1>secure-chat <span class="sub">end-to-end encrypted relay</span></h1>
+    </header>
 
-    <section class="panel" id="identity">
-      <div class="row">
-        <label>Your identity (verified in person by your contact)</label>
-        <p class="hint" id="idStatus">Checking for an identity on this device…</p>
-      </div>
-      <div class="row" id="idPassRow">
-        <label for="idPass">Identity passphrase</label>
-        <input id="idPass" type="password" autocomplete="off"
-               placeholder="protects your private keys on this device" />
-      </div>
-      <div class="row inline">
-        <button id="idCreate" type="button">Create identity</button>
-        <button id="idUnlock" type="button">Unlock</button>
-        <button id="idExport" type="button" hidden>Copy backup</button>
-        <button id="idForget" type="button" hidden>Forget</button>
-      </div>
-      <p class="hint" id="idFingerprint" hidden></p>
-    </section>
+    <nav id="drawer" class="drawer" hidden>
+      <button type="button" class="navitem active" data-view="live">🔒 Live room</button>
+      <button type="button" class="navitem" data-view="users">👥 Users</button>
+      <button type="button" class="navitem" data-view="chats">💬 Chats</button>
+    </nav>
+    <div id="scrim" class="scrim" hidden></div>
 
-    <section class="panel" id="account" hidden>
-      <div class="row">
-        <label for="username">Username — claim it so contacts can look up your identity</label>
-        <div class="inline">
-          <input id="username" type="text" inputmode="latin" autocomplete="off"
-                 spellcheck="false" maxlength="32" placeholder="3–32 chars: a-z 0-9 _ . -" />
-          <button id="register" type="button">Register</button>
-          <button id="login" type="button">Log in</button>
+    <!-- View: live room (the original 3-step flow) -->
+    <div id="viewLive" class="view">
+
+    <!-- Screen 1: identity + optional account directory -->
+    <div id="scrIdentity" class="screen">
+      <p class="step">Step 1 of 3 — <strong>Identity</strong> · Room · Chat</p>
+
+      <section class="panel" id="identity">
+        <div class="row">
+          <label>Your identity (verified in person by your contact)</label>
+          <p class="hint" id="idStatus">Checking for an identity on this device…</p>
         </div>
-      </div>
-      <p class="hint" id="accountStatus"></p>
-    </section>
-
-    <section class="panel" id="setup">
-      <div class="row">
-        <label for="room">Room id (64 hex chars)</label>
-        <div class="inline">
-          <input id="room" type="text" inputmode="latin" autocomplete="off"
-                 spellcheck="false" maxlength="64" placeholder="share this with one other person" />
-          <button id="gen" type="button">Generate</button>
+        <div class="row" id="idPassRow">
+          <label for="idPass">Identity passphrase</label>
+          <input id="idPass" type="password" autocomplete="off"
+                 placeholder="protects your private keys on this device" />
         </div>
+        <div class="row inline">
+          <button id="idCreate" type="button">Create identity</button>
+          <button id="idUnlock" type="button">Unlock</button>
+          <button id="idExport" type="button" hidden>Copy backup</button>
+          <button id="idForget" type="button" hidden>Forget</button>
+        </div>
+        <p class="hint" id="idFingerprint" hidden></p>
+      </section>
+
+      <section class="panel" id="account" hidden>
+        <div class="row">
+          <label for="username">Username — claim it so contacts can look up your identity</label>
+          <div class="inline">
+            <input id="username" type="text" inputmode="latin" autocomplete="off"
+                   spellcheck="false" maxlength="32" placeholder="3–32 chars: a-z 0-9 _ . -" />
+            <button id="register" type="button">Register</button>
+            <button id="login" type="button">Log in</button>
+          </div>
+        </div>
+        <p class="hint" id="accountStatus"></p>
+      </section>
+
+      <div class="row nav">
+        <button id="toRoom" type="button">Continue →</button>
+      </div>
+    </div>
+
+    <!-- Screen 2: room + encryption setup -->
+    <div id="scrRoom" class="screen" hidden>
+      <p class="step">Step 2 of 3 — Identity · <strong>Room</strong> · Chat</p>
+
+      <section class="panel" id="setup">
+        <div class="row">
+          <label for="room">Room id (64 hex chars)</label>
+          <div class="inline">
+            <input id="room" type="text" inputmode="latin" autocomplete="off"
+                   spellcheck="false" maxlength="64" placeholder="share this with one other person" />
+            <button id="gen" type="button">Generate</button>
+          </div>
+        </div>
+
+        <div class="row">
+          <label>Encryption</label>
+          <div id="algCards" class="alg-cards">
+            <label class="alg-card">
+              <input type="radio" name="alg" value="DHKE" checked />
+              <span class="alg-name">DHKE <em class="badge">recommended</em></span>
+              <span class="alg-desc">Ephemeral ECDH P-256 → AES-256-GCM</span>
+            </label>
+            <label class="alg-card">
+              <input type="radio" name="alg" value="AES256" />
+              <span class="alg-name">AES-256</span>
+              <span class="alg-desc">Shared passphrase → AES-256-GCM</span>
+            </label>
+            <label class="alg-card">
+              <input type="radio" name="alg" value="RSA" />
+              <span class="alg-name">RSA</span>
+              <span class="alg-desc">RSA-2048-OAEP hybrid — per-message AES-256</span>
+            </label>
+            <label class="alg-card">
+              <input type="radio" name="alg" value="PQKEM" />
+              <span class="alg-name">Post-quantum <em class="badge pq">ML-KEM-768</em></span>
+              <span class="alg-desc">Hybrid ECDH P-256 + ML-KEM-768 → AES-256-GCM</span>
+            </label>
+            <label class="alg-card">
+              <input type="radio" name="alg" value="OTP" />
+              <span class="alg-name">One-time pad</span>
+              <span class="alg-desc">Pre-shared pad, exchanged in person</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="row" id="passRow" hidden>
+          <label for="pass">Shared passphrase</label>
+          <input id="pass" type="password" autocomplete="off" placeholder="agree on this out of band" />
+        </div>
+
+        <div id="otpPanel" hidden>
+          <div class="row">
+            <label for="otpSelect">One-time pad</label>
+            <select id="otpSelect"><option value="">— no pad on this device —</option></select>
+            <button id="otpForget" type="button" class="danger" hidden>Forget</button>
+          </div>
+          <div class="row">
+            <label for="otpPass">Pad passphrase (encrypts this pad on this device; unlocks it to use)</label>
+            <input id="otpPass" type="password" autocomplete="off" placeholder="a passphrase only you know — asked again each session" />
+          </div>
+          <p class="hint" id="otpStatus">Generate a pad, or import one your contact gave you in person.</p>
+
+          <details id="otpTools">
+            <summary>Generate / share a pad</summary>
+
+            <div class="otp-sub">
+              <p class="hint">
+                Generate on ONE device, then export the encrypted file and give it to your
+                contact in person (Bluetooth, USB, QR…). They import it. A pad is a shared
+                secret for exactly two devices — never import it on more than one.
+              </p>
+              <div class="row">
+                <label for="otpSize">Pad size</label>
+                <select id="otpSize"></select>
+              </div>
+              <div class="row">
+                <label for="otpLabel">Label</label>
+                <input id="otpLabel" type="text" inputmode="latin" autocomplete="off"
+                       spellcheck="false" maxlength="60" placeholder="e.g. Alice ↔ Bob 2026" />
+              </div>
+              <p class="hint">Optional: draw in the box below to fold your own physical randomness into the pad.</p>
+              <canvas id="otpEntropy" width="320" height="90" class="otp-entropy" aria-label="draw here to add entropy"></canvas>
+              <p class="hint" id="otpEntropyStatus">Entropy from drawing: none yet (the OS random generator is used regardless).</p>
+              <div class="row">
+                <button id="otpGenerate" type="button">Generate pad</button>
+              </div>
+            </div>
+
+            <div class="otp-sub">
+              <label for="otpXferPass">Transfer passphrase (agree on it in person — protects the file)</label>
+              <input id="otpXferPass" type="password" autocomplete="off" placeholder="a DIFFERENT secret you say to your contact" />
+              <p class="hint">
+                A pad may be imported on only ONE device per side. Importing the same file on
+                more than one device causes catastrophic key reuse — generate a separate pad
+                for each contact.
+              </p>
+              <div class="row">
+                <button id="otpExport" type="button">Export selected pad…</button>
+                <button id="otpImport" type="button">Import pad file…</button>
+              </div>
+              <input id="otpFile" type="file" accept="application/json,.json,.txt" hidden />
+            </div>
+          </details>
+        </div>
+
+        <div class="row" id="contactRow">
+          <label for="contact">Contact handle (optional — fetch &amp; pin their identity)</label>
+          <input id="contact" type="text" inputmode="latin" autocomplete="off"
+                 spellcheck="false" maxlength="99" placeholder="username#token (as your contact shared it)" />
+        </div>
+
+        <div class="row">
+          <button id="connect" type="button">Connect</button>
+          <span id="status" class="status">disconnected</span>
+        </div>
+      </section>
+
+      <div class="row nav">
+        <button id="toIdentity" type="button" class="ghost">‹ Back to identity</button>
+      </div>
+    </div>
+
+    <!-- Screen 3: chat (with verification gate) -->
+    <div id="scrChat" class="screen" hidden>
+      <div class="topbar panel">
+        <span class="roomid" id="roomShort"></span>
+        <button id="copyRoom" type="button" class="ghost">Copy room id</button>
+        <span id="chatStatus" class="status"></span>
+        <button id="disconnect" type="button" class="danger">Disconnect</button>
       </div>
 
-      <div class="row">
-        <label for="alg">Encryption</label>
-        <select id="alg">
-          <option value="DHKE">DHKE — ephemeral ECDH P-256 → AES-256-GCM (recommended)</option>
-          <option value="AES256">AES-256-GCM — shared passphrase</option>
-          <option value="RSA">RSA-2048-OAEP — hybrid (per-message AES-256)</option>
-          <option value="PQKEM">Post-quantum — hybrid ECDH P-256 + ML-KEM-768 → AES-256-GCM</option>
-          <option value="OTP" disabled>One-time pad — deferred</option>
-        </select>
-      </div>
+      <section class="panel" id="verify" hidden>
+        <div class="row">
+          <label id="verifyTitle">Verify your contact — in person</label>
+          <p class="hint" id="verifyHint">
+            Compare this safety number with your contact over a trusted channel
+            (in person, or a call where you recognise their voice). It must be
+            identical on both devices. If it differs, a relay may be intercepting
+            you — do not send anything.
+          </p>
+        </div>
+        <p class="safety" id="safetyNumber"></p>
+        <p class="hint" id="peerFingerprint"></p>
+        <div class="row inline">
+          <button id="verifyOk" type="button">It matches — unlock messaging</button>
+          <button id="verifyNo" type="button" class="danger">It differs — disconnect</button>
+        </div>
+      </section>
 
-      <div class="row" id="passRow" hidden>
-        <label for="pass">Shared passphrase</label>
-        <input id="pass" type="password" autocomplete="off" placeholder="agree on this out of band" />
-      </div>
+      <section class="panel" id="chat">
+        <ul id="log" aria-live="polite"></ul>
+        <form id="sendForm" class="inline" autocomplete="off">
+          <input id="text" type="text" maxlength="2000" placeholder="ASCII only…" disabled />
+          <button id="send" type="submit" disabled>Send</button>
+        </form>
+        <p class="hint" id="hint"></p>
+      </section>
+    </div>
+    </div><!-- /viewLive -->
 
-      <div class="row" id="contactRow">
-        <label for="contact">Contact handle (optional — fetch &amp; pin their identity)</label>
-        <input id="contact" type="text" inputmode="latin" autocomplete="off"
-               spellcheck="false" maxlength="99" placeholder="username#token (as your contact shared it)" />
-      </div>
+    <!-- View: users (known keys + trust) -->
+    <div id="viewUsers" class="view" hidden>
+      <p class="step">Users — known public keys &amp; trust</p>
 
-      <div class="row">
-        <button id="connect" type="button">Connect</button>
-        <span id="status" class="status">disconnected</span>
-      </div>
-    </section>
+      <section class="panel">
+        <div id="usersLocked">
+          <p class="hint">
+            Contacts are stored encrypted under your identity passphrase.
+            Unlock (or create) your identity in the Live room view first.
+          </p>
+        </div>
+        <div id="usersUnlocked" hidden>
+          <div class="row">
+            <label for="addHandle">Add a user by their handle</label>
+            <div class="inline">
+              <input id="addHandle" type="text" inputmode="latin" autocomplete="off"
+                     spellcheck="false" maxlength="99" placeholder="username#token (as they shared it)" />
+              <button id="addContact" type="button">Add</button>
+            </div>
+          </div>
+          <p class="hint" id="usersStatus"></p>
+          <ul id="userList" class="userlist"></ul>
+          <p class="hint">
+            🟢 verified — you compared the fingerprint in person ·
+            🟡 vouched — someone you verified has verified them ·
+            ⚪ unverified
+          </p>
+        </div>
+      </section>
+    </div><!-- /viewUsers -->
 
-    <section class="panel" id="verify" hidden>
-      <div class="row">
-        <label id="verifyTitle">Verify your contact — in person</label>
-        <p class="hint" id="verifyHint">
-          Compare this safety number with your contact over a trusted channel
-          (in person, or a call where you recognise their voice). It must be
-          identical on both devices. If it differs, a relay may be intercepting
-          you — do not send anything.
-        </p>
-      </div>
-      <p class="safety" id="safetyNumber"></p>
-      <p class="hint" id="peerFingerprint"></p>
-      <div class="row inline">
-        <button id="verifyOk" type="button">It matches — unlock messaging</button>
-        <button id="verifyNo" type="button" class="danger">It differs — disconnect</button>
-      </div>
-    </section>
+    <!-- View: chats (async 1:1 via the sealed mailbox) -->
+    <div id="viewChats" class="view" hidden>
+      <p class="step">Chats — direct messages</p>
 
-    <section class="panel" id="chat" hidden>
-      <ul id="log" aria-live="polite"></ul>
-      <form id="sendForm" class="inline" autocomplete="off">
-        <input id="text" type="text" maxlength="2000" placeholder="ASCII only…" disabled />
-        <button id="send" type="submit" disabled>Send</button>
-      </form>
-      <p class="hint" id="hint"></p>
-    </section>
+      <section class="panel" id="chatsPanel">
+        <div id="chatsLocked">
+          <p class="hint">
+            Chats are stored encrypted under your identity passphrase.
+            Unlock (or create) your identity in the Live room view first.
+          </p>
+        </div>
+
+        <div id="chatsUnlocked" hidden>
+          <p class="hint" id="chatsStatus"></p>
+
+          <div id="chatListWrap">
+            <div class="row">
+              <label for="chatNew">Start a chat with a saved user</label>
+              <div class="inline">
+                <select id="chatNew"></select>
+                <button id="chatStart" type="button">Open</button>
+              </div>
+            </div>
+            <ul id="chatList" class="userlist"></ul>
+          </div>
+
+          <div id="chatConvo" hidden>
+            <div class="topbar convo-head">
+              <button id="chatBack" type="button" class="ghost">‹</button>
+              <span class="u-name" id="chatPeer"></span>
+              <span class="u-mark" id="chatPeerMark"></span>
+              <span class="chatmode" id="chatMode"></span>
+              <select id="chatModeSel" title="Propose an encryption mode for this chat">
+                <option value="SEALED">SEALED (default)</option>
+                <option value="AES256">AES-256 (extra passphrase)</option>
+              </select>
+            </div>
+            <div id="chatPending" class="pending" hidden></div>
+            <ul id="chatLog"></ul>
+            <form id="chatForm" class="inline" autocomplete="off">
+              <input id="chatText" type="text" maxlength="2000" placeholder="ASCII only…" />
+              <button id="chatSend" type="submit">Send</button>
+            </form>
+            <p class="hint" id="chatHint"></p>
+          </div>
+        </div>
+      </section>
+    </div><!-- /viewChats -->
   </main>
 
   <script type="importmap">{"imports":{"@noble/post-quantum/":"./vendor/@noble/post-quantum/","@noble/hashes/":"./vendor/@noble/hashes/","@noble/curves/":"./vendor/@noble/curves/"}}</script>

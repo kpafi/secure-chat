@@ -10,8 +10,10 @@ ciphertext.
 
 ## How it works
 - `MainActivity` serves the bundled `assets/web/` to a `WebView` from a local
-  **secure** origin (`https://appassets.androidplatform.net`) via
-  `WebViewAssetLoader`. A secure origin is required for `window.crypto.subtle`.
+  **secure** origin (`https://secure-chat.internal`, pinned via
+  `WebViewAssetLoader.setDomain()` so the origin is unique to this app rather
+  than androidx.webkit's shared default domain). A secure origin is required for
+  `window.crypto.subtle`.
 - The relay is remote, so the app supplies the two things the same-origin web
   build got for free:
   1. **Relay location** — injected as `window.__SECURE_CHAT_RELAY__ = {api, ws}`

@@ -461,6 +461,88 @@ async function pqkemReplayDoesNotDesync() {
   console.log("OK  PQKEM replayed handshake offer does not desync the key");
 }
 
+// ---- OTP (pre-shared one-time pad) -----------------------------------------
+// Build two peer views of the SAME pad (as export/import would produce on two
+// devices): identical bytes, opposite roles, independent Uint8Arrays so zeroing
+// on one peer never touches the other's copy.
+function otpPeers(regionSize = 4096) {
+  const shared = crypto.getRandomValues(new Uint8Array(2 * regionSize));
+  const view = (role) => makeCipher("OTP", ROOM, {
+    pad: { bytes: shared.slice(), role, regionSize, sendOffset: 0, recvHighWater: 0 },
+  });
+  return [view(0), view(1)];
+}
+
+async function otpChecks() {
+  // Round-trip both directions.
+  {
+    const [a, b] = otpPeers();
+    assert.ok(a.ready && b.ready, "OTP ready once the pad is loaded");
+    assert.strictEqual(await b.decrypt(await a.encrypt(MSG)), MSG, "OTP A->B");
+    assert.strictEqual(await a.decrypt(await b.encrypt(MSG)), MSG, "OTP B->A");
+    // Distinct messages consume distinct pad bytes (offset advances).
+    assert.strictEqual(await b.decrypt(await a.encrypt("second")), "second", "OTP second A->B");
+  }
+  // Replay (and cross-session replay) rejected: an already-consumed offset never
+  // decrypts twice.
+  {
+    const [a, b] = otpPeers();
+    const wire = await a.encrypt(MSG);
+    assert.strictEqual(await b.decrypt(wire), MSG, "OTP first delivery ok");
+    await assert.rejects(() => b.decrypt(wire), /consumed|replay/i, "OTP replay rejected");
+  }
+  // Tamper: flipping a ciphertext byte fails authentication, and the channel
+  // still works afterwards (a rejected frame consumes no pad).
+  {
+    const [a, b] = otpPeers();
+    const frame = JSON.parse(Buffer.from(await a.encrypt(MSG), "base64").toString());
+    const ctBytes = Buffer.from(frame.ct, "base64");
+    ctBytes[0] ^= 0x01;
+    frame.ct = ctBytes.toString("base64");
+    const tampered = Buffer.from(JSON.stringify(frame)).toString("base64");
+    await assert.rejects(() => b.decrypt(tampered), /authentication/i, "OTP tamper rejected");
+    assert.strictEqual(await b.decrypt(await a.encrypt("after tamper")), "after tamper",
+      "OTP channel survives a rejected frame");
+  }
+  // Reflection: our own frame echoed back to us is refused (wrong region).
+  {
+    const [a] = otpPeers();
+    const wire = await a.encrypt(MSG);
+    await assert.rejects(() => a.decrypt(wire), /region|reflected/i, "OTP reflection rejected");
+  }
+  // Forgery: a peer holding a DIFFERENT pad cannot authenticate a frame.
+  {
+    const [a] = otpPeers();
+    const [, bOther] = otpPeers(); // unrelated pad, role 1
+    const wire = await a.encrypt(MSG);
+    await assert.rejects(() => bOther.decrypt(wire), /authentication/i,
+      "OTP forged/other-pad frame rejected");
+  }
+  // Exhaustion: sending past the region end throws rather than reusing pad.
+  {
+    const region = 128;
+    const shared = crypto.getRandomValues(new Uint8Array(2 * region));
+    const a = makeCipher("OTP", ROOM, { pad: { bytes: shared.slice(), role: 0, regionSize: region, sendOffset: 0, recvHighWater: 0 } });
+    // 32-byte MAC + payload; a 200-byte message cannot fit a 128-byte region.
+    await assert.rejects(() => a.encrypt("x".repeat(200)), /exhausted/i, "OTP exhaustion refused");
+  }
+  // Forward secrecy: consumed pad bytes are zeroed on both sender and receiver.
+  {
+    const region = 4096;
+    const shared = crypto.getRandomValues(new Uint8Array(2 * region));
+    const aBytes = shared.slice();
+    const bBytes = shared.slice();
+    const a = makeCipher("OTP", ROOM, { pad: { bytes: aBytes, role: 0, regionSize: region, sendOffset: 0, recvHighWater: 0 } });
+    const b = makeCipher("OTP", ROOM, { pad: { bytes: bBytes, role: 1, regionSize: region, sendOffset: 0, recvHighWater: 0 } });
+    const wire = await a.encrypt(MSG);
+    const used = 32 + Buffer.byteLength(MSG);
+    assert.ok(aBytes.slice(0, used).every((x) => x === 0), "sender zeroed consumed pad (region 0)");
+    await b.decrypt(wire);
+    assert.ok(bBytes.slice(0, used).every((x) => x === 0), "receiver zeroed consumed pad (region 0)");
+  }
+  console.log("OK  OTP round-trip, replay/tamper/reflection/forgery rejected, exhaustion + FS zeroing");
+}
+
 await roundtripShared();
 await roundtripHandshake("DHKE");
 await roundtripHandshake("RSA");
@@ -478,4 +560,5 @@ await concurrencyChecks("AES256");
 await concurrencyChecks("DHKE");
 await concurrencyChecks("RSA");
 await concurrencyChecks("PQKEM");
+await otpChecks();
 console.log("\nAll crypto checks passed.");

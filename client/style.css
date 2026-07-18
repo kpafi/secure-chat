@@ -23,8 +23,119 @@ body {
 
 main { width: 100%; max-width: 640px; }
 
-h1 { font-size: 1.4rem; margin: 0 0 1rem; }
+h1 { font-size: 1.4rem; margin: 0; }
 h1 .sub { font-size: 0.8rem; color: var(--muted); font-weight: normal; }
+
+/* App header: menu button + title. */
+.apphead { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 1rem; }
+#menuBtn { font-size: 1.1rem; line-height: 1; padding: 0.45rem 0.65rem; }
+
+/* Left drawer menu. */
+/* `display: flex` would override the `hidden` attribute's UA display:none —
+   restate it explicitly so a hidden drawer is really gone (not click-eating). */
+.drawer[hidden] { display: none; }
+.drawer {
+  position: fixed;
+  top: 0; left: 0; bottom: 0;
+  width: min(75vw, 260px);
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  padding: 1rem 0.6rem;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.navitem {
+  background: none;
+  border: none;
+  color: var(--fg);
+  text-align: left;
+  padding: 0.7rem 0.8rem;
+  border-radius: 6px;
+  font: inherit;
+  cursor: pointer;
+}
+.navitem:hover { background: var(--bg); }
+.navitem.active { background: var(--bg); color: var(--accent); outline: 1px solid var(--border); }
+.scrim { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55); z-index: 10; }
+
+/* Users view: contact list with trust marks. */
+.userlist { list-style: none; margin: 0.5rem 0 0.75rem; padding: 0; }
+.userlist li {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  padding: 0.6rem 0.75rem;
+  margin-bottom: 0.5rem;
+}
+.u-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; flex-wrap: wrap; }
+.u-name { font-size: 0.95rem; color: var(--fg); }
+.u-mark { font-size: 0.74rem; color: var(--muted); }
+.u-mark.ok { color: var(--ok); }
+.u-mark.mid { color: #d29922; }
+.u-fp { font-size: 0.72rem; color: var(--muted); margin: 0.35rem 0; word-break: break-word; }
+.u-actions { margin-top: 0.35rem; }
+.u-actions button { font-size: 0.78rem; padding: 0.4rem 0.6rem; }
+
+/* Chats view: chat list rows + WhatsApp-style conversation bubbles. */
+.chatrow { cursor: pointer; }
+.chatrow:hover { border-color: var(--accent); }
+/* The conversation header keeps a flex row on every screen size (the mobile
+   .topbar grid is meant for the live-room bar only). */
+.topbar.convo-head { position: static; margin-bottom: 0.6rem; display: flex; align-items: center; flex-wrap: wrap; }
+.convo-head .u-name { flex: 1 1 auto; }
+.convo-head .u-mark { flex: 0 0 auto; }
+#chatModeSel { margin-left: auto; }
+#chatBack { flex: 0 0 auto; }
+.chatmode { font-size: 0.72rem; color: var(--muted); }
+#chatModeSel { width: auto; flex: 0 0 auto; padding: 0.3rem 0.4rem; font-size: 0.76rem; }
+.pending {
+  background: #2b2410;
+  border: 1px solid #d29922;
+  color: #e3b341;
+  border-radius: 6px;
+  padding: 0.5rem 0.6rem;
+  margin-bottom: 0.6rem;
+  font-size: 0.82rem;
+}
+.pending button { margin-left: 0.4rem; font-size: 0.76rem; padding: 0.3rem 0.55rem; }
+#chatLog {
+  list-style: none;
+  margin: 0 0 0.75rem;
+  padding: 0.5rem;
+  height: min(50vh, 440px);
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+#chatLog li {
+  max-width: 82%;
+  padding: 0.45rem 0.65rem;
+  border-radius: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.9rem;
+}
+#chatLog li.me {
+  align-self: flex-end;
+  background: #1f4e9b;
+  color: #fff;
+  border-bottom-right-radius: 4px;
+}
+#chatLog li.peer {
+  align-self: flex-start;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-bottom-left-radius: 4px;
+}
+@media (max-width: 600px) {
+  #chatLog { height: calc(100dvh - 21rem); min-height: 10rem; }
+}
 
 .panel {
   background: var(--panel);
@@ -71,11 +182,92 @@ button#gen { background: #21262d; color: var(--fg); border: 1px solid var(--bord
 .status.ok { color: var(--ok); }
 .status.err { color: var(--err); }
 
+/* Three-step flow: step indicator + per-screen navigation. */
+.step { font-size: 0.78rem; color: var(--muted); margin: 0 0 0.6rem; letter-spacing: 0.03em; }
+.step strong { color: var(--accent); font-weight: 600; }
+.nav { display: flex; justify-content: flex-end; }
+button.ghost { background: #21262d; color: var(--fg); border: 1px solid var(--border); }
+
+/* Chat top bar: room id (copyable) + status + disconnect, always in view. */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.6rem 0.75rem;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.roomid {
+  font-size: 0.8rem;
+  color: var(--muted);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.35rem 0.5rem;
+  white-space: nowrap;
+}
+.topbar .status { flex: 1; text-align: right; margin-left: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.topbar button { padding: 0.35rem 0.6rem; font-size: 0.82rem; }
+
+/* Encryption picker: radio cards (large touch targets, description visible). */
+.alg-cards { display: grid; gap: 0.45rem; }
+.alg-card {
+  display: block;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
+  cursor: pointer;
+  margin-bottom: 0;
+}
+.alg-card input {
+  /* Visually hidden but still focusable/checkable — the card is the control. */
+  position: absolute;
+  width: 1px; height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+.alg-card:has(input:checked) { border-color: var(--accent); outline: 1px solid var(--accent); }
+.alg-card:has(input:focus-visible) { outline: 2px solid var(--accent); }
+.alg-name { display: block; font-size: 0.9rem; color: var(--fg); margin-bottom: 0.15rem; }
+.alg-card:has(input:checked) .alg-name { color: var(--accent); }
+.alg-desc { display: block; font-size: 0.74rem; color: var(--muted); }
+.badge {
+  font-style: normal;
+  font-size: 0.65rem;
+  color: var(--ok);
+  border: 1px solid var(--ok);
+  border-radius: 999px;
+  padding: 0.05rem 0.45rem;
+  margin-left: 0.35rem;
+  vertical-align: 0.1em;
+}
+.badge.pq { color: var(--accent); border-color: var(--accent); }
+
+/* Phone-sized screens: tighter chrome, bigger touch targets, chat fills the
+   viewport. 16px inputs stop mobile browsers from zooming on focus. */
+@media (max-width: 600px) {
+  body { padding: 0.75rem 0.6rem; }
+  h1 { font-size: 1.1rem; margin-bottom: 0.6rem; }
+  .panel { padding: 0.75rem; }
+  input, select, button { font-size: 16px; }
+  button { padding: 0.65rem 0.9rem; }
+  /* 2×2 grid: room id | copy  //  status | disconnect. */
+  .topbar { display: grid; grid-template-columns: 1fr auto; gap: 0.4rem; }
+  .topbar button { font-size: 13px; padding: 0.45rem 0.55rem; }
+  .roomid { overflow: hidden; text-overflow: ellipsis; font-size: 0.72rem; align-self: center; }
+  .topbar .status { text-align: left; margin: 0; align-self: center; }
+  .topbar #disconnect { justify-self: end; }
+  /* 100dvh minus header, top bar, send form and margins. */
+  #log { height: calc(100dvh - 17rem); min-height: 10rem; }
+}
+
 #log {
   list-style: none;
   margin: 0 0 0.75rem;
   padding: 0;
-  height: 340px;
+  height: min(55vh, 480px);
   overflow-y: auto;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -111,3 +303,13 @@ button#idCreate, button#idUnlock { background: #21262d; color: var(--fg); border
 /* Loud banner when a pinned contact's identity key has changed. */
 #verify.changed { border-color: var(--err); }
 #verify.changed #verifyTitle { color: var(--err); }
+
+/* One-time-pad panel. */
+#otpPanel { margin-bottom: 0.85rem; }
+#otpTools { margin-top: 0.6rem; border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.7rem; background: var(--bg); }
+#otpTools summary { cursor: pointer; font-size: 0.82rem; color: var(--accent); }
+.otp-sub { margin-top: 0.8rem; padding-top: 0.7rem; border-top: 1px solid var(--border); }
+.otp-sub:first-of-type { border-top: none; }
+.otp-entropy { display: block; width: 100%; max-width: 340px; height: 90px; background: var(--panel); border: 1px dashed var(--border); border-radius: 6px; touch-action: none; cursor: crosshair; }
+#otpForget { margin-left: 0.5rem; }
+button#otpImport, button#otpExport { background: #21262d; color: var(--fg); border: 1px solid var(--border); }

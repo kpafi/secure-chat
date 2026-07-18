@@ -43,3 +43,31 @@ def test_csp_pins_current_importmap_hash():
         f"served CSP script-src does not pin the current import map hash.\n"
         f"expected {expected}\nCSP: {csp}"
     )
+
+
+# The Android app stamps its OWN CSP (it serves index.html from a local origin,
+# not through main.py) and hardcodes the import-map hash in MainActivity.kt. That
+# constant has no other automated drift guard, so if the import map changes the
+# app would silently break. Recompute the hash here and assert the Kotlin copy
+# still matches. Skipped when the android/ module isn't checked out alongside the
+# backend, so the backend stays independently testable.
+_MAIN_ACTIVITY = Path(
+    config.CLIENT_DIR, "..", "android", "app", "src", "main", "java",
+    "org", "securechat", "app", "MainActivity.kt",
+)
+_KT_HASH_RE = re.compile(r'importMapHash\s*=\s*"([^"]+)"')
+
+
+def test_android_importmap_hash_matches():
+    if not _MAIN_ACTIVITY.exists():
+        import pytest
+
+        pytest.skip("android/ module not present")
+    kt = _MAIN_ACTIVITY.read_text(encoding="utf-8")
+    match = _KT_HASH_RE.search(kt)
+    assert match, "MainActivity.kt must declare importMapHash"
+    assert match.group(1) == _importmap_hash(), (
+        "MainActivity.kt importMapHash has drifted from the web client's import "
+        "map. Regenerate it to match index.html or the app's CSP will block the "
+        "inline import map and the app will break."
+    )

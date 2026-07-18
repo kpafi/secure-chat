@@ -22,6 +22,10 @@ import { makeCipher, isAscii, bufToB64, b64ToBuf } from "./crypto.js";
 import { Identity } from "./identity.js";
 import { signHandshake, verifyHandshake, freshNonce, isValidNonce } from "./auth.js";
 import * as account from "./account.js";
+import * as otp from "./otp.js";
+import * as contacts from "./contacts.js";
+import * as chats from "./chats.js";
+import * as sealed from "./sealed.js";
 
 const $ = (id) => document.getElementById(id);
 const els = {
@@ -33,9 +37,15 @@ const els = {
   account: $("account"), username: $("username"), register: $("register"),
   login: $("login"), accountStatus: $("accountStatus"),
   // setup
-  room: $("room"), gen: $("gen"), alg: $("alg"), pass: $("pass"),
+  room: $("room"), gen: $("gen"), algCards: $("algCards"), pass: $("pass"),
   passRow: $("passRow"), contactRow: $("contactRow"), contact: $("contact"),
   connect: $("connect"), status: $("status"), setup: $("setup"),
+  // one-time pad
+  otpPanel: $("otpPanel"), otpSelect: $("otpSelect"), otpForget: $("otpForget"),
+  otpStatus: $("otpStatus"), otpSize: $("otpSize"), otpLabel: $("otpLabel"),
+  otpEntropy: $("otpEntropy"), otpEntropyStatus: $("otpEntropyStatus"),
+  otpGenerate: $("otpGenerate"), otpPass: $("otpPass"), otpXferPass: $("otpXferPass"),
+  otpExport: $("otpExport"), otpImport: $("otpImport"), otpFile: $("otpFile"),
   // verification gate
   verify: $("verify"), verifyTitle: $("verifyTitle"), verifyHint: $("verifyHint"),
   safetyNumber: $("safetyNumber"), peerFingerprint: $("peerFingerprint"),
@@ -43,6 +53,27 @@ const els = {
   // chat
   chat: $("chat"), log: $("log"),
   form: $("sendForm"), text: $("text"), send: $("send"), hint: $("hint"),
+  // screens + chat top bar
+  scrIdentity: $("scrIdentity"), scrRoom: $("scrRoom"), scrChat: $("scrChat"),
+  toRoom: $("toRoom"), toIdentity: $("toIdentity"),
+  roomShort: $("roomShort"), copyRoom: $("copyRoom"),
+  chatStatus: $("chatStatus"), disconnect: $("disconnect"),
+  // drawer menu + views
+  menuBtn: $("menuBtn"), drawer: $("drawer"), scrim: $("scrim"),
+  viewLive: $("viewLive"), viewUsers: $("viewUsers"), viewChats: $("viewChats"),
+  // users view
+  usersLocked: $("usersLocked"), usersUnlocked: $("usersUnlocked"),
+  addHandle: $("addHandle"), addContact: $("addContact"),
+  usersStatus: $("usersStatus"), userList: $("userList"),
+  // chats view
+  chatsLocked: $("chatsLocked"), chatsUnlocked: $("chatsUnlocked"),
+  chatsStatus: $("chatsStatus"), chatListWrap: $("chatListWrap"),
+  chatNew: $("chatNew"), chatStart: $("chatStart"), chatList: $("chatList"),
+  chatConvo: $("chatConvo"), chatBack: $("chatBack"), chatPeer: $("chatPeer"),
+  chatPeerMark: $("chatPeerMark"), chatLog: $("chatLog"),
+  chatForm: $("chatForm"), chatText: $("chatText"), chatSend: $("chatSend"),
+  chatHint: $("chatHint"), chatMode: $("chatMode"), chatModeSel: $("chatModeSel"),
+  chatPending: $("chatPending"),
 };
 
 const enc = new TextEncoder();
@@ -67,6 +98,10 @@ const LS_LOOKUP_TOKEN = "sc.lookuptoken.v1"; // our directory lookup token
 
 let ws = null;
 let cipher = null;
+let otpRecord = null;      // the OTP pad in use this session (bytes + offsets), or null
+let otpAtRest = null;      // cached at-rest key {key,salt,iters} for cheap re-saves
+let otpLockRelease = null; // releases this pad's exclusive same-origin lock
+const TAB_ID = Math.random().toString(36).slice(2) + Date.now().toString(36);
 let joined = false;
 let verified = false; // in-person gate passed; gates RECEIVING as well as sending
 
@@ -84,6 +119,7 @@ let currentPinKey = null;      // pin key for the active session
 let myNonce = null;       // our fresh nonce for this connection
 let peerNonce = null;     // the peer's nonce (first-write-wins)
 let helloAnswered = false; // answered the peer's hello (and sent our offer) once
+let msgChain = Promise.resolve(); // serializes async message handling (C-01)
 
 // ---- handshake payload framing -------------------------------------------
 // `key` messages carry base64(JSON(...)) of one of two payload kinds:
@@ -105,21 +141,17 @@ function unpackKey(b64) {
 // ---- pin store (TOFU + change detection) ----------------------------------
 // Pins are keyed by `user:<name>` when a contact username is in play, else by
 // `room:<id>`. A later session whose key differs from the pin warns loudly.
+// M-02: pins now live INSIDE the identity-encrypted, GCM-authenticated contact
+// store (contacts.js), not plaintext localStorage — a forged pin can no longer
+// be planted to auto-unlock a MITM. These require the store to be unlocked,
+// which is guaranteed in the handshake modes (they need the identity anyway).
 
-function loadPins() {
-  try {
-    return JSON.parse(localStorage.getItem(LS_PINS) || "{}");
-  } catch {
-    return {};
-  }
-}
 function getPin(key) {
-  return loadPins()[key] || null;
+  return contacts.isUnlocked() ? contacts.getPin(key) : null;
 }
 function savePin(key, bundle) {
-  const pins = loadPins();
-  pins[key] = { ed: bundle.ed, mldsa: bundle.mldsa };
-  localStorage.setItem(LS_PINS, JSON.stringify(pins));
+  if (contacts.isUnlocked()) return contacts.savePin(key, bundle);
+  return Promise.resolve();
 }
 function sameBundle(a, b) {
   return !!a && !!b && a.ed === b.ed && a.mldsa === b.mldsa;
@@ -130,6 +162,42 @@ function sameBundle(a, b) {
 function setStatus(text, cls = "") {
   els.status.textContent = text;
   els.status.className = "status" + (cls ? " " + cls : "");
+  // Mirror onto the chat top bar (only one of the two is visible at a time).
+  els.chatStatus.textContent = text;
+  els.chatStatus.className = els.status.className;
+}
+
+// The UI is a three-step flow; exactly one screen is visible at a time.
+// Screens only group existing panels — no crypto or connection logic lives here.
+function showScreen(name) {
+  els.scrIdentity.hidden = name !== "identity";
+  els.scrRoom.hidden = name !== "room";
+  els.scrChat.hidden = name !== "chat";
+}
+
+// ---- drawer menu + top-level views ----------------------------------------
+// Three views: live (the 3-step room flow), users (contact list + trust),
+// chats (async DMs, later phase). Pure presentation — switching views never
+// touches an active connection.
+
+function setDrawer(open) {
+  els.drawer.hidden = !open;
+  els.scrim.hidden = !open;
+}
+
+function showView(name) {
+  els.viewLive.hidden = name !== "live";
+  els.viewUsers.hidden = name !== "users";
+  els.viewChats.hidden = name !== "chats";
+  for (const b of els.drawer.querySelectorAll(".navitem")) {
+    b.classList.toggle("active", b.dataset.view === name);
+  }
+  setDrawer(false);
+  if (name === "users") refreshUsers();
+  if (name === "chats") {
+    refreshChats();
+    pollMailbox(); // opportunistic fetch on entering the view
+  }
 }
 
 function hint(text, isErr = false) {
@@ -172,6 +240,12 @@ function algNeedsIdentity(alg) {
   return alg === "DHKE" || alg === "RSA" || alg === "PQKEM";
 }
 
+// The encryption picker is a radio-card group (one input per mode); exactly one
+// is always checked (DHKE by default in the markup).
+function algValue() {
+  return els.algCards.querySelector('input[name="alg"]:checked').value;
+}
+
 // ---- identity management --------------------------------------------------
 
 function setIdentityStatus(text, cls = "") {
@@ -192,8 +266,16 @@ async function showIdentityUnlocked() {
   els.idForget.hidden = false;
   // The account directory is only meaningful once we hold an identity to bind.
   els.account.hidden = false;
+  els.toRoom.textContent = "Continue →";
   const savedName = localStorage.getItem(LS_USERNAME);
   const savedToken = localStorage.getItem(LS_LOOKUP_TOKEN);
+  // Opportunistically (re-)publish the bundle for registered users so the
+  // directory learns the encryption keys of an upgraded identity. The server
+  // treats a same-identity re-registration as a bundle refresh; failures
+  // (offline, foreign name) are non-fatal.
+  if (savedName && savedToken && myBundle.ecdh) {
+    account.register(API_BASE, identity, savedName).catch(() => {});
+  }
   if (savedName && savedToken) {
     els.username.value = savedName;
     accountStatus(`Your contact handle: ${savedName}#${savedToken} — share it so contacts can look you up. Log in to prove control.`);
@@ -214,6 +296,7 @@ function refreshIdentityUI() {
   els.idFingerprint.hidden = true;
   els.idExport.hidden = true;
   els.account.hidden = true;
+  els.toRoom.textContent = "Skip — no identity (AES-256 / OTP only) →";
   els.idPassRow.hidden = false;
   els.idCreate.hidden = !!stored;   // hide "Create" if one already exists
   els.idUnlock.hidden = !stored;
@@ -240,6 +323,7 @@ async function createIdentity() {
     identity = await Identity.generate();
     const blob = await identity.export(pass);
     localStorage.setItem(LS_IDENTITY, blob);
+    await unlockContacts(pass); // contact store shares the identity passphrase
     els.idPass.value = "";
     await showIdentityUnlocked();
   } catch (e) {
@@ -262,6 +346,12 @@ async function unlockIdentity() {
   setIdentityStatus("Unlocking…");
   try {
     identity = await Identity.import(blob, pass);
+    if (identity.upgraded) {
+      // Pre-v3 blob: encryption keys were just added — persist them so the
+      // upgrade happens exactly once, then re-publish the bundle below.
+      localStorage.setItem(LS_IDENTITY, await identity.export(pass));
+    }
+    await unlockContacts(pass); // contact store shares the identity passphrase
     els.idPass.value = "";
     await showIdentityUnlocked();
   } catch (e) {
@@ -286,6 +376,8 @@ function forgetIdentity() {
     return;
   }
   localStorage.removeItem(LS_IDENTITY);
+  contacts.wipe(); // bound to the identity passphrase; unusable without it
+  chats.wipe();
   identity = null;
   myBundle = null;
   refreshIdentityUI();
@@ -324,7 +416,9 @@ async function loginAccount() {
   }
   accountStatus("Proving account control…");
   try {
-    const { ttl } = await account.login(API_BASE, identity, username);
+    const { token, ttl } = await account.login(API_BASE, identity, username);
+    apiToken = token; // kept in memory only — enables vouches + mailbox fetch
+    startMailboxPolling();
     localStorage.setItem(LS_USERNAME, username);
     accountStatus(`Logged in as "${username}" (session valid ~${Math.round(ttl / 60)} min). You control this account.`, "ok");
   } catch (e) {
@@ -332,11 +426,599 @@ async function loginAccount() {
   }
 }
 
+// ---- users view (contact list + safety marks) -----------------------------
+
+let contactsError = null; // unlock failure message, shown in the Users view
+let apiToken = null;      // directory session token (from Log in), memory only
+
+// Unlock the contact store with the identity passphrase. Called wherever the
+// identity itself is created/unlocked, BEFORE the passphrase field is cleared.
+async function unlockContacts(pass) {
+  try {
+    await contacts.unlock(pass);
+    contactsError = null;
+  } catch (e) {
+    contactsError = e.message;
+  }
+  try {
+    await chats.unlock(pass); // chat history shares the at-rest posture
+  } catch (e) {
+    contactsError = contactsError || e.message;
+  }
+}
+
+function usersStatus(text, isErr = false) {
+  els.usersStatus.textContent = text;
+  els.usersStatus.className = "hint" + (isErr ? " err" : "");
+}
+
+function refreshUsers() {
+  const unlocked = contacts.isUnlocked();
+  els.usersLocked.hidden = unlocked;
+  els.usersUnlocked.hidden = !unlocked;
+  if (!unlocked) {
+    els.usersLocked.querySelector("p").textContent = contactsError
+      ? "Contact store error: " + contactsError +
+        " (Forget + recreate the identity resets it — contacts are bound to the identity passphrase.)"
+      : "Contacts are stored encrypted under your identity passphrase. " +
+        "Unlock (or create) your identity in the Live room view first.";
+    return;
+  }
+  renderUserList();
+}
+
+function renderUserList() {
+  els.userList.textContent = "";
+  const all = contacts.list().sort((a, b) => a.username.localeCompare(b.username));
+  if (all.length === 0) {
+    usersStatus("No users saved yet. Add one with their username#token handle.");
+    return;
+  }
+  for (const c of all) {
+    const li = document.createElement("li");
+
+    const head = document.createElement("div");
+    head.className = "u-head";
+    const name = document.createElement("span");
+    name.className = "u-name";
+    name.textContent = c.username;
+    const mark = document.createElement("span");
+    let markText = "⚪ unverified", markCls = "";
+    if (c.verified) {
+      markText = "🟢 verified by you";
+      markCls = " ok";
+    } else if (c.vouchedBy && c.vouchedBy.length) {
+      // Middle trust level: someone YOU verified has published a vouch whose
+      // signature checked out against YOUR pinned copy of their keys.
+      markText = "🟡 vouched by " + c.vouchedBy.join(", ");
+      markCls = " mid";
+    }
+    mark.className = "u-mark" + markCls;
+    mark.textContent = markText;
+    head.append(name, mark);
+    li.appendChild(head);
+
+    if (c.keyChangedAt && !c.verified) {
+      const warn = document.createElement("div");
+      warn.className = "hint err";
+      warn.textContent = "⚠ this user's key CHANGED since you saved them — re-verify in person before trusting";
+      li.appendChild(warn);
+    }
+
+    const fp = document.createElement("div");
+    fp.className = "u-fp";
+    fp.textContent = "fingerprint: …";
+    Identity.fingerprintOf({ ed: c.ed, mldsa: c.mldsa }).then((f) => {
+      fp.textContent = "fingerprint: " + f;
+    });
+    li.appendChild(fp);
+
+    const row = document.createElement("div");
+    row.className = "inline u-actions";
+    const vbtn = document.createElement("button");
+    vbtn.type = "button";
+    vbtn.className = c.verified ? "ghost" : "";
+    vbtn.textContent = c.verified ? "Unverify" : "Verified in person ✓";
+    vbtn.addEventListener("click", async () => {
+      if (!c.verified && !confirm(
+        `Mark "${c.username}" as verified ONLY if you compared this fingerprint with them in person ` +
+        "(or over a call where you recognise their voice). Continue?",
+      )) return;
+      await contacts.setVerified(c.username, !c.verified);
+      let statusMsg = null, statusErr = false;
+      if (!c.verified) {
+        // Just turned 🟢 — offer to publish a signed vouch so users who
+        // verified YOU can see this contact as 🟡 "vouched by you". Opt-in.
+        if (apiToken && identity && confirm(
+          `Also publish a signed vouch for "${c.username}"? Anyone who has verified YOU ` +
+          "will then see them as 🟡 vouched-by-you. (This reveals publicly that you know them.)",
+        )) {
+          try {
+            await account.vouch(API_BASE, identity, apiToken, c.username, { ed: c.ed, mldsa: c.mldsa });
+            statusMsg = `Vouch for "${c.username}" published.`;
+          } catch (e) {
+            statusMsg = "Could not publish the vouch: " + e.message;
+            statusErr = true;
+          }
+        } else if (!apiToken) {
+          statusMsg = "Tip: Log in (Live room → step 1) to also publish a signed vouch for people you verify.";
+        }
+      } else if (apiToken) {
+        // Turned back to unverified — retract a published vouch if any.
+        account.unvouch(API_BASE, apiToken, c.username).catch(() => { /* none published */ });
+      }
+      renderUserList(); // clears the status line…
+      if (statusMsg) usersStatus(statusMsg, statusErr); // …so report after
+    });
+    const rbtn = document.createElement("button");
+    rbtn.type = "button";
+    rbtn.className = "danger";
+    rbtn.textContent = "Remove";
+    rbtn.addEventListener("click", async () => {
+      if (!confirm(`Remove "${c.username}" (and your verification of them) from this device?`)) return;
+      await contacts.remove(c.username);
+      renderUserList();
+    });
+    row.append(vbtn, rbtn);
+    li.appendChild(row);
+
+    els.userList.appendChild(li);
+  }
+  usersStatus("");
+  refreshVouchMarks(); // opportunistic 🟡 refresh; re-renders only on change
+}
+
+// Refresh the 🟡 marks: fetch vouches for unverified contacts and validate
+// them LOCALLY — a vouch counts only if (a) the voucher is a contact YOU
+// verified in person, (b) the server-returned voucher keys equal your pinned
+// copy, and (c) the dual signature verifies over the target bundle YOU hold.
+// A lying directory therefore cannot invent a 🟡 mark.
+const VOUCH_RECHECK_MS = 10 * 60 * 1000;
+let vouchRefreshRunning = false;
+
+async function refreshVouchMarks() {
+  if (vouchRefreshRunning || !contacts.isUnlocked()) return;
+  vouchRefreshRunning = true;
+  let changed = false;
+  try {
+    for (const c of contacts.list()) {
+      if (c.verified || !c.token) continue;
+      if (c.vouchCheckedAt && Date.now() - c.vouchCheckedAt < VOUCH_RECHECK_MS) continue;
+      let raw;
+      try {
+        raw = await account.fetchVouches(API_BASE, c.username + "#" + c.token);
+      } catch {
+        continue; // offline / rate-limited: leave the cache, retry next render
+      }
+      const names = [];
+      for (const v of raw || []) {
+        const voucher = contacts.get(v.voucher);
+        if (!voucher || !voucher.verified) continue;
+        if (voucher.ed !== v.voucher_ed || voucher.mldsa !== v.voucher_mldsa) continue;
+        const ok = await Identity.verify(
+          { ed: voucher.ed, mldsa: voucher.mldsa },
+          account.vouchMessageBytes(c.username, { ed: c.ed, mldsa: c.mldsa }),
+          { ed: v.sig, mldsa: v.mldsa_sig },
+        ).catch(() => false);
+        if (ok) names.push(v.voucher);
+      }
+      await contacts.setVouches(c.username, names);
+      changed = true;
+    }
+  } finally {
+    vouchRefreshRunning = false;
+  }
+  if (changed && !els.viewUsers.hidden) renderUserList();
+}
+
+async function addContactFromHandle() {
+  const handle = els.addHandle.value.trim();
+  const parsed = account.parseHandle(handle);
+  if (!parsed) {
+    usersStatus("A handle looks like username#token — exactly as the user shared it.", true);
+    return;
+  }
+  usersStatus("Looking up…");
+  let bundle;
+  try {
+    bundle = await account.fetchBundle(API_BASE, handle);
+  } catch (e) {
+    usersStatus("Directory lookup failed: " + e.message, true);
+    return;
+  }
+  if (!bundle) {
+    usersStatus(`No directory entry for "${parsed.username}" with that token.`, true);
+    return;
+  }
+  // Never auto-verify from the fetched bundle: the directory is not a trust
+  // root, and a pin only attests the SIGNING identity, not the encryption keys
+  // (H-01). upsert() keeps an existing 🟢 only when EVERY key (incl. ecdh/mlkem)
+  // still matches what was verified in person; any change drops it to ⚪.
+  const before = contacts.get(parsed.username);
+  await contacts.upsert({
+    username: parsed.username, token: parsed.token,
+    ed: bundle.ed, mldsa: bundle.mldsa,
+    ecdh: bundle.ecdh || null, mlkem: bundle.mlkem || null,
+  });
+  const after = contacts.get(parsed.username);
+  els.addHandle.value = "";
+  usersStatus(after.verified
+    ? `Updated "${parsed.username}" — keys match what you verified in person (🟢).`
+    : (before && before.verified
+      ? `⚠ "${parsed.username}" — the fetched keys DIFFER from what you verified; reset to ⚪. Re-verify in person.`
+      : `Added "${parsed.username}" (⚪ unverified — compare fingerprints in person to trust this key).`));
+  renderUserList();
+}
+
+// ---- chats view (async 1:1 via the sealed mailbox) ------------------------
+
+let activeChat = null;    // username of the open conversation, or null
+let mailboxTimer = null;  // polling interval handle
+
+function chatsStatus(text, isErr = false) {
+  els.chatsStatus.textContent = text;
+  els.chatsStatus.className = "hint" + (isErr ? " err" : "");
+}
+
+function chatHint(text, isErr = false) {
+  els.chatHint.textContent = text;
+  els.chatHint.className = "hint" + (isErr ? " err" : "");
+}
+
+function contactMark(c) {
+  if (!c) return "⚪ not in your users list";
+  if (c.verified) return "🟢 verified by you";
+  if (c.vouchedBy && c.vouchedBy.length) return "🟡 vouched by " + c.vouchedBy.join(", ");
+  return "⚪ unverified";
+}
+
+function refreshChats() {
+  const unlocked = chats.isUnlocked() && contacts.isUnlocked();
+  els.chatsLocked.hidden = unlocked;
+  els.chatsUnlocked.hidden = !unlocked;
+  if (!unlocked) return;
+  if (!apiToken) {
+    chatsStatus("You can send now; to RECEIVE messages, log in (Live room → step 1) so the mailbox can be fetched.");
+  } else {
+    chatsStatus("");
+  }
+  // "Start a chat" picker: saved users not already in the chat list.
+  els.chatNew.textContent = "";
+  const have = new Set(chats.list().map((c) => c.username));
+  const candidates = contacts.list().filter((c) => !have.has(c.username));
+  const none = document.createElement("option");
+  none.value = "";
+  none.textContent = candidates.length ? "— pick a user —" : "— add users in the Users view first —";
+  els.chatNew.appendChild(none);
+  for (const c of candidates) {
+    const o = document.createElement("option");
+    o.value = c.username;
+    o.textContent = c.username;
+    els.chatNew.appendChild(o);
+  }
+  if (activeChat) {
+    renderConversation();
+  } else {
+    renderChatList();
+  }
+}
+
+function renderChatList() {
+  els.chatConvo.hidden = true;
+  els.chatListWrap.hidden = false;
+  els.chatList.textContent = "";
+  for (const chat of chats.list()) {
+    const c = contacts.get(chat.username);
+    const li = document.createElement("li");
+    li.className = "chatrow";
+    const head = document.createElement("div");
+    head.className = "u-head";
+    const name = document.createElement("span");
+    name.className = "u-name";
+    name.textContent = chat.username;
+    const mark = document.createElement("span");
+    mark.className = "u-mark" + (c && c.verified ? " ok" : c && c.vouchedBy && c.vouchedBy.length ? " mid" : "");
+    mark.textContent = contactMark(c);
+    head.append(name, mark);
+    const last = chat.messages[chat.messages.length - 1];
+    const preview = document.createElement("div");
+    preview.className = "u-fp";
+    preview.textContent = last ? (last.dir === "out" ? "you: " : "") + last.text.slice(0, 60) : "no messages yet";
+    li.append(head, preview);
+    li.addEventListener("click", () => openChat(chat.username));
+    els.chatList.appendChild(li);
+  }
+}
+
+async function openChat(username) {
+  await chats.ensure(username);
+  activeChat = username;
+  renderConversation();
+}
+
+function renderConversation() {
+  const chat = chats.get(activeChat);
+  if (!chat) return;
+  els.chatListWrap.hidden = true;
+  els.chatConvo.hidden = false;
+  const c = contacts.get(activeChat);
+  els.chatPeer.textContent = activeChat;
+  els.chatPeerMark.className = "u-mark" + (c && c.verified ? " ok" : c && c.vouchedBy && c.vouchedBy.length ? " mid" : "");
+  els.chatPeerMark.textContent = contactMark(c);
+  els.chatLog.textContent = "";
+  for (const m of chat.messages) {
+    const li = document.createElement("li");
+    li.className = m.dir === "out" ? "me" : "peer";
+    li.textContent = m.text; // textContent path: no markup, ever
+    els.chatLog.appendChild(li);
+  }
+  els.chatLog.scrollTop = els.chatLog.scrollHeight;
+
+  // Mode indicator + picker (picker shows the CURRENT mode; changing it
+  // proposes a switch).
+  els.chatMode.textContent = "🔒 " + chat.mode;
+  els.chatModeSel.value = chat.mode;
+
+  // Pending mode negotiation banner.
+  renderPending(chat);
+
+  if (!c) {
+    chatHint("This sender is not in your Users list — you cannot reply until they share their handle.", true);
+  } else if (!c.token) {
+    chatHint("No handle token saved for this user — re-add them by their full username#token handle to reply.", true);
+  } else if (!c.ecdh || !c.mlkem) {
+    chatHint("This user has not published encryption keys yet (older app) — they must unlock once with the updated app; then re-add them.", true);
+  } else if (chat.mode === "AES256") {
+    chatHint("🔒 AES256 — extra AES-256-GCM under your shared chat passphrase, inside the sealed PQ envelope.");
+  } else {
+    chatHint("🔒 SEALED — hybrid ECDH P-256 + ML-KEM-768, sender sealed inside. " + (c.verified ? "" : "Verify this contact in person for the strongest trust."));
+  }
+}
+
+function renderPending(chat) {
+  els.chatPending.textContent = "";
+  const p = chat.pending;
+  if (!p) { els.chatPending.hidden = true; return; }
+  els.chatPending.hidden = false;
+  if (p.dir === "out") {
+    els.chatPending.textContent = `Waiting for ${chat.username} to accept the switch to ${p.mode}…`;
+    return;
+  }
+  // Inbound proposal: accept / decline.
+  const msg = document.createElement("span");
+  msg.textContent = `${chat.username} wants to switch this chat to ${p.mode}. `;
+  const accept = document.createElement("button");
+  accept.type = "button";
+  accept.textContent = "Accept";
+  accept.addEventListener("click", () => acceptModeChange(chat.username));
+  const decline = document.createElement("button");
+  decline.type = "button";
+  decline.className = "danger";
+  decline.textContent = "Decline";
+  decline.addEventListener("click", () => declineModeChange(chat.username));
+  els.chatPending.append(msg, accept, decline);
+}
+
+async function proposeModeChange(username, mode) {
+  const chat = chats.get(username);
+  const c = contacts.get(username);
+  if (!chat || chat.mode === mode || !c || !c.token || !c.ecdh) return;
+  const control = { kind: "mode-propose", mode };
+  let salt = null, secret = null;
+  if (mode === "AES256") {
+    secret = prompt(
+      `Choose a shared passphrase for the ${username} chat. Tell it to them out of band — ` +
+      "they must enter the SAME one to accept. It adds AES-256 on top of the sealed envelope.",
+    );
+    if (!secret) return;
+    salt = chats.newInnerSalt();
+    control.salt = salt;
+  }
+  try {
+    await sendControl(username, c, control);
+  } catch (e) {
+    chatHint("Could not propose mode change: " + e.message, true);
+    els.chatModeSel.value = chat.mode; // revert the picker
+    return;
+  }
+  await chats.setPending(username, { mode, dir: "out", salt, secret });
+  renderConversation();
+}
+
+async function acceptModeChange(username) {
+  const chat = chats.get(username);
+  const c = contacts.get(username);
+  if (!chat || !chat.pending || chat.pending.dir !== "in" || !c) return;
+  const { mode, salt } = chat.pending;
+  let secret = null;
+  if (mode === "AES256") {
+    secret = prompt(`Enter the shared passphrase ${username} gave you for this chat (must match exactly).`);
+    if (!secret) return;
+  }
+  try {
+    await sendControl(username, c, { kind: "mode-accept", mode, salt });
+  } catch (e) {
+    chatHint("Could not accept: " + e.message, true);
+    return;
+  }
+  await chats.setMode(username, mode, { secret, salt });
+  chatHint(`Switched to ${mode}.`);
+  renderConversation();
+}
+
+async function declineModeChange(username) {
+  const c = contacts.get(username);
+  if (c) { try { await sendControl(username, c, { kind: "mode-decline" }); } catch { /* best effort */ } }
+  await chats.clearPending(username);
+  renderConversation();
+}
+
+async function sendControl(username, contact, control) {
+  const myName = localStorage.getItem(LS_USERNAME);
+  const myToken = localStorage.getItem(LS_LOOKUP_TOKEN);
+  const senderHandle = myName && myToken ? myName + "#" + myToken : null;
+  const envelope = await sealed.seal(
+    identity, { ed: contact.ed, mldsa: contact.mldsa, ecdh: contact.ecdh, mlkem: contact.mlkem }, control, senderHandle,
+  );
+  await account.sendMail(API_BASE, username + "#" + contact.token, envelope);
+}
+
+async function sendChatMessage(e) {
+  e.preventDefault();
+  const text = els.chatText.value;
+  if (!text || !activeChat) return;
+  if (!isAscii(text)) {
+    chatHint("Only printable ASCII characters are allowed.", true);
+    return;
+  }
+  const c = contacts.get(activeChat);
+  if (!c || !c.token || !c.ecdh || !c.mlkem) {
+    chatHint("Cannot send — see the note above.", true);
+    return;
+  }
+  const chat = chats.get(activeChat);
+  if (chat.mode === "AES256" && (!chat.secret || !chat.salt)) {
+    chatHint("This chat is set to AES256 but the shared passphrase isn't set here — re-negotiate the mode.", true);
+    return;
+  }
+  els.chatSend.disabled = true;
+  try {
+    // Include our handle (if registered) sealed inside, so the receiver can
+    // reply even if they never saved us. Self-claimed; keyed by bundle.
+    const myName = localStorage.getItem(LS_USERNAME);
+    const myToken = localStorage.getItem(LS_LOOKUP_TOKEN);
+    const senderHandle = myName && myToken ? myName + "#" + myToken : null;
+    // AES256 mode: wrap the text in the inner layer first; the sealed core
+    // then carries {enc} instead of {msg} so the transport still hides it.
+    let content;
+    if (chat.mode === "AES256") {
+      content = { kind: "msg", enc: await chats.innerEncrypt(chat.secret, chat.salt, text) };
+    } else {
+      content = text;
+    }
+    const envelope = await sealed.seal(identity, { ed: c.ed, mldsa: c.mldsa, ecdh: c.ecdh, mlkem: c.mlkem }, content, senderHandle);
+    await account.sendMail(API_BASE, activeChat + "#" + c.token, envelope);
+    await chats.append(activeChat, { dir: "out", text, ts: Date.now() });
+    els.chatText.value = "";
+    renderConversation();
+  } catch (err) {
+    chatHint("Send failed: " + err.message, true);
+  } finally {
+    els.chatSend.disabled = false;
+  }
+}
+
+// Fetch queued envelopes, open them, and file them into chats. Sender identity
+// = the SEALED bundle (signature-verified in sealed.open). The self-claimed
+// handle inside is used only to (a) name a brand-new contact and (b) store the
+// reply token; an existing contact keyed by the same bundle always wins.
+async function pollMailbox() {
+  if (!apiToken || !identity || !chats.isUnlocked() || !contacts.isUnlocked()) return;
+  let batch;
+  try {
+    batch = await account.fetchMail(API_BASE, apiToken);
+  } catch {
+    return; // offline / expired session: next tick retries
+  }
+  let changed = false;
+  for (const m of batch) {
+    let opened;
+    try {
+      opened = await sealed.open(identity, m.envelope);
+    } catch {
+      continue; // undecryptable/forged envelope: drop silently
+    }
+    const senderBundle = opened.from;
+    // Match the sender to a saved user by their SIGNING keys.
+    let sender = contacts.list().find((c) => c.ed === senderBundle.ed && c.mldsa === senderBundle.mldsa) || null;
+    if (!sender) {
+      // Unknown sender: create an unverified contact. Prefer their sealed
+      // self-claimed handle; fall back to a fingerprint-derived name.
+      const parsed = opened.name ? account.parseHandle(opened.name) : null;
+      const fallback = "unknown-" + senderBundle.ed.replace(/[^a-zA-Z0-9]/g, "").slice(0, 8).toLowerCase();
+      const uname = parsed && !contacts.get(parsed.username) ? parsed.username : fallback;
+      sender = await contacts.upsert({
+        username: uname, token: parsed ? parsed.token : null,
+        ed: senderBundle.ed, mldsa: senderBundle.mldsa,
+        ecdh: senderBundle.ecdh || null, mlkem: senderBundle.mlkem || null,
+      });
+    } else if (sender.token === null && opened.name) {
+      // Known bundle but no reply token yet: adopt the sealed handle's token.
+      const parsed = account.parseHandle(opened.name);
+      if (parsed && parsed.username === sender.username) {
+        sender = await contacts.upsert({
+          username: sender.username, token: parsed.token,
+          ed: sender.ed, mldsa: sender.mldsa, ecdh: sender.ecdh, mlkem: sender.mlkem,
+        });
+      }
+    }
+    // Control traffic (mode negotiation) vs a regular message.
+    if (opened.kind && opened.kind !== "msg") {
+      if (await handleControl(sender, opened)) changed = true;
+      continue;
+    }
+
+    // Regular message. Decrypt the inner AES256 layer if this chat is in that
+    // mode; a mode mismatch (peer still on the old mode) shows a system note.
+    let text = opened.msg;
+    if (opened.enc !== undefined) {
+      const chat = chats.get(sender.username);
+      if (chat && chat.mode === "AES256" && chat.secret && chat.salt) {
+        try {
+          text = await chats.innerDecrypt(chat.secret, chat.salt, opened.enc);
+        } catch {
+          text = "[AES256 message that did not decrypt — shared passphrase mismatch]";
+        }
+      } else {
+        text = "[AES256 message but this chat isn't in AES256 mode here]";
+      }
+    }
+    const isNew = await chats.append(sender.username, {
+      dir: "in", text, ts: opened.ts, id: opened.id,
+    });
+    changed = changed || isNew;
+  }
+  if (changed && !els.viewChats.hidden) refreshChats();
+}
+
+// Apply an inbound mode-negotiation control message. Returns true if anything
+// changed. The sender is already bundle-authenticated (sealed.open); only a
+// verified-enough contact can drive our chat state.
+async function handleControl(sender, opened) {
+  const u = sender.username;
+  if (opened.kind === "mode-propose") {
+    await chats.setPending(u, { mode: opened.mode, dir: "in", salt: opened.salt || null });
+    if (activeChat === u) renderConversation();
+    return true;
+  }
+  if (opened.kind === "mode-accept") {
+    // Our proposal was accepted — lock in the mode we staged.
+    const chat = chats.get(u);
+    if (chat && chat.pending && chat.pending.dir === "out" && chat.pending.mode === opened.mode) {
+      await chats.setMode(u, opened.mode, { secret: chat.pending.secret || null, salt: chat.pending.salt || null });
+      if (activeChat === u) { chatHint(`${u} accepted — switched to ${opened.mode}.`); renderConversation(); }
+    }
+    return true;
+  }
+  if (opened.kind === "mode-decline") {
+    await chats.clearPending(u);
+    if (activeChat === u) { chatHint(`${u} declined the mode change.`, true); renderConversation(); }
+    return true;
+  }
+  return false;
+}
+
+function startMailboxPolling() {
+  if (mailboxTimer) return;
+  mailboxTimer = setInterval(pollMailbox, 6000);
+  pollMailbox();
+}
+
 // ---- connection lifecycle -------------------------------------------------
 
 async function connect() {
   const room = els.room.value.trim();
-  const alg = els.alg.value;
+  const alg = algValue();
   if (!ROOM_RE.test(room)) {
     hint("Room id must be exactly 64 hex characters. Use Generate.", true);
     return;
@@ -373,8 +1055,42 @@ async function connect() {
     expectedPeerName = parsed.username;
   }
 
+  releaseOtpLock();
+  otpRecord = null;
+  otpAtRest = null;
+  const opts = { passphrase: els.pass.value };
+  if (alg === "OTP") {
+    const padId = els.otpSelect.value;
+    if (!padId) {
+      hint("Select or generate a one-time pad first (Generate / share a pad).", true);
+      return;
+    }
+    // Exclusive same-origin lock: a pad must be live in only ONE tab/window at a
+    // time, or two sessions would draw the same keystream (two-time pad).
+    otpLockRelease = await acquirePadLock(padId);
+    if (!otpLockRelease) {
+      hint("This pad is already in use in another tab or window. Close it there before using the pad here.", true);
+      return;
+    }
+    try {
+      const unlocked = await ensureUnlocked(padId); // decrypts the pad at rest
+      otpRecord = unlocked.record;
+      otpAtRest = unlocked.atRest;
+    } catch (e) {
+      releaseOtpLock();
+      hint(e.message, true);
+      return;
+    }
+    if (otpRecord.regionSize - otpRecord.sendOffset < 64) {
+      releaseOtpLock();
+      hint("This pad is exhausted for sending — exchange a fresh pad in person.", true);
+      return;
+    }
+    opts.pad = otpRecord;
+  }
+
   try {
-    cipher = makeCipher(alg, room, { passphrase: els.pass.value });
+    cipher = makeCipher(alg, room, opts);
     await cipher.init();
   } catch (e) {
     hint("Setup failed: " + e.message, true);
@@ -411,16 +1127,25 @@ async function connect() {
     ws.send(JSON.stringify({ type: "join", room }));
   };
 
-  ws.onmessage = (ev) => handleMessage(room, ev.data);
+  // Serialize message handling. handleMessage is async and awaits (signature
+  // verification, key derivation); without serialization two handshake frames
+  // could both pass verification before either pins the peer identity — the
+  // TOCTOU half of C-01. A single FIFO chain makes the pin check atomic.
+  msgChain = Promise.resolve();
+  ws.onmessage = (ev) => {
+    msgChain = msgChain.then(() => handleMessage(room, ev.data)).catch(() => {});
+  };
 
   ws.onclose = () => {
     setStatus("disconnected", "err");
+    if (joined) addLine("sys", "", "disconnected");
     joined = false;
     verified = false;
     enableSend(false);
     els.verify.hidden = true;
-    els.setup.hidden = false;
+    showScreen("room");
     els.connect.disabled = false;
+    releaseOtpLock();
   };
 
   ws.onerror = () => setStatus("connection error", "err");
@@ -442,7 +1167,7 @@ async function signedHandshake(room) {
 function sendSignedKey(room, reply) {
   return signedHandshake(room).then(({ pub, sig }) => {
     ws.send(JSON.stringify({
-      type: "key", room, alg: els.alg.value,
+      type: "key", room, alg: algValue(),
       payload: packKey({ pub, reply, idb: myBundle, sig }),
     }));
   });
@@ -459,16 +1184,16 @@ async function handleMessage(room, raw) {
   switch (m.type) {
     case "joined": {
       joined = true;
-      els.setup.hidden = true;
-      els.chat.hidden = false;
+      els.roomShort.textContent = room.slice(0, 8) + "…" + room.slice(-8);
+      showScreen("chat");
       setStatus("connected", "ok");
-      addLine("sys", "", `joined room — encryption: ${els.alg.value}`);
+      addLine("sys", "", `joined room — encryption: ${algValue()}`);
       // Phase 1: announce our fresh session nonce. For handshake modes the
       // signed handshake follows once we also know the peer's nonce; for
       // AES256 (usesNonces, no key material on the wire) the nonces alone fix
       // the session's ratchet chains, closing cross-session frame replay.
       ws.send(JSON.stringify({
-        type: "key", room, alg: els.alg.value,
+        type: "key", room, alg: algValue(),
         payload: packKey({ hello: true, n: myNonce, reply: false }),
       }));
       hint("Waiting for the other party to join / exchange keys…");
@@ -497,7 +1222,7 @@ async function handleMessage(room, raw) {
           if (!p.reply && !helloAnswered) {
             helloAnswered = true;
             ws.send(JSON.stringify({
-              type: "key", room, alg: els.alg.value,
+              type: "key", room, alg: algValue(),
               payload: packKey({ hello: true, n: myNonce, reply: true }),
             }));
             if (cipher.needsHandshake) await sendSignedKey(room, false);
@@ -510,6 +1235,14 @@ async function handleMessage(room, raw) {
             verified = true;
             enableSend(true);
             hint("Ready. Messages are end-to-end encrypted.");
+          } else if (!cipher.needsHandshake && !cipher.usesNonces && !verified) {
+            // OTP: no key material and no nonces — the pre-shared pad IS the
+            // out-of-band secret (like AES256's passphrase), so seeing the peer
+            // join is enough to unlock messaging.
+            verified = true;
+            enableSend(true);
+            updateOtpBudget();
+            hint("Ready. Messages are one-time-pad encrypted.");
           }
           break;
         }
@@ -540,7 +1273,25 @@ async function handleMessage(room, raw) {
           return;
         }
 
-        peerBundle = idb;
+        // C-01: atomically bind the peer IDENTITY to the FIRST accepted
+        // handshake. The ciphers are first-key-wins (a later ephemeral key is
+        // ignored), so if we let a second, differently-signed handshake through
+        // it could set peerBundle (and thus the safety number / pin check) to a
+        // DIFFERENT identity than the one whose key the cipher actually locked
+        // in — decoupling the verified identity from the live channel key. So:
+        // pin the identity on first accept; hard-refuse any later frame whose
+        // identity differs, and close the connection (that is a MITM attempt).
+        if (peerBundle === null) {
+          peerBundle = idb; // write-once for this connection
+        } else if (!sameBundle(peerBundle, idb)) {
+          addLine("sys", "", "[a SECOND identity tried to complete the key exchange — refusing; this is a relay MITM attempt]");
+          hint("Two different identities attempted this handshake — disconnecting to protect you.", true);
+          if (ws) ws.close();
+          return;
+        }
+        // Feed the key material (same identity guaranteed above). The cipher
+        // keeps its first key; repeat/answer frames from this identity are
+        // folded idempotently.
         await cipher.onPeerKey(pub);
 
         // Answer the initiator exactly once with our own signed key.
@@ -549,7 +1300,7 @@ async function handleMessage(room, raw) {
         }
 
         if (cipher.ready) {
-          await enterVerification(room);
+          await enterVerification(room, peerBundle);
         }
       } catch (e) {
         hint("Key exchange failed: " + e.message, true);
@@ -569,6 +1320,7 @@ async function handleMessage(room, raw) {
       try {
         const text = await cipher.decrypt(m.payload);
         addLine("peer", "peer", text);
+        persistOtpProgress();
       } catch {
         addLine("sys", "", "[undecryptable message — wrong key or tampered]");
       }
@@ -584,9 +1336,12 @@ async function handleMessage(room, raw) {
 // The in-person verification gate. The dual signature is already verified at
 // this point; this step defeats a relay that swaps the WHOLE identity (the two
 // honest endpoints would then see different safety numbers).
-async function enterVerification(room) {
-  const sn = await Identity.safetyNumber(myBundle, peerBundle);
-  const peerFp = await Identity.fingerprintOf(peerBundle);
+async function enterVerification(room, verifiedBundle) {
+  // Use the bundle passed from the pinned first handshake — never re-read a
+  // mutable global that a later frame might have changed (C-01).
+  const bundle = verifiedBundle || peerBundle;
+  const sn = await Identity.safetyNumber(myBundle, bundle);
+  const peerFp = await Identity.fingerprintOf(bundle);
   els.safetyNumber.textContent = sn;
   els.peerFingerprint.textContent = "Contact fingerprint: " + peerFp;
   currentPinKey = expectedPeerName ? "user:" + expectedPeerName : "room:" + room;
@@ -594,7 +1349,7 @@ async function enterVerification(room) {
   // If we looked the contact up by username, the live key must match what the
   // directory published. A mismatch is a strong red flag (though note the
   // directory is not a trust root — see account.js).
-  if (expectedPeerBundle && !sameBundle(expectedPeerBundle, peerBundle)) {
+  if (expectedPeerBundle && !sameBundle(expectedPeerBundle, bundle)) {
     els.verify.hidden = false;
     els.verify.classList.add("changed");
     els.verifyTitle.textContent = `⚠ Key does NOT match the directory entry for "${expectedPeerName}"`;
@@ -606,8 +1361,8 @@ async function enterVerification(room) {
     return;
   }
 
-  const pin = getPin(currentPinKey);
-  if (sameBundle(pin, peerBundle)) {
+  const pin = await getPin(currentPinKey);
+  if (sameBundle(pin, bundle)) {
     // Seen and verified before — accept without re-prompting.
     addLine("sys", "", expectedPeerName
       ? `contact "${expectedPeerName}" matches your saved pin`
@@ -645,9 +1400,22 @@ function unlockMessaging() {
   els.hint.className = "hint ok";
 }
 
-function onVerifyOk() {
+async function onVerifyOk() {
   if (!peerBundle || !currentPinKey) return;
-  savePin(currentPinKey, peerBundle);
+  await savePin(currentPinKey, peerBundle);
+  // An in-person safety-number confirmation is the strongest trust signal we
+  // have — mirror it into the Users list (🟢) when the peer is known by name.
+  // Store the FULL bundle incl. the encryption keys the safety number covered
+  // (H-01), so async chats trust exactly the keys just verified in person.
+  if (expectedPeerName && contacts.isUnlocked()) {
+    const parsed = account.parseHandle(els.contact.value.trim());
+    await contacts.upsert({
+      username: expectedPeerName, token: parsed ? parsed.token : null,
+      ed: peerBundle.ed, mldsa: peerBundle.mldsa,
+      ecdh: peerBundle.ecdh || null, mlkem: peerBundle.mlkem || null,
+      verified: true,
+    }).catch(() => { /* contact mirroring must never block messaging */ });
+  }
   addLine("sys", "", "contact verified and pinned");
   unlockMessaging();
 }
@@ -680,10 +1448,11 @@ async function sendText(e) {
   els.send.disabled = true;
   try {
     const payload = await cipher.encrypt(text);
-    ws.send(JSON.stringify({ type: "msg", room: els.room.value.trim(), payload, alg: els.alg.value }));
+    ws.send(JSON.stringify({ type: "msg", room: els.room.value.trim(), payload, alg: algValue() }));
     addLine("me", "me", text);
     els.text.value = "";
     hint("");
+    persistOtpProgress();
   } catch (err) {
     hint("Encryption failed: " + err.message, true);
   } finally {
@@ -692,6 +1461,272 @@ async function sendText(e) {
     // closed while the encrypt was in flight, which disables the form).
     if (verified) els.send.disabled = false;
   }
+}
+
+// ---- one-time pad UI ------------------------------------------------------
+
+function otpStatusMsg(text, isErr = false) {
+  els.otpStatus.textContent = text;
+  els.otpStatus.className = "hint" + (isErr ? " err" : "");
+}
+
+function fmtBytes(n) {
+  if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MiB";
+  if (n >= 1024) return Math.round(n / 1024) + " KiB";
+  return n + " B";
+}
+
+// Sync the cipher's advanced offsets back onto the pad record (its bytes array
+// is the same reference the cipher zeroes in place) and persist (encrypted at
+// rest, with the cached key so there is no per-message PBKDF2). Called after
+// every send/receive so consumption survives a reload — reuse would be
+// catastrophic for a one-time pad.
+function persistOtpProgress() {
+  if (!otpRecord || !otpAtRest || !cipher || algValue() !== "OTP") return;
+  otpRecord.sendOffset = cipher.sendOffset;
+  otpRecord.recvHighWater = cipher.recvHighWater;
+  otp.savePadProgress(otpRecord, otpAtRest).catch((e) => hint("Could not save pad progress: " + e.message, true));
+  updateOtpBudget();
+}
+
+// ---- pad exclusive lock (one live session per pad) ------------------------
+// Prevents the concurrent-use two-time-pad break: two tabs each loading the same
+// pad at the same offset. Uses the Web Locks API (auto-released if the tab dies)
+// where available, with a localStorage-heartbeat lease as a fallback.
+function acquirePadLock(padId) {
+  const name = "sc.otp.lock.v1." + padId;
+  if (navigator.locks && navigator.locks.request) {
+    return new Promise((resolveGot) => {
+      let releaseHeld;
+      navigator.locks.request(name, { ifAvailable: true }, (lock) => {
+        if (!lock) { resolveGot(null); return; } // held elsewhere
+        resolveGot(() => { if (releaseHeld) releaseHeld(); });
+        return new Promise((r) => { releaseHeld = r; }); // hold until released
+      }).catch(() => resolveGot(null));
+    });
+  }
+  return Promise.resolve(acquireLeaseFallback(name));
+}
+function acquireLeaseFallback(name) {
+  const STALE = 12000;
+  try {
+    const cur = JSON.parse(localStorage.getItem(name) || "null");
+    if (cur && Date.now() - cur.ts < STALE && cur.owner !== TAB_ID) return null;
+  } catch { /* fall through */ }
+  const write = () => localStorage.setItem(name, JSON.stringify({ owner: TAB_ID, ts: Date.now() }));
+  write();
+  try { if (JSON.parse(localStorage.getItem(name)).owner !== TAB_ID) return null; } catch { return null; }
+  const hb = setInterval(write, 4000);
+  return () => {
+    clearInterval(hb);
+    try { if (JSON.parse(localStorage.getItem(name)).owner === TAB_ID) localStorage.removeItem(name); } catch { /* ignore */ }
+  };
+}
+function releaseOtpLock() {
+  if (otpLockRelease) { try { otpLockRelease(); } catch { /* ignore */ } otpLockRelease = null; }
+}
+
+// Decrypt the selected pad at rest using the pad passphrase, caching the result
+// for the session. Returns { record, atRest }.
+let otpUnlockedId = null;
+async function ensureUnlocked(padId) {
+  if (otpUnlockedId === padId && otpRecord && otpAtRest) {
+    return { record: otpRecord, atRest: otpAtRest };
+  }
+  if (!els.otpPass.value) throw new Error("Enter this pad's passphrase to unlock it.");
+  const unlocked = await otp.unlockPad(padId, els.otpPass.value);
+  otpUnlockedId = padId;
+  otpRecord = unlocked.record;
+  otpAtRest = unlocked.atRest;
+  return unlocked;
+}
+
+function updateOtpBudget() {
+  if (!otpRecord) return;
+  const remain = otpRecord.regionSize - otpRecord.sendOffset;
+  const est = Math.max(0, Math.floor(remain / (32 + 60))); // ~60-byte messages
+  otpStatusMsg(`Pad "${otpRecord.label}": ${fmtBytes(remain)} left to send (~${est} more short messages).`);
+}
+
+function syncOtpSelection() {
+  els.otpForget.hidden = !els.otpSelect.value;
+}
+
+function refreshOtpPads(selectId) {
+  const pads = otp.listPads();
+  els.otpSelect.textContent = "";
+  const none = document.createElement("option");
+  none.value = "";
+  none.textContent = pads.length ? "— select a pad —" : "— no pad on this device —";
+  els.otpSelect.appendChild(none);
+  for (const p of pads) {
+    const o = document.createElement("option");
+    o.value = p.padId;
+    o.textContent = `${p.label} (${p.role === 0 ? "you generated" : "imported"}, ${fmtBytes(p.regionSize)}/side)`;
+    els.otpSelect.appendChild(o);
+  }
+  if (selectId) els.otpSelect.value = selectId;
+  syncOtpSelection();
+}
+
+function populateOtpSizes() {
+  els.otpSize.textContent = "";
+  otp.PAD_SIZES.forEach((s, i) => {
+    const o = document.createElement("option");
+    o.value = String(s.bytes);
+    o.textContent = s.label;
+    if (i === 1) o.selected = true; // default to the middle size
+    els.otpSize.appendChild(o);
+  });
+}
+
+// Draw-to-generate entropy: capture pointer motion samples to fold into the pad.
+let otpDrawing = false;
+let otpEntropySamples = [];
+
+function updateEntropyStatus() {
+  const n = otpEntropySamples.length / 3;
+  els.otpEntropyStatus.textContent = n === 0
+    ? "Entropy from drawing: none yet (the OS random generator is used regardless)."
+    : `Entropy from drawing: ${n} motion samples captured.`;
+}
+function entropyBytes() {
+  if (otpEntropySamples.length === 0) return new Uint8Array(0);
+  return new Uint8Array(new Float64Array(otpEntropySamples).buffer);
+}
+function clearEntropy() {
+  otpEntropySamples = [];
+  const c = els.otpEntropy;
+  if (c) c.getContext("2d").clearRect(0, 0, c.width, c.height);
+  updateEntropyStatus();
+}
+function setupEntropyCanvas() {
+  const c = els.otpEntropy;
+  if (!c) return;
+  const ctx = c.getContext("2d");
+  ctx.strokeStyle = "#2f81f7";
+  ctx.lineWidth = 1.5;
+  ctx.lineCap = "round";
+  let last = null;
+  const sample = (e) => {
+    const r = c.getBoundingClientRect();
+    const x = (e.clientX - r.left) * (c.width / r.width);
+    const y = (e.clientY - r.top) * (c.height / r.height);
+    otpEntropySamples.push(x, y, performance.now());
+    if (last) {
+      ctx.beginPath();
+      ctx.moveTo(last[0], last[1]);
+      ctx.lineTo(x, y);
+      ctx.stroke();
+    }
+    last = [x, y];
+    updateEntropyStatus();
+  };
+  c.addEventListener("pointerdown", (e) => { otpDrawing = true; last = null; c.setPointerCapture(e.pointerId); sample(e); });
+  c.addEventListener("pointermove", (e) => { if (otpDrawing) sample(e); });
+  const end = () => { otpDrawing = false; last = null; };
+  c.addEventListener("pointerup", end);
+  c.addEventListener("pointercancel", end);
+}
+
+async function otpGenerate() {
+  if (!els.otpPass.value) {
+    otpStatusMsg("Set a pad passphrase first — it encrypts the pad on this device.", true);
+    return;
+  }
+  try {
+    otpStatusMsg("Generating pad… (deriving the at-rest key, this takes a moment)");
+    const totalBytes = parseInt(els.otpSize.value, 10);
+    const rec = await otp.generatePad({ label: els.otpLabel.value.trim(), totalBytes, fingerBytes: entropyBytes() });
+    otpAtRest = await otp.saveNewPad(rec, els.otpPass.value); // encrypted at rest
+    otpRecord = rec;
+    otpUnlockedId = rec.padId; // keep unlocked so Export works immediately
+    clearEntropy();
+    els.otpLabel.value = "";
+    refreshOtpPads(rec.padId);
+    otpStatusMsg(`Generated + encrypted pad "${rec.label}". Now Export it and give the file to your contact in person.`);
+  } catch (e) {
+    otpStatusMsg("Generation failed: " + e.message, true);
+  }
+}
+
+function downloadText(name, text) {
+  const blob = new Blob([text], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name.replace(/[^\w.\-]+/g, "_");
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+let pendingReexportId = null;
+async function otpExport() {
+  const id = els.otpSelect.value;
+  if (!id) { otpStatusMsg("Select a pad to export.", true); return; }
+  if (!els.otpXferPass.value) { otpStatusMsg("Enter a transfer passphrase first (agree on it with your contact in person).", true); return; }
+  // Re-export guard (Finding 3): sharing one pad with more than one importer
+  // causes key reuse. Warn once and require a second click to confirm.
+  const meta = otp.padMeta(id);
+  if (meta && meta.exported && pendingReexportId !== id) {
+    pendingReexportId = id;
+    otpStatusMsg("⚠ This pad was already exported. A pad must be imported on only ONE device — re-exporting risks catastrophic key reuse. Click Export again to confirm you know what you are doing.", true);
+    return;
+  }
+  pendingReexportId = null;
+  try {
+    const { record } = await ensureUnlocked(id); // decrypt at rest first
+    const text = await otp.exportPad(record, els.otpXferPass.value);
+    downloadText(`secure-chat-pad-${record.label || record.padId}.json`, text);
+    otp.markExported(id);
+    otpStatusMsg("Exported. Give the file to your contact in person; they Import it with the same TRANSFER passphrase.");
+  } catch (e) {
+    otpStatusMsg("Export failed: " + e.message, true);
+  }
+}
+
+function otpImportClick() {
+  if (!els.otpXferPass.value) {
+    otpStatusMsg("Enter the TRANSFER passphrase your contact agreed on, then choose their file.", true);
+    return;
+  }
+  if (!els.otpPass.value) {
+    otpStatusMsg("Also set a pad passphrase (top of this panel) — it encrypts the imported pad on this device.", true);
+    return;
+  }
+  els.otpFile.click();
+}
+
+async function otpFileChosen() {
+  const file = els.otpFile.files[0];
+  els.otpFile.value = "";
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const rec = await otp.importPad(text, els.otpXferPass.value); // transfer passphrase + entropy check
+    if (otp.padMeta(rec.padId)) {
+      refreshOtpPads(rec.padId);
+      otpStatusMsg("You already have this pad on this device — not importing again (a pad must live on exactly one device per side).", true);
+      return;
+    }
+    otpAtRest = await otp.saveNewPad(rec, els.otpPass.value); // encrypt at rest with the pad passphrase
+    otpRecord = rec;
+    otpUnlockedId = rec.padId;
+    refreshOtpPads(rec.padId);
+    otpStatusMsg(`Imported + encrypted pad "${rec.label}". Select it, use the same room id as your contact, and Connect.`);
+  } catch (e) {
+    otpStatusMsg("Import failed: " + e.message, true);
+  }
+}
+
+function otpForgetSelected() {
+  const id = els.otpSelect.value;
+  if (!id) return;
+  otp.forgetPad(id);
+  refreshOtpPads();
+  otpStatusMsg("Pad forgotten (deleted from this device).");
 }
 
 // ---- wiring ---------------------------------------------------------------
@@ -710,16 +1745,66 @@ els.gen.addEventListener("click", () => {
 });
 
 function syncAlgUI() {
-  const alg = els.alg.value;
+  const alg = algValue();
   els.passRow.hidden = alg !== "AES256";
   els.contactRow.hidden = !algNeedsIdentity(alg); // lookup only aids DHKE/RSA
+  els.otpPanel.hidden = alg !== "OTP";
 }
-els.alg.addEventListener("change", syncAlgUI);
+els.algCards.addEventListener("change", syncAlgUI); // radio changes bubble here
 
 els.connect.addEventListener("click", connect);
 els.form.addEventListener("submit", sendText);
 els.verifyOk.addEventListener("click", onVerifyOk);
 els.verifyNo.addEventListener("click", onVerifyNo);
 
+// drawer menu + views
+els.menuBtn.addEventListener("click", () => setDrawer(els.drawer.hidden));
+els.scrim.addEventListener("click", () => setDrawer(false));
+for (const b of els.drawer.querySelectorAll(".navitem")) {
+  b.addEventListener("click", () => showView(b.dataset.view));
+}
+els.addContact.addEventListener("click", addContactFromHandle);
+
+// chats view
+els.chatStart.addEventListener("click", () => {
+  if (els.chatNew.value) openChat(els.chatNew.value);
+});
+els.chatBack.addEventListener("click", () => {
+  activeChat = null;
+  refreshChats();
+});
+els.chatForm.addEventListener("submit", sendChatMessage);
+els.chatModeSel.addEventListener("change", () => {
+  if (activeChat) proposeModeChange(activeChat, els.chatModeSel.value);
+});
+
+// screen navigation + chat top bar
+els.toRoom.addEventListener("click", () => showScreen("room"));
+els.toIdentity.addEventListener("click", () => showScreen("identity"));
+els.disconnect.addEventListener("click", () => {
+  if (ws) ws.close(); // onclose does the cleanup and returns to the room screen
+});
+els.copyRoom.addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(els.room.value.trim());
+    els.copyRoom.textContent = "Copied ✓";
+  } catch {
+    els.copyRoom.textContent = "Copy failed";
+  }
+  setTimeout(() => { els.copyRoom.textContent = "Copy room id"; }, 1500);
+});
+
+// one-time pad controls
+els.otpSelect.addEventListener("change", syncOtpSelection);
+els.otpGenerate.addEventListener("click", otpGenerate);
+els.otpExport.addEventListener("click", otpExport);
+els.otpImport.addEventListener("click", otpImportClick);
+els.otpFile.addEventListener("change", otpFileChosen);
+els.otpForget.addEventListener("click", otpForgetSelected);
+populateOtpSizes();
+setupEntropyCanvas();
+refreshOtpPads();
+
+showScreen("identity");
 syncAlgUI();
 refreshIdentityUI();

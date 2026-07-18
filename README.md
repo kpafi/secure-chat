@@ -79,7 +79,7 @@ python tests/smoke_client.py
 | AES256  | PBKDF2 from shared passphrase + session nonces | ratcheted AES-256-GCM (one-time keys) | no key swap → not relay-MITM-able |
 | RSA     | RSA-OAEP-2048 key transport         | ratcheted AES-256-GCM (one-time keys) | **identity-authenticated**, **forward-secret** |
 | PQKEM   | **hybrid ECDH P-256 + ML-KEM-768**  | ratcheted AES-256-GCM (one-time keys) | post-quantum; **identity-authenticated**, **forward-secret** |
-| OTP     | —                                   | —                   | deferred (in-person pad exchange)           |
+| OTP     | pre-shared pad, exchanged in person | **true XOR one-time pad** + one-time HMAC-SHA-256 tag | information-theoretic *confidentiality* (see caveats); no network key swap → not relay-MITM-able |
 
 Every mode frames its messages through the same **forward-secret ratchet**:
 two direction-separated one-way HMAC-SHA-256 chains, a one-time AES-256-GCM
@@ -136,6 +136,34 @@ and recorded the ciphertext can still derive every session's keys — the
 ratchet's forward secrecy protects only against captured ratchet *state*. For
 real forward secrecy use DHKE, PQKEM, or RSA.
 
+**OTP mode** is a genuine **one-time pad**: a large random pad is generated on
+one device and carried to the other **in person** (exported as a
+passphrase-encrypted file you move over Bluetooth / USB / QR / NFC, then
+imported). Each plaintext byte is XORed with a fresh pad byte that is **never
+reused**, so the *confidentiality of the content* is information-theoretic — no
+computational assumption, no key exchange the relay could MITM. The pad is split
+into two halves so the two peers draw from disjoint bytes (no reuse across
+senders), a strictly increasing offset rejects replays (including across
+sessions), and consumed pad bytes are **zeroed as they are used** (device
+capture at time T cannot decrypt earlier traffic). Two honest caveats, both
+documented in the client: (1) XOR alone has *no integrity*, so each message
+carries an **HMAC-SHA-256 tag under a one-time key also drawn from the pad** —
+that authenticator is *computational*, because an information-theoretic one-time
+MAC would be hand-rolled crypto this project forbids; and (2) the pad is
+generated from the OS CSPRNG (optionally hardened with user-drawn "draw to
+generate" entropy), not a certified hardware TRNG, so treat its confidentiality
+as *"at least as strong as the CSPRNG"* rather than literally perfect. The pad
+is consumed one byte per plaintext byte (+32 per message), so it is a finite
+budget the UI shows depleting; when it runs low, exchange a new pad in person.
+The pad is stored **encrypted at rest** (PBKDF2-600k → AES-256-GCM under a
+per-pad passphrase, like the identity blob), with its consumption offsets inside
+the authenticated blob so they can't be rolled back to force reuse; an imported
+pad is rejected if it isn't random enough (all-zero/low-entropy); and a pad may
+be **live in only one tab/window at a time** (an exclusive same-origin lock),
+because two concurrent senders drawing from one pad would be a two-time-pad
+break. These last three were added after a self-pentest of the mode (see
+`PROGRESS.md`, 2026-07-16).
+
 ## Accounts (optional directory)
 The server doubles as a passwordless **public-key directory** under `/api`. From
 the client you can claim a username, prove control of it by signing a server
@@ -160,6 +188,38 @@ be walked to harvest who has an account. A dedicated, stricter rate limit
 bounds the lookup path on top of the shared `/api` limiter. (Registering a
 name that is taken still returns `409` — inherent to a unique namespace — but
 each probe costs a full dual-signed proof and is rate-limited.)
+
+## Contacts, web of trust, and async chats
+Beyond the live room, a left-drawer menu opens two more views. Everything they
+store on the device — the contact list AND full chat history — is encrypted at
+rest with **PBKDF2-600k → AES-256-GCM under your identity passphrase** (the key
+lives only in memory while the identity is unlocked), the same posture as the
+identity blob and OTP pads.
+
+**Users** — your known contacts with their public keys and a **trust mark**:
+🟢 *verified by you* (you compared the fingerprint/safety number in person, or
+confirmed it through the live-room gate), 🟡 *vouched* (a contact **you**
+verified has published a signed vouch for them — the marker names the voucher),
+or ⚪ *unverified*. Vouches are **dual-signed** (Ed25519 + ML-DSA-65) statements
+the server verifies before storing, but the server is still not the trust root:
+the 🟡 mark is awarded **only** when the client re-checks the signature against
+its **own pinned copy** of the voucher's keys, so a lying directory cannot
+invent trust.
+
+**Chats** — persistent one-to-one messaging with no shared live room, WhatsApp
+style. Messages travel as a **sealed envelope**: hybrid *ephemeral ECDH P-256 +
+ML-KEM-768* → HKDF → AES-256-GCM to the recipient's published encryption keys,
+with the sender's identity and a dual signature sealed **inside** the ciphertext
+(the store-and-forward mailbox never learns who wrote a message). The mailbox
+stores only *(recipient, opaque ciphertext, arrival time)*, gated by the
+recipient's lookup token to post and their session token to fetch, and deletes
+on fetch. Each chat is **locked to a mode** — `SEALED` (default) or `AES256` (an
+extra passphrase layer inside the envelope); changing it sends a signed control
+message the other side must **accept** before either switches. Trade-off:
+sealed messages have per-message ephemerals but no live ratchet, so a
+compromise of a recipient's long-term encryption keys can expose past envelopes
+captured on the wire — the `AES256` mode's out-of-band passphrase mitigates
+exactly this.
 
 ## Wire protocol
 Client -> server JSON envelope:
@@ -210,3 +270,44 @@ expose one.
 **What the relay still sees.** Room id, message timing, and ciphertext sizes
 (length padding is a possible future addition). This is the minimal routing
 metadata a relay cannot avoid.
+
+## External pentest (2026-07-18) — findings & fixes
+An independent black-box audit of the live web instance raised nine items;
+each has been addressed (see PROGRESS.md for the code):
+
+- **C-01 (critical) — session key not atomically bound to the peer identity.**
+  A malicious relay could deliver its own validly-signed handshake first (the
+  cipher locks that key, "first key wins") then the real peer's, flipping the
+  displayed identity/safety-number to the honest peer while the channel kept the
+  attacker's key. **Fixed:** message handling is serialized and the peer
+  identity is *pinned on the first accepted handshake*; any later frame from a
+  different identity hard-closes the connection. Regression-tested with two
+  validly-signed offers from different identities on the same nonces.
+- **H-01 (high) — relay could swap the async encryption keys.** Fingerprint and
+  safety number covered only the signing keys, so a relay could pair the real
+  `ed`/`mldsa` with its own `ecdh`/`mlkem`. **Fixed:** the fingerprint and
+  safety number now fold in `ecdh`+`mlkem`, and any change to those keys resets
+  a contact's verified state — the in-person check now authenticates the keys
+  used to seal async messages.
+- **M-02 (medium) — trust pins in plaintext localStorage.** A forged pin could
+  auto-unlock a session. **Fixed:** pins moved into the identity-encrypted,
+  GCM-authenticated contact store (with one-time migration that deletes the old
+  plaintext key).
+- **M-01 (medium) — OTP rollback.** A wholesale restore of an old encrypted pad
+  blob reused consumed keystream. **Fixed:** a separate monotonic send-offset
+  high-water tripwire refuses a pad whose offset regressed. *Residual:* a
+  full-storage rollback that also reverts the tripwire is inherent to untrusted
+  browser storage (needs OS-level trusted monotonic storage) — documented, out
+  of scope.
+- **M-03 / L-01 / L-02.** Dedicated stricter rate bucket on `/api/auth/challenge`;
+  `Strict-Transport-Security` sent over HTTPS; dev files (`package.json`,
+  `*.test.mjs`) are 404'd and removed from the deployed client.
+- **H-02 (architecture) — the relay serves the web client.** Unchanged by
+  design and documented above ("Trust boundary of the web client"): the web
+  client is the *honest-but-curious* model; the **bundled Android app** (audited
+  client shipped in the APK, not server-delivered) is the answer for the
+  *actively-malicious-relay* model. C-01/H-01 make that app's guarantees hold
+  against a hostile relay.
+- **L-03 (SSH) / PQ-assurance.** SSH is key-only on a disposable test box
+  (accepted); `@noble/post-quantum` is the current self-audited release (no
+  constant-time guarantee) — an assurance note, not a known vulnerability.

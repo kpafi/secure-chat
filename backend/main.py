@@ -35,6 +35,7 @@ from starlette.websockets import WebSocketState
 
 import accounts
 import config
+import mailbox
 from relay import ConnectionLimiter, RoomRegistry, TokenBucket
 from validation import Envelope, MsgType, is_ascii_printable
 
@@ -96,12 +97,34 @@ connections = ConnectionLimiter()
 accounts.init_db()
 app.include_router(accounts.router)
 
+# Store-and-forward mailbox for sealed messages (opaque ciphertext only).
+mailbox.init_db()
+app.include_router(mailbox.router)
+
+
+# Development/tooling files that live in the client dir but must never be
+# served to the public (L-02). StaticFiles would otherwise expose them; this
+# guard 404s them regardless of what is on disk (defense in depth alongside the
+# deploy excludes). Exact paths + a suffix rule for test modules.
+_BLOCKED_STATIC = {"/package.json", "/package-lock.json"}
+
+
+def _is_blocked_static(path: str) -> bool:
+    return path in _BLOCKED_STATIC or path.endswith(".test.mjs")
+
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
+    if _is_blocked_static(request.url.path):
+        return Response(status_code=404)
     resp: Response = await call_next(request)
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
+    # HSTS only when actually reached over HTTPS (L-01). Caddy terminates TLS
+    # and forwards X-Forwarded-Proto; loopback dev and .onion are plain HTTP
+    # (and HSTS is meaningless/harmful for .onion), so we don't send it there.
+    if request.headers.get("x-forwarded-proto") == "https":
+        resp.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
     # Tight CSP: only same-origin script/style, WebSocket to same origin, no
     # inline anything (app.js/style.css are external; no inline handlers). The
     # one exception is the static <script type="importmap"> in index.html, which
@@ -120,6 +143,10 @@ async def security_headers(request: Request, call_next):
     )
     resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    # no-cache = always revalidate (cheap 304 via the ETag StaticFiles sends).
+    # Without it browsers cache heuristically and keep serving a stale client
+    # after a deploy — for a security-critical client, staleness is a bug.
+    resp.headers["Cache-Control"] = "no-cache"
     return resp
 
 

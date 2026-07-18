@@ -15,6 +15,7 @@
 // break BOTH a classical AND a post-quantum signature scheme.
 
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
+import { ml_kem768 } from "@noble/post-quantum/ml-kem.js";
 
 const enc = new TextEncoder();
 
@@ -57,11 +58,26 @@ function groupHex(bytes, groups = 16) {
 // ---- Identity -------------------------------------------------------------
 
 export class Identity {
-  constructor({ edPriv, edPubRaw, mldsaSecret, mldsaPub }) {
+  constructor({ edPriv, edPubRaw, mldsaSecret, mldsaPub, ecdhPriv, ecdhPubRaw, mlkemSecret, mlkemPub }) {
     this._edPriv = edPriv; // CryptoKey (Ed25519 private)
     this.edPubRaw = edPubRaw; // Uint8Array(32)
     this._mldsaSecret = mldsaSecret; // Uint8Array
     this.mldsaPub = mldsaPub; // Uint8Array(1952)
+    // Encryption keys (bundle v2, for the async sealed envelope). SIGNING keys
+    // above define the identity (fingerprint/safety number cover only them);
+    // these are bound to it by the dual-signed registration bundle.
+    this._ecdhPriv = ecdhPriv || null;   // CryptoKey (P-256 ECDH private)
+    this.ecdhPubRaw = ecdhPubRaw || null; // Uint8Array(65, uncompressed point)
+    this._mlkemSecret = mlkemSecret || null; // Uint8Array
+    this.mlkemPub = mlkemPub || null;    // Uint8Array(1184)
+    this.upgraded = false; // true when import() added missing encryption keys
+  }
+
+  static async _genEncKeys() {
+    const ek = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+    const ecdhPubRaw = new Uint8Array(await crypto.subtle.exportKey("raw", ek.publicKey));
+    const kk = ml_kem768.keygen();
+    return { ecdhPriv: ek.privateKey, ecdhPubRaw, mlkemSecret: kk.secretKey, mlkemPub: kk.publicKey };
   }
 
   static async generate() {
@@ -69,17 +85,40 @@ export class Identity {
     const edPubRaw = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
     const seed = crypto.getRandomValues(new Uint8Array(32));
     const mk = ml_dsa65.keygen(seed);
+    const encKeys = await Identity._genEncKeys();
     return new Identity({
       edPriv: kp.privateKey,
       edPubRaw,
       mldsaSecret: mk.secretKey,
       mldsaPub: mk.publicKey,
+      ...encKeys,
     });
   }
 
   // The shareable public identity (what the server stores and others pin).
+  // `ecdh`/`mlkem` are absent on a pre-upgrade identity that has not been
+  // unlocked (and thus upgraded) yet.
   publicBundle() {
-    return { ed: b64(this.edPubRaw), mldsa: b64(this.mldsaPub) };
+    const b = { ed: b64(this.edPubRaw), mldsa: b64(this.mldsaPub) };
+    if (this.ecdhPubRaw && this.mlkemPub) {
+      b.ecdh = b64(this.ecdhPubRaw);
+      b.mlkem = b64(this.mlkemPub);
+    }
+    return b;
+  }
+
+  // ECDH shared secret with a peer's public encryption key (sealed envelope).
+  async ecdhSharedBits(peerEcdhPubRaw) {
+    if (!this._ecdhPriv) throw new Error("identity has no encryption keys yet");
+    const peer = await crypto.subtle.importKey(
+      "raw", peerEcdhPubRaw, { name: "ECDH", namedCurve: "P-256" }, false, [],
+    );
+    return new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: peer }, this._ecdhPriv, 256));
+  }
+
+  mlkemDecapsulate(ciphertext) {
+    if (!this._mlkemSecret) throw new Error("identity has no encryption keys yet");
+    return ml_kem768.decapsulate(ciphertext, this._mlkemSecret);
   }
 
   // Per-identity fingerprint: read this aloud to confirm a single key is right.
@@ -107,14 +146,20 @@ export class Identity {
   async export(passphrase) {
     if (!passphrase) throw new Error("a passphrase is required to protect the identity");
     const edPkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", await this._reimportExtractable()));
-    const plain = enc.encode(
-      JSON.stringify({
-        edPriv: b64(edPkcs8),
-        edPub: b64(this.edPubRaw),
-        mldsaSecret: b64(this._mldsaSecret),
-        mldsaPub: b64(this.mldsaPub),
-      }),
-    );
+    const inner = {
+      edPriv: b64(edPkcs8),
+      edPub: b64(this.edPubRaw),
+      mldsaSecret: b64(this._mldsaSecret),
+      mldsaPub: b64(this.mldsaPub),
+    };
+    if (this._ecdhPriv) {
+      const ecdhPkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", this._ecdhPriv));
+      inner.ecdhPriv = b64(ecdhPkcs8);
+      inner.ecdhPub = b64(this.ecdhPubRaw);
+      inner.mlkemSecret = b64(this._mlkemSecret);
+      inner.mlkemPub = b64(this.mlkemPub);
+    }
+    const plain = enc.encode(JSON.stringify(inner));
     const salt = crypto.getRandomValues(new Uint8Array(16));
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const iters = KDF_ITERS;
@@ -122,7 +167,8 @@ export class Identity {
     const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain));
     // `iters` is stored so the count can be raised over time without breaking
     // existing backups (import reads it; pre-v2 blobs default to the old count).
-    return JSON.stringify({ v: 2, iters, salt: b64(salt), iv: b64(iv), ct: b64(ct) });
+    // v3 = may carry encryption keys; v2 blobs import fine (keys added then).
+    return JSON.stringify({ v: 3, iters, salt: b64(salt), iv: b64(iv), ct: b64(ct) });
   }
 
   // Ed25519 private keys generated as non-extractable can't be exported; we
@@ -142,12 +188,32 @@ export class Identity {
     }
     const o = JSON.parse(new TextDecoder().decode(plain));
     const edPriv = await crypto.subtle.importKey("pkcs8", unb64(o.edPriv), { name: "Ed25519" }, true, ["sign"]);
-    return new Identity({
+    const fields = {
       edPriv,
       edPubRaw: unb64(o.edPub),
       mldsaSecret: unb64(o.mldsaSecret),
       mldsaPub: unb64(o.mldsaPub),
-    });
+    };
+    if (o.ecdhPriv) {
+      fields.ecdhPriv = await crypto.subtle.importKey(
+        "pkcs8", unb64(o.ecdhPriv), { name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"],
+      );
+      fields.ecdhPubRaw = unb64(o.ecdhPub);
+      fields.mlkemSecret = unb64(o.mlkemSecret);
+      fields.mlkemPub = unb64(o.mlkemPub);
+    }
+    const id = new Identity(fields);
+    if (!o.ecdhPriv) {
+      // Pre-v3 blob: add encryption keys now. The SIGNING identity (and thus
+      // fingerprint/safety number/pins) is unchanged; the caller should
+      // re-export the blob and re-register so the directory learns the keys.
+      Object.assign(id, await Identity._genEncKeys().then((k) => ({
+        _ecdhPriv: k.ecdhPriv, ecdhPubRaw: k.ecdhPubRaw,
+        _mlkemSecret: k.mlkemSecret, mlkemPub: k.mlkemPub,
+      })));
+      id.upgraded = true;
+    }
+    return id;
   }
 
   // ---- static verification (no private material needed) -------------------
@@ -166,16 +232,31 @@ export class Identity {
     return edOk && pqOk;
   }
 
+  // Canonical bytes covering ALL public keys in a bundle. H-01: the ENCRYPTION
+  // keys (ecdh/mlkem) are folded in when present, so an in-person fingerprint /
+  // safety-number comparison also authenticates the keys used to seal async
+  // messages — a relay that swaps only ecdh/mlkem (keeping the signing
+  // identity) produces a DIFFERENT value on the honest peer's device and is
+  // caught. A pre-v2 bundle (no enc keys) hashes exactly as before, so legacy
+  // fingerprints are unchanged.
+  static _bundleBytes(bundle) {
+    const parts = [unb64(bundle.ed), unb64(bundle.mldsa)];
+    if (bundle.ecdh && bundle.mlkem) {
+      parts.push(unb64(bundle.ecdh), unb64(bundle.mlkem));
+    }
+    return concat(...parts);
+  }
+
   static async fingerprintOf(publicBundle) {
-    const digest = await sha256(concat(unb64(publicBundle.ed), unb64(publicBundle.mldsa)));
+    const digest = await sha256(Identity._bundleBytes(publicBundle));
     return groupHex(digest);
   }
 
   // Safety number for a PAIR of identities (Signal-style): order-independent so
   // both people see the same value to compare in person.
   static async safetyNumber(bundleA, bundleB) {
-    const a = concat(unb64(bundleA.ed), unb64(bundleA.mldsa));
-    const b = concat(unb64(bundleB.ed), unb64(bundleB.mldsa));
+    const a = Identity._bundleBytes(bundleA);
+    const b = Identity._bundleBytes(bundleB);
     const [lo, hi] = compareBytes(a, b) <= 0 ? [a, b] : [b, a];
     const digest = await sha256(concat(lo, hi));
     return groupHex(digest, 20);

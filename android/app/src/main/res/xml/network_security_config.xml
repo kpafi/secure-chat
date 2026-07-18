@@ -14,5 +14,13 @@
   is end-to-end inside the bundled client; the relay only sees opaque ciphertext.
 -->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="true" />
+    <!-- Default: no cleartext anywhere. A clearnet relay must be https/wss. -->
+    <base-config cleartextTrafficPermitted="false" />
+    <!-- Cleartext is scoped to exactly the two hosts the browser still treats as
+         potentially-trustworthy from the app's secure page: loopback and .onion. -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">127.0.0.1</domain>
+        <domain includeSubdomains="true">localhost</domain>
+        <domain includeSubdomains="true">onion</domain>
+    </domain-config>
 </network-security-config>

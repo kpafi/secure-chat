@@ -3,16 +3,69 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (snapshot as of 2026-07-07)
-**Status:** backend relay + web client working locally; git repo on `master`.
-Backend `pytest` = **56 passed**; client offline suite (`npm test`) green; all
+## ⮕ RESUME HERE (snapshot as of 2026-07-18)
+**Status:** live on Hetzner `https://138-199-144-35.sslip.io`. **An external
+black-box pentest (2026-07-18) found 9 issues incl. a CRITICAL handshake bug
+(C-01); ALL are now fixed, tested, and deployed** — see the 2026-07-18 DONE
+entry. Highlights: C-01 (session key ↔ identity now atomically bound: identity
+pinned on first handshake, serialized message handling, hard-close on a second
+identity — regression-tested); H-01 (fingerprint + safety number now cover the
+ecdh/mlkem encryption keys; a change resets verified); M-02 (trust pins moved
+into the identity-encrypted store, plaintext pins migrated + deleted); M-01
+(OTP rollback tripwire); M-03/L-01/L-02 (challenge rate bucket, HSTS, dev-file
+404 + removed from server). Backend **71 pytest passed**; client offline suites
+green (crypto/identity/contacts/sealed/otp-rollback); C-01 regression + P6
+pentest + full UI flow green local AND live; 3 live integration suites still
+green. APK rebuilt (phone unplugged — reconnect + `adb install -r
+android/app/build/outputs/apk/debug/app-debug.apk`). Verification harness in
+`/tmp/verify-sc/`: `c01-regression.mjs`, `pentest-p6.mjs`, `ui-flow.mjs`.
+
+## ⮕ (previous snapshot 2026-07-17, evening)
+**Status:** backend relay + web client working locally **and LIVE on a Hetzner
+test server: `https://138-199-144-35.sslip.io`** (all 3 live integration suites
+green over the public internet — see the first 2026-07-17 DONE entry for the
+server layout, hardening, and the rsync deploy recipe); git repo on `master`.
+**BIG feature set landed today (P1–P6, all deployed): a left-drawer menu with a
+Users view (contacts + 🟢/🟡/⚪ web-of-trust marks, dual-signed vouches) and a
+Chats view (WhatsApp-style async 1:1 over a sealed store-and-forward mailbox;
+hybrid ECDH P-256 + ML-KEM-768 sealed envelope with sealed sender; per-chat
+mode lock SEALED/AES256 with a signed accept/decline mode change). Identity is
+now bundle v2 (adds ECDH + ML-KEM encryption keys; pre-today identities
+auto-upgrade + re-publish on first unlock). Contacts + chat history are
+encrypted at rest under the identity passphrase.** Backend **70 pytest passed**;
+client offline suites (crypto/identity/contacts/sealed) green; full puppeteer
+flow (identity→room→chat, users, vouches, async chat both ways, mode
+negotiation) green; P6 adversarial pentest green local + live. Tests to run
+live: sed-swap `127.0.0.1:8000`→`138-199-144-35.sslip.io` in the three
+`*.integration.test.mjs`. NEW client modules: `contacts.js`, `chats.js`,
+`sealed.js`; NEW backend: `mailbox.py` (+ vouch endpoints in `accounts.py`).
+**Phone:** APK rebuilt (5.8 MB) but the last two installs were skipped (phone
+unplugged) — reconnect USB + `adb install -r
+android/app/build/outputs/apk/debug/app-debug.apk` to update it.
+Backend `pytest` = **57 passed**; client offline suite (`npm test`) green; all
 3 live integration suites green; real-browser (puppeteer/Chromium) checks green
-(v2 handshake, token-gated directory, RSA ratchet, and the double-click send
-regression). **All four 2026-06-19-review accepted-risk items (L1, I1, L2, I2)
-are CLOSED.**
+(v2 handshake, token-gated directory, RSA ratchet, the double-click send
+regression, and the new OTP generate→export/import→two-way→persist flow).
+**FIVE working encryption modes now: AES256, DHKE, RSA, PQKEM, and OTP (true
+one-time pad, in-person pad exchange — added 2026-07-16, see dated entry).**
+**OTP was self-pentested the same day; all 4 findings (concurrent-use lock,
+encrypt-at-rest, export single-use, import entropy check) are FIXED + verified.**
+**All four 2026-06-19-review accepted-risk items (L1, I1, L2, I2) are CLOSED.**
 `pip install -r requirements.txt` also pulls `dilithium-py`. Logging is
 minimized (no request/connection metadata at rest); `run.sh` must keep
 `--no-access-log --log-level warning`.
+**2026-07-16 — all four 2026-07-08 Android pentest findings FIXED** (+ the
+informational should-fixes): `RelayUrls.parse` now whitelists the host charset
+(Critical Finding 1), the injected config is built with `JSONObject`, the
+`shouldOverrideUrlLoading` origin check compares parsed scheme+host (Finding 2),
+the app serves from a unique `https://secure-chat.internal` origin via
+`WebViewAssetLoader.setDomain` (Finding 4, `APP_WEBVIEW_ORIGIN` updated to
+match), WebView remote debugging is `BuildConfig.DEBUG`-gated, cleartext is
+scoped to loopback/.onion, and `importMapHash` drift is guarded in
+`test_csp_hash.py`. New Robolectric `RelayUrlsTest` (11 tests) rejects the live
+PoC payloads; debug APK builds clean. See the 2026-07-16 DONE entry. **Remaining
+Android work:** on-device re-run against the new origin + the DHKE/RSA/PQKEM
+safety-number gate (needs the emulator), app icon, and release-signing.
 **2026-07-07 (four entries, newest first):**
 0. **Android app (new `android/` module):** thin Kotlin/WebView shell that
    BUNDLES the audited web client in the APK (closes web-only trust gap H1) and
@@ -62,8 +115,9 @@ Both were committed this session (c756cf9 = handshake replay; 1703a19 = L1/I1).
 **Done & verified end-to-end (incl. real-browser checks via puppeteer):**
 - Dumb-relay backend (strict validation, rate limit, connection cap, join +
   idle timeouts) + passwordless account directory (`/api`, rate-limited + capped).
-- Web client: 4 working encryption modes — **AES256, DHKE, RSA, PQKEM**
-  (PQKEM = hybrid ECDH P-256 + ML-KEM-768). Identity = Ed25519 + ML-DSA-65,
+- Web client: 5 working encryption modes — **AES256, DHKE, RSA, PQKEM, OTP**
+  (PQKEM = hybrid ECDH P-256 + ML-KEM-768; OTP = true XOR one-time pad with an
+  in-person pad exchange, added 2026-07-16). Identity = Ed25519 + ML-DSA-65,
   passphrase-encrypted at rest (PBKDF2 600k).
 - **Authenticated handshake** (dual-sig) + in-person safety-number gate closes
   the relay-MITM gap. Account register/login + fetch-by-username pinning.
@@ -99,6 +153,679 @@ at the bottom.
    The server's `alg` field is an advisory tag only and is never acted upon.
 
 ## DONE
+### 2026-07-18 — External pentest response: C-01 (critical) + 8 more, all fixed ✅
+An independent black-box audit of the live web instance reported 9 findings.
+All addressed, tested, deployed. Full write-up in README ("External pentest").
+
+**C-01 — CRITICAL — session key not atomically bound to peer identity.**
+Confirmed by reading the code: `handleMessage` set `peerBundle = idb` then
+`cipher.onPeerKey(pub)`, and the ciphers are first-key-wins. A relay could send
+its OWN validly-signed offer first (cipher locks attacker key) then relay the
+peer's real signed offer (peerBundle → real peer, cipher IGNORES the real key),
+so the safety number / pin verified against the honest peer while the live
+channel used the attacker's key — decoupling exactly what the safety-number
+gate protects. **Fix (app.js):** (1) message handling serialized through a FIFO
+`msgChain` (closes the TOCTOU where two frames pass verification before either
+pins); (2) the peer identity is PINNED to the first accepted handshake —
+`peerBundle` is write-once, and a later frame whose `idb` differs hard-closes
+the connection with a MITM notice; (3) `enterVerification(room, verifiedBundle)`
+takes the pinned bundle explicitly instead of re-reading a mutable global.
+**Regression:** `/tmp/verify-sc/c01-regression.mjs` — a mock relay feeds two
+validly-signed DHKE offers from DIFFERENT identities with identical nonces; the
+first is accepted, the second hard-closes, messaging never unlocks, a MITM line
+is logged.
+
+**H-01 — HIGH — relay could swap the async (ecdh/mlkem) encryption keys.**
+Fingerprint/safety-number covered only ed+mldsa, and a contacts enc-key change
+did NOT reset verified — so a relay could pair the real signing keys with its
+own encryption keys and silently redirect sealed messages. **Fix:**
+`identity.js` `_bundleBytes` folds ecdh+mlkem into `fingerprintOf` +
+`safetyNumber` (pre-v2 bundles hash unchanged); `contacts.upsert` treats ANY of
+the four keys changing as a key change (resets verified, drops stale vouches);
+the live-room verify gate mirrors the FULL bundle (incl. enc keys) into
+contacts; adding a contact by handle no longer auto-verifies from an
+ed/mldsa-only pin.
+
+**M-02 — MEDIUM — trust pins were plaintext localStorage.** A forged
+`sc.pins.v1` entry could auto-unlock. **Fix:** pins live inside the
+identity-encrypted, GCM-authenticated contact store (`contacts.getPin/savePin`),
+blob bumped to v2 `{contacts, pins}`; a one-time migration imports the old
+plaintext pins then deletes the key.
+
+**M-01 — MEDIUM — OTP rollback.** A wholesale restore of an old encrypted pad
+blob rewound `sendOffset` to reuse keystream (GCM stops edits, not rollback).
+**Fix (otp.js):** a SEPARATE monotonic high-water key `sc.otp.hw.v1.<id>`;
+unlock refuses a pad whose offset regressed below it. `otp-rollback.test.mjs`
+proves an old-blob restore is refused. *Residual (documented):* a full-storage
+rollback that also reverts the tripwire needs OS-level trusted storage — out of
+scope for browser localStorage.
+
+**M-03 / L-01 / L-02.** Dedicated stricter rate bucket on `/api/auth/challenge`
+(`CHALLENGE_RATE_CAPACITY=10`, 0.5/s) + test; `Strict-Transport-Security` sent
+when `X-Forwarded-Proto: https` (not on loopback/.onion); middleware 404s
+`package.json`/`package-lock.json`/`*.test.mjs` and they were removed from the
+deployed client dir. **H-02 / L-03 / PQ-assurance:** documented as accepted /
+architectural (web client = honest-but-curious; Android app = malicious-relay
+answer; SSH key-only on a disposable box; noble-PQ self-audited).
+
+**Verification:** backend **71 passed**; client offline suites green incl. new
+`otp-rollback.test.mjs`; `c01-regression.mjs`, `pentest-p6.mjs`, full
+`ui-flow.mjs` green LOCAL and the pentest + 3 integration suites green LIVE
+against Hetzner. Deployed; HSTS + dev-file-404 confirmed on the live box; APK
+rebuilt.
+
+### 2026-07-17 — P6: hardening pass over the contacts/chats surface + live E2E ✅
+Adversarial pass following the project method (attack the running code, prove
+it with a live PoC): `/tmp/verify-sc/pentest-p6.mjs`, run against BOTH the
+local relay and the live Hetzner box. Every attack refused:
+
+- **Vouch forgery:** zero-signature vouch → 400; a vouch signed by a
+  non-owner key but submitted under the attacker's session → 400 (server
+  checks the sig against the AUTHENTICATED user's keys). **Client 🟡
+  forge-resistance:** proved `Identity.verify` rejects a genuine vouch when
+  the voucher keys are swapped to the attacker's, and when the target key is
+  rotated — so a lying directory cannot manufacture a 🟡 (the award rule
+  re-verifies against the client's OWN pinned voucher keys).
+- **Mailbox:** wrong-token-for-real-user and unknown-user POST return
+  byte-identical 404 (not an existence oracle); fetch without / with a bogus
+  bearer token → 401; a logged-in eve never sees bob's queue (per-recipient);
+  an envelope captured off the wire won't `open()` without the recipient's
+  keys.
+- **Chat sender spoofing:** eve seals a message to bob with alice's
+  self-claimed handle — `open()` still binds the sender to EVE's real bundle,
+  and since chats are keyed by bundle (never the claimed name), she cannot
+  inject into bob's alice-chat.
+- **Regression:** the 3 live integration suites (relay 4-mode, account
+  directory, authenticated handshake) still pass against Hetzner after all the
+  backend changes — the dumb relay + directory are untouched in behaviour.
+- Docs: README gained a "Contacts, web of trust, and async chats" section
+  (trust marks, sealed envelope, mailbox, mode lock, the FS trade-off). APK
+  rebuilt (5.8 MB, ready for the next phone connect).
+- NOTE: the pentests + browser runs left a handful of `pt-*`/`bob-*` test
+  accounts in the LIVE directory (public keys only, harmless) — restart/redeploy
+  starts fresh if you want a clean box for real testing.
+
+### 2026-07-17 — P5: per-chat mode lock + negotiated mode change ✅
+- **Modes (async):** SEALED (default, transport only) and AES256 (an inner
+  AES-256-GCM layer under a per-chat passphrase, applied to the plaintext
+  BEFORE sealing — so even a break of the recipient's long-term TRANSPORT keys
+  leaks nothing without the chat passphrase). OTP-over-mailbox deliberately NOT
+  offered (async pad sync = two-time-pad risk); it stays live-room only.
+- **Negotiation:** the sealed envelope core now carries a `kind`
+  (msg / mode-propose / mode-accept / mode-decline) — control messages are
+  signed and authenticated exactly like text (`sealed.js` generalised from
+  `text` to a `content` object; open() returns the whole signed body). One
+  side proposes via the chat's mode picker (AES256 → prompts for a shared
+  passphrase, mints a PBKDF2 salt sent in the proposal); the peer sees an
+  accept/decline banner; the switch happens only after a signed accept, on
+  both sides. Decline/lost-response leave the locked mode untouched.
+- **Store:** `chats.js` gained `setMode`/`setPending`/`clearPending`, the
+  AES256 fields (`secret`,`salt`), and inner-layer `innerEncrypt/innerDecrypt`
+  (+ `newInnerSalt`). Mismatch cases render a clear system line rather than
+  garbage. All negotiation state is inside the identity-encrypted chat store.
+- **Verified:** `sealed.test.mjs` gains a control-message case (kind/mode/salt
+  survive sign+seal); browser flow drives alice→propose AES256, bob→accept
+  (both prompts auto-answered with the same passphrase), both lock to AES256,
+  then a message round-trips through the inner layer. Offline suites + backend
+  70 green; deployed to Hetzner. Screenshot eyeballed; tightened the convo
+  header to wrap on narrow screens.
+
+### 2026-07-17 — P4: store-and-forward mailbox + Chats view (WhatsApp-style async DMs) ✅
+- **Backend `mailbox.py` (new):** rows are (recipient, opaque envelope,
+  arrival time) — the sender is sealed INSIDE the envelope, invisible to the
+  server. `POST /api/mailbox/{recipient}?t=<lookup token>` (token gate = same
+  anti-enumeration boundary as the bundle lookup: wrong token / unknown user
+  are an identical 404; printable-ASCII + 64 KiB envelope cap; dedicated
+  per-host rate bucket 30 burst / 1 rps; per-inbox cap 200; global cap 100k;
+  14-day TTL pruned on access). `GET /api/mailbox` requires the session token
+  and DELETES what it returns — no server-side read history. New
+  `tests/test_mailbox.py` (roundtrip+delete-on-fetch, token-gate oracle check,
+  auth, size/ASCII/inbox-cap, TTL prune) → backend **70 passed**.
+- **Client:** `chats.js` — encrypted chat store (same PBKDF2→AES-GCM posture,
+  unlocked with the identity, wiped on forget; 500-msg cap per chat; inbound
+  dedup by envelope id). `sealed.js` core gained a signed, self-claimed
+  sender handle (display/reply-token only — chats are KEYED by the sender's
+  signature-verified bundle, never by the claimed name). `account.js`:
+  `sendMail`/`fetchMail`. Chats view: start-a-chat picker (saved users),
+  chat list with safety marks + last-message preview, bubble conversation
+  (textContent-only rendering), mode line "🔒 SEALED …". Sending needs only
+  the contact's handle token; RECEIVING needs login (mailbox auth) — 6s
+  polling after login + on view entry. Unknown senders are auto-added as ⚪
+  contacts (sealed handle preferred, fingerprint-derived name fallback); a
+  known bundle without a reply token adopts the sealed handle's token.
+- **Verified:** browser suite extended — alice→bob sealed send, bob logs in,
+  chat auto-appears filed under alice's handle, bob replies using the sealed
+  token, alice's open conversation updates, chat blob at rest is ciphertext
+  (no plaintext leak). Screenshots eyeballed (bubble UI). Deployed to the
+  Hetzner box; APK rebuilt (phone was unplugged — install pending reconnect).
+- **Known limitation (documented):** sealed envelopes have per-envelope
+  ephemerals but NO live ratchet — long-term-key compromise exposes captured
+  past envelopes. P5 adds the mode lock/negotiation; the hardening pass (P6)
+  revisits mailbox abuse surface end-to-end.
+
+### 2026-07-17 — P3: bundle v2 (encryption keys) + sealed async envelope ✅
+Foundation for chats-without-a-live-room:
+
+- **Identity (client):** now also holds ENCRYPTION keypairs — ECDH P-256 +
+  ML-KEM-768 (`identity.js`). Blob format v3 (v2 blobs auto-upgrade on
+  unlock: enc keys generated, blob re-exported once, bundle re-published to
+  the directory opportunistically for registered users). Fingerprint / safety
+  number / pins still cover ONLY the signing keys (identity continuity); the
+  enc keys are bound to the identity by the registration signature.
+- **Directory (backend):** registration v2 under `secure-chat/register/v2`
+  (dual sig covers ecdh+mlkem; both-or-neither, strict sizes 65/1184 B).
+  `accounts` table gained `ecdh_pub`/`mlkem_pub` (empty for v1 rows; those
+  can't receive sealed messages until re-registered). **Same-identity
+  re-registration is now a bundle refresh** (verifies the dual sig, matches
+  stored ed+mldsa exactly, updates enc keys, returns the EXISTING lookup
+  token) — foreign identities still get 409. Lookup returns enc keys when
+  present; v1 registration still accepted. `tests/test_bundle_v2.py` (5
+  tests): roundtrip, sig-must-cover-enc-keys (v1-sig + keys, post-sign key
+  swap), both-or-neither + size validation, refresh-vs-409, v1 compat —
+  backend **65 passed**.
+- **`sealed.js` (client, new):** async E2EE to a contact's public bundle.
+  Hybrid: ephemeral ECDH + ML-KEM-768 encaps → HKDF-SHA256(salt=domain,
+  info=recipient-ed) → AES-256-GCM. **Sealed sender:** sender bundle + DUAL
+  signature live inside the ciphertext; sig covers domain + RECIPIENT identity
+  key + eph + KEM ct + core, so envelopes can't be re-targeted and the mailbox
+  never learns the sender. FS trade-off documented (per-envelope ephemerals;
+  no live ratchet in store-and-forward). `sealed.test.mjs`: roundtrip, opaque
+  envelope (no plaintext/sender leak), wrong-recipient, tamper,
+  eve-signs-as-alice forgery, legacy-blob upgrade — all green.
+- Contacts store now carries contacts' enc keys (updated on add/lookup; an
+  enc-key change alone does NOT reset `verified` — trust anchors stay
+  ed/mldsa). Client suites + full browser flow green; deployed to Hetzner +
+  phone. NOTE: identities created before today must unlock once (auto-upgrade
+  + re-publish) before they can RECEIVE sealed messages.
+
+### 2026-07-17 — P2: web-of-trust vouches (🟡 mark) ✅
+- **Backend:** `vouches` table (voucher→target, dual sigs, created_at; PK
+  dedups re-vouches). `POST /api/vouch` (session-token auth) verifies BOTH
+  signatures against the voucher's registered keys over the TARGET's currently
+  registered bundle before storing — the table can only hold statements the
+  voucher really signed about the real directory entry. `DELETE /api/vouch/
+  {target}` revokes. `GET /api/users/{u}/vouches` is gated by the target's
+  lookup token (no graph enumeration) + the strict lookup rate bucket, returns
+  ≤50 vouches incl. voucher public keys. Bounds in config: 200/voucher, 200k
+  total. Domain-separated message: `secure-chat/vouch/v1\ntarget\ned\nmldsa`.
+  Self-vouch 422. New `tests/test_vouches.py` (publish/fetch/revoke; wrong-key,
+  cross-target, single-scheme-forgery, auth rejections; token-gated 404
+  indistinguishability) — backend now **60 passed**.
+- **Client:** `account.js` vouch/unvouch/fetchVouches (+ exported
+  `vouchMessageBytes`); login now retains the session token in memory.
+  Users view: turning a contact 🟢 offers (confirm, opt-in — it reveals the
+  social edge publicly) publishing a vouch signed over MY pinned copy of their
+  bundle; Unverify retracts. 🟡 computation is strictly local: a vouch counts
+  ONLY if the voucher is a contact I verified in person AND the
+  server-returned voucher keys equal my pinned copy AND the dual signature
+  verifies over MY stored target bundle — a lying directory cannot invent a 🟡.
+  Results cached in the encrypted store (10-min recheck TTL).
+- **Verified:** full puppeteer flow incl. new WoT scenario (alice registers,
+  logs in, re-verifies bob → publishes vouch; carol verifies alice in person,
+  adds bob → 🟡 "vouched by alice"), screenshots eyeballed; all offline suites
+  green. Deployed to Hetzner (backend restarted) + phone APK. Found+fixed in
+  passing: renderUserList() wiped the just-set vouch status line (order swap).
+
+### 2026-07-17 — P1 of the contacts/chats overhaul: drawer menu + encrypted contact store + Users view ✅
+First phase of the planned contacts + web-of-trust + async-chats feature set
+(full plan in TODO). Shipped:
+
+- **Drawer menu** (☰ top-left): Live room (the untouched 3-step flow) / Users
+  (new) / Chats (placeholder until P4). Pure presentation; switching views
+  never touches an active connection. CSS gotcha fixed along the way:
+  `.drawer { display:flex }` silently overrode the `hidden` attribute
+  (author display beats the UA's `display:none`), leaving an invisible
+  click-eating overlay — caught by the browser suite, fixed with an explicit
+  `.drawer[hidden] { display:none }`.
+- **`contacts.js` — encrypted contact store.** Records
+  `{username, token, ed, mldsa, verified, verifiedAt, addedAt, keyChangedAt}`;
+  at rest PBKDF2-600k → AES-256-GCM under the IDENTITY passphrase (same
+  posture as identity + pads; GCM doubles as tamper protection — flipping
+  `verified` in the blob just breaks decryption). Unlocked wherever the
+  identity is created/unlocked (before the passphrase field is cleared);
+  locked state renders a hint; wiped on identity-forget; a changed key for a
+  known username RESETS `verified` (same rule as the pin store). Foreign/
+  tampered blob → clear error, resettable via identity-forget.
+- **Users view:** add contact by `username#token` (directory lookup),
+  fingerprint per contact, marks 🟢 "verified by you" / ⚪ unverified (🟡
+  vouched comes with P2), confirm-gated "Verified in person ✓" / Unverify /
+  Remove, loud key-changed warning. Auto-🟢: adding a handle whose bundle
+  matches an existing in-person pin, and the live-room safety-number confirm
+  (`onVerifyOk`) mirrors into the store when the contact-handle field named
+  the peer.
+- **Tests:** new `contacts.test.mjs` (npm test now runs it): encrypted
+  round-trip, wrong-passphrase refusal, GCM tamper refusal, key-change trust
+  reset, wipe, opaque-at-rest. Browser suite extended: register→handle→add→
+  ⚪→verify→🟢→reload-unlock→persisted→blob-is-ciphertext. All green
+  (client offline, backend 57/57, full puppeteer flow); deployed to the
+  Hetzner box + phone APK reinstalled.
+
+### 2026-07-17 — UI rework: 3-screen flow + disconnect + copy-room-id (deployed live + on phone)
+User feedback from live testing: no way to disconnect once connected, and the
+single-page UI felt raw. Reworked the client into a guided **3-screen flow** —
+UI structure only, **zero crypto/handshake/connection-logic changes** (all
+element ids kept, so the test suites run unmodified):
+
+1. **Identity screen** (identity panel + optional username register/login);
+   Continue button (labelled "Skip — no identity (AES-256 / OTP only) →" until
+   an identity is unlocked).
+2. **Room screen** (room id + Generate, encryption picker, passphrase/OTP
+   panel, contact handle, Connect) with Back navigation.
+3. **Chat screen** with a sticky **top bar**: shortened room id, **Copy room
+   id** button (clipboard), mirrored status, and the new **Disconnect** button
+   (`ws.close()` → the existing onclose cleanup now returns to the room
+   screen). Verify (safety-number) panel lives inside this screen.
+
+Implementation: `index.html` regrouped into `#scrIdentity/#scrRoom/#scrChat`
+wrappers + `showScreen()` in app.js; `joined`/`onclose` swap screens instead of
+toggling `#setup`/`#chat`; the inline importmap kept **byte-identical** (CSP
+hash — `test_csp_hash.py` still green). style.css: step indicator, topbar,
+ghost buttons, `#log` height now `min(55vh, 480px)` for phones.
+**Verified:** client `npm test` green, backend 57/57 green, and a new
+puppeteer/Chromium two-peer UI-flow check (`/tmp/verify-sc/ui-flow.mjs` —
+screen navigation, DHKE session, safety-number match, message delivery,
+topbar copy → clipboard content asserted, disconnect → room screen). Deployed
+to the Hetzner box and reinstalled on the phone (`adb install -r`) same day.
+**Follow-up 2 (same day) — mobile polish + encryption picker cards.** The
+`<select>` encryption picker is now a **radio-card group** (`#algCards`, one
+`<input type="radio" name="alg">` per mode with name/badge/description —
+`els.alg.value` reads became the `algValue()` helper; `syncAlgUI` listens on
+the container). Phone-sized screens (`@media max-width: 600px`): tighter
+padding, 16px inputs (no focus-zoom), bigger touch targets, `#log` sized via
+`100dvh`, and the chat top bar becomes a 2×2 grid (room id | copy // status |
+disconnect). Verified: npm test + 57/57 pytest green; ui-flow.mjs (extended
+with a card-toggling check) green at a 390×844 viewport; screenshots
+eyeballed. Deployed to the Hetzner box + phone same day.
+**Follow-up (same day):** the browser kept showing the OLD client after the
+deploy — StaticFiles sends only ETag/Last-Modified, no `Cache-Control`, so
+browsers cache heuristically without revalidating. Fixed: the security-headers
+middleware now also sets `Cache-Control: no-cache` (always revalidate; ETag
+makes unchanged loads a 304). One manual hard reload (Ctrl+F5) is needed on
+clients that cached before this fix; after that, deploys show up on plain
+reload. 57/57 backend tests still green; live-verified on the Hetzner box.
+
+### 2026-07-17 — FIRST LIVE DEPLOYMENT: Hetzner test server, all live suites green 🚀
+The relay + web client are live on a Hetzner Cloud box (Debian 13, x86_64,
+4 GB) for real-network testing:
+
+- **URL: `https://138-199-144-35.sslip.io`** (sslip.io wildcard DNS → the
+  server IP `138.199.144.35`; free Let's Encrypt cert via Caddy — swap in a
+  real domain or the `.onion` later without touching the backend).
+- Layout on the server: `/opt/secure-chat/{backend,client,venv}`, runs as the
+  no-login system user `securechat` under systemd (`secure-chat.service`) with
+  sandboxing (`ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
+  `NoNewPrivileges`). Uvicorn binds **loopback only** and keeps the mandatory
+  `--no-access-log --log-level warning`; Caddy terminates TLS on 443 and its
+  access log is set to `output discard` (metadata-minimization carried over,
+  I2). Public origin allow-listed via
+  `Environment=SECURE_CHAT_EXTRA_ORIGINS=https://138-199-144-35.sslip.io` in
+  the unit (WS origin check + CORS).
+- Host hardening: SSH is key-only (password auth disabled via
+  `sshd_config.d/90-no-password.conf`), Hetzner cloud firewall allows only
+  22/80/443 TCP inbound, unattended security upgrades enabled. Local test
+  `accounts.db` was NOT deployed — the live directory starts empty.
+- **Verified from the laptop against the live server:** all 3 live integration
+  suites green over the public internet — relay (DHKE/AES256/RSA/PQKEM
+  end-to-end via `wss://`), account directory (register→lookup→login→me,
+  dup-username 409, wrong-key rejected), authenticated handshake
+  (DHKE/RSA/PQKEM safety numbers + cross-session replay REJECTED). Run them
+  live by sed-swapping `127.0.0.1:8000` → `138-199-144-35.sslip.io` (ws→wss,
+  http→https) in the three `*.integration.test.mjs` files.
+- Deploy/update recipe: `rsync -az --delete --exclude '.git' --exclude
+  '__pycache__' --exclude 'node_modules' --exclude 'accounts.db*'
+  backend client root@138.199.144.35:/opt/secure-chat/ && ssh
+  root@138.199.144.35 systemctl restart secure-chat`.
+- NOTE: test box is disposable (hourly billing); nothing on it is
+  irreplaceable — everything above is reproducible from this repo.
+
+### 2026-07-16 — OTP pentest: 2 Medium + 2 Low found (NOT yet fixed) 🔴
+Adversarial review of the just-shipped OTP mode (crypto.js `OtpPad`, otp.js, the
+app.js wiring), following this project's "attack the running code, prove it with
+a live PoC" method. PoCs run against the actual shipping modules
+(`/tmp/verify-sc/pentest-otp.mjs`). **The OTP core crypto held up** — replay,
+cross-room replay, cross-session replay, ciphertext tamper, offset-relabeling,
+reflection, and forward-secrecy zeroing are all correctly rejected/enforced
+(re-proven). Four weaknesses found, all in pad *lifecycle/state management*, not
+the cipher:
+
+**Finding 1 — MEDIUM — concurrent pad use = two-time pad (catastrophic reuse).**
+Nothing locks a pad to one active session. Two OtpPad instances built from the
+same persisted record — exactly what two browser TABS get from `loadPad` (they
+share localStorage but each holds its own in-memory offset) — both start at the
+same offset and reuse the same keystream. **Live-proven:** `C1^C2 == P1^P2`, the
+classic two-time-pad break (an eavesdropping relay recovers plaintext
+relationships, and any one known/guessable message reveals the other outright).
+`MAX_ROOM_MEMBERS=2` blocks the naïve "two tabs + peer in ONE room" variant, but
+NOT (a) two concurrent conversations (two rooms) sharing one pad, nor (b) two
+tabs alone in a room unlocking each other. Single-tab sequential use is safe
+(offset persisted after every message). Fix: a same-origin lock (BroadcastChannel
+lease / a localStorage "pad in use" epoch checked before each send) so a pad can
+be live in only one session at a time; refuse or hard-warn on concurrent use.
+
+**Finding 2 — MEDIUM — pad stored UNENCRYPTED at rest.** `otp.savePad` writes
+`bytes: b64(record.bytes)` straight to localStorage in the clear, unlike the
+identity private keys (which are PBKDF2→AES-GCM encrypted at rest). A device /
+browser-profile compromise reads the entire REMAINING pad → decrypts all FUTURE
+traffic until a new pad is exchanged. Consumed bytes are zeroed, so past traffic
+stays protected (the FS property holds), but the long-term secret sitting in
+plaintext is inconsistent with the rest of the app's at-rest posture and
+undercuts exactly the high-assurance users who pick OTP. Fix: encrypt the pad at
+rest under a passphrase (reuse the identity export machinery), unlocked per
+session like the identity is.
+
+**Finding 3 — LOW — export file has no single-use / role binding.** `importPad`
+always returns `recipientRole` (= 1), so importing the same export file on more
+than one device gives EVERY importer role 1 → two role-1 senders reuse region 1
+(two-time pad again). Same if the generator forgets its role-0 copy and
+re-imports its own file. **Live-proven** (two imports → identical role → keystream
+reuse). Only the otp.js header doc ("import on one device per side") prevents it.
+Fix direction: bind the pad to the exchanging identities if available, or at
+least track "this file already imported / this pad already has a role-1 peer" and
+warn hard; there is no fully-robust cross-device enforcement without identities.
+
+**Finding 4 — LOW/informational — a malicious pad generator can downgrade the
+importer's outbound confidentiality.** The generator produces ALL pad bytes,
+including the importer's send region. A hostile (or corrupted) pad with an
+all-zero / low-entropy send region makes the importer's outbound `ct = pt XOR 0
+= pt` — plaintext on the wire, readable by the RELAY, not just the generator.
+Bounded: the generator is your trusted in-person contact who receives your
+plaintext anyway; the only *new* exposure is to third parties. Fix: a cheap
+entropy sanity check on import (reject an all-zero / obviously non-random pad),
+and/or document that the pad's randomness is only as trustworthy as whoever
+generated it.
+
+**Verified negatives (no finding):** the AD binds domain|room|role|offset|len so
+moving a frame across rooms/offsets/regions fails the MAC; the one-time HMAC key
+is full 32-byte SHA-256 (untruncated); `crypto.subtle.verify` is constant-time;
+auth-failed frames consume no pad (a hostile relay can't burn the pad with
+forgeries); the entropy mixer (CSPRNG XOR AES-CTR(H(finger))) is never weaker
+than the CSPRNG; the export file is GCM-authenticated (wrong passphrase → clean
+reject). `offset | 0` would truncate for >2 GiB pads but max pad is 1 MiB
+(unreachable, latent-only). The non-OTP stack (relay, accounts, other four
+ciphers) was not changed this session and its previously-closed findings remain
+closed; a quick re-confirm left backend `pytest` 57 and all live suites green.
+
+**Not yet fixed** — all four are on the TODO list below. **(All four FIXED later
+the same day — see the entry above this one.)**
+
+### 2026-07-16 — OTP pentest findings 1–4 FIXED ✅
+Fixed all four findings from the OTP pentest (entry below). The OTP cipher core
+was already sound; these harden pad lifecycle/state.
+- **F1 (MEDIUM) — concurrent-use two-time pad.** New exclusive same-origin lock
+  in app.js: `acquirePadLock(padId)` uses the **Web Locks API**
+  (`navigator.locks`, auto-released if the tab dies) with a localStorage-
+  heartbeat lease fallback. Taken on connect, released on disconnect; a pad live
+  in one tab makes connect in any other tab refuse ("already in use"). Single-tab
+  sequential use is unaffected.
+- **F2 (MEDIUM) — pad unencrypted at rest.** `otp.js` persistence rewritten: the
+  pad bytes AND consumption offsets are stored **encrypted** (PBKDF2-600k →
+  AES-256-GCM) under a per-pad passphrase, never in the clear — same at-rest
+  posture as the identity blob. `saveNewPad` derives the key once (PBKDF2);
+  `unlockPad` decrypts on connect; `savePadProgress` re-encrypts each message
+  with the cached key (no per-message PBKDF2). Offsets live INSIDE the GCM blob,
+  so a local attacker can't roll `sendOffset` back to force pad reuse. A new
+  "pad passphrase" field (distinct from the file "transfer passphrase") unlocks
+  the pad per session.
+- **F3 (LOW) — export single-use.** Re-exporting an already-shared pad warns and
+  requires a confirming second click (`markExported` / `padMeta.exported`);
+  import dedups by padId and the UI carries a strong "one device per side"
+  warning. Cross-device double-import of a manually-copied file is inherent
+  without identities (documented).
+- **F4 (LOW) — low-entropy imported pad.** `importPad` now runs `looksRandom`
+  (Shannon entropy over a byte histogram) and refuses a pad below 7.0 bits/byte
+  (all-zero / grossly low-entropy), so a corrupt/sabotaged pad can't silently
+  make outbound `ct == pt`.
+- **UI:** two OTP passphrases now — a top-level **pad passphrase** (at-rest,
+  per-session unlock) and the export/import **transfer passphrase** (`otpXferPass`).
+- **Verified.** `node crypto.test.mjs` + `npm test` green (cipher unchanged);
+  module-level checks (localStorage shim): at-rest blob carries only kdf/iv/ct
+  (no plaintext bytes), unlock round-trips bytes+offsets, wrong passphrase
+  rejected, all-zero pad import rejected, `looksRandom` correct. **Real-browser
+  E2E (Chromium/puppeteer, two contexts + extra tabs):** generate (encrypted at
+  rest) → export → re-export warns → import (encrypted, both passphrases) →
+  connect → two-way messaging, zero undecryptable frames; a second tab is refused
+  the in-use pad (F1); a wrong pad passphrase refuses unlock (F2). Backend
+  `pytest` 57 + all 3 live integration suites still green.
+
+### 2026-07-16 — OTP mode: true one-time pad, in-person pad exchange ✅
+Implemented the deferred OTP mode as a genuine XOR one-time pad. Design forks
+were decided with the user: true XOR OTP (not a pad-as-keypool shortcut),
+file-based in-person pad transport (not Web Bluetooth), and CSPRNG hardened with
+optional draw-to-generate entropy.
+- **`OtpPad` cipher (`client/crypto.js`).** Confidentiality is a real one-time
+  pad: `ct = plaintext XOR keystream`, keystream = fresh pad bytes never reused.
+  The pad is split in half by ROLE (generator = role 0, importer = role 1); each
+  side sends from its own region and receives from the other, so no byte is ever
+  used to encrypt twice. Integrity: each message carries an HMAC-SHA-256 tag
+  under a one-time 32-byte key also drawn from the pad, binding
+  domain|room|role|offset|len|ct (stops XOR malleability; honest computational
+  limit, since an info-theoretic one-time MAC would be hand-rolled crypto we
+  forbid). A strictly increasing receive offset rejects replays AND cross-session
+  replays (offsets persist per pad, never rewind). Consumed pad bytes are ZEROED
+  on both send and receive (forward secrecy: capture at time T can't decrypt
+  earlier traffic). Auth-failed frames consume nothing (a hostile relay can't
+  burn pad with forgeries). Serialized through the shared `CallQueue`.
+  `needsHandshake=false`, `usesNonces=false`; removed from `UNAVAILABLE`.
+- **Pad lifecycle (`client/otp.js`, new).** `generatePad` = OS CSPRNG XOR an
+  AES-CTR keystream keyed by SHA-256 of the user's drawn-motion samples (never
+  weaker than the CSPRNG alone). `exportPad`/`importPad` = a passphrase-encrypted
+  file (PBKDF2-600k → AES-256-GCM) carrying padId + region size + recipient role
+  + pad bytes; export refuses a already-used pad (would hand the peer zeroed
+  regions that XOR back to plaintext). localStorage persistence of bytes +
+  offsets + role, pad index/list/forget. Size presets 64 KiB / 256 KiB / 1 MiB
+  with honest per-side message estimates.
+- **UI (`index.html`, `style.css`, `app.js`).** OTP panel: pad selector,
+  generate (with a draw-to-generate entropy canvas), encrypted export (file
+  download) / import (file upload), forget, and a live remaining-budget display.
+  OTP unlocks messaging on peer PRESENCE (the pad is the out-of-band secret, like
+  AES256's passphrase — no identity/safety-number gate). Offsets persisted after
+  every send/receive so consumption survives reload (reuse would be
+  catastrophic). `syncAlgUI` shows the panel; `connect()` loads the selected pad.
+- **Docs.** README encryption-modes table + a new OTP paragraph state the two
+  honest caveats plainly (computational MAC; CSPRNG-not-TRNG pad, so "at least as
+  strong as the CSPRNG"). Backend needed no change — the `Algorithm` enum already
+  allowed `OTP` (advisory tag; relay never acts on it).
+- **Tests / verification.** New `otpChecks` in `crypto.test.mjs` (round-trip both
+  directions, replay/tamper/reflection/forgery rejected, exhaustion refused, and
+  FS zeroing asserted on sender + receiver) — `node crypto.test.mjs` green.
+  Offline `npm test` green; all 3 live integration suites green (no regression to
+  the other modes). **Real-browser check (Chromium/puppeteer, two isolated
+  contexts):** Alice generated a pad with drawn entropy and exported the
+  encrypted file; Bob imported it (wrong transfer passphrase rejected); both
+  connected to one room, unlocked on presence, exchanged messages BOTH directions
+  with zero undecryptable frames; the budget decremented; and localStorage showed
+  the offsets persisted AND the consumed pad bytes zeroed at rest.
+- **Known limits (documented):** a pad is a shared secret for exactly two
+  devices (never import on more than one per side); pad size = total text budget
+  (XOR consumes 1 byte/char + 32/msg); no post-compromise recovery beyond the
+  zeroing already described. Cross-tab concurrent use of one pad on the same
+  device is not locked — the offset is persisted before/after each send, but two
+  tabs are a footgun; documented, IndexedDB/BroadcastChannel hardening is a
+  future option if larger pads or multi-tab use are wanted.
+
+### 2026-07-16 — Android pentest findings 1–4 (+ informational) FIXED ✅
+Closed all four 2026-07-08 Android pentest findings and the informational
+should-fix items. Root cause of Findings 1 & 3 was one permissive value flowing
+into two sinks; fixed at the source plus defense in depth at each sink.
+- **Finding 1 (CRITICAL) — relay-address → JS execution.** `RelayUrls.parse`
+  (`RelayUrls.kt`) now rejects any host with a character outside
+  `^[A-Za-z0-9.-]+$` (a `SAFE_HOST` regex) and rejects `user:pass@` authorities,
+  BEFORE returning — so `android.net.Uri`'s permissive/percent-decoded `.host`
+  can no longer smuggle `"`, `;`, `{`, `}`, spaces, or decoded delimiters
+  downstream. Defense in depth: `MainActivity.loadWithRelay()` builds the
+  injected `window.__SECURE_CHAT_RELAY__` config with `org.json.JSONObject`
+  (proper escaping) instead of hand-interpolating a JS string literal.
+- **Finding 2 (Medium) — prefix-confusable origin check.**
+  `shouldOverrideUrlLoading` now compares the parsed `request.url.scheme`/`host`
+  to the app origin (`https` + `appHost`), not `startsWith(appOrigin)`, so
+  `https://secure-chat.internal.evil.com/…` is correctly treated as off-origin.
+- **Finding 3 (Low) — CSP corruption.** Covered by the Finding 1 host whitelist:
+  the value interpolated into `csp()` can no longer contain `;`/quotes/braces.
+- **Finding 4 (Low/docs) — non-unique origin.** The asset loader now calls
+  `.setDomain("secure-chat.internal")`, so the app serves from
+  `https://secure-chat.internal` — an origin unique to this app, not
+  androidx.webkit's shared `DEFAULT_DOMAIN`. `appOrigin`/`indexUrl`/`appHost`
+  in `MainActivity.kt`, `APP_WEBVIEW_ORIGIN` in `backend/config.py` (WS + CORS
+  allow-lists), and the `android/README.md` doc all updated in lockstep; the
+  stale config.py comment claiming the default domain uniquely identifies the
+  app is corrected.
+- **Informational should-fixes.** `WebView.setWebContentsDebuggingEnabled` is now
+  `if (BuildConfig.DEBUG)` (added `buildConfig = true` to `build.gradle.kts`);
+  `network_security_config.xml` sets `base-config cleartextTrafficPermitted=
+  "false"` and scopes cleartext to a `domain-config` of `127.0.0.1`/`localhost`/
+  `onion` only; `importMapHash` drift is now guarded by
+  `test_android_importmap_hash_matches` in `backend/tests/test_csp_hash.py`
+  (recomputes the hash from index.html, asserts the Kotlin constant matches,
+  skips when android/ isn't present so the backend stays standalone-testable).
+- **Tests / verification:** new `android/app/src/test/.../RelayUrlsTest.kt`
+  (Robolectric, so a REAL `android.net.Uri`) — 11 tests: legit https/loopback/
+  onion/trailing-slash parse correctly; the exact Finding 1 PoC payloads
+  (`http://y"};window.__pwn=1;%2f%2f`, percent-encoded `%2f%2f`/`%22`, and
+  literal quote/brace/semicolon/space hosts) are all rejected; plus
+  scheme/credentials/path-query-fragment/empty-host rejections.
+  `./gradlew testDebugUnitTest` → 11 passed, 0 failures. Debug APK still builds
+  clean (`./gradlew assembleDebug` BUILD SUCCESSFUL). Backend `pytest` = **57
+  passed** (was 56 + the new drift guard). Web client untouched.
+- **Remaining (unchanged):** on-device re-run of the app against the new origin
+  + the identity/safety-number gate for DHKE/RSA/PQKEM (needs the emulator);
+  app icon + release-signing config; OTP mode; Tor `.onion` deployment.
+
+### 2026-07-08 — Android app pentest: 1 Critical + 3 Medium/Low found (NOT yet fixed) 🔴
+Live pentest of the Android app on the same emulator used for on-device
+verification, following this project's usual "attack the running system, prove
+it with a live PoC" methodology. All four findings below are reproduced against
+the actual installed APK; none require jailbreak/root — `run-as` on a **debug**
+build stood in for "an attacker gets a value into `Prefs`", which for finding 1
+is realistic via the app's own Settings dialog (see reachability note).
+
+**Finding 1 — CRITICAL — relay-address string → arbitrary JS execution,
+pre-page-script, CSP-bypassing (full app compromise).**
+`RelayUrls.parse()` (`RelayUrls.kt`) validates a user-supplied "relay address"
+using only `android.net.Uri.parse(text)` — scheme must be http/https, host must
+be non-empty, and path/query/fragment must be absent. **`android.net.Uri` does
+NOT validate hostname characters.** Empirically confirmed on-device: `"`, `;`,
+`{`, `}`, and space all survive verbatim in `.host`; percent-encoding decodes
+into `.host` too (`%22`→`"`, `%3a`→`:`, `%2f`→`/`) *without* tripping the
+path/query rejection (the raw `%XX` bytes don't look like the real delimiter
+chars to the top-level splitter, so a percent-encoded `%2f%2f` becomes a
+literal `//` in the decoded host that the path check never saw coming).
+`MainActivity.loadWithRelay()` then string-interpolates the PARSED value,
+unescaped, into a JS snippet:
+```kotlin
+val js = "window.__SECURE_CHAT_RELAY__ = {api:\"${relay.httpOrigin}\", ws:\"${relay.wsOrigin}/ws\"};"
+```
+injected via `WebViewCompat.addDocumentStartJavaScript` — a mechanism that
+(by design, so it can run before any page script) is **not subject to the
+page's CSP**. The same unescaped value is also interpolated into the CSP
+header itself (`csp()`), but that's a secondary effect (see Finding 3) — the
+PRIMARY bypass is that `addDocumentStartJavaScript` doesn't consult CSP at all.
+- **PoC 1 (marker):** relay address
+  `http://y"};window.__pwn=1;%2f%2f` → after Uri decoding, httpOrigin becomes
+  `http://y"};window.__pwn=1;//`. Substituted into the template, `//` becomes
+  a JS line-comment eating the rest of the (single-line) injected script:
+  `window.__SECURE_CHAT_RELAY__ = {api:"http://y"};window.__pwn=1;//", ws:...`
+  parses as three clean statements (assign the object, `;`, `window.__pwn=1;`)
+  followed by a comment. **Confirmed live via CDP: `window.__pwn === 1`.**
+- **PoC 2 (real impact):** same technique, payload hooks
+  `crypto.subtle.importKey` before any page script runs, then the "Create
+  identity" / AES256-connect flow was driven for real. **Captured the actual
+  first 8 bytes of the user's typed secret**: `[115,117,112,101,114,32,115,101]`
+  = ASCII `"super se"` (from the passphrase "super secret victim passphrase"),
+  proving the injected code can intercept identity/passphrase key material as
+  the app derives it — a full break of the app's core security property
+  (client-side key custody) via its one user-configurable value.
+- **Reachability:** the ONLY way `Prefs` gets a relay value is the Settings
+  dialog's `RelayUrls.parse(input.text.toString())` (confirmed by reading
+  `MainActivity.kt` — no other write path exists). The realistic attack is
+  social engineering: an attacker hands the victim a "relay address" to paste
+  (a natural ask in this app — relays are meant to be shared), and the
+  malicious JS executes the moment they hit Save (`loadWithRelay(parsed)`
+  fires immediately with the freshly single-pass-parsed value, no restart
+  needed). Note: writing the value to `Prefs` via `run-as` (used for the PoCs,
+  since driving the native dialog's EditText through `adb shell input text`
+  with these characters fights two layers of shell escaping) exactly reproduces
+  what a successful dialog Save persists.
+- **Fix direction:** `RelayUrls.parse` must reject any host containing
+  characters outside a safe hostname charset (`[A-Za-z0-9.-]`, plus `[...]` for
+  literal IPv6 — or just reject IPv6 literals too, unneeded here) BEFORE
+  accepting it — don't rely on `Uri` alone. Independently, stop string-building
+  JSON/JS by hand: `JSONObject` (or a proper JS-string-escape helper) for the
+  injected config, and construct the CSP header via a list of validated tokens
+  rather than raw interpolation.
+
+**Finding 2 — Medium — `shouldOverrideUrlLoading` origin check is
+prefix-confusable (chainable off Finding 1).**
+```kotlin
+override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean =
+    request.url.toString().startsWith(appOrigin).not()
+```
+`"https://appassets.androidplatform.net.evil.com/x".startsWith("https://appassets.androidplatform.net")`
+is `true` — `startsWith` doesn't check for a following `/` or end-of-string.
+**Live-confirmed:** ran `location.href = "https://appassets.androidplatform.net.evil.com/probe"`
+via CDP inside the loaded page; `window.location.href` afterward was
+`chrome-error://chromewebdata/` — a real failed-navigation page, proving the
+WebView actually attempted to load the attacker-suffixed host (only failing
+because that specific fake domain doesn't resolve in DNS; a real
+attacker-owned domain would succeed). On its own this needs a script already
+running to trigger `location.href` — but Finding 1 supplies exactly that,
+so the two chain into "malicious relay string → JS execution → silent
+top-level navigation to an attacker page" as a single attack. Fix: compare
+`Uri.parse(request.url.toString()).host == "appassets.androidplatform.net"`
+(and scheme), not string-prefix matching.
+
+**Finding 3 — Low/robustness — the same unescaped relay value corrupts the CSP
+header.** `csp()` also interpolates `relay.httpOrigin`/`wsOrigin` unescaped
+into the `Content-Security-Policy` header value. A payload containing `;`
+splits it into bogus extra "directives" (confirmed via WebView console:
+`"The Content-Security-Policy directive name 'window.__pwn=1' contains one or
+more invalid characters"` etc.) — Chromium safely rejects the malformed
+directives, so this isn't itself an escape (script-src, set BEFORE
+connect-src in the string, is unaffected), but it can silently swallow the
+directives that come AFTER connect-src in the source (`img-src`, `base-uri`,
+`form-action`, `frame-ancestors`) if enough injected `;` shift the boundary,
+and/or break the app's OWN legitimate relay connection (connect-src ends up
+with no valid entries but `'self'`). Same fix as Finding 1 covers this too.
+
+**Finding 4 — Low/docs — `https://appassets.androidplatform.net` is
+`androidx.webkit`'s shared default domain, not unique to this app.**
+Verified directly from the library bytecode (`WebViewAssetLoader.class`):
+`public static final String DEFAULT_DOMAIN = "appassets.androidplatform.net"`,
+and `MainActivity.kt` never calls `.setDomain(...)`, so it uses this literal
+default. **Any other Android app** using `WebViewAssetLoader` with default
+settings presents an identical `Origin` header. `backend/config.py`'s comment
+on `APP_WEBVIEW_ORIGIN` — *"a single fixed value, not a wildcard, so
+allow-listing it does not open the relay to arbitrary web pages"* — is
+therefore not accurate: it doesn't uniquely gate "our app". **Impact is
+bounded, not ignored:** CORS only restricts browser/WebView-enforced
+`fetch()`; any native Android code could already hit `/api` with a raw HTTP
+client with no CORS involved at all, and `/api` is designed to expose nothing
+sensitive to an unauthenticated caller (token-gated lookup, signature-verified
+registration, no existence oracles — see the I1 closeout). So this doesn't
+grant a new capability, but the code comment's claim is false and should be
+corrected; fix by calling `.setDomain("secure-chat.internal")` (or similar) to
+make the origin genuinely unique, which closes the gap outright.
+
+**Verified negative (no finding):** `WebViewAssetLoader`'s `AssetsPathHandler`
+correctly rejects path traversal — tried literal `../`, `%2e%2e/`, `..%2f`,
+and `....//` variants against `/assets/web/...`; all either hard-failed
+("Failed to fetch") or cleanly 404'd, no content outside `assets/web/` leaked,
+while the legitimate `index.html` fetch succeeded normally. Also noted but not
+separately itemized (pre-existing, informational): `setWebContentsDebuggingEnabled(true)`
+is unconditional (not gated to debug builds — should be `if (BuildConfig.DEBUG)`
+before a release build ships); `network_security_config.xml`'s
+`cleartextTrafficPermitted="true"` is unscoped (any domain, not just
+loopback/.onion) though the Mixed-Content browser check is the actual gate in
+practice; `importMapHash` in `MainActivity.kt` is a hardcoded duplicate of the
+backend's value with no automated drift guard analogous to
+`backend/tests/test_csp_hash.py` (fails closed if it drifts — app breaks
+loudly rather than a security hole, but worth a guard).
+
+**Not yet fixed** — all four are on the TODO list below. Diagnostic code used
+to characterize `Uri.parse` behavior was added temporarily to
+`MainActivity.onCreate` during testing and fully reverted (`git diff` clean
+afterward); the device's `Prefs` was reset to a benign
+`http://127.0.0.1:8000` relay before finishing.
+
 ### 2026-07-08 — Android app verified ON-DEVICE + Mixed-Content fix ✅
 Installed the emulator (Android 14 `google_apis;x86_64`, KVM-accelerated) and
 ran the app on a real WebView. Findings + fixes:
@@ -879,6 +1606,133 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
   live integration suites, backend `pytest` 48 passed.
 
 ## TODO / NEXT (suggested order)
+
+### ⮕ PLAN (2026-07-17): contacts + web-of-trust + async 1:1 chats ("WhatsApp mode")
+User-requested feature set: a left drawer menu with two new views next to the
+existing live room — a **Users** list (known users + public keys + 3-level
+safety marks, securely stored on-device) and a **Chats** list (persistent 1:1
+chats, WhatsApp-style, no shared live room needed). Big change incl. backend
+(store-and-forward). Locked design decisions:
+
+- **Safety marks (trust levels):** 🟢 *verified by you* (you compared the
+  fingerprint/safety number in person — the existing verify gate or an explicit
+  action in the Users view); 🟡 *vouched* (a user YOU verified has published a
+  signed vouch for them; UI names the voucher); ⚪ *unverified*. Vouches are
+  dual-signed (Ed25519 + ML-DSA-65) statements over the target bundle,
+  published to / fetched from the directory. The server is never the trust
+  root — marks are computed client-side from signatures it can't forge.
+- **Contacts & chats at rest:** encrypted client-side under a key derived from
+  the identity passphrase (PBKDF2-600k → AES-256-GCM, own salt; key lives only
+  in memory while the identity is unlocked) — same posture as the identity
+  blob and OTP pads. Never plaintext in localStorage.
+- **Async E2EE (chats without a live room)** needs public ENCRYPTION keys in
+  the directory → **bundle v2**: identity adds P-256 ECDH + ML-KEM-768 public
+  keys, dual-signed at registration. Async chat modes: **SEALED** (default:
+  per-message ephemeral hybrid ECDH+ML-KEM → AES-256-GCM; sender identity +
+  dual signature INSIDE the ciphertext), **AES256** (shared passphrase),
+  **OTP** (pad). DHKE/RSA stay live-room-only (inherently interactive).
+- **Mode lock + negotiated change:** each chat is locked to one mode; a mode
+  change is an encrypted in-chat control message the peer must accept (both
+  directions signed); the chat renders it as system lines.
+- **Mailbox backend (store-and-forward):** server stores ONLY
+  (recipient, opaque ciphertext, arrival time) — sender is inside the sealed
+  envelope, invisible to the server. Hard caps: per-recipient message + byte
+  quota, global cap, TTL (~14 d), delete-on-fetch (auth: session token), own
+  rate bucket. No content, no sender metadata, no read receipts server-side.
+
+**Phases** (each ends verified: unit + live-browser + deploy; check off here):
+- [x] **P1 — client shell + contacts** — DONE 2026-07-17 (see dated entry):
+      drawer menu (Live room / Users / Chats placeholder), `contacts.js`
+      encrypted store (PBKDF2-600k → AES-GCM under the identity passphrase,
+      unlocked alongside the identity, wiped on identity-forget, key-change
+      resets `verified`), Users view (add by handle, fingerprint, 🟢/⚪ marks,
+      confirm-gated verify/unverify/remove, auto-🟢 from the live-room verify
+      gate + from a matching pin on add). Unit + live-browser verified;
+      deployed to Hetzner + phone.
+- [x] **P2 — web of trust** — DONE 2026-07-17 (see dated entry): vouch
+      endpoints (POST/DELETE `/api/vouch`, GET `/api/users/{u}/vouches`
+      token-gated), dual-sig verified server-side over the target's registered
+      bundle, caps (200/voucher, 200k total, 50/response); client publishes on
+      🟢 (opt-in confirm, requires login), retracts on Unverify, and computes
+      🟡 STRICTLY locally (voucher must be a contact I verified, server keys
+      must equal my pinned copy, dual sig over MY stored target bundle).
+      3 new backend tests; browser flow: alice vouches bob → carol (verified
+      alice) sees 🟡 "vouched by alice". Deployed to Hetzner + phone.
+- [x] **P3 — bundle v2 + sealed envelope** — DONE 2026-07-17 (see dated
+      entry): identity carries ECDH P-256 + ML-KEM-768 keypairs (blob v3;
+      pre-v3 blobs auto-upgrade on unlock and re-publish), registration v2
+      (own domain, dual sig covers enc keys; same-identity re-registration =
+      bundle refresh keeping the lookup token), new `sealed.js`
+      (hybrid HKDF→AES-GCM envelope, sealed sender + dual sig inside,
+      re-target/forgery/tamper refused). 5 new backend tests (65 total),
+      new `sealed.test.mjs`. Deployed.
+- [x] **P4 — mailbox + Chats view** — DONE 2026-07-17 (see dated entry):
+      `mailbox.py` store-and-forward (token-gated POST, login-gated
+      delete-on-fetch GET, size/inbox/global caps + 14d TTL + own rate
+      bucket; 5 tests, backend 70 passed); `chats.js` encrypted chat store;
+      Chats view (start-chat picker, chat list w/ marks + preview,
+      bubble conversation, 6s polling incl. auto-add of unknown senders from
+      the sealed handle). Browser-verified both directions; deployed.
+- [x] **P5 — mode lock + negotiated mode change** — DONE 2026-07-17 (see
+      dated entry): each chat is locked to SEALED or AES256; a change is a
+      signed control message the peer must accept/decline; AES256 adds an
+      inner AES-256-GCM layer under a per-chat passphrase inside the sealed
+      envelope. Browser-verified propose→accept→double-encrypted message;
+      deployed (APK rebuilt, phone reconnect pending).
+- [x] **P6 — hardening pass over the new surface** — DONE 2026-07-17 (see
+      dated entry): adversarial `pentest-p6.mjs` (vouch forgery, client 🟡
+      forge-resistance, mailbox enumeration/auth/cross-user isolation,
+      captured-envelope, chat sender spoofing) — all attacks refused, local
+      AND live. 3 live integration suites still green (no relay regression).
+      README documents contacts/WoT/chats. APK rebuilt. Live E2E on Hetzner.
+- [x] **MEDIUM — OTP concurrent pad use = two-time pad (2026-07-16 OTP pentest,
+      Finding 1)** — FIXED 2026-07-16 (see dated entry): a same-origin exclusive
+      lock (Web Locks API, localStorage-heartbeat fallback) is taken on connect;
+      a pad live in one tab refuses connect in any other. Live-verified (second
+      tab refused).
+- [x] **MEDIUM — OTP pad stored unencrypted at rest (2026-07-16 OTP pentest,
+      Finding 2)** — FIXED 2026-07-16: the pad bytes AND offsets are now stored
+      encrypted (PBKDF2-600k → AES-256-GCM) under a per-pad passphrase, unlocked
+      per session (PBKDF2 once; cached key for cheap per-message re-saves).
+      Offsets inside the GCM blob, so an attacker can't roll `sendOffset` back to
+      force reuse. Live-verified (blob has kdf/iv/ct only; wrong passphrase
+      refused).
+- [x] **LOW — OTP export file has no single-use/role binding (2026-07-16 OTP
+      pentest, Finding 3)** — FIXED 2026-07-16: re-export of an already-shared pad
+      warns and requires a confirming second click; import still dedups by padId
+      and shows a strong one-device-per-side warning. (Cross-device double-import
+      of a manually-copied file remains inherent without identities — documented.)
+- [x] **LOW/info — malicious/low-entropy imported pad downgrades the importer's
+      outbound confidentiality (2026-07-16 OTP pentest, Finding 4)** — FIXED
+      2026-07-16: `importPad` rejects a pad whose Shannon entropy is < 7.0
+      bits/byte (all-zero / grossly low-entropy). Live-verified.
+- [x] **CRITICAL — relay-address JS injection (2026-07-08 Android pentest,
+      Finding 1)** — FIXED 2026-07-16 (see dated entry): `RelayUrls.parse` now
+      whitelist-validates the host charset (`^[A-Za-z0-9.-]+$`) and rejects
+      credentials in the authority, before accepting; `MainActivity` builds the
+      injected relay config with `JSONObject` instead of hand-interpolation.
+      Regression tests (`RelayUrlsTest`, Robolectric) reject the live PoC
+      payloads against the real `android.net.Uri`.
+- [x] **Medium — `shouldOverrideUrlLoading` origin check is prefix-confusable
+      (2026-07-08 Android pentest, Finding 2)** — FIXED 2026-07-16: the check now
+      compares the PARSED `request.url` scheme+host to the app origin instead of
+      `startsWith`, so `…internal.evil.com` no longer matches.
+- [x] **Low — relay value also corrupts the CSP header (2026-07-08 Android
+      pentest, Finding 3)** — FIXED 2026-07-16 by the Finding 1 host whitelist
+      (the CSP interpolation can no longer receive `;`/quote/brace characters).
+- [x] **Low/docs — CORS/WS-origin allow-list entry for the app isn't unique
+      (2026-07-08 Android pentest, Finding 4)** — FIXED 2026-07-16: the app now
+      pins a unique virtual origin via `WebViewAssetLoader.setDomain(
+      "secure-chat.internal")`; `APP_WEBVIEW_ORIGIN` + `backend/config.py`'s
+      comment updated to match (comment no longer claims the shared default
+      domain uniquely identifies the app).
+- [x] **Should-fix (informational, same pentest)** — FIXED 2026-07-16:
+      `setWebContentsDebuggingEnabled` is now gated behind `BuildConfig.DEBUG`
+      (enabled `buildConfig` in build.gradle.kts); `network_security_config.xml`
+      scopes cleartext to loopback + `.onion` only (base-config now
+      `cleartextTrafficPermitted="false"`); `importMapHash` drift is guarded by
+      a new assertion in the backend's `test_csp_hash.py`
+      (`test_android_importmap_hash_matches`, skips if android/ absent).
 - [x] **Initialize git** in `~/secure-chat` and make the first commit — DONE
       (repo initialized on `master`; initial commit covers backend, client, and
       tests; `.venv`/`node_modules`/DBs/logs ignored).
@@ -919,8 +1773,16 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
       REMAINING: app icon, release-signing config, and an on-device pass of the
       identity + safety-number gate (DHKE/RSA/PQKEM; only AES256 driven on-device
       so far).
-- [ ] **OTP mode** (deferred) — pre-shared pad handling, pad consumption
-      tracking, never-reuse enforcement (all client-side).
+- [x] **OTP mode** — DONE (2026-07-16, see dated entry): true XOR one-time pad
+      (`OtpPad` in crypto.js) with two-region split (no reuse across senders),
+      strictly-increasing offsets (replay + cross-session replay rejected),
+      per-message one-time HMAC-SHA-256 authenticator, and forward-secrecy
+      zeroing of consumed bytes. Pad lifecycle in `otp.js`: CSPRNG + draw-to-
+      generate entropy, passphrase-encrypted export/import file for the in-person
+      exchange, localStorage persistence of bytes + offsets. UI + budget display
+      in app.js/index.html. Verified end-to-end in a real browser (generate →
+      export/import → two-way messaging → offsets persist → consumed bytes zeroed
+      at rest).
 - [ ] **Tor deployment** — hardened reverse setup, `.onion` service config,
       bind notes; never expose uvicorn directly to a public interface. Pairs
       with the app: point the relay at the `.onion`, add its origin via

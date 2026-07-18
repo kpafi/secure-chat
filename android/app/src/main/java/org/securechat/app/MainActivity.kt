@@ -4,6 +4,9 @@ import android.annotation.SuppressLint
 import android.net.Uri
 import android.os.Bundle
 import android.text.InputType
+import android.webkit.JsPromptResult
+import android.webkit.JsResult
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -16,6 +19,7 @@ import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import org.json.JSONObject
 import org.securechat.app.databinding.ActivityMainBinding
 
 /**
@@ -41,8 +45,14 @@ class MainActivity : AppCompatActivity() {
     private var relayScript: ScriptHandler? = null
 
     // Local secure origin the bundled client is served from. Treated as a secure
-    // context by WebView, so window.crypto.subtle is available.
-    private val appOrigin = "https://appassets.androidplatform.net"
+    // context by WebView, so window.crypto.subtle is available. We set an
+    // app-specific virtual domain (via WebViewAssetLoader.setDomain below) rather
+    // than androidx.webkit's shared DEFAULT_DOMAIN ("appassets.androidplatform.net",
+    // which every default WebViewAssetLoader app presents) so this origin uniquely
+    // identifies our app to the relay's WS/CORS allow-list — see 2026-07-08
+    // pentest Finding 4. It is a reserved-style name that never resolves publicly.
+    private val appHost = "secure-chat.internal"
+    private val appOrigin = "https://$appHost"
     private val indexUrl = "$appOrigin/assets/web/index.html"
 
     // SHA-256 of the inline import map in index.html, pinned in script-src. Must
@@ -56,6 +66,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         assetLoader = WebViewAssetLoader.Builder()
+            .setDomain(appHost)
             .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(this))
             .build()
 
@@ -75,7 +86,9 @@ class MainActivity : AppCompatActivity() {
             allowContentAccess = false
             cacheMode = android.webkit.WebSettings.LOAD_NO_CACHE
         }
-        WebView.setWebContentsDebuggingEnabled(true) // debug build aid
+        // Remote debugging exposes the WebView (and its localStorage identity
+        // blob) over the devtools socket — only ever in debug builds.
+        if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true)
 
         wv.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(
@@ -93,17 +106,79 @@ class MainActivity : AppCompatActivity() {
 
             // Keep every navigation inside the app origin; never hand a URL to an
             // external browser (the relay is reached via fetch/WebSocket, not nav).
+            // Match on the PARSED scheme+host, not a string prefix: startsWith
+            // would accept "https://secure-chat.internal.evil.com/..." and let the
+            // WebView navigate off-origin (2026-07-08 pentest Finding 2).
             override fun shouldOverrideUrlLoading(
                 view: WebView, request: WebResourceRequest,
-            ): Boolean = request.url.toString().startsWith(appOrigin).not()
+            ): Boolean {
+                val url = request.url
+                val sameOrigin = url.scheme == "https" && url.host == appHost
+                return !sameOrigin
+            }
+        }
+
+        // Without a WebChromeClient the WebView SUPPRESSES JavaScript dialogs:
+        // window.confirm()/prompt() return false/null immediately, so the
+        // client's confirmations (Forget identity, verify contact, mode change,
+        // pad passphrases) silently do nothing. Provide native dialogs so those
+        // flows work in the app exactly as they do in a browser. The messages
+        // are app-local (from our bundled client), never from the relay.
+        wv.webChromeClient = object : WebChromeClient() {
+            override fun onJsAlert(
+                view: WebView, url: String?, message: String?, result: JsResult,
+            ): Boolean {
+                AlertDialog.Builder(this@MainActivity)
+                    .setMessage(message)
+                    .setCancelable(false)
+                    .setPositiveButton(android.R.string.ok) { _, _ -> result.confirm() }
+                    .show()
+                return true
+            }
+
+            override fun onJsConfirm(
+                view: WebView, url: String?, message: String?, result: JsResult,
+            ): Boolean {
+                AlertDialog.Builder(this@MainActivity)
+                    .setMessage(message)
+                    .setCancelable(false)
+                    .setPositiveButton(android.R.string.ok) { _, _ -> result.confirm() }
+                    .setNegativeButton(android.R.string.cancel) { _, _ -> result.cancel() }
+                    .show()
+                return true
+            }
+
+            override fun onJsPrompt(
+                view: WebView, url: String?, message: String?, defaultValue: String?,
+                result: JsPromptResult,
+            ): Boolean {
+                val input = EditText(this@MainActivity).apply {
+                    inputType = InputType.TYPE_CLASS_TEXT
+                    setText(defaultValue ?: "")
+                }
+                AlertDialog.Builder(this@MainActivity)
+                    .setMessage(message)
+                    .setView(input)
+                    .setCancelable(false)
+                    .setPositiveButton(android.R.string.ok) { _, _ -> result.confirm(input.text.toString()) }
+                    .setNegativeButton(android.R.string.cancel) { _, _ -> result.cancel() }
+                    .show()
+                return true
+            }
         }
     }
 
     /** Point the client at [relay], (re)inject the config script, and load. */
     private fun loadWithRelay(relay: RelayUrls) {
         relayScript?.remove()
-        val js = "window.__SECURE_CHAT_RELAY__ = " +
-            "{api:\"${relay.httpOrigin}\", ws:\"${relay.wsOrigin}/ws\"};"
+        // Build the config as JSON so the origins are properly escaped rather than
+        // hand-interpolated into a JS string literal. RelayUrls.parse already
+        // whitelists the host charset (the primary fix), but escaping here means
+        // this injection point stays safe even if a raw value ever reaches it.
+        val config = JSONObject()
+            .put("api", relay.httpOrigin)
+            .put("ws", "${relay.wsOrigin}/ws")
+        val js = "window.__SECURE_CHAT_RELAY__ = $config;"
         if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
             relayScript = WebViewCompat.addDocumentStartJavaScript(
                 binding.webview, js, setOf(appOrigin),

@@ -35,6 +35,7 @@ def _reset_api_limiter():
     # client host, so otherwise the buckets would deplete across the suite).
     accounts._api_limiter._buckets.clear()
     accounts._lookup_limiter._buckets.clear()
+    accounts._challenge_limiter._buckets.clear()
     yield
 
 
@@ -278,3 +279,17 @@ def test_register_forbids_extra_fields():
     body["admin"] = True
     resp = client.post("/api/register", json=body)
     assert resp.status_code == 422
+
+
+def test_challenge_endpoint_is_rate_limited():
+    # M-03: a dedicated bucket caps challenge minting well below the general
+    # /api limiter. Burst = CHALLENGE_RATE_CAPACITY; the next one is 429.
+    accounts._challenge_limiter._buckets.clear()
+    _register("rl-user")
+    ok = 0
+    for _ in range(config.CHALLENGE_RATE_CAPACITY):
+        if client.post("/api/auth/challenge", json={"username": "rl-user"}).status_code == 200:
+            ok += 1
+    assert ok == config.CHALLENGE_RATE_CAPACITY
+    # The next challenge within the same burst is throttled.
+    assert client.post("/api/auth/challenge", json={"username": "rl-user"}).status_code == 429

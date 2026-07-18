@@ -17,6 +17,7 @@ android {
 
     buildFeatures {
         viewBinding = true
+        buildConfig = true // for BuildConfig.DEBUG (debug-only WebView remote debugging)
     }
 
     buildTypes {
@@ -54,4 +55,9 @@ dependencies {
     // WebViewAssetLoader (serves bundled assets as a secure https origin) and
     // addDocumentStartJavaScript (injects the relay config before page scripts).
     implementation("androidx.webkit:webkit:1.11.0")
+
+    // Local unit tests. Robolectric supplies a real android.net.Uri so the
+    // RelayUrls host-validation regression tests exercise the actual parser.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.12.2")
 }

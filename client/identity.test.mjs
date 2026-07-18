@@ -93,7 +93,11 @@ async function testLegacyBlobImport() {
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain));
   const legacy = JSON.stringify({ v: 1, salt: b64(salt), iv: b64(iv), ct: b64(ct) }); // no `iters`
   const back = await Identity.import(legacy, "pp");
-  assert.deepStrictEqual(back.publicBundle(), id.publicBundle(), "legacy v:1 blob imports via 310k fallback");
+  // The SIGNING identity must survive unchanged; the import also upgrades the
+  // blob with fresh encryption keys (bundle v2), so compare only ed/mldsa.
+  assert.strictEqual(back.publicBundle().ed, id.publicBundle().ed, "legacy v:1 blob imports via 310k fallback (ed)");
+  assert.strictEqual(back.publicBundle().mldsa, id.publicBundle().mldsa, "legacy v:1 blob imports via 310k fallback (mldsa)");
+  assert.ok(back.upgraded && back.publicBundle().ecdh, "legacy blob is upgraded with encryption keys");
   console.log("OK  legacy (v:1, 310k) identity backup still imports");
 }
 
