@@ -15,6 +15,7 @@
     </header>
 
     <nav id="drawer" class="drawer" hidden>
+      <button type="button" class="navitem" data-view="profile">👤 Profile</button>
       <button type="button" class="navitem active" data-view="live">🔒 Live room</button>
       <button type="button" class="navitem" data-view="users">👥 Users</button>
       <button type="button" class="navitem" data-view="chats">💬 Chats</button>
@@ -226,6 +227,58 @@
     </div><!-- /viewLive -->
 
     <!-- View: users (known keys + trust) -->
+    <!-- View: profile (your own identity, presentation-only) -->
+    <div id="viewProfile" class="view" hidden>
+      <p class="step">Profile — your identity on this device</p>
+
+      <section class="panel">
+        <div id="profileLocked">
+          <p class="hint">
+            Your profile shows the identity stored on this device.
+            Unlock (or create) your identity in the Live room view first.
+          </p>
+        </div>
+        <div id="profileUnlocked" hidden>
+          <div class="row">
+            <label>Name</label>
+            <p class="hint" id="profileName"></p>
+          </div>
+          <div class="row myhandle">
+            <label>Your handle — share it so others can add you</label>
+            <p class="hint" id="profileHandleText"></p>
+            <div class="inline" id="profileHandleActions" hidden>
+              <button id="profileCopyHandle" type="button">Copy handle</button>
+              <button id="profileCopyInvite" type="button">Copy invite link</button>
+            </div>
+          </div>
+          <div class="row" id="profileQrRow" hidden>
+            <label>Invite QR — a contact scans this to add you</label>
+            <canvas id="profileQr" class="profile-qr" aria-label="QR code of your invite link"></canvas>
+            <p class="hint">
+              Scanning only pre-fills your handle on their device — they still
+              verify you by comparing fingerprints in person.
+            </p>
+          </div>
+          <div class="row">
+            <label>Fingerprint — what contacts compare with you in person</label>
+            <p class="safety" id="profileFingerprint"></p>
+          </div>
+          <div class="row">
+            <label>Keys</label>
+            <p class="hint" id="profileKeys"></p>
+          </div>
+          <div class="row">
+            <label>Status</label>
+            <p class="hint" id="profileStatus"></p>
+          </div>
+          <div class="inline">
+            <button id="profileExport" type="button">Copy backup</button>
+            <button id="profileForget" type="button" class="danger">Forget identity</button>
+          </div>
+        </div>
+      </section>
+    </div><!-- /viewProfile -->
+
     <div id="viewUsers" class="view" hidden>
       <p class="step">Users — known public keys &amp; trust</p>
 
@@ -314,7 +367,7 @@
     </div><!-- /viewChats -->
   </main>
 
-  <script type="importmap">{"imports":{"@noble/post-quantum/":"./vendor/@noble/post-quantum/","@noble/hashes/":"./vendor/@noble/hashes/","@noble/curves/":"./vendor/@noble/curves/"}}</script>
+  <script type="importmap">{"imports":{"@noble/post-quantum/":"./vendor/@noble/post-quantum/","@noble/hashes/":"./vendor/@noble/hashes/","@noble/curves/":"./vendor/@noble/curves/","lean-qr":"./vendor/lean-qr/index.mjs"}}</script>
   <script type="module" src="app.js"></script>
 </body>
 </html>

@@ -3,6 +3,36 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
+## ⮕ RESUME HERE (snapshot as of 2026-07-18, Profile tab shipped)
+**The 👤 Profile tab (drawer TODO below) is BUILT, VERIFIED, DEPLOYED, and in
+the APK.** New drawer entry (first, before Live room) → a presentation-only
+view that reads existing unlocked-identity state: **Name** (registered
+username or "not registered yet"), **Handle** with **Copy handle** / **Copy
+invite link** (the Users-view helpers were factored into a shared
+`renderHandleInto()` + the copy wiring reused), an **invite QR** (new vendored
+`lean-qr`, `client/vendor/lean-qr/index.mjs`, added to the importmap — no CDN,
+CSP-safe), the four-key **fingerprint** (`identity.fingerprint()`), **key
+details** (Ed25519 + ML-DSA-65 / ECDH P-256 + ML-KEM-768), a **status line**
+(unlocked · registered? · logged in? · N saved users), and the **Copy backup /
+Forget identity** actions surfaced here too. Locked state shows the same
+"unlock in Live room first" hint as Users/Chats. All `textContent`, no new
+network calls or trust surface.
+
+**Importmap changed → CSP hash regenerated** to
+`sha256-6Sm2nhNvoa7gr7uuY2hbAbpdWhIlL15/wXLm4dhO9UQ=` in BOTH `backend/main.py`
+and `android/.../MainActivity.kt` (guarded by `test_csp_hash.py`, which passes).
+
+**Verified:** new `scratchpad/verify-sc/profile-flow.mjs` (two-context
+Chromium) — locked-before-unlock, pre/post-registration fields, key details,
+status line, copy buttons present, and the rendered **invite QR decodes back to
+the exact invite link** (jsQR). Green LOCAL and LIVE. Offline suites +
+backend 76/76 + H-01 flow still green (no nav regression from adding the tab).
+**DEPLOYED to Hetzner** (rsync + the `chown securechat` step + restart;
+confirmed live: Profile nav, vendored lean-qr 200, served CSP hash matches,
+profile flow green against production). **APK rebuilt** (5.8 MB, bundles the
+Profile view + lean-qr; unit tests green) — `adb install -r
+android/app/build/outputs/apk/debug/app-debug.apk` when the phone is back.
+
 ## ⮕ RESUME HERE (snapshot as of 2026-07-18, Codex-Terra audit fixes)
 **A second external audit ("Codex Terra", pushed to GitHub as
 `secure-chat-security-audit-2026-07-18.md`, auditing commit 70bbfcc) found
@@ -1702,7 +1732,11 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
 
 ## TODO / NEXT (suggested order)
 
-### ⮕ NEW (2026-07-18, user-requested): Profile tab in the left drawer
+### ✅ DONE (2026-07-18): Profile tab in the left drawer
+**SHIPPED — see the "Profile tab shipped" snapshot at the top.** Built with ALL
+the suggested additions (QR, key details, status line, identity actions,
+saved-users count). What follows is the original spec, kept for reference.
+
 Add a **👤 Profile** view to the drawer menu (alongside Live room / Users /
 Chats — probably first) that shows the user's OWN data in one place. Read-only
 display of what's already in memory when the identity is unlocked; no new crypto.

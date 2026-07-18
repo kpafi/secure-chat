@@ -8,6 +8,7 @@
     "test": "node crypto.test.mjs && node identity.test.mjs && node contacts.test.mjs && node sealed.test.mjs && node otp-rollback.test.mjs"
   },
   "dependencies": {
-    "@noble/post-quantum": "^0.6.1"
+    "@noble/post-quantum": "^0.6.1",
+    "lean-qr": "^2.7.2"
   }
 }

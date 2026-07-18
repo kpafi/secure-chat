@@ -58,7 +58,7 @@ class MainActivity : AppCompatActivity() {
     // SHA-256 of the inline import map in index.html, pinned in script-src. Must
     // match the value the backend serves (guarded there by test_csp_hash.py); it
     // is identical because the bundled index.html is a copy of the web one.
-    private val importMapHash = "sha256-8alK18bvJunVDTi6IeRPvle6KjTYfSgRbp5alxxa+M8="
+    private val importMapHash = "sha256-6Sm2nhNvoa7gr7uuY2hbAbpdWhIlL15/wXLm4dhO9UQ="
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)

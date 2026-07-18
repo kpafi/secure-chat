@@ -316,4 +316,18 @@ button#otpImport, button#otpExport { background: #21262d; color: var(--fg); bord
 
 /* "Your handle" share block in the Users view */
 .myhandle { padding: 0.6rem 0.75rem; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; }
+
+/* Invite QR in the Profile view: white quiet-zone card, pixelated upscale so
+   the small module grid stays crisp when enlarged. */
+.profile-qr {
+  display: block;
+  width: 200px;
+  max-width: 100%;
+  height: auto;
+  image-rendering: pixelated;
+  background: #fff;
+  padding: 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+}
 #myHandleText { word-break: break-all; margin: 0.3rem 0; }

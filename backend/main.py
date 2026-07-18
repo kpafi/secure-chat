@@ -137,7 +137,7 @@ async def security_headers(request: Request, call_next):
     # hash must be regenerated to match.
     resp.headers["Content-Security-Policy"] = (
         "default-src 'none'; "
-        "script-src 'self' 'sha256-8alK18bvJunVDTi6IeRPvle6KjTYfSgRbp5alxxa+M8='; "
+        "script-src 'self' 'sha256-6Sm2nhNvoa7gr7uuY2hbAbpdWhIlL15/wXLm4dhO9UQ='; "
         "style-src 'self'; "
         "connect-src 'self'; "
         "img-src 'self' data:; "

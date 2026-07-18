@@ -26,6 +26,7 @@ import * as otp from "./otp.js";
 import * as contacts from "./contacts.js";
 import * as chats from "./chats.js";
 import * as sealed from "./sealed.js";
+import { generate as qrGenerate } from "lean-qr";
 
 const $ = (id) => document.getElementById(id);
 const els = {
@@ -61,6 +62,16 @@ const els = {
   // drawer menu + views
   menuBtn: $("menuBtn"), drawer: $("drawer"), scrim: $("scrim"),
   viewLive: $("viewLive"), viewUsers: $("viewUsers"), viewChats: $("viewChats"),
+  viewProfile: $("viewProfile"),
+  // profile view
+  profileLocked: $("profileLocked"), profileUnlocked: $("profileUnlocked"),
+  profileName: $("profileName"), profileHandleText: $("profileHandleText"),
+  profileHandleActions: $("profileHandleActions"),
+  profileCopyHandle: $("profileCopyHandle"), profileCopyInvite: $("profileCopyInvite"),
+  profileQrRow: $("profileQrRow"), profileQr: $("profileQr"),
+  profileFingerprint: $("profileFingerprint"), profileKeys: $("profileKeys"),
+  profileStatus: $("profileStatus"),
+  profileExport: $("profileExport"), profileForget: $("profileForget"),
   // users view
   usersLocked: $("usersLocked"), usersUnlocked: $("usersUnlocked"),
   addHandle: $("addHandle"), addContact: $("addContact"),
@@ -198,6 +209,7 @@ function setDrawer(open) {
 }
 
 function showView(name) {
+  els.viewProfile.hidden = name !== "profile";
   els.viewLive.hidden = name !== "live";
   els.viewUsers.hidden = name !== "users";
   els.viewChats.hidden = name !== "chats";
@@ -205,6 +217,7 @@ function showView(name) {
     b.classList.toggle("active", b.dataset.view === name);
   }
   setDrawer(false);
+  if (name === "profile") renderProfile();
   if (name === "users") refreshUsers();
   if (name === "chats") {
     refreshChats();
@@ -499,17 +512,80 @@ function inviteLink(handle) {
   return location.origin + location.pathname + "#add=" + encodeURIComponent(handle);
 }
 
-function renderMyHandle() {
+// Render "your handle" into a text element + toggle its copy actions. Shared by
+// the Users view and the Profile view so both stay identical (one source).
+function renderHandleInto(textEl, actionsEl) {
   const h = myHandle();
   if (h) {
-    els.myHandleText.textContent = h;
-    els.myHandleText.className = "hint ok";
-    els.myHandleActions.hidden = false;
+    textEl.textContent = h;
+    textEl.className = "hint ok";
+    if (actionsEl) actionsEl.hidden = false;
   } else {
-    els.myHandleText.textContent =
+    textEl.textContent =
       "Register a username in the Live room (Step 1) to get a shareable handle.";
-    els.myHandleText.className = "hint";
-    els.myHandleActions.hidden = true;
+    textEl.className = "hint";
+    if (actionsEl) actionsEl.hidden = true;
+  }
+  return h;
+}
+
+function renderMyHandle() {
+  renderHandleInto(els.myHandleText, els.myHandleActions);
+}
+
+// ---- profile view (presentation-only: shows existing local state) ---------
+// Adds no network calls and no new trust surface; the handle/fingerprint shown
+// are already public-shareable. textContent only, matching the rest of app.js.
+function renderProfile() {
+  const unlocked = !!identity;
+  els.profileLocked.hidden = unlocked;
+  els.profileUnlocked.hidden = !unlocked;
+  if (!unlocked) return;
+
+  // Name (registered username, or not-yet-registered).
+  const name = localStorage.getItem(LS_USERNAME);
+  els.profileName.textContent = name || "not registered yet";
+  els.profileName.className = "hint" + (name ? " ok" : "");
+
+  // Handle + copy/invite (shared with the Users view) and the invite QR.
+  const h = renderHandleInto(els.profileHandleText, els.profileHandleActions);
+  if (h) {
+    els.profileQrRow.hidden = false;
+    drawInviteQr(inviteLink(h));
+  } else {
+    els.profileQrRow.hidden = true;
+  }
+
+  // Fingerprint — the string contacts compare in person (all four keys, H-01).
+  els.profileFingerprint.textContent = "…";
+  identity.fingerprint().then((fp) => { els.profileFingerprint.textContent = fp; });
+
+  // Key details.
+  els.profileKeys.textContent =
+    "Signing: Ed25519 + ML-DSA-65 · Encryption: ECDH P-256 + ML-KEM-768";
+
+  // Status line.
+  const parts = ["identity unlocked"];
+  parts.push(name ? "registered" : "not registered");
+  parts.push(apiToken ? "logged in (mailbox reachable)" : "not logged in");
+  let n = 0;
+  try { if (contacts.isUnlocked()) n = contacts.list().length; } catch { /* locked */ }
+  parts.push(`${n} saved ${n === 1 ? "user" : "users"}`);
+  els.profileStatus.textContent = parts.join(" · ");
+}
+
+// Render the invite link as a QR into the profile canvas (lean-qr, vendored —
+// no network, CSP-safe). Wrapped so a QR failure never blocks the rest of the
+// view.
+function drawInviteQr(link) {
+  try {
+    const code = qrGenerate(link);
+    code.toCanvas(els.profileQr, {
+      on: [0, 0, 0, 255],
+      off: [0, 0, 0, 0],
+    });
+  } catch {
+    els.profileQrRow.hidden = true;
   }
 }
 
@@ -1870,6 +1946,21 @@ els.copyHandle.addEventListener("click", () => {
 els.copyInvite.addEventListener("click", () => {
   const h = myHandle();
   if (h) copyToClipboard(els.copyInvite, inviteLink(h));
+});
+
+// Profile view: same share controls + the identity actions surfaced here too.
+els.profileCopyHandle.addEventListener("click", () => {
+  const h = myHandle();
+  if (h) copyToClipboard(els.profileCopyHandle, h);
+});
+els.profileCopyInvite.addEventListener("click", () => {
+  const h = myHandle();
+  if (h) copyToClipboard(els.profileCopyInvite, inviteLink(h));
+});
+els.profileExport.addEventListener("click", exportIdentity);
+els.profileForget.addEventListener("click", async () => {
+  await forgetIdentity();
+  renderProfile(); // reflect the now-locked state without leaving the view
 });
 
 // chats view
