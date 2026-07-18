@@ -52,6 +52,24 @@ async function testFingerprints() {
   const sn2 = await Identity.safetyNumber(b.publicBundle(), a.publicBundle());
   assert.strictEqual(sn1, sn2, "safety number is order-independent");
   console.log("OK  fingerprint + safety number (sample SN: " + sn1.slice(0, 23) + " …)");
+
+  // Audit 2026-07-18 H-01 regression: the fingerprint must change when ANY of
+  // the four public keys changes — including the encryption keys that seal
+  // async messages, not just the signing identity.
+  const base = a.publicBundle();
+  const donor = b.publicBundle();
+  for (const key of ["ed", "mldsa", "ecdh", "mlkem"]) {
+    const swapped = { ...base, [key]: donor[key] };
+    assert.notStrictEqual(
+      await Identity.fingerprintOf(swapped), fpA1,
+      `fingerprint changes when ${key} changes`,
+    );
+    assert.notStrictEqual(
+      await Identity.safetyNumber(swapped, donor), sn1,
+      `safety number changes when ${key} changes`,
+    );
+  }
+  console.log("OK  fingerprint/safety number cover all four keys (H-01)");
 }
 
 async function testExportImport() {
@@ -71,6 +89,26 @@ async function testExportImport() {
   }
   assert.ok(failed, "wrong passphrase rejected");
   console.log("OK  identity encrypted export/import (PBKDF2 + AES-256-GCM)");
+
+  // Audit 2026-07-18 L-01: KDF parameters from the (external) backup file are
+  // bounded BEFORE PBKDF2 runs — a crafted file must not stall the UI (huge
+  // count), weaken the KDF (tiny count), or drive large allocations (size).
+  const crafted = JSON.parse(blob);
+  // (falsy `iters` falls back to the legacy 310k default — safe — so only
+  // truthy out-of-bounds values are expected to hit the parameter check)
+  for (const iters of [2_000_000_000, 1000, -1, 1.5, "600000"]) {
+    await assert.rejects(
+      Identity.import(JSON.stringify({ ...crafted, iters }), "strong device passphrase"),
+      /key-derivation/,
+      `iters=${iters} rejected before PBKDF2`,
+    );
+  }
+  await assert.rejects(
+    Identity.import("x".repeat(300 * 1024), "strong device passphrase"),
+    /identity backup/,
+    "oversized backup file rejected before parsing",
+  );
+  console.log("OK  L-01: crafted KDF parameters / oversized backup rejected");
 }
 
 async function testLegacyBlobImport() {

@@ -155,7 +155,17 @@ function savePin(key, bundle) {
   if (contacts.isUnlocked()) return contacts.savePin(key, bundle);
   return Promise.resolve();
 }
+// Audit 2026-07-18 H-01: bundle equality covers ALL FOUR public keys,
+// normalized so missing and present never compare equal — a swapped or newly
+// appeared ecdh/mlkem pair must never ride under an existing match.
 function sameBundle(a, b) {
+  return !!a && !!b && a.ed === b.ed && a.mldsa === b.mldsa &&
+    (a.ecdh ?? null) === (b.ecdh ?? null) &&
+    (a.mlkem ?? null) === (b.mlkem ?? null);
+}
+// Signing-only equality, used ONLY to tell "same identity, pin predates
+// encryption-key coverage" apart from a full identity change in the pin flow.
+function sameSigning(a, b) {
   return !!a && !!b && a.ed === b.ed && a.mldsa === b.mldsa;
 }
 
@@ -554,12 +564,23 @@ function renderUserList() {
       warn.className = "hint err";
       warn.textContent = "⚠ this user's key CHANGED since you saved them — re-verify in person before trusting";
       li.appendChild(warn);
+    } else if (c.reverify && !c.verified) {
+      // Set by the H-01 store migration: the old 🟢 was compared against a
+      // fingerprint that did not cover the encryption keys.
+      const warn = document.createElement("div");
+      warn.className = "hint err";
+      warn.textContent = "⚠ verification reset — the fingerprint format now also covers this user's encryption keys; compare it again in person";
+      li.appendChild(warn);
     }
 
     const fp = document.createElement("div");
     fp.className = "u-fp";
     fp.textContent = "fingerprint: …";
-    Identity.fingerprintOf({ ed: c.ed, mldsa: c.mldsa }).then((f) => {
+    // Full four-key fingerprint (audit 2026-07-18 H-01): the value the user
+    // compares in person must also cover the keys that seal async messages.
+    Identity.fingerprintOf({
+      ed: c.ed, mldsa: c.mldsa, ecdh: c.ecdh ?? null, mlkem: c.mlkem ?? null,
+    }).then((f) => {
       fp.textContent = "fingerprint: " + f;
     });
     li.appendChild(fp);
@@ -1423,7 +1444,20 @@ async function enterVerification(room, verifiedBundle) {
   }
 
   els.verify.hidden = false;
-  if (pin) {
+  if (pin && sameSigning(pin, bundle) && pin.ecdh == null && pin.mlkem == null &&
+      (bundle.ecdh || bundle.mlkem)) {
+    // Audit 2026-07-18 H-01: a pre-fix pin covered only the signing keys. The
+    // signing identity matches, but the encryption keys now presented were
+    // never part of what was verified — treat the pin as NOT sufficient and
+    // require a fresh in-person check (the safety number now covers all keys).
+    els.verify.classList.add("changed");
+    els.verifyTitle.textContent = "Re-verify this contact — your saved pin predates encryption-key checks";
+    els.verifyHint.textContent =
+      "Your earlier verification did not cover the keys now used to encrypt messages to this contact. " +
+      "Compare the safety number with them in person (or over a call where you recognise their voice) " +
+      "before proceeding.";
+    addLine("sys", "", "[pin predates encryption-key coverage — re-verification required]");
+  } else if (pin) {
     // A pin exists but the key changed: loud warning, require re-verification.
     els.verify.classList.add("changed");
     els.verifyTitle.textContent = "⚠ Contact identity key CHANGED — re-verify in person";

@@ -38,7 +38,19 @@ function unb64(s) {
   return u;
 }
 
+// Audit 2026-07-18 L-01: `iters`/`salt` come from the persisted blob — bound
+// them before WebCrypto runs (huge count = UI stalled for hours; tiny count =
+// silently weakened KDF). Same bounds as identity.js.
+const KDF_MIN_ITERS = 100000;
+const KDF_MAX_ITERS = 5000000;
+
 async function deriveKey(passphrase, salt, iters) {
+  if (!Number.isInteger(iters) || iters < KDF_MIN_ITERS || iters > KDF_MAX_ITERS) {
+    throw new Error("invalid key-derivation parameters (iteration count)");
+  }
+  if (!(salt instanceof Uint8Array) || salt.length < 8 || salt.length > 64) {
+    throw new Error("invalid key-derivation parameters (salt)");
+  }
   const base = await crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
   return crypto.subtle.deriveKey(
     { name: "PBKDF2", salt, iterations: iters, hash: "SHA-256" },

@@ -152,8 +152,17 @@ class MainActivity : AppCompatActivity() {
                 view: WebView, url: String?, message: String?, defaultValue: String?,
                 result: JsPromptResult,
             ): Boolean {
+                // Audit 2026-07-18 L-02: the client requests chat passphrases via
+                // window.prompt(); a plain text field shows them to anyone
+                // shoulder-surfing. Mask the input whenever the (app-local,
+                // bundled-client-controlled) message asks for a passphrase.
+                val secret = message?.contains("passphrase", ignoreCase = true) == true
                 val input = EditText(this@MainActivity).apply {
-                    inputType = InputType.TYPE_CLASS_TEXT
+                    inputType = if (secret) {
+                        InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                    } else {
+                        InputType.TYPE_CLASS_TEXT
+                    }
                     setText(defaultValue ?: "")
                 }
                 AlertDialog.Builder(this@MainActivity)

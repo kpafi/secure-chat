@@ -3,6 +3,63 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
+## ⮕ RESUME HERE (snapshot as of 2026-07-18, Codex-Terra audit fixes)
+**A second external audit ("Codex Terra", pushed to GitHub as
+`secure-chat-security-audit-2026-07-18.md`, auditing commit 70bbfcc) found
+1 High + 3 Medium + 3 Low. ALL 7 ARE FIXED AND TESTED LOCALLY; the Hetzner
+deploy is still PENDING (the deploy commands were blocked by the session's
+permission system — see DEPLOY TODO below).**
+
+- **H-01 (async keys not fully bound into verification):** contact-list
+  fingerprint now covers all four keys (`app.js` renderUserList);
+  `sameBundle` compares all four normalized (`?? null`); pins store all four
+  keys (`contacts.savePin`); `contacts.upsert` treats missing→present as a
+  real key change; store blob v2→v3 migration downgrades 🟢 contacts that
+  have enc keys (verified against the old signing-only fingerprint) to ⚪
+  with a `reverify` UI hint; handshake distinguishes "pin predates
+  encryption-key coverage" (specific re-verify prompt) from a real key
+  change. Regression tests in `contacts.test.mjs` (5 new) +
+  `identity.test.mjs` (per-key fingerprint/SN change) — all green. Full
+  two-context Chromium flow green (handshake → verify → pin → reconnect
+  silently accepted → messaging), harness
+  `scratchpad/verify-sc/h01-flow.mjs`.
+- **M-01 (Starlette host-header bypass of the dev-file gate):** middleware
+  now gates on `request.scope["path"]`; Starlette upgraded (see M-02); new
+  `backend/tests/test_static_hardening.py` (malicious-Host 404s, version
+  floor, cheap pathological Range) — verified live on a running local server
+  with curl.
+- **M-02 (Starlette Range CPU DoS, CVE-2025-62727):** FastAPI 0.139.2 +
+  Starlette 1.3.1 (also covers M-01's GHSA-86qp-5c8j-p5mr), cryptography
+  49.0.0, uvicorn 0.51.0 etc. — exact pins in `requirements.txt`, hashed
+  lockfile `requirements.lock` (pip-compile --generate-hashes). Backend
+  suite 76/76 green on the new stack, installed `--require-hashes`.
+- **M-03 (WS 16 MiB buffered before the 64 KiB app check):** uvicorn now
+  runs with `--ws-max-size 66560` (run.sh; MUST also be added to the
+  systemd unit ExecStart on deploy). Live-tested: 1 MiB frame → hard close
+  1009, no buffering.
+- **L-01 (unbounded PBKDF2 iters):** all four `deriveKey`s
+  (identity/contacts/chats/otp) enforce integer iters ∈ [100k, 5M] and salt
+  8–64 bytes BEFORE WebCrypto; identity backup capped 256 KiB, pad file
+  capped 4 MiB before JSON.parse. Tests in identity/contacts suites.
+- **L-02 (Android prompt shows passphrases):** `onJsPrompt` masks input
+  (TYPE_TEXT_VARIATION_PASSWORD) when the app-local message asks for a
+  passphrase. APK rebuilt (5.8 MB, bundles the new client) — `adb install
+  -r android/app/build/outputs/apk/debug/app-debug.apk` when the phone is
+  back.
+- **L-03 (dependency hardening):** Python exact pins + hashed lock (above);
+  gradle wrapper pinned via `distributionSha256Sum`; Gradle dependency
+  verification enabled (`android/gradle/verification-metadata.xml`, 631
+  sha256 entries — builds fail on any unpinned/tampered artifact).
+
+**DEPLOY TODO (blocked, do next):** (1) rsync backend+client to the box
+(exclude `.venv`, keep the usual excludes + `package*.json`/`*.test.mjs`);
+(2) `venv/bin/pip install --require-hashes -r
+/opt/secure-chat/backend/requirements.lock`; (3) add `--ws-max-size 66560`
+to ExecStart in `secure-chat.service`, `systemctl daemon-reload && systemctl
+restart secure-chat`; (4) re-run the 3 live integration suites + live 404 /
+oversize-frame checks. Also PENDING: backport of M-01/M-02/M-03/L-01 (+
+four-key pins) to `~/secure-chat-live`.
+
 ## ⮕ RESUME HERE (snapshot as of 2026-07-18, later)
 **Repos split + published to GitHub.** The project now has TWO git repos:
 this full one (`~/secure-chat` → `github.com/kpafi/secure-chat`) and a

@@ -178,6 +178,13 @@ export class Identity {
   }
 
   static async import(blob, passphrase) {
+    // Audit 2026-07-18 L-01: cap the file before any parsing/decoding. A
+    // genuine backup (incl. ML-DSA/ML-KEM private material) is well under
+    // 64 KiB; 256 KiB leaves room for future fields without letting a crafted
+    // file drive large JSON/base64 allocations.
+    if (typeof blob !== "string" || blob.length > 256 * 1024) {
+      throw new Error("not a valid identity backup file");
+    }
     const { salt, iv, ct, iters } = JSON.parse(blob);
     const key = await deriveKey(passphrase, unb64(salt), iters || 310000);
     let plain;
@@ -266,7 +273,25 @@ export class Identity {
 // PBKDF2-SHA256 work factor for identity-at-rest (OWASP 2023 guidance).
 const KDF_ITERS = 600000;
 
+// Audit 2026-07-18 L-01: `iters`/`salt` reach deriveKey from imported backup
+// files and persistent storage. Bound them BEFORE WebCrypto runs — a crafted
+// blob with a huge count would stall the UI for hours, a tiny one would
+// silently weaken the KDF. The floor sits below the oldest legacy count
+// (310k) so every genuine blob still opens.
+const KDF_MIN_ITERS = 100000;
+const KDF_MAX_ITERS = 5000000;
+
+function checkKdfParams(salt, iters) {
+  if (!Number.isInteger(iters) || iters < KDF_MIN_ITERS || iters > KDF_MAX_ITERS) {
+    throw new Error("invalid key-derivation parameters (iteration count)");
+  }
+  if (!(salt instanceof Uint8Array) || salt.length < 8 || salt.length > 64) {
+    throw new Error("invalid key-derivation parameters (salt)");
+  }
+}
+
 async function deriveKey(passphrase, salt, iters = KDF_ITERS) {
+  checkKdfParams(salt, iters);
   const base = await crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
   return crypto.subtle.deriveKey(
     { name: "PBKDF2", salt, iterations: iters, hash: "SHA-256" },

@@ -115,7 +115,11 @@ def _is_blocked_static(path: str) -> bool:
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    if _is_blocked_static(request.url.path):
+    # Audit 2026-07-18 M-01: decide on the raw ASGI path, NOT request.url.path.
+    # Affected Starlette versions reconstruct `url` using the client-controlled
+    # Host header, which can desync it from the routed path and bypass this
+    # gate (GHSA-86qp-5c8j-p5mr). scope["path"] is what routing actually uses.
+    if _is_blocked_static(request.scope["path"]):
         return Response(status_code=404)
     resp: Response = await call_next(request)
     resp.headers["X-Content-Type-Options"] = "nosniff"

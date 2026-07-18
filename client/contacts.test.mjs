@@ -82,4 +82,77 @@ await contacts.remove("alice");
 assert.strictEqual(contacts.list().length, 0);
 console.log("OK  remove");
 
+// ---- Audit 2026-07-18 H-01 regressions ------------------------------------
+
+// A verified contact saved WITHOUT encryption keys must lose verification the
+// moment encryption keys first appear (missing→present is a real key change).
+await contacts.upsert({ username: "carol", token: "tok-c", ed: "EDC==", mldsa: "MLC==", verified: true });
+assert.strictEqual(contacts.get("carol").verified, true);
+await contacts.upsert({ username: "carol", ed: "EDC==", mldsa: "MLC==", ecdh: "ECX==", mlkem: "KMX==" });
+assert.strictEqual(contacts.get("carol").verified, false, "new enc keys drop verified");
+assert.ok(contacts.get("carol").keyChangedAt, "enc-key appearance recorded as key change");
+console.log("OK  H-01: encryption keys appearing drops verification");
+
+// Changing ONLY one encryption key on a fully-keyed verified contact drops it.
+await contacts.setVerified("carol", true);
+await contacts.upsert({ username: "carol", ed: "EDC==", mldsa: "MLC==", ecdh: "ECY==", mlkem: "KMX==" });
+assert.strictEqual(contacts.get("carol").verified, false, "ecdh change drops verified");
+await contacts.setVerified("carol", true);
+await contacts.upsert({ username: "carol", ed: "EDC==", mldsa: "MLC==", ecdh: "ECY==", mlkem: "KMY==" });
+assert.strictEqual(contacts.get("carol").verified, false, "mlkem change drops verified");
+console.log("OK  H-01: any single encryption-key change drops verification");
+
+// An update WITHOUT encryption keys keeps the stored ones and the trust mark
+// (nothing the record trusts actually changed).
+await contacts.setVerified("carol", true);
+await contacts.upsert({ username: "carol", ed: "EDC==", mldsa: "MLC==" });
+assert.strictEqual(contacts.get("carol").verified, true, "absent enc keys in update keep verified");
+assert.strictEqual(contacts.get("carol").ecdh, "ECY==", "stored ecdh kept");
+assert.strictEqual(contacts.get("carol").mlkem, "KMY==", "stored mlkem kept");
+console.log("OK  H-01: enc-keyless update keeps stored keys and trust");
+
+// Pins store all four public keys.
+await contacts.savePin("user:carol", { ed: "EDC==", mldsa: "MLC==", ecdh: "ECY==", mlkem: "KMY==" });
+assert.deepStrictEqual(
+  contacts.getPin("user:carol"),
+  { ed: "EDC==", mldsa: "MLC==", ecdh: "ECY==", mlkem: "KMY==" },
+  "pin covers all four keys",
+);
+console.log("OK  H-01: pins cover all four keys");
+
+// v2→v3 migration: a verified contact WITH encryption keys was verified
+// against a signing-only fingerprint — the mark must be dropped on unlock.
+// (The version byte lives in the outer plaintext wrapper, so rewriting it
+// simulates a pre-fix blob; the encrypted payload is unchanged.)
+{
+  const outer = JSON.parse(localStorage.getItem("sc.contacts.v1"));
+  assert.strictEqual(outer.v, 3, "store persists as v3 now");
+  outer.v = 2;
+  localStorage.setItem("sc.contacts.v1", JSON.stringify(outer));
+  contacts.lock();
+  await contacts.unlock(PASS);
+  assert.strictEqual(contacts.get("carol").verified, false, "v2 verified+enc-keys downgraded");
+  assert.ok(contacts.get("carol").reverify, "downgrade flagged for the UI");
+  assert.strictEqual(JSON.parse(localStorage.getItem("sc.contacts.v1")).v, 3, "re-persisted as v3");
+  // Re-verifying clears the flag.
+  await contacts.setVerified("carol", true);
+  assert.ok(!contacts.get("carol").reverify, "fresh verification clears the reverify flag");
+}
+console.log("OK  H-01: v2→v3 migration downgrades signing-only verifications");
+
+// Audit 2026-07-18 L-01: the iteration count in the (plaintext) outer wrapper
+// is bounded before PBKDF2 runs — a planted blob with a huge count must not
+// stall the UI, and a tiny count must not silently weaken the KDF.
+{
+  contacts.lock();
+  const outer = JSON.parse(localStorage.getItem("sc.contacts.v1"));
+  for (const iters of [2_000_000_000, 1000]) {
+    localStorage.setItem("sc.contacts.v1", JSON.stringify({ ...outer, iters }));
+    await assert.rejects(contacts.unlock(PASS), /key-derivation/, `iters=${iters} rejected`);
+  }
+  localStorage.setItem("sc.contacts.v1", JSON.stringify(outer));
+  await contacts.unlock(PASS);
+}
+console.log("OK  L-01: out-of-bounds KDF iteration counts rejected");
+
 console.log("\nAll contact-store checks passed.");

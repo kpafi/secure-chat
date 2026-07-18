@@ -118,7 +118,19 @@ export async function generatePad({ label, totalBytes, fingerBytes }) {
 
 // ---- encrypted export / import --------------------------------------------
 
+// Audit 2026-07-18 L-01: `iters`/`salt` come from pad files and the persisted
+// blobs — bound them before WebCrypto runs (huge count = UI stalled for hours;
+// tiny count = silently weakened KDF). Same bounds as identity.js.
+const KDF_MIN_ITERS = 100000;
+const KDF_MAX_ITERS = 5000000;
+
 async function deriveKey(passphrase, salt, iters) {
+  if (!Number.isInteger(iters) || iters < KDF_MIN_ITERS || iters > KDF_MAX_ITERS) {
+    throw new Error("invalid key-derivation parameters (iteration count)");
+  }
+  if (!(salt instanceof Uint8Array) || salt.length < 8 || salt.length > 64) {
+    throw new Error("invalid key-derivation parameters (salt)");
+  }
   const base = await crypto.subtle.importKey("raw", encU.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
   return crypto.subtle.deriveKey(
     { name: "PBKDF2", salt, iterations: iters, hash: "SHA-256" },
@@ -159,6 +171,13 @@ export async function exportPad(record, passphrase) {
 
 // Decrypt an export file into a fresh local pad record (role = recipient role).
 export async function importPad(fileText, passphrase) {
+  // Audit 2026-07-18 L-01: cap the file before any parsing/decoding. The
+  // largest genuine export (1 MiB pad) is ~1.4 MiB of base64 + envelope;
+  // 4 MiB leaves headroom without letting a crafted file drive large
+  // JSON/base64 allocations.
+  if (typeof fileText !== "string" || fileText.length > 4 * 1024 * 1024) {
+    throw new Error("not a valid pad file");
+  }
   let file;
   try {
     file = JSON.parse(fileText);
@@ -166,6 +185,7 @@ export async function importPad(fileText, passphrase) {
     throw new Error("not a valid pad file");
   }
   if (file.fmt !== "secure-chat-otp-pad" || file.v !== 1) throw new Error("unrecognized pad file format");
+  if (!file.kdf || typeof file.kdf !== "object") throw new Error("unrecognized pad file format");
   const key = await deriveKey(passphrase, unb64(file.kdf.salt), file.kdf.iters || KDF_ITERS);
   let plain;
   try {

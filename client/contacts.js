@@ -34,7 +34,19 @@ function unb64(s) {
   return u;
 }
 
+// Audit 2026-07-18 L-01: `iters`/`salt` come from the persisted blob — bound
+// them before WebCrypto runs (huge count = UI stalled for hours; tiny count =
+// silently weakened KDF). Same bounds as identity.js.
+const KDF_MIN_ITERS = 100000;
+const KDF_MAX_ITERS = 5000000;
+
 async function deriveKey(passphrase, salt, iters) {
+  if (!Number.isInteger(iters) || iters < KDF_MIN_ITERS || iters > KDF_MAX_ITERS) {
+    throw new Error("invalid key-derivation parameters (iteration count)");
+  }
+  if (!(salt instanceof Uint8Array) || salt.length < 8 || salt.length > 64) {
+    throw new Error("invalid key-derivation parameters (salt)");
+  }
   const base = await crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
   return crypto.subtle.deriveKey(
     { name: "PBKDF2", salt, iterations: iters, hash: "SHA-256" },
@@ -97,7 +109,9 @@ export async function unlock(passphrase) {
     contacts = data.contacts || [];
     pins = data.pins || {};
   }
-  if (migrateLegacyPins()) await persist();
+  let dirty = migrateLegacyPins();
+  if ((blob.v || 1) < 3 && migrateH01Verification()) dirty = true;
+  if (dirty) await persist();
 }
 
 // One-time migration of the old PLAINTEXT localStorage pins (sc.pins.v1) into
@@ -116,6 +130,27 @@ function migrateLegacyPins() {
   return true;
 }
 
+// One-time v2→v3 migration (audit 2026-07-18 H-01): earlier builds displayed a
+// contact fingerprint over the SIGNING keys only, so a 🟢 set from the Users
+// view never covered the ecdh/mlkem keys that seal async messages. Those marks
+// are therefore "not sufficiently verified" — drop them so the user re-compares
+// the (now four-key) fingerprint in person. Contacts without encryption keys
+// keep their mark: it still covers everything the record can be used for, and
+// upsert() drops it the moment encryption keys first appear.
+function migrateH01Verification() {
+  let changed = false;
+  for (const c of contacts) {
+    if (c.verified && (c.ecdh || c.mlkem)) {
+      c.verified = false;
+      c.verifiedAt = null;
+      c.reverify = true; // UI hint: verification predates enc-key coverage
+      delete c.vouchedBy;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 async function persist() {
   if (!dataKey) throw new Error("contact store is locked");
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -123,7 +158,7 @@ async function persist() {
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, dataKey, plain));
   localStorage.setItem(
     LS_CONTACTS,
-    JSON.stringify({ v: 2, iters: KDF_ITERS, salt: b64(salt), iv: b64(iv), ct: b64(ct) }),
+    JSON.stringify({ v: 3, iters: KDF_ITERS, salt: b64(salt), iv: b64(iv), ct: b64(ct) }),
   );
 }
 
@@ -134,9 +169,16 @@ export function getPin(key) {
   return pins[key] || null;
 }
 
+// Pins store ALL FOUR public keys (audit 2026-07-18 H-01): a pin that only
+// covered ed/mldsa would let a swapped ecdh/mlkem pair ride under an existing
+// 🟢 pin. Pins without enc keys (pre-fix) are treated by the caller as not
+// sufficiently verified once the peer presents encryption keys.
 export async function savePin(key, bundle) {
   if (!pins) throw new Error("contact store is locked");
-  pins[key] = { ed: bundle.ed, mldsa: bundle.mldsa };
+  pins[key] = {
+    ed: bundle.ed, mldsa: bundle.mldsa,
+    ecdh: bundle.ecdh ?? null, mlkem: bundle.mlkem ?? null,
+  };
   await persist();
 }
 
@@ -153,9 +195,9 @@ export function hasStore() {
 // ---- contact records ------------------------------------------------------
 // { username, token, ed, mldsa, ecdh?, mlkem?, verified, verifiedAt, addedAt }
 // ecdh/mlkem are the contact's public ENCRYPTION keys (bundle v2, needed to
-// seal async messages to them). They are bound to the identity by the
-// directory registration signature; the TRUST anchors remain ed/mldsa — an
-// encryption-key update alone does not reset `verified`.
+// seal async messages to them). All four keys are trust anchors: fingerprints
+// and safety numbers cover them, and ANY of them changing (including a key
+// appearing for the first time) resets `verified` (audit 2026-07-18 H-01).
 
 export function list() {
   if (!contacts) throw new Error("contact store is locked");
@@ -185,10 +227,15 @@ export async function upsert({ username, token, ed, mldsa, ecdh = null, mlkem = 
       verified, verifiedAt: verified ? now : null, addedAt: now,
     });
   } else {
+    // Audit 2026-07-18 H-01: missing→present IS a key change. A verified
+    // contact saved before encryption keys existed must NOT stay 🟢 when keys
+    // first appear — they were never part of what was compared in person.
+    // (present→absent keeps the stored keys below, so nothing the record
+    // trusts actually changed in that direction.)
     const keyChanged =
       cur.ed !== ed || cur.mldsa !== mldsa ||
-      (ecdh && cur.ecdh && cur.ecdh !== ecdh) ||
-      (mlkem && cur.mlkem && cur.mlkem !== mlkem);
+      (ecdh != null && (cur.ecdh ?? null) !== ecdh) ||
+      (mlkem != null && (cur.mlkem ?? null) !== mlkem);
     cur.ed = ed;
     cur.mldsa = mldsa;
     if (ecdh) cur.ecdh = ecdh;
@@ -203,6 +250,7 @@ export async function upsert({ username, token, ed, mldsa, ecdh = null, mlkem = 
     if (verified) {
       cur.verified = true;
       cur.verifiedAt = now;
+      delete cur.reverify; // fresh in-person check supersedes the H-01 reset
     }
   }
   await persist();
@@ -215,6 +263,7 @@ export async function setVerified(username, on) {
   if (!cur) throw new Error("unknown contact");
   cur.verified = !!on;
   cur.verifiedAt = on ? Date.now() : null;
+  if (on) delete cur.reverify; // fresh in-person check supersedes the H-01 reset
   await persist();
   return get(username);
 }
