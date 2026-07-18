@@ -6,9 +6,9 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
 ## ⮕ RESUME HERE (snapshot as of 2026-07-18, Codex-Terra audit fixes)
 **A second external audit ("Codex Terra", pushed to GitHub as
 `secure-chat-security-audit-2026-07-18.md`, auditing commit 70bbfcc) found
-1 High + 3 Medium + 3 Low. ALL 7 ARE FIXED AND TESTED LOCALLY; the Hetzner
-deploy is still PENDING (the deploy commands were blocked by the session's
-permission system — see DEPLOY TODO below).**
+1 High + 3 Medium + 3 Low. ALL 7 ARE FIXED, TESTED, AND DEPLOYED TO THE
+HETZNER BOX** (deploy commands were run by hand because the session's
+permission system blocked remote writes; ownership gotcha below).
 
 - **H-01 (async keys not fully bound into verification):** contact-list
   fingerprint now covers all four keys (`app.js` renderUserList);
@@ -51,14 +51,22 @@ permission system — see DEPLOY TODO below).**
   verification enabled (`android/gradle/verification-metadata.xml`, 631
   sha256 entries — builds fail on any unpinned/tampered artifact).
 
-**DEPLOY TODO (blocked, do next):** (1) rsync backend+client to the box
-(exclude `.venv`, keep the usual excludes + `package*.json`/`*.test.mjs`);
-(2) `venv/bin/pip install --require-hashes -r
-/opt/secure-chat/backend/requirements.lock`; (3) add `--ws-max-size 66560`
-to ExecStart in `secure-chat.service`, `systemctl daemon-reload && systemctl
-restart secure-chat`; (4) re-run the 3 live integration suites + live 404 /
-oversize-frame checks. Also PENDING: backport of M-01/M-02/M-03/L-01 (+
-four-key pins) to `~/secure-chat-live`.
+**DEPLOYED + LIVE-VERIFIED (2026-07-18):** rsync of backend+client (now also
+excluding `.venv`/`package*.json`/`*.test.mjs`), venv upgraded with
+`pip install --require-hashes -r requirements.lock` (starlette 1.3.1 /
+fastapi 0.139.2 / cryptography 49.0.0 confirmed on the box), ExecStart now
+carries `--ws-max-size 66560`. **Deploy gotcha for next time:** the rsync
+runs as root and re-owns `/opt/secure-chat/backend`, which crash-loops the
+service (`sqlite3 … readonly database`, 502s) — always finish with
+`chown -R securechat:securechat /opt/secure-chat/backend` before the
+restart. Live checks all green: app.js on the site carries the H-01 fix;
+`package.json`/`*.test.mjs` 404 (a hostile Host header hits Caddy's
+catch-all — empty 200, never reaches the backend); HSTS present; 1 MiB WS
+frame → hard close 1009; all 3 live integration suites green; full
+two-context Chromium H-01 flow (handshake → verify → pin → reconnect
+silently accepted) green AGAINST PRODUCTION. The audit-fix backport to
+`~/secure-chat-live` is also DONE and pushed (cdc3ba8). Still pending:
+`adb install -r` of the rebuilt APK when the phone is reconnected.
 
 ## ⮕ RESUME HERE (snapshot as of 2026-07-18, later)
 **Repos split + published to GitHub.** The project now has TWO git repos:
