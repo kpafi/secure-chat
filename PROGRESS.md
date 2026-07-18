@@ -3,6 +3,29 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
+## ⮕ RESUME HERE (snapshot as of 2026-07-18, later)
+**Repos split + published to GitHub.** The project now has TWO git repos:
+this full one (`~/secure-chat` → `github.com/kpafi/secure-chat`) and a
+**live-chat-only** split (`~/secure-chat-live` →
+`github.com/kpafi/secure-chat-live`) that keeps only the live-room flow (4 modes,
+no OTP, no async/contacts layer) plus an encrypted `pins.js` and a consolidated
+`PENTEST-FINDINGS.md`. Both pushed on `master` over SSH (key `kpafi@…-deploy`).
+
+**NEW feature (Users view share UX):** the Users view now shows **"Your handle"**
+with **Copy handle** + **Copy invite link** buttons, and an inbound invite link
+(`<origin>/#add=<url-encoded handle>`) opens the Users view and **pre-fills** the
+add field for review. Security note: the link carries the handle in the URL
+FRAGMENT (never sent to the server) and only PRE-FILLS — it never auto-adds and
+never conveys trust (verification is still the in-person safety-number check), so
+it grants nothing a pasted handle wouldn't. Changed files: `client/index.html`
+(handle block in `#usersUnlocked`), `client/app.js` (`renderMyHandle`,
+`inviteLink`, `applyPendingInvite`, `handleInviteLink`, copy wiring),
+`client/style.css` (`.myhandle`). Web-verified in a two-context Chromium run
+(`/tmp/verify-sclive/invite-flow.mjs`): handle shown, both buttons pass the
+correct strings, invite pre-fills the peer's add field, contact lands ⚪
+unverified. Phone app inherits it via the gradle `syncWebClient` copy on the next
+APK build (rebuild in progress / `adb install -r` when the phone is reconnected).
+
 ## ⮕ RESUME HERE (snapshot as of 2026-07-18)
 **Status:** live on Hetzner `https://138-199-144-35.sslip.io`. **An external
 black-box pentest (2026-07-18) found 9 issues incl. a CRITICAL handshake bug

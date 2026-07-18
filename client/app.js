@@ -65,6 +65,8 @@ const els = {
   usersLocked: $("usersLocked"), usersUnlocked: $("usersUnlocked"),
   addHandle: $("addHandle"), addContact: $("addContact"),
   usersStatus: $("usersStatus"), userList: $("userList"),
+  myHandleText: $("myHandleText"), myHandleActions: $("myHandleActions"),
+  copyHandle: $("copyHandle"), copyInvite: $("copyInvite"),
   // chats view
   chatsLocked: $("chatsLocked"), chatsUnlocked: $("chatsUnlocked"),
   chatsStatus: $("chatsStatus"), chatListWrap: $("chatListWrap"),
@@ -464,7 +466,56 @@ function refreshUsers() {
         "Unlock (or create) your identity in the Live room view first.";
     return;
   }
+  renderMyHandle();
+  applyPendingInvite();
   renderUserList();
+}
+
+// My shareable handle (username#token) — only exists after registering, since
+// the token is minted at registration (anti-enumeration; a bare username never
+// resolves).
+function myHandle() {
+  const n = localStorage.getItem(LS_USERNAME);
+  const t = localStorage.getItem(LS_LOOKUP_TOKEN);
+  return n && t ? n + "#" + t : null;
+}
+
+// An invite link carries the handle in the URL FRAGMENT (`#add=...`), so it
+// stays client-side and never reaches the server. It is a convenience only:
+// opening it PRE-FILLS the add field — it never auto-adds and never verifies,
+// so it grants no trust a pasted handle wouldn't (trust still needs the
+// in-person safety-number check).
+function inviteLink(handle) {
+  return location.origin + location.pathname + "#add=" + encodeURIComponent(handle);
+}
+
+function renderMyHandle() {
+  const h = myHandle();
+  if (h) {
+    els.myHandleText.textContent = h;
+    els.myHandleText.className = "hint ok";
+    els.myHandleActions.hidden = false;
+  } else {
+    els.myHandleText.textContent =
+      "Register a username in the Live room (Step 1) to get a shareable handle.";
+    els.myHandleText.className = "hint";
+    els.myHandleActions.hidden = true;
+  }
+}
+
+// If the app was opened from an invite link, drop the target handle into the
+// add field for the user to review and Add. Runs once (cleared after use).
+let pendingInviteHandle = null;
+function applyPendingInvite() {
+  if (!pendingInviteHandle) return;
+  const handle = pendingInviteHandle;
+  pendingInviteHandle = null;
+  if (contacts.get(account.parseHandle(handle).username)) {
+    usersStatus(`"${account.parseHandle(handle).username}" is already in your users list.`);
+    return;
+  }
+  els.addHandle.value = handle;
+  usersStatus("Someone shared this handle with you — review it and click Add (you still verify them in person to trust the key).");
 }
 
 function renderUserList() {
@@ -1765,6 +1816,28 @@ for (const b of els.drawer.querySelectorAll(".navitem")) {
 }
 els.addContact.addEventListener("click", addContactFromHandle);
 
+// "Your handle" share controls (Users view). Copy the raw handle, or an invite
+// link that pre-fills the add field for the recipient. Both are convenience
+// only — neither conveys trust (the recipient still verifies in person).
+async function copyToClipboard(btn, text, okLabel = "Copied ✓") {
+  const orig = btn.textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+    btn.textContent = okLabel;
+  } catch {
+    btn.textContent = "Copy failed";
+  }
+  setTimeout(() => { btn.textContent = orig; }, 1500);
+}
+els.copyHandle.addEventListener("click", () => {
+  const h = myHandle();
+  if (h) copyToClipboard(els.copyHandle, h);
+});
+els.copyInvite.addEventListener("click", () => {
+  const h = myHandle();
+  if (h) copyToClipboard(els.copyInvite, inviteLink(h));
+});
+
 // chats view
 els.chatStart.addEventListener("click", () => {
   if (els.chatNew.value) openChat(els.chatNew.value);
@@ -1808,3 +1881,21 @@ refreshOtpPads();
 showScreen("identity");
 syncAlgUI();
 refreshIdentityUI();
+
+// Invite-link handling: an inbound `#add=<handle>` opens the Users view and
+// stages the handle for review (never auto-adds). The fragment is cleared from
+// the URL immediately so it isn't re-triggered or left in history/bookmarks.
+(function handleInviteLink() {
+  const m = /^#add=(.+)$/.exec(location.hash || "");
+  if (!m) return;
+  let handle;
+  try {
+    handle = decodeURIComponent(m[1]);
+  } catch {
+    return;
+  }
+  history.replaceState(null, "", location.pathname + location.search);
+  if (!account.parseHandle(handle)) return; // ignore anything not username#token
+  pendingInviteHandle = handle;
+  showView("users"); // refreshUsers() applies the pending invite once unlocked
+})();

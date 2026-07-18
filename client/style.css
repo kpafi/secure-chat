@@ -313,3 +313,7 @@ button#idCreate, button#idUnlock { background: #21262d; color: var(--fg); border
 .otp-entropy { display: block; width: 100%; max-width: 340px; height: 90px; background: var(--panel); border: 1px dashed var(--border); border-radius: 6px; touch-action: none; cursor: crosshair; }
 #otpForget { margin-left: 0.5rem; }
 button#otpImport, button#otpExport { background: #21262d; color: var(--fg); border: 1px solid var(--border); }
+
+/* "Your handle" share block in the Users view */
+.myhandle { padding: 0.6rem 0.75rem; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; }
+#myHandleText { word-break: break-all; margin: 0.3rem 0; }
