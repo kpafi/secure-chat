@@ -23,8 +23,15 @@ it grants nothing a pasted handle wouldn't. Changed files: `client/index.html`
 `client/style.css` (`.myhandle`). Web-verified in a two-context Chromium run
 (`/tmp/verify-sclive/invite-flow.mjs`): handle shown, both buttons pass the
 correct strings, invite pre-fills the peer's add field, contact lands ⚪
-unverified. Phone app inherits it via the gradle `syncWebClient` copy on the next
-APK build (rebuild in progress / `adb install -r` when the phone is reconnected).
+unverified. **DEPLOYED to Hetzner** (rsync of `client/` to
+`/opt/secure-chat/client/`, no restart needed for static files; confirmed the
+live `app.js`/`index.html`/`style.css` carry the change via curl). Phone app
+inherits it via the gradle `syncWebClient` copy — APK rebuilt (5.8 MB);
+`adb install -r android/app/build/outputs/apk/debug/app-debug.apk` when the phone
+is reconnected. Committed + pushed to `github.com/kpafi/secure-chat` (643fc7f).
+NOTE for future deploys: this is a SEPARATE step from the git push — the live
+site serves `/opt/secure-chat/client/` on the box, so a frontend change is only
+live after the rsync.
 
 ## ⮕ RESUME HERE (snapshot as of 2026-07-18)
 **Status:** live on Hetzner `https://138-199-144-35.sslip.io`. **An external
@@ -1629,6 +1636,43 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
   live integration suites, backend `pytest` 48 passed.
 
 ## TODO / NEXT (suggested order)
+
+### ⮕ NEW (2026-07-18, user-requested): Profile tab in the left drawer
+Add a **👤 Profile** view to the drawer menu (alongside Live room / Users /
+Chats — probably first) that shows the user's OWN data in one place. Read-only
+display of what's already in memory when the identity is unlocked; no new crypto.
+
+**Must show (user-specified):**
+- **Name** — the registered username (`sc.username.v1`), or "not registered yet".
+- **Handle** — `username#token` with the **Copy handle** + **Copy invite link**
+  buttons (reuse `myHandle()` / `inviteLink()` / the copy wiring already built
+  for the Users view — factor them out so both views share one implementation).
+- **Fingerprint** — the identity fingerprint (`identity.fingerprint()`), the same
+  string contacts verify in person. Show it prominently.
+
+**Suggested additions (my picks — confirm before building):**
+- **QR code of the invite link** — the natural in-person exchange (a contact
+  scans it to add you). Needs a tiny self-contained QR generator; keep it inline
+  (no CDN — CSP forbids external scripts).
+- **Key details** — the algorithms (Ed25519 + ML-DSA-65 signing; ECDH P-256 +
+  ML-KEM-768 encryption) and maybe the short public-key fingerprints, so a
+  curious/technical user can see what's protecting them.
+- **Status line** — identity unlocked? registered? logged in (mailbox reachable)?
+- **Identity actions** — surface the existing **Copy backup** (export) and
+  **Forget identity** here too (currently only on the Live-room identity screen),
+  since a "Profile" page is where users will look for them.
+- **Counts** — e.g. "N saved users" (from `contacts.list()`), for a quick sense
+  of state. Optional.
+
+**Locked/unlocked:** when the identity is locked, show a "unlock in the Live room
+first" hint (same pattern as Users/Chats). No data is available before unlock.
+
+**Security note:** this is presentation-only — it displays existing local state,
+adds no network calls and no new trust surface. The fingerprint/handle shown are
+already public-shareable. Keep everything `textContent` (no innerHTML), matching
+the rest of app.js. Do it in `client/` (the single source of truth) so the phone
+app inherits it via the gradle `syncWebClient` copy; then deploy to Hetzner
+(rsync — separate from git push) and rebuild the APK.
 
 ### ⮕ PLAN (2026-07-17): contacts + web-of-trust + async 1:1 chats ("WhatsApp mode")
 User-requested feature set: a left drawer menu with two new views next to the
