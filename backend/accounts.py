@@ -148,10 +148,25 @@ def _register_message_v2(username: str, ed: str, mldsa: str, ecdh: str, mlkem: s
 # Web-of-trust vouch: the voucher dual-signs the TARGET's (username, bundle)
 # under its own domain, so a vouch can never be confused with a registration
 # or login signature. Client builds the identical bytes (account.js).
+#
+# H-01 (2026-07-19): the v1 vouch covered only the SIGNING keys (ed + mldsa),
+# so a malicious directory could pair a genuinely-vouched contact's real
+# signing keys with its OWN encryption keys and read sealed messages while the
+# 🟡 mark still displayed. v2 folds the target's ENCRYPTION keys (ecdh + mlkem)
+# into the signed statement — mirroring the fingerprint/safety-number fix — so
+# a vouch now attests all four keys. A target with encryption keys is vouched
+# under v2; a legacy target without them (can't receive sealed mail anyway)
+# stays v1. The domain differs so a v1 signature can never be read as a v2 one.
 _VOUCH_DOMAIN = b"secure-chat/vouch/v1"
+_VOUCH_V2_DOMAIN = b"secure-chat/vouch/v2"
 
 
-def _vouch_message(target: str, ed: str, mldsa: str) -> bytes:
+def _vouch_message(target: str, ed: str, mldsa: str, ecdh: str = "", mlkem: str = "") -> bytes:
+    if ecdh and mlkem:
+        return b"\n".join(
+            [_VOUCH_V2_DOMAIN, target.encode("ascii"), ed.encode("ascii"),
+             mldsa.encode("ascii"), ecdh.encode("ascii"), mlkem.encode("ascii")]
+        )
     return b"\n".join(
         [_VOUCH_DOMAIN, target.encode("ascii"), ed.encode("ascii"), mldsa.encode("ascii")]
     )
@@ -422,7 +437,7 @@ def vouch(req: VouchReq, username: str = Depends(current_user)) -> dict:
         raise HTTPException(status_code=422, detail="cannot vouch for yourself")
     with _db() as conn:
         target_row = conn.execute(
-            "SELECT ed_pub, mldsa_pub FROM accounts WHERE username = ?", (req.target,)
+            "SELECT ed_pub, mldsa_pub, ecdh_pub, mlkem_pub FROM accounts WHERE username = ?", (req.target,)
         ).fetchone()
         voucher_row = conn.execute(
             "SELECT ed_pub, mldsa_pub FROM accounts WHERE username = ?", (username,)
@@ -436,7 +451,12 @@ def vouch(req: VouchReq, username: str = Depends(current_user)) -> dict:
 
     sig_raw = _b64decode_fixed(req.sig, config.ED25519_SIG_BYTES)
     mldsa_sig_raw = _b64decode_fixed(req.mldsa_sig, config.MLDSA65_SIG_BYTES)
-    msg = _vouch_message(req.target, target_row["ed_pub"], target_row["mldsa_pub"])
+    # v2 covers the target's encryption keys when present (H-01); the client
+    # signs the identical bytes (account.vouchMessageBytes).
+    msg = _vouch_message(
+        req.target, target_row["ed_pub"], target_row["mldsa_pub"],
+        target_row["ecdh_pub"], target_row["mlkem_pub"],
+    )
     ed_raw = base64.b64decode(voucher_row["ed_pub"], validate=True)
     mldsa_raw = base64.b64decode(voucher_row["mldsa_pub"], validate=True)
     if not _ed25519_verify(ed_raw, sig_raw, msg):

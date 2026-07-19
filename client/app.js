@@ -682,7 +682,12 @@ function renderUserList() {
           "will then see them as 🟡 vouched-by-you. (This reveals publicly that you know them.)",
         )) {
           try {
-            await account.vouch(API_BASE, identity, apiToken, c.username, { ed: c.ed, mldsa: c.mldsa });
+            // Vouch over the FULL in-person-verified bundle incl. encryption
+            // keys (H-01) so the 🟡 mark attests the keys used to seal async
+            // messages, not just the signing identity.
+            await account.vouch(API_BASE, identity, apiToken, c.username, {
+              ed: c.ed, mldsa: c.mldsa, ecdh: c.ecdh ?? null, mlkem: c.mlkem ?? null,
+            });
             statusMsg = `Vouch for "${c.username}" published.`;
           } catch (e) {
             statusMsg = "Could not publish the vouch: " + e.message;
@@ -743,9 +748,16 @@ async function refreshVouchMarks() {
         const voucher = contacts.get(v.voucher);
         if (!voucher || !voucher.verified) continue;
         if (voucher.ed !== v.voucher_ed || voucher.mldsa !== v.voucher_mldsa) continue;
+        // H-01: verify the vouch over the FULL bundle WE hold for this contact,
+        // including the encryption keys. If a malicious directory swapped the
+        // ecdh/mlkem it served us, the v2 vouch signature (which the in-person
+        // voucher made over the REAL enc keys) no longer matches, so no 🟡 is
+        // awarded — the mark can never vouch for keys the directory forged.
         const ok = await Identity.verify(
           { ed: voucher.ed, mldsa: voucher.mldsa },
-          account.vouchMessageBytes(c.username, { ed: c.ed, mldsa: c.mldsa }),
+          account.vouchMessageBytes(c.username, {
+            ed: c.ed, mldsa: c.mldsa, ecdh: c.ecdh ?? null, mlkem: c.mlkem ?? null,
+          }),
           { ed: v.sig, mldsa: v.mldsa_sig },
         ).catch(() => false);
         if (ok) names.push(v.voucher);

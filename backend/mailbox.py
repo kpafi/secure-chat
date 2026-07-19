@@ -100,7 +100,14 @@ def post_mail(recipient: str, req: PostReq, t: str = Query(default="", max_lengt
 
 @router.get("")
 def fetch_mail(username: str = Depends(current_user)) -> dict:
-    """Return AND DELETE all queued envelopes for the authenticated user."""
+    """Return AND DELETE the queued envelopes for the authenticated user.
+
+    Delete only the rows we actually read, by id — never a blanket
+    `WHERE recipient = ?`. Two overlapping fetches (sync endpoints run in a
+    threadpool) or a POST racing the fetch could otherwise have the DELETE
+    remove an envelope that arrived after the SELECT and was never returned,
+    losing it silently.
+    """
     with _db() as conn:
         _prune(conn)
         rows = conn.execute(
@@ -108,5 +115,6 @@ def fetch_mail(username: str = Depends(current_user)) -> dict:
             (username,),
         ).fetchall()
         if rows:
-            conn.execute("DELETE FROM mailbox WHERE recipient = ?", (username,))
+            ids = [r["id"] for r in rows]
+            conn.executemany("DELETE FROM mailbox WHERE id = ?", [(i,) for i in ids])
     return {"messages": [{"envelope": r["envelope"], "created_at": r["created_at"]} for r in rows]}

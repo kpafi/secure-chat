@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from main import app  # noqa: E402
 import accounts  # noqa: E402
+import config  # noqa: E402
 
 client = TestClient(app)
 
@@ -154,6 +155,79 @@ def test_vouch_rejects_bad_signatures_and_auth():
     # Nothing slipped into storage.
     r = client.get(f"/api/users/{bob['username']}/vouches", params={"t": bob["token"]})
     assert r.json()["vouches"] == []
+
+
+def _register_v2(username):
+    """Register a bundle-v2 identity (with encryption keys), like a real client."""
+    ident = _new_identity()
+    ecdh = _b64(os.urandom(config.ECDH_PUB_BYTES))
+    mlkem = _b64(os.urandom(config.MLKEM768_PUB_BYTES))
+    msg = b"\n".join([
+        b"secure-chat/register/v2", username.encode(), ident["ed"].encode(),
+        ident["mldsa"].encode(), ecdh.encode(), mlkem.encode(),
+    ])
+    resp = client.post("/api/register", json={
+        "username": username, "ed": ident["ed"], "mldsa": ident["mldsa"],
+        "sig": _b64(ident["ed_priv"].sign(msg)),
+        "mldsa_sig": _b64(ML_DSA_65.sign(ident["mldsa_secret"], msg)),
+        "ecdh": ecdh, "mlkem": mlkem,
+    })
+    assert resp.status_code == 200, resp.text
+    ident.update(username=username, token=resp.json()["lookup_token"], ecdh=ecdh, mlkem=mlkem)
+    return ident
+
+
+def _vouch_message_v2(target):
+    return b"\n".join([
+        b"secure-chat/vouch/v2", target["username"].encode(), target["ed"].encode(),
+        target["mldsa"].encode(), target["ecdh"].encode(), target["mlkem"].encode(),
+    ])
+
+
+def _vouch_body_v2(voucher, target, msg=None):
+    msg = msg if msg is not None else _vouch_message_v2(target)
+    return {
+        "target": target["username"],
+        "sig": _b64(voucher["ed_priv"].sign(msg)),
+        "mldsa_sig": _b64(ML_DSA_65.sign(voucher["mldsa_secret"], msg)),
+    }
+
+
+def test_vouch_v2_binds_encryption_keys():
+    """H-01: a vouch for a target WITH encryption keys must be signed over the
+    v2 message (covering ecdh + mlkem). A v1 (signing-only) signature for such a
+    target is refused, so a 🟡 can never attest keys the vouch didn't cover."""
+    alice = _register("wot-v2a")
+    bob = _register_v2("wot-v2b")
+    tok = _login(alice)
+
+    # v1 signature (signing keys only) for a v2 target is rejected by the server.
+    v1_body = _vouch_body(alice, bob)  # uses the signing-only _vouch_message
+    assert client.post("/api/vouch", json=v1_body, headers=_auth(tok)).status_code == 400
+
+    # The correct v2 vouch (covers the encryption keys) is accepted.
+    r = client.post("/api/vouch", json=_vouch_body_v2(alice, bob), headers=_auth(tok))
+    assert r.status_code == 200 and r.json()["status"] == "vouched"
+
+    # A v2 signature over SWAPPED encryption keys (what a malicious directory
+    # would need) does not verify against the registered bundle → refused.
+    poisoned = dict(bob, ecdh=_b64(os.urandom(config.ECDH_PUB_BYTES)),
+                    mlkem=_b64(os.urandom(config.MLKEM768_PUB_BYTES)))
+    bad = _vouch_body_v2(alice, bob, msg=_vouch_message_v2(poisoned))
+    assert client.post("/api/vouch", json=bad, headers=_auth(tok)).status_code == 400
+
+    # The stored vouch's signature verifies over bob's REAL v2 bundle (the exact
+    # client-side check refreshVouchMarks performs before awarding 🟡).
+    r = client.get(f"/api/users/{bob['username']}/vouches", params={"t": bob["token"]})
+    vs = r.json()["vouches"]
+    assert len(vs) == 1
+    assert accounts._ed25519_verify(
+        base64.b64decode(alice["ed"]), base64.b64decode(vs[0]["sig"]), _vouch_message_v2(bob)
+    )
+    # ...and does NOT verify over a poisoned-enc-key bundle → no 🟡 client-side.
+    assert not accounts._ed25519_verify(
+        base64.b64decode(alice["ed"]), base64.b64decode(vs[0]["sig"]), _vouch_message_v2(poisoned)
+    )
 
 
 def test_vouch_list_is_token_gated():

@@ -3,6 +3,52 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
+## ⮕ RESUME HERE (snapshot as of 2026-07-19, pentest: vouch enc-key gap fixed)
+**A fresh in-depth pentest found ONE real issue (MEDIUM) plus one LOW; BOTH are
+now fixed, tested, and committed — deploy PENDING (permission-blocked, commands
+below).** The rest of the stack (relay, C-01 handshake binding, ratchet, OTP,
+identity/contacts/chats at-rest, anti-enumeration, CSP/headers) was attacked and
+held up.
+
+- **MEDIUM — web-of-trust vouch (🟡) did not authenticate encryption keys
+  (the H-01 gap, still open in the WoT path).** `vouchMessageBytes` /
+  `_vouch_message` signed only the target's SIGNING keys (ed+mldsa), so a
+  malicious directory could serve a genuinely-vouched contact's REAL signing
+  keys + its OWN ecdh/mlkem and read every sealed message the victim sent, while
+  the 🟡 "vouched by X" mark still displayed. Proven with a live module-level
+  PoC (`scratchpad/verify-sc/pentest-vouch-enckey.mjs`): attacker decrypted the
+  plaintext; real recipient could not. **Fix (v2 vouch, mirrors the H-01
+  fingerprint fix):** the vouch now signs all four keys under a new
+  `secure-chat/vouch/v2` domain when the target has encryption keys (legacy
+  no-enc targets stay v1). Server (`accounts._vouch_message` + the `/api/vouch`
+  handler now selects+binds ecdh/mlkem), client (`account.vouchMessageBytes`
+  v2), publish path (`app.js` vouches over the full in-person bundle) and the
+  🟡 award check (`refreshVouchMarks` verifies over the full bundle it holds —
+  so swapped enc keys fail the signature and no 🟡 is given). Old v1 vouches
+  stop lighting 🟡 for enc-key contacts until re-published (correct, safe
+  migration). **Verified:** new `client/vouch.test.mjs` (in `npm test`) +
+  `backend/tests/test_vouches.py::test_vouch_v2_binds_encryption_keys`; the
+  fixed-code PoC (`scratchpad/verify-sc/pentest-vouch-fixed.mjs`) shows the
+  poisoned bundle now earns NO 🟡 while the honest bundle still does.
+- **LOW — mailbox fetch was a SELECT-then-DELETE race.** `fetch_mail` deleted
+  the whole inbox (`WHERE recipient = ?`) after selecting, so an envelope that
+  arrived between the two statements (two overlapping fetches, or a POST racing
+  the GET; sync endpoints run in a threadpool) was silently lost. **Fix:** delete
+  only the specific ids that were read (`mailbox.py`).
+
+**Verified:** backend **77 passed** (was 76; +1 vouch-v2 test), client offline
+suites all green (+ `vouch.test.mjs`), CSP-hash test still green (importmap
+untouched), and a two-context Chromium smoke run (all views + live AES-256
+round-trip + disconnect) green — no regression from the app.js edits.
+**PENDING (permission-blocked — run by hand):** deploy backend+client and
+restart (backend changed, so the full recipe incl. the `chown securechat` step):
+`rsync -az --exclude node_modules --exclude 'package*.json' --exclude
+'*.test.mjs' --exclude __pycache__ backend client
+root@138.199.144.35:/opt/secure-chat/ && ssh root@138.199.144.35
+'chown -R securechat:securechat /opt/secure-chat/backend && systemctl restart
+secure-chat'`. Then rebuild+install the APK (client changed). NOTE: this is on
+top of the still-pending cosmetic-pass deploy below — one rsync covers both.
+
 ## ⮕ RESUME HERE (snapshot as of 2026-07-19, cosmetic polish pass)
 **The user-requested cosmetic polish pass ("make it look less cheap") is BUILT
 and VERIFIED locally — deploy + APK rebuild still PENDING (this session's

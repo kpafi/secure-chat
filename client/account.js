@@ -132,8 +132,20 @@ export async function login(base, identity, username) {
 // Exact bytes the server reconstructs in accounts._vouch_message.
 
 const VOUCH_DOMAIN = "secure-chat/vouch/v1";
+const VOUCH_V2_DOMAIN = "secure-chat/vouch/v2";
 
+// H-01 (2026-07-19): a vouch now covers the target's ENCRYPTION keys (ecdh +
+// mlkem) when present, not just the signing keys — so a 🟡 mark attests all
+// four keys and a malicious directory cannot swap encryption keys under a
+// still-valid vouch. Matches accounts._vouch_message: v2 when enc keys exist,
+// v1 (signing-only, legacy targets that can't receive sealed mail) otherwise.
 export function vouchMessageBytes(targetUsername, targetBundle) {
+  if (targetBundle.ecdh && targetBundle.mlkem) {
+    return enc.encode(
+      [VOUCH_V2_DOMAIN, targetUsername, targetBundle.ed, targetBundle.mldsa,
+        targetBundle.ecdh, targetBundle.mlkem].join("\n"),
+    );
+  }
   return enc.encode([VOUCH_DOMAIN, targetUsername, targetBundle.ed, targetBundle.mldsa].join("\n"));
 }
 
