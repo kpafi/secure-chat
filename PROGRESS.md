@@ -3,6 +3,45 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
+## ⮕ RESUME HERE (snapshot as of 2026-07-19, cosmetic polish pass)
+**The user-requested cosmetic polish pass ("make it look less cheap") is BUILT
+and VERIFIED locally — deploy + APK rebuild still PENDING (this session's
+permission system blocked the rsync and the gradle build; run them by hand,
+commands below).** Presentation-only, zero logic/crypto changes, importmap
+untouched (`test_csp_hash.py` green — no CSP-hash churn):
+
+- **Drawer emojis removed** (`client/index.html`): the four `👤🔒👥💬` labels
+  are now **monochrome inline SVG icons** (16×16 `stroke="currentColor"`,
+  CSP-safe) + plain-text labels in `<span>`s. The `☰` menu button and the
+  functional 🟢🟡⚪ trust glyphs are KEPT (documented security UX).
+- **Design-token refresh** (`client/style.css`, full-file pass, same var
+  names + hue language): new tokens `--panel-2` (raised/hover surface),
+  `--inset` (input/log wells), `--accent-soft`, `--ring`, `--warn`,
+  `--border-soft`, radii `--r-s/m/l`, spacing `--sp-1..5`, shadows
+  `--shadow-1/2`. Refined: soft elevation on `.panel`/drawer, gradient
+  primary buttons with hover/active/focus-visible states, input focus rings
+  (`box-shadow` ring instead of outline), flex nav items with accent-tinted
+  active state, uppercase `.step`, pill badges with tinted backgrounds
+  (`color-mix`), gradient chat bubbles, polished `.safety`/`.myhandle`/
+  `.profile-qr`, surface-layered `#log`/`.alg-cards`/`.userlist`. Mobile
+  `@media (max-width:600px)` behavior preserved verbatim.
+- **Verified:** new harness `scratchpad/verify-sc/cosmetic-pass.mjs`
+  (system Chromium via puppeteer-core): all 4 views render on desktop AND
+  390×844 phone, drawer labels pure-ASCII (no emoji) with SVG icons, trust
+  glyphs still present, **zero horizontal overflow** in every view/viewport,
+  and a full two-context AES-256 flow (generate room → connect ×2 → unlock →
+  message both ways → disconnect) green. Client offline `npm test` green;
+  backend `test_csp_hash.py` 2/2 green. Screenshots eyeballed (drawer, room
+  cards, live chat, phone views).
+- **PENDING (blocked remote/exec permissions — run by hand):**
+  1. Deploy (client only, no restart/chown needed):
+     `cd ~/secure-chat && rsync -az --exclude node_modules --exclude
+     'package*.json' --exclude '*.test.mjs' --exclude __pycache__ client
+     root@138.199.144.35:/opt/secure-chat/`
+  2. APK: `cd ~/secure-chat/android && ANDROID_HOME=$HOME/android-sdk
+     ./gradlew assembleDebug -Dorg.gradle.java.home=$HOME/jdk-21.0.4+7`,
+     then `adb install -r app/build/outputs/apk/debug/app-debug.apk`.
+
 ## ⮕ RESUME HERE (snapshot as of 2026-07-18, Profile tab shipped)
 **The 👤 Profile tab (drawer TODO below) is BUILT, VERIFIED, DEPLOYED, and in
 the APK.** New drawer entry (first, before Live room) → a presentation-only
@@ -1731,6 +1770,65 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
   live integration suites, backend `pytest` 48 passed.
 
 ## TODO / NEXT (suggested order)
+
+### ✅ DONE (2026-07-19): cosmetic polish pass ("make it look less cheap")
+**SHIPPED — see the 2026-07-19 snapshot at the top** (built + verified;
+deploy/APK were run by hand due to session permissions). Original spec below.
+
+### (original spec, 2026-07-18, user-requested): cosmetic polish pass
+User wants the web client + app to look **more polished while KEEPING the
+existing design language** (dark GitHub-ish palette, monospace, panel cards).
+Explicit ask: **remove the emojis from the drawer menu** — they make it look
+cheap. This is presentation-only: no crypto, no logic changes, no new runtime
+deps.
+
+**Hard constraints (these rule out the usual redesign tools — do NOT fight them):**
+- **Strict CSP:** `style-src 'self'` + no `unsafe-inline`, `default-src 'none'`.
+  No inline styles, no CDN, no external stylesheets. **Web fonts are blocked**
+  (font-src falls back to `'none'`) unless you add `font-src 'self'` to the CSP
+  in BOTH `backend/main.py` and `android/.../MainActivity.kt` AND vendor a
+  woff2 — treat a custom typeface as a *separate, security-relevant* change, not
+  part of this pass. Default to a refined system stack instead.
+- **No build step / vanilla JS, security-audited:** do it as a **hand-written
+  CSS token refresh in `client/style.css`** (it already uses CSS custom
+  properties — `--bg/--panel/--fg/--muted/--accent/--ok/--err/--border`). NO
+  framework, NO Tailwind/CDN. Keep JS `textContent`-only.
+- **Bundled into the Android WebView** via gradle `syncWebClient` — whatever you
+  ship in `client/` must stay self-contained.
+- **Do NOT touch the `<script type="importmap">` line in index.html** — its text
+  is pinned by the CSP hash (`test_csp_hash.py`); changing it means regenerating
+  the hash in two files. A pure style pass shouldn't need to.
+
+**Do:**
+1. **Remove drawer emojis** — `client/index.html:18–21` (`👤 Profile / 🔒 Live
+   room / 👥 Users / 💬 Chats`). Prefer **subtle monochrome inline SVG icons**
+   (inline SVG is CSP-safe; `img-src 'self' data:` also allows data-URIs) for a
+   polished look; plain text labels are the safe fallback. **KEEP** the `☰`
+   menu button (standard) and the **functional trust-mark glyphs 🟢🟡⚪** in the
+   Users/Chats views (they're documented security UX, not decoration).
+2. **Token refresh in `style.css`:** introduce a small design-token layer on top
+   of the existing vars — a spacing scale, consistent radii, a real type scale
+   (sizes/weights/letter-spacing on labels + `.step`), soft elevation/shadow for
+   `.panel` and the drawer, and refined **hover/active/focus-visible** states on
+   `.navitem`, `button`, `input/select`, `.alg-card`. Tighten the palette
+   (subtle surface layering panel-vs-bg, gentler borders) WITHOUT changing the
+   hue language. Polish the chat bubbles, `.safety` block, `.myhandle`,
+   `.profile-qr`, badges. Keep the mobile `@media (max-width:600px)` behavior.
+3. Keep everything responsive + theme-consistent; no horizontal overflow.
+
+**Optional first step:** prototype 1–2 directions in a **Claude Artifact**
+(self-contained, already CSP-shaped) so the user can eyeball before porting into
+`style.css`.
+
+**Verify + ship:** puppeteer harness in `scratchpad/verify-sc` (reuse
+`profile-flow.mjs` / `h01-flow.mjs`) — confirm every view renders, the menu has
+NO emoji, nothing overflows, all flows still work; screenshot a couple of views.
+Then **deploy: rsync ONLY `client/`** to the box (backend untouched → no
+`chown`/restart needed, static files serve immediately; importmap untouched → no
+CSP-hash change). Rebuild the APK (`JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+./gradlew assembleDebug`, `syncWebClient` copies the client) and `adb install
+-r`. Backend `test_csp_hash.py` must still pass. Commit + push; update this file.
+
 
 ### ✅ DONE (2026-07-18): Profile tab in the left drawer
 **SHIPPED — see the "Profile tab shipped" snapshot at the top.** Built with ALL
