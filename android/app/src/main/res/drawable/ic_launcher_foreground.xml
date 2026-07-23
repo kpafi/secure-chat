@@ -1,0 +1,18 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Padlock, same shape language as the drawer's "Live room" nav icon
+         (client/index.html), scaled from its 16x16 viewBox into the 108x108
+         adaptive-icon canvas and centered in the safe zone. -->
+    <path
+        android:fillColor="@color/ic_launcher_foreground_tint"
+        android:pathData="M39.6,44.55L68.4,44.55A7.2,7.2 0 0 1 75.6,51.75L75.6,65.7A7.2,7.2 0 0 1 68.4,72.9L39.6,72.9A7.2,7.2 0 0 1 32.4,65.7L32.4,51.75A7.2,7.2 0 0 1 39.6,44.55Z" />
+    <path
+        android:strokeColor="@color/ic_launcher_foreground_tint"
+        android:strokeWidth="6.3"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M42.3,44.55 V35.1 A11.7,11.7 0 0 1 65.7,35.1 V44.55" />
+</vector>

@@ -3,6 +3,60 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
+## ⮕ RESUME HERE (snapshot as of 2026-07-23, Android polish: icon + release signing)
+**Deploy is STILL PENDING** (blocked again this session by the Claude Code
+auto-mode permission classifier on SSH/rsync to the Hetzner box — same class of
+block noted in earlier sessions, not a new problem). The 2026-07-19 vouch-v2 +
+mailbox-race fix (commit `a548f56`, see snapshot below) is confirmed **still
+not live** — diffed the deployed `app.js` against local and it's missing the
+`ecdh`/`mlkem` binding in the vouch call sites. Run by hand:
+`cd ~/secure-chat && rsync -az --exclude node_modules --exclude 'package*.json'
+--exclude '*.test.mjs' --exclude __pycache__ backend client
+root@138.199.144.35:/opt/secure-chat/ && ssh root@138.199.144.35 'chown -R
+securechat:securechat /opt/secure-chat/backend && systemctl restart
+secure-chat'`. Then rebuild/reinstall the APK (client changed).
+
+**Android polish, two of three items done this session:**
+- **App icon — DONE.** Adaptive icon (API 26+; no legacy PNG mipmaps needed
+  since `minSdk = 26` is the same level adaptive icons were introduced at): a
+  monochrome padlock reusing the same path language as the drawer's "Live
+  room" nav SVG icon, `--bg` dark background (`#0D1117`) with `--accent` blue
+  foreground (`#2F81F7`), plus a `<monochrome>` variant for Android 13+ themed
+  icons. New files: `android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml`
+  (+ `_round`), `res/drawable/ic_launcher_{foreground,monochrome}.xml`,
+  `res/values/colors.xml`. Manifest wired (`android:icon`/`android:roundIcon`).
+- **Release signing config — DONE.** `signingConfigs { release { ... } }` in
+  `app/build.gradle.kts` reads `android/keystore.properties` (gitignored) if
+  present; falls back to an **unsigned** release build if absent (documented
+  in new `android/keystore.properties.example`, committed). Generated a real
+  local release keystore this session — `android/release.keystore` (PKCS12,
+  RSA-4096, 10000-day validity, alias `secure-chat-release`, pseudonymous DN,
+  no real name/org in the cert). **Gotcha:** PKCS12 keystores ignore a
+  distinct `-keypass` — store and key password must be identical or the build
+  breaks; documented in the `.example` file. Verified: `assembleDebug` +
+  `assembleRelease` both build clean, and `apksigner verify --print-certs`
+  confirms the release APK is actually signed (cert DN + SHA-256 fingerprint
+  printed). **Both `release.keystore` and `keystore.properties` are gitignored
+  + chmod 600, never committed. Back them up somewhere durable (password
+  manager / offline storage) before ever shipping a signed build — losing
+  them breaks the ability to publish updates under the same signature.**
+- Side-effect fix: `assembleRelease` runs `lintVitalAnalyzeRelease`, which
+  pulled lint/kotlin-compiler/groovy jars not covered by the existing
+  `gradle/verification-metadata.xml` checksum allowlist (first time anyone
+  ran a release build here — only `assembleDebug` had ever been exercised).
+  Fixed the TOFU way this project already uses for dependency verification:
+  ran once with `--write-verification-metadata sha256`, then confirmed a
+  clean rebuild (`rm -rf app/build && assembleRelease`) passes verification
+  normally — not a permanent bypass.
+- **On-device verification-gate pass (DHKE/RSA/PQKEM) — STARTED, NOT
+  FINISHED, session interrupted.** State left behind: emulator `sc_test` was
+  running headless with the new-icon debug APK installed and launched
+  (confirmed it resolves/launches); next step is attaching CDP per the
+  on-device verify recipe and driving each of the three untested modes
+  end-to-end (only AES256 has ever been verified on-device). Check
+  `adb devices` first — may need reboot via the recipe further down this file
+  / `memory/secure-chat-project.md`.
+
 ## ⮕ RESUME HERE (snapshot as of 2026-07-19, pentest: vouch enc-key gap fixed)
 **A fresh in-depth pentest found ONE real issue (MEDIUM) plus one LOW; BOTH are
 now fixed, tested, and committed — deploy PENDING (permission-blocked, commands
@@ -2075,14 +2129,16 @@ chats, WhatsApp-style, no shared live room needed). Big change incl. backend
       chain sequentially), plus app.js disables Send while a send is in flight.
       Verified live in a real browser: double-click Send delivers exactly once
       and the channel keeps working.
-- [~] **Android app** — IN PROGRESS (2026-07-07/08, see dated entries):
-      `android/` WebView shell bundling the audited client; debug APK builds
-      clean; verified in a real browser AND ON-DEVICE (Android 14 emulator —
-      AES256 end-to-end through the relay, both directions). Surfaced + fixed
-      the Mixed-Content transport constraint (relay must be wss/loopback/.onion).
-      REMAINING: app icon, release-signing config, and an on-device pass of the
-      identity + safety-number gate (DHKE/RSA/PQKEM; only AES256 driven on-device
-      so far).
+- [~] **Android app** — IN PROGRESS (2026-07-07/08, see dated entries; icon +
+      signing done 2026-07-23, see top snapshot): `android/` WebView shell
+      bundling the audited client; debug APK builds clean; verified in a real
+      browser AND ON-DEVICE (Android 14 emulator — AES256 end-to-end through
+      the relay, both directions). Surfaced + fixed the Mixed-Content
+      transport constraint (relay must be wss/loopback/.onion). Adaptive app
+      icon and a real release-signing config (local keystore, gitignored) are
+      now in place. REMAINING: an on-device pass of the identity +
+      safety-number gate (DHKE/RSA/PQKEM; only AES256 driven on-device so far
+      — started 2026-07-23, interrupted mid-session).
 - [x] **OTP mode** — DONE (2026-07-16, see dated entry): true XOR one-time pad
       (`OtpPad` in crypto.js) with two-region split (no reuse across senders),
       strictly-increasing offsets (replay + cross-session replay rejected),

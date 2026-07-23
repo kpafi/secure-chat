@@ -14,5 +14,8 @@ android/.gradle/
 android/build/
 android/app/build/
 android/local.properties
+android/keystore.properties
+android/*.keystore
+android/*.jks
 android/app/src/main/assets/web/
 .gradle/

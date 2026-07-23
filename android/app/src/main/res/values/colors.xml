@@ -1,0 +1,5 @@
+<resources>
+    <!-- Matches client/style.css bg/accent tokens (dark GitHub-ish palette). -->
+    <color name="ic_launcher_background">#0D1117</color>
+    <color name="ic_launcher_foreground_tint">#2F81F7</color>
+</resources>
