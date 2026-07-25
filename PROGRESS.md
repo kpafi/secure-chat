@@ -12,6 +12,14 @@ sender really signed it) as TRUSTED (they are who they claim, and their values
 are well-formed).** Deps clean (`npm audit` 0, `pip-audit` 0); starlette 1.3.1 /
 fastapi 0.139.2 / cryptography 49.0.0 close the 2026-07-18 M-01/M-02/L-03.
 
+**SHIPPED 2026-07-25:** pushed (`91dbdf7`), deployed to Hetzner (backend
+changed → full chown+restart recipe; DB excluded and confirmed byte-identical
+afterwards, pre-deploy backup at `/root/accounts.db.bak-2026-07-25-1603`), and
+installed on the phone — F-02 is a CLIENT fix, so the APK rebuild is required,
+not optional. Verified live: all three F-04 endpoints return 404 with no
+traceback in the journal, and `isValidMode` is present in the deployed and
+bundled `chats.js`/`app.js`.
+
 **FIXED + committed this session (both re-verified against their own PoCs):**
 - **F-02 (Medium) — chat mode string was unvalidated.** A peer could propose an
   arbitrary `mode`; on accept the header rendered `🔒 AES256 + verified by
