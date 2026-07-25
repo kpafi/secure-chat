@@ -59,16 +59,51 @@ puppeteer-core — `shots.mjs`, `flow.mjs`, `live.mjs`):
 - **Zero horizontal overflow** in every view at both widths; no pageerrors.
   Only console error is the known `/favicon.ico` 404.
 
-**PENDING (unchanged from below — permission-blocked, run by hand):** deploy
-and rebuild the APK. Client-only changed this session, so no `chown`/restart is
-needed *for this pass* — but the vouch-v2 backend fix below is STILL not live,
-so use the full recipe:
-`cd ~/secure-chat && rsync -az --exclude node_modules --exclude 'package*.json'
---exclude '*.test.mjs' --exclude __pycache__ backend client
-root@138.199.144.35:/opt/secure-chat/ && ssh root@138.199.144.35 'chown -R
-securechat:securechat /opt/secure-chat/backend && systemctl restart
-secure-chat'`. (The box was unreachable by curl from this session's network —
-confirm it's up when you deploy.)
+**DEPLOYED + SHIPPED 2026-07-25.** Pushed to GitHub (`3e20702`), deployed to
+Hetzner, and installed on the user's physical phone (Nothing A063 over USB;
+`org.securechat.app`, launches clean, screenshot confirms the new type stack
+and button tiers on-device). This ALSO finally made the long-pending
+**vouch-v2 + mailbox-race backend fix (`a548f56`, pending since 2026-07-19)
+live** — verified `vouch/v2` present in the deployed `accounts.py` and
+`account.js`. The box had been serving Jul-18 code until now.
+
+### ⚠️ THE OLD DEPLOY RECIPE WAS DESTRUCTIVE — DO NOT USE IT
+Every earlier snapshot in this file records this rsync:
+`rsync -az --exclude node_modules --exclude 'package*.json' --exclude
+'*.test.mjs' --exclude __pycache__ backend client root@…:/opt/secure-chat/`
+A `--dry-run` on 2026-07-25 showed it transfers **`backend/accounts.db`**
+(plus `.venv/` and `.pytest_cache/`) — i.e. it **overwrites the live account
+database with the local dev one**. Local was 327 KB (full of throwaway test
+accounts); live was 176 KB. Always `--dry-run --itemize-changes` first.
+**Use this instead:**
+```
+cd ~/secure-chat && rsync -az --itemize-changes \
+  --exclude node_modules --exclude 'package*.json' --exclude '*.test.mjs' \
+  --exclude __pycache__ --exclude '.venv' --exclude '.pytest_cache' \
+  --exclude 'accounts.db*' --exclude '*.db' --exclude '*.db-shm' --exclude '*.db-wal' \
+  --exclude 'tests' \
+  backend client root@138.199.144.35:/opt/secure-chat/ \
+&& ssh root@138.199.144.35 'chown -R securechat:securechat /opt/secure-chat/backend \
+   && systemctl restart secure-chat'
+```
+A pre-deploy backup now exists at `/root/accounts.db.bak-2026-07-25-1333` on
+the box. NOTE: `curl` to `https://138.199.144.35` fails from some networks
+(direct-IP TLS); SSH works fine — verify over loopback on the box instead
+(`ssh … 'curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/'`).
+
+**APK rebuild (worked as documented):**
+`cd ~/secure-chat/android && ANDROID_HOME=$HOME/android-sdk ./gradlew
+assembleDebug -Dorg.gradle.java.home=$HOME/jdk-21.0.4+7 && adb install -r
+app/build/outputs/apk/debug/app-debug.apk`
+
+**Open UI nit found on-device (not yet fixed):** on the Step-1 screen with a
+LOCKED stored identity, `#toRoom` ("Skip — no identity (AES-256 / OTP only)")
+is the `.primary` while **Unlock** is a quiet secondary — backwards, since
+Unlock is what the user wants there. The primary should move to `#idUnlock`
+when a locked identity exists. Separately, the Android shell shows a native
+ActionBar titled "secure-chat" ABOVE the web header's own wordmark — a
+duplicated title bar; consider hiding the native one (pre-existing, not from
+the redesign).
 
 ## ⮕ RESUME HERE (snapshot as of 2026-07-23, Android polish: icon + release signing)
 **Deploy is STILL PENDING** (blocked again this session by the Claude Code
