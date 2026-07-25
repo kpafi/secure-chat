@@ -40,6 +40,17 @@ green, Android unit tests green, all browser harnesses green.
   "passphrase" (old check kept as a fail-SECURE fallback). Marker added only
   in-app, so browser dialogs are unchanged.
 
+**SHIPPED 2026-07-25:** pushed (`88225d2`), deployed, APK rebuilt + installed.
+**The systemd unit was edited on the box** (backup at
+`/root/secure-chat.service.bak-2026-07-25-1617`): added
+`Environment=SECURE_CHAT_TRUSTED_PROXIES=127.0.0.1` and `--no-proxy-headers` to
+ExecStart — without BOTH, F-03's fix would silently degrade production to a
+single global rate-limit bucket. **Any future re-provision of that unit must
+carry these two changes.** Verified on the live box THROUGH Caddy (the real
+attacker path): rotating a spoofed `X-Forwarded-For` now gets 429 after 10 —
+no extra budget — while honest per-IP limiting still works. F-04 still 404s,
+DB byte-identical, site 200.
+
 **STILL OPEN (operational, not a code fix):** the phone runs the **DEBUG** APK,
 so WebView debugging is live. Switching to the release build needs an uninstall
 (different signing key) which **destroys the on-device identity blob and contact
