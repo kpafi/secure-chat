@@ -74,6 +74,12 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        // The web client renders its own header (wordmark + drawer button), so
+        // showing the native title too gave the app two stacked "secure-chat"
+        // bars. Drop the native title but KEEP the bar: its overflow holds
+        // Reload and Relay settings, and Relay settings is the only way to
+        // recover from a wrong relay address, when the page will not load at all.
+        supportActionBar?.setDisplayShowTitleEnabled(false)
 
         assetLoader = WebViewAssetLoader.Builder()
             .setDomain(appHost)

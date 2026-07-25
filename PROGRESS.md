@@ -3,7 +3,23 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (2026-07-25, UX pass: comprehension + accessibility)
+## ⮕ RESUME HERE (2026-07-25, Android: duplicate title bar removed)
+The app showed TWO stacked "secure-chat" bars — the native ActionBar plus the
+web client's own header. **Fixed by dropping the native TITLE, not the bar:**
+`supportActionBar?.setDisplayShowTitleEnabled(false)`.
+
+**Why the bar stays.** Both menu items are `showAsAction="never"`, i.e.
+overflow-only, and **"Relay settings" is the sole way to fix a wrong relay
+address when the page cannot load at all** — hiding the bar would strand the
+recovery path. What remains is a background-matched strip with just the ⋮.
+Theme now paints the ActionBar / status bar / nav bar in the client's own `bg`
+(`#0D1117`, new `app_bg`/`app_fg` colours) with 0dp elevation, so the native
+chrome and the page read as one surface instead of two.
+Verified on-device: overflow still opens with Reload + Relay settings.
+**Gotcha:** `--` is illegal inside an XML comment; referencing the CSS custom
+property names in `colors.xml` broke the resource merger.
+
+## ⮕ (2026-07-25) UX pass: comprehension + accessibility
 **Feedback from a real user: "hard to understand at first, very technical", and
 "joining a live room without generating a code fails with no error message".**
 

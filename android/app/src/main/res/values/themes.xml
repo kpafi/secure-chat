@@ -1,5 +1,24 @@
 <resources>
     <style name="Theme.SecureChat" parent="Theme.Material3.DayNight">
-        <item name="android:statusBarColor">?attr/colorSurface</item>
+        <!-- The bundled web client draws its own header (wordmark + menu), so
+             the native ActionBar must not repeat the title — that produced two
+             stacked "secure-chat" bars. The bar itself STAYS: both menu items
+             are overflow-only, and "Relay settings" is the only way to fix a
+             wrong relay address when the page cannot load. Title off, colours
+             matched to the page, so what remains reads as one surface with an
+             overflow button rather than a second title bar. -->
+        <item name="android:statusBarColor">@color/app_bg</item>
+        <item name="android:navigationBarColor">@color/app_bg</item>
+        <item name="actionBarTheme">@style/ThemeOverlay.SecureChat.ActionBar</item>
+        <item name="actionBarStyle">@style/Widget.SecureChat.ActionBar</item>
+    </style>
+
+    <style name="Widget.SecureChat.ActionBar" parent="Widget.Material3.ActionBar.Solid">
+        <item name="background">@color/app_bg</item>
+        <item name="elevation">0dp</item>
+    </style>
+
+    <style name="ThemeOverlay.SecureChat.ActionBar" parent="ThemeOverlay.Material3.ActionBar">
+        <item name="colorControlNormal">@color/app_fg</item>
     </style>
 </resources>

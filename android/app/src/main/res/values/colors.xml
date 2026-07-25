@@ -2,4 +2,8 @@
     <!-- Matches client/style.css bg/accent tokens (dark GitHub-ish palette). -->
     <color name="ic_launcher_background">#0D1117</color>
     <color name="ic_launcher_foreground_tint">#2F81F7</color>
+    <!-- Same tokens the web client uses, so the native chrome and the page do
+         not read as two different surfaces (style.css bg and fg). -->
+    <color name="app_bg">#0D1117</color>
+    <color name="app_fg">#D8DFE7</color>
 </resources>
