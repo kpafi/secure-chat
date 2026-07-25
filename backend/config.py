@@ -58,6 +58,26 @@ IDLE_TIMEOUT_SEC = 900  # 15 minutes
 # fast (whereas a joined, idle-but-reading peer gets the generous idle window).
 JOIN_TIMEOUT_SEC = 30
 
+# --- Trusted reverse proxies (rate-limit keying) --------------------------
+# Pentest 2026-07-25 F-03: every /api limiter keys on the client address. When
+# the app is reached DIRECTLY over loopback — which is exactly what a Tor
+# onion service does — uvicorn's proxy-header middleware would trust the
+# client's own X-Forwarded-For, so rotating that header handed out a fresh
+# rate-limit bucket per request and defeated the anti-enumeration lookup
+# limiter, the challenge limiter and the mailbox limiter at once.
+#
+# We therefore run uvicorn with --no-proxy-headers and resolve the address
+# ourselves (see accounts.client_key), trusting X-Forwarded-For ONLY when the
+# immediate peer is a proxy the operator explicitly listed here. Default: trust
+# nobody, so a misconfigured deployment fails CLOSED (one shared bucket) rather
+# than open (unlimited buckets).
+#
+# Set SECURE_CHAT_TRUSTED_PROXIES=127.0.0.1 when running behind the Caddy
+# reverse proxy. Leave it UNSET for a direct/.onion deployment.
+TRUSTED_PROXY_IPS = frozenset(
+    p.strip() for p in os.environ.get("SECURE_CHAT_TRUSTED_PROXIES", "").split(",") if p.strip()
+)
+
 # --- HTTP /api abuse bounds (account directory) ---------------------------
 # The /ws relay has its own token bucket; the HTTP account endpoints need their
 # own. Keyed per client host — behind Tor every request appears from loopback,

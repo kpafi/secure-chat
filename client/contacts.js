@@ -217,13 +217,25 @@ export function get(username) {
 // (ecdh/mlkem) too — a relay that swaps only those, keeping the signing
 // identity, would otherwise silently redirect sealed async messages while the
 // contact still shows 🟢. Any of the four keys changing drops verification.
-export async function upsert({ username, token, ed, mldsa, ecdh = null, mlkem = null, verified = false }) {
+export async function upsert({
+  username, token, ed, mldsa, ecdh = null, mlkem = null, verified = false,
+  // Pentest 2026-07-25 F-01: `username` is the LOCAL label and is chosen by us
+  // (or by the user), never by a remote party. `addrUsername` is the directory
+  // name used to address mail and look the contact up; `claimedName` is the
+  // sender's self-asserted handle, kept only so the UI can show it as an
+  // explicitly unverified claim. `auto` marks a record created from inbound
+  // mail rather than by the user, which is what the F-05 cap counts.
+  addrUsername = null, claimedName = null, auto = false,
+}) {
   if (!contacts) throw new Error("contact store is locked");
   const now = Date.now();
   const cur = contacts.find((c) => c.username === username);
   if (!cur) {
     contacts.push({
       username, token: token || null, ed, mldsa, ecdh, mlkem,
+      addrUsername: addrUsername || null,
+      claimedName: claimedName || null,
+      auto: !!auto,
       verified, verifiedAt: verified ? now : null, addedAt: now,
     });
   } else {
@@ -241,6 +253,8 @@ export async function upsert({ username, token, ed, mldsa, ecdh = null, mlkem = 
     if (ecdh) cur.ecdh = ecdh;
     if (mlkem) cur.mlkem = mlkem;
     if (token) cur.token = token;
+    if (addrUsername) cur.addrUsername = addrUsername;
+    if (claimedName) cur.claimedName = claimedName;
     if (keyChanged) {
       cur.verified = false; // key change invalidates earlier in-person trust
       cur.verifiedAt = null;

@@ -60,6 +60,16 @@ class MainActivity : AppCompatActivity() {
     // is identical because the bundled index.html is a copy of the web one.
     private val importMapHash = "sha256-6Sm2nhNvoa7gr7uuY2hbAbpdWhIlL15/wXLm4dhO9UQ="
 
+    companion object {
+        /**
+         * Prefix the bundled client puts on a window.prompt() whose answer is a
+         * SECRET, so the shell masks the input instead of guessing from the
+         * wording (pentest 2026-07-25 F-08). Must match SECRET_PROMPT_MARK in
+         * client/app.js; the client only adds it when running inside the app.
+         */
+        const val SECRET_PROMPT_MARK = "[secure-chat:secret] "
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
@@ -154,9 +164,18 @@ class MainActivity : AppCompatActivity() {
             ): Boolean {
                 // Audit 2026-07-18 L-02: the client requests chat passphrases via
                 // window.prompt(); a plain text field shows them to anyone
-                // shoulder-surfing. Mask the input whenever the (app-local,
-                // bundled-client-controlled) message asks for a passphrase.
-                val secret = message?.contains("passphrase", ignoreCase = true) == true
+                // shoulder-surfing, so secret input must be masked.
+                //
+                // Pentest 2026-07-25 F-08: this used to guess by searching the
+                // message for the word "passphrase", which would silently
+                // un-mask a secret as soon as a prompt was reworded. The
+                // bundled client now marks secret prompts explicitly (see
+                // promptSecret in app.js) and we strip the marker before
+                // display. The old substring check is kept only as a
+                // fail-SECURE fallback: it can add masking, never remove it.
+                val marked = message?.startsWith(SECRET_PROMPT_MARK) == true
+                val secret = marked || message?.contains("passphrase", ignoreCase = true) == true
+                val shown = if (marked) message!!.removePrefix(SECRET_PROMPT_MARK) else message
                 val input = EditText(this@MainActivity).apply {
                     inputType = if (secret) {
                         InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
@@ -166,7 +185,7 @@ class MainActivity : AppCompatActivity() {
                     setText(defaultValue ?: "")
                 }
                 AlertDialog.Builder(this@MainActivity)
-                    .setMessage(message)
+                    .setMessage(shown)
                     .setView(input)
                     .setCancelable(false)
                     .setPositiveButton(android.R.string.ok) { _, _ -> result.confirm(input.text.toString()) }

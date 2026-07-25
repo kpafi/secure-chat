@@ -19,6 +19,13 @@ import { ml_kem768 } from "@noble/post-quantum/ml-kem.js";
 
 const enc = new TextEncoder();
 
+// Fixed public-key sizes, mirroring backend/config.py. Used to reject malformed
+// bundles before they are hashed into a fingerprint / safety number (F-07).
+const ED25519_PUB_BYTES = 32;
+const MLDSA65_PUB_BYTES = 1952;
+const ECDH_PUB_BYTES = 65;      // P-256 uncompressed point
+const MLKEM768_PUB_BYTES = 1184;
+
 // ---- small byte/encoding helpers (kept local so this module stands alone) --
 
 function b64(bytes) {
@@ -247,9 +254,28 @@ export class Identity {
   // caught. A pre-v2 bundle (no enc keys) hashes exactly as before, so legacy
   // fingerprints are unchanged.
   static _bundleBytes(bundle) {
-    const parts = [unb64(bundle.ed), unb64(bundle.mldsa)];
+    // Pentest 2026-07-25 F-07: this concatenation is what the fingerprint and
+    // safety number hash, so it is the client's canonicalisation boundary. The
+    // fields have fixed sizes, which is the only reason two different bundles
+    // cannot be made to concatenate identically — enforce that explicitly here
+    // rather than leaving it as an emergent property of how the keys are used
+    // downstream. A wrong-length key is a malformed bundle, not a comparison.
+    const field = (b64s, want, name) => {
+      const raw = unb64(b64s);
+      if (raw.length !== want) {
+        throw new Error(`malformed identity bundle: ${name} is ${raw.length} bytes, expected ${want}`);
+      }
+      return raw;
+    };
+    const parts = [
+      field(bundle.ed, ED25519_PUB_BYTES, "ed"),
+      field(bundle.mldsa, MLDSA65_PUB_BYTES, "mldsa"),
+    ];
     if (bundle.ecdh && bundle.mlkem) {
-      parts.push(unb64(bundle.ecdh), unb64(bundle.mlkem));
+      parts.push(
+        field(bundle.ecdh, ECDH_PUB_BYTES, "ecdh"),
+        field(bundle.mlkem, MLKEM768_PUB_BYTES, "mlkem"),
+      );
     }
     return concat(...parts);
   }

@@ -10,5 +10,9 @@ cd "$(dirname "$0")"
 # connections. 66560 = MAX_FRAME_BYTES (64 KiB) + 1 KiB headroom so frames just
 # over the app limit still get the app's polite "frame too large" error while
 # anything larger is hard-closed (1009) without being buffered.
+# --no-proxy-headers (pentest 2026-07-25 F-03): uvicorn would otherwise trust a
+# client-supplied X-Forwarded-For whenever the peer is loopback, handing out a
+# fresh rate-limit bucket per forged header. The app resolves the client address
+# itself (accounts.client_key) against SECURE_CHAT_TRUSTED_PROXIES.
 exec python -m uvicorn main:app --host 127.0.0.1 --port 8000 --no-server-header \
-    --no-access-log --log-level warning --ws-max-size 66560
+    --no-proxy-headers --no-access-log --log-level warning --ws-max-size 66560

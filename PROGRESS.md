@@ -3,7 +3,49 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (snapshot as of 2026-07-25, in-depth pentest: 2 of 8 fixed)
+## ⮕ RESUME HERE (snapshot as of 2026-07-25, pentest: ALL 8 findings fixed)
+**The remaining six findings (F-01, F-03, F-05, F-06, F-07, F-08) are now fixed,
+tested and verified against their own PoCs.** See the updated
+`secure-chat-pentest-2026-07-25.md`. Backend **103 passed**, client `npm test`
+green, Android unit tests green, all browser harnesses green.
+
+- **F-01 (Medium) — contact injection.** The local contact label is now always
+  derived from the sender's KEY (`neutralName()` → `unknown-<key>`); the
+  self-claimed handle is kept as `claimedName` and rendered as an explicit
+  warning row. **Because the local label no longer matches the directory name,
+  addressing had to be split out** — contacts carry `addrUsername`, and every
+  mail/vouch/lookup site goes through `dirName()`/`mailHandle()`. The PoC now
+  yields `unknown-…` contacts; `regress-reply.mjs` proves replies to an
+  auto-created contact still reach the right account (otherwise unsolicited
+  chats would silently become one-way — the trap in this fix).
+- **F-03 (Medium) — rate-limit keying.** No longer relies on uvicorn defaults:
+  `run.sh` passes `--no-proxy-headers` and `accounts.client_key()` honours
+  `X-Forwarded-For` only from a peer listed in the new
+  `SECURE_CHAT_TRUSTED_PROXIES`, taking the RIGHTMOST hop. Default trusts
+  nobody → a direct/.onion deploy fails CLOSED (one shared bucket) instead of
+  open. **DEPLOY REQUIREMENT: the systemd unit must set
+  `SECURE_CHAT_TRUSTED_PROXIES=127.0.0.1` for the Caddy box; leave it UNSET for
+  .onion.** New `tests/test_proxy_headers.py`.
+- **F-05 (Low)** — auto-created contacts marked `auto:true`, capped at
+  `MAX_AUTO_CONTACTS = 50`; past the cap unknown senders are refused and the
+  Chats view says why. `regress-cap.mjs`.
+- **F-06 (Low)** — each envelope is filed by `processEnvelope()` in its own
+  try/catch so one failure cannot discard the rest of an already-deleted batch.
+  Defensive: the window was never demonstrated.
+- **F-07 (Info)** — `_bundleBytes` asserts all four key lengths
+  (32/1952/65/1184); the Users view shows "fingerprint unavailable" instead of
+  hanging on "…".
+- **F-08 (Info)** — secret prompts now carry an explicit `SECRET_PROMPT_MARK`
+  that the Android shell strips and masks on, instead of guessing from the word
+  "passphrase" (old check kept as a fail-SECURE fallback). Marker added only
+  in-app, so browser dialogs are unchanged.
+
+**STILL OPEN (operational, not a code fix):** the phone runs the **DEBUG** APK,
+so WebView debugging is live. Switching to the release build needs an uninstall
+(different signing key) which **destroys the on-device identity blob and contact
+store** — only do it with an exported backup or a fresh identity.
+
+## ⮕ (superseded) snapshot as of 2026-07-25, in-depth pentest: 2 of 8 fixed
 **Full-stack pentest run against `4b9f270`; report in
 `secure-chat-pentest-2026-07-25.md`. The crypto core held — nothing broke in
 the handshake, ratchet, OTP, sealed envelope or web-of-trust. Every finding is

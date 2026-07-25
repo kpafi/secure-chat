@@ -188,6 +188,15 @@ h1 .sub {
 .u-mark.ok { color: var(--ok); }
 .u-mark.mid { color: var(--warn); }
 .u-fp { font-size: 0.72rem; color: var(--muted); margin: 0.35rem 0; word-break: break-word; }
+.u-fp.err { color: var(--err); }
+/* A sender's self-claimed handle. Deliberately quiet and marked as a claim —
+   it is attacker-chosen text, never an identity (pentest F-01). */
+.u-claim {
+  font-size: 0.72rem;
+  color: var(--warn);
+  margin: 0.35rem 0 0;
+  word-break: break-word;
+}
 .u-actions { margin-top: 0.35rem; }
 .u-actions button { font-size: 0.78rem; padding: 0.4rem 0.6rem; }
 

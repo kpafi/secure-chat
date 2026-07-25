@@ -58,21 +58,42 @@ _lookup_limiter = KeyedRateLimiter(config.LOOKUP_RATE_CAPACITY, config.LOOKUP_RA
 _challenge_limiter = KeyedRateLimiter(config.CHALLENGE_RATE_CAPACITY, config.CHALLENGE_RATE_REFILL_PER_SEC)
 
 
+def client_key(request: Request) -> str:
+    """The address every rate limiter is keyed on.
+
+    Pentest 2026-07-25 F-03. `X-Forwarded-For` is attacker-controlled unless a
+    trusted proxy rewrote it, so it is honoured ONLY when the immediate peer is
+    a proxy the operator listed in SECURE_CHAT_TRUSTED_PROXIES. We take the
+    RIGHTMOST entry, which is the one that proxy appended (anything further
+    left was supplied by the client and can say whatever it likes).
+
+    With no trusted proxy configured this returns the real peer address, so a
+    direct/.onion deployment collapses to one shared bucket — throttled, which
+    is the safe direction — instead of handing out a bucket per forged header.
+
+    Requires uvicorn to run with --no-proxy-headers; otherwise its middleware
+    rewrites request.client before we ever see it.
+    """
+    peer = request.client.host if request.client else "unknown"
+    if peer not in config.TRUSTED_PROXY_IPS:
+        return peer
+    forwarded = request.headers.get("x-forwarded-for", "")
+    hops = [h.strip() for h in forwarded.split(",") if h.strip()]
+    return hops[-1] if hops else peer
+
+
 def rate_limit(request: Request) -> None:
-    host = request.client.host if request.client else "unknown"
-    if not _api_limiter.allow(host):
+    if not _api_limiter.allow(client_key(request)):
         raise HTTPException(status_code=429, detail="rate limited")
 
 
 def challenge_rate_limit(request: Request) -> None:
-    host = request.client.host if request.client else "unknown"
-    if not _challenge_limiter.allow(host):
+    if not _challenge_limiter.allow(client_key(request)):
         raise HTTPException(status_code=429, detail="rate limited")
 
 
 def lookup_rate_limit(request: Request) -> None:
-    host = request.client.host if request.client else "unknown"
-    if not _lookup_limiter.allow(host):
+    if not _lookup_limiter.allow(client_key(request)):
         raise HTTPException(status_code=429, detail="rate limited")
 
 

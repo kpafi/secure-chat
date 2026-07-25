@@ -103,6 +103,18 @@ const ROOM_RE = /^[0-9a-f]{64}$/;
 const RELAY = (typeof window !== "undefined" && window.__SECURE_CHAT_RELAY__) || null;
 const API_BASE = RELAY ? RELAY.api : ""; // same-origin unless the host app overrides
 
+// Pentest 2026-07-25 F-08: the Android shell has to decide whether a
+// window.prompt() is asking for a secret so it can mask the input. It used to
+// guess by looking for the word "passphrase" in the message, which silently
+// un-masks a secret the moment a prompt is reworded. Secret prompts now carry
+// an explicit marker the shell recognises and strips. It is added ONLY when
+// running inside the app (RELAY is injected by MainActivity), so the browser
+// still shows the plain message.
+const SECRET_PROMPT_MARK = "[secure-chat:secret] ";
+function promptSecret(message) {
+  return prompt(RELAY ? SECRET_PROMPT_MARK + message : message);
+}
+
 // localStorage keys. Private keys live only inside the passphrase-encrypted
 // identity blob; pins hold peers' PUBLIC bundles only.
 const LS_IDENTITY = "sc.identity.v1";
@@ -670,6 +682,16 @@ function renderUserList() {
     head.append(name, mark);
     li.appendChild(head);
 
+    // F-01: an auto-created contact's self-claimed handle is displayed as a
+    // claim, clearly separated from the neutral local label, so a stranger
+    // cannot make themselves LOOK like a name you recognise.
+    if (c.claimedName) {
+      const claim = document.createElement("div");
+      claim.className = "u-claim";
+      claim.textContent = `claims to be "${c.claimedName}" — unverified, they chose this name themselves`;
+      li.appendChild(claim);
+    }
+
     if (c.keyChangedAt && !c.verified) {
       const warn = document.createElement("div");
       warn.className = "hint err";
@@ -693,6 +715,12 @@ function renderUserList() {
       ed: c.ed, mldsa: c.mldsa, ecdh: c.ecdh ?? null, mlkem: c.mlkem ?? null,
     }).then((f) => {
       fp.textContent = "fingerprint: " + f;
+    }).catch(() => {
+      // F-07: _bundleBytes now rejects wrong-length keys. Say so instead of
+      // leaving the row showing "…" forever — a contact whose stored keys are
+      // malformed cannot be verified and must not look like it is loading.
+      fp.textContent = "fingerprint unavailable — stored keys are malformed";
+      fp.className = "u-fp err";
     });
     li.appendChild(fp);
 
@@ -720,7 +748,7 @@ function renderUserList() {
             // Vouch over the FULL in-person-verified bundle incl. encryption
             // keys (H-01) so the 🟡 mark attests the keys used to seal async
             // messages, not just the signing identity.
-            await account.vouch(API_BASE, identity, apiToken, c.username, {
+            await account.vouch(API_BASE, identity, apiToken, dirName(c), {
               ed: c.ed, mldsa: c.mldsa, ecdh: c.ecdh ?? null, mlkem: c.mlkem ?? null,
             });
             statusMsg = `Vouch for "${c.username}" published.`;
@@ -733,7 +761,7 @@ function renderUserList() {
         }
       } else if (apiToken) {
         // Turned back to unverified — retract a published vouch if any.
-        account.unvouch(API_BASE, apiToken, c.username).catch(() => { /* none published */ });
+        account.unvouch(API_BASE, apiToken, dirName(c)).catch(() => { /* none published */ });
       }
       renderUserList(); // clears the status line…
       if (statusMsg) usersStatus(statusMsg, statusErr); // …so report after
@@ -774,7 +802,7 @@ async function refreshVouchMarks() {
       if (c.vouchCheckedAt && Date.now() - c.vouchCheckedAt < VOUCH_RECHECK_MS) continue;
       let raw;
       try {
-        raw = await account.fetchVouches(API_BASE, c.username + "#" + c.token);
+        raw = await account.fetchVouches(API_BASE, mailHandle(c));
       } catch {
         continue; // offline / rate-limited: leave the cache, retry next render
       }
@@ -790,7 +818,7 @@ async function refreshVouchMarks() {
         // awarded — the mark can never vouch for keys the directory forged.
         const ok = await Identity.verify(
           { ed: voucher.ed, mldsa: voucher.mldsa },
-          account.vouchMessageBytes(c.username, {
+          account.vouchMessageBytes(dirName(c), {
             ed: c.ed, mldsa: c.mldsa, ecdh: c.ecdh ?? null, mlkem: c.mlkem ?? null,
           }),
           { ed: v.sig, mldsa: v.mldsa_sig },
@@ -1009,7 +1037,7 @@ async function proposeModeChange(username, mode) {
   const control = { kind: "mode-propose", mode };
   let salt = null, secret = null;
   if (mode === "AES256") {
-    secret = prompt(
+    secret = promptSecret(
       `Choose a shared passphrase for the ${username} chat. Tell it to them out of band — ` +
       "they must enter the SAME one to accept. It adds AES-256 on top of the sealed envelope.",
     );
@@ -1035,7 +1063,7 @@ async function acceptModeChange(username) {
   const { mode, salt } = chat.pending;
   let secret = null;
   if (mode === "AES256") {
-    secret = prompt(`Enter the shared passphrase ${username} gave you for this chat (must match exactly).`);
+    secret = promptSecret(`Enter the shared passphrase ${username} gave you for this chat (must match exactly).`);
     if (!secret) return;
   }
   try {
@@ -1063,7 +1091,7 @@ async function sendControl(username, contact, control) {
   const envelope = await sealed.seal(
     identity, { ed: contact.ed, mldsa: contact.mldsa, ecdh: contact.ecdh, mlkem: contact.mlkem }, control, senderHandle,
   );
-  await account.sendMail(API_BASE, username + "#" + contact.token, envelope);
+  await account.sendMail(API_BASE, mailHandle(contact), envelope);
 }
 
 async function sendChatMessage(e) {
@@ -1100,7 +1128,7 @@ async function sendChatMessage(e) {
       content = text;
     }
     const envelope = await sealed.seal(identity, { ed: c.ed, mldsa: c.mldsa, ecdh: c.ecdh, mlkem: c.mlkem }, content, senderHandle);
-    await account.sendMail(API_BASE, activeChat + "#" + c.token, envelope);
+    await account.sendMail(API_BASE, mailHandle(c), envelope);
     await chats.append(activeChat, { dir: "out", text, ts: Date.now() });
     els.chatText.value = "";
     renderConversation();
@@ -1125,63 +1153,121 @@ async function pollMailbox() {
   }
   let changed = false;
   for (const m of batch) {
-    let opened;
+    // Pentest 2026-07-25 F-06: GET /api/mailbox is delete-on-read, so the server
+    // has ALREADY discarded everything in `batch`. Anything that throws while
+    // filing one envelope must not take the rest of the batch with it — the
+    // remainder would be unrecoverable. Each envelope is therefore processed in
+    // full isolation, and the loop continues past a failure.
     try {
-      opened = await sealed.open(identity, m.envelope);
-    } catch {
-      continue; // undecryptable/forged envelope: drop silently
+      changed = (await processEnvelope(m)) || changed;
+    } catch (err) {
+      // Keep going: the other envelopes in this batch are still deliverable.
+      console.error("[mailbox] dropping one envelope:", err && err.message);
     }
-    const senderBundle = opened.from;
-    // Match the sender to a saved user by their SIGNING keys.
-    let sender = contacts.list().find((c) => c.ed === senderBundle.ed && c.mldsa === senderBundle.mldsa) || null;
-    if (!sender) {
-      // Unknown sender: create an unverified contact. Prefer their sealed
-      // self-claimed handle; fall back to a fingerprint-derived name.
-      const parsed = opened.name ? account.parseHandle(opened.name) : null;
-      const fallback = "unknown-" + senderBundle.ed.replace(/[^a-zA-Z0-9]/g, "").slice(0, 8).toLowerCase();
-      const uname = parsed && !contacts.get(parsed.username) ? parsed.username : fallback;
-      sender = await contacts.upsert({
-        username: uname, token: parsed ? parsed.token : null,
-        ed: senderBundle.ed, mldsa: senderBundle.mldsa,
-        ecdh: senderBundle.ecdh || null, mlkem: senderBundle.mlkem || null,
-      });
-    } else if (sender.token === null && opened.name) {
-      // Known bundle but no reply token yet: adopt the sealed handle's token.
-      const parsed = account.parseHandle(opened.name);
-      if (parsed && parsed.username === sender.username) {
-        sender = await contacts.upsert({
-          username: sender.username, token: parsed.token,
-          ed: sender.ed, mldsa: sender.mldsa, ecdh: sender.ecdh, mlkem: sender.mlkem,
-        });
-      }
-    }
-    // Control traffic (mode negotiation) vs a regular message.
-    if (opened.kind && opened.kind !== "msg") {
-      if (await handleControl(sender, opened)) changed = true;
-      continue;
-    }
-
-    // Regular message. Decrypt the inner AES256 layer if this chat is in that
-    // mode; a mode mismatch (peer still on the old mode) shows a system note.
-    let text = opened.msg;
-    if (opened.enc !== undefined) {
-      const chat = chats.get(sender.username);
-      if (chat && chat.mode === "AES256" && chat.secret && chat.salt) {
-        try {
-          text = await chats.innerDecrypt(chat.secret, chat.salt, opened.enc);
-        } catch {
-          text = "[AES256 message that did not decrypt — shared passphrase mismatch]";
-        }
-      } else {
-        text = "[AES256 message but this chat isn't in AES256 mode here]";
-      }
-    }
-    const isNew = await chats.append(sender.username, {
-      dir: "in", text, ts: opened.ts, id: opened.id,
-    });
-    changed = changed || isNew;
   }
   if (changed && !els.viewChats.hidden) refreshChats();
+}
+
+// Cap on contacts created automatically from inbound mail (F-05). Anyone who
+// knows our handle — which the app publishes as an invite link / QR — can send
+// sealed mail, and each unknown sender used to add a record to the encrypted
+// contact store with no ceiling. Past this many, unknown senders are refused
+// until the user clears some; known contacts are never affected.
+const MAX_AUTO_CONTACTS = 50;
+
+// The DIRECTORY name for a contact: what the server knows them as, which is
+// NOT necessarily the local label (F-01 — an auto-created contact is labelled
+// neutrally and keeps the claimed directory name in `addrUsername`).
+function dirName(c) {
+  return c.addrUsername || c.username;
+}
+// The `username#token` handle used to address mail / directory lookups.
+function mailHandle(c) {
+  return dirName(c) + "#" + c.token;
+}
+
+// A local label derived from the sender's OWN key material, so an unknown
+// sender can never choose how they are listed (F-01). Deterministic, so the
+// same sender always lands on the same record.
+function neutralName(edB64) {
+  return "unknown-" + edB64.replace(/[^a-zA-Z0-9]/g, "").slice(0, 12).toLowerCase();
+}
+
+// File one fetched envelope. Returns true if it changed anything on screen.
+async function processEnvelope(m) {
+  let opened;
+  try {
+    opened = await sealed.open(identity, m.envelope);
+  } catch {
+    return false; // undecryptable/forged envelope: drop silently
+  }
+  const senderBundle = opened.from;
+  // Match the sender to a saved user by their SIGNING keys — never by any
+  // string they supplied.
+  let sender = contacts.list().find((c) => c.ed === senderBundle.ed && c.mldsa === senderBundle.mldsa) || null;
+  // The handle sealed inside is SELF-CLAIMED. It is signed, which proves the
+  // sender wrote it — not that it is theirs.
+  const claimed = opened.name ? account.parseHandle(opened.name) : null;
+
+  if (!sender) {
+    // Pentest 2026-07-25 F-01: this used to take the local username straight
+    // from the claim, so any stranger could seat a contact called "alice" or
+    // "bank-support" (bound to THEIR keys) in the Users and Chats lists. The
+    // local label is now always derived from the sender's own key material;
+    // the claim is kept separately, shown as unverified, and used only to
+    // address replies.
+    if (contacts.list().filter((c) => c.auto).length >= MAX_AUTO_CONTACTS) {
+      chatsStatus(
+        `Ignoring mail from unknown senders — the automatic contact limit (${MAX_AUTO_CONTACTS}) is reached. ` +
+        "Remove some unknown contacts in Users to accept new ones.", true,
+      );
+      return false;
+    }
+    sender = await contacts.upsert({
+      username: neutralName(senderBundle.ed),
+      addrUsername: claimed ? claimed.username : null,
+      claimedName: opened.name || null,
+      auto: true,
+      token: claimed ? claimed.token : null,
+      ed: senderBundle.ed, mldsa: senderBundle.mldsa,
+      ecdh: senderBundle.ecdh || null, mlkem: senderBundle.mlkem || null,
+    });
+  } else if (sender.token === null && claimed) {
+    // Known bundle, no reply address yet: adopt the claimed one. Safe because
+    // the bundle already matched a contact WE hold — the claim only decides
+    // where a reply is posted, and a wrong one simply fails to deliver.
+    sender = await contacts.upsert({
+      username: sender.username,
+      addrUsername: sender.addrUsername || claimed.username,
+      claimedName: sender.claimedName || opened.name || null,
+      token: claimed.token,
+      ed: sender.ed, mldsa: sender.mldsa, ecdh: sender.ecdh, mlkem: sender.mlkem,
+    });
+  }
+
+  // Control traffic (mode negotiation) vs a regular message.
+  if (opened.kind && opened.kind !== "msg") {
+    return await handleControl(sender, opened);
+  }
+
+  // Regular message. Decrypt the inner AES256 layer if this chat is in that
+  // mode; a mode mismatch (peer still on the old mode) shows a system note.
+  let text = opened.msg;
+  if (opened.enc !== undefined) {
+    const chat = chats.get(sender.username);
+    if (chat && chat.mode === "AES256" && chat.secret && chat.salt) {
+      try {
+        text = await chats.innerDecrypt(chat.secret, chat.salt, opened.enc);
+      } catch {
+        text = "[AES256 message that did not decrypt — shared passphrase mismatch]";
+      }
+    } else {
+      text = "[AES256 message but this chat isn't in AES256 mode here]";
+    }
+  }
+  return await chats.append(sender.username, {
+    dir: "in", text, ts: opened.ts, id: opened.id,
+  });
 }
 
 // Apply an inbound mode-negotiation control message. Returns true if anything

@@ -27,7 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 import config
 from relay import KeyedRateLimiter
-from accounts import _db, current_user, _check_username, token_matches
+from accounts import _db, current_user, _check_username, token_matches, client_key
 
 _post_limiter = KeyedRateLimiter(config.MAILBOX_RATE_CAPACITY, config.MAILBOX_RATE_REFILL_PER_SEC)
 
@@ -38,8 +38,8 @@ router = APIRouter(prefix="/api/mailbox", tags=["mailbox"])
 
 
 def _post_rate_limit(request: Request) -> None:
-    host = request.client.host if request.client else "unknown"
-    if not _post_limiter.allow(host):
+    # Same trusted-proxy-aware keying as the /api limiters (pentest F-03).
+    if not _post_limiter.allow(client_key(request)):
         raise HTTPException(status_code=429, detail="rate limited")
 
 
