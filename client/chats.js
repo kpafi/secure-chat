@@ -96,6 +96,28 @@ export async function unlock(passphrase) {
     throw new Error("chat store does not decrypt with this passphrase (different identity, or tampered)");
   }
   chats = JSON.parse(dec.decode(plain));
+  if (sanitizeModes()) await persist();
+}
+
+// Repair a store written before the F-02 allow-list existed: a chat whose mode
+// (or pending proposal) holds an unrecognised string was never actually using
+// an inner layer, so SEALED is both the safe and the accurate value. Without
+// this an already-poisoned chat would keep rendering the attacker's string.
+function sanitizeModes() {
+  let changed = false;
+  for (const c of Object.values(chats || {})) {
+    if (!isValidMode(c.mode)) {
+      c.mode = "SEALED";
+      delete c.secret;
+      delete c.salt;
+      changed = true;
+    }
+    if (c.pending && !isValidMode(c.pending.mode)) {
+      delete c.pending;
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 async function persist() {
@@ -150,6 +172,24 @@ export async function innerDecrypt(secret, saltB64, blob) {
 
 // ---- chats ----------------------------------------------------------------
 
+// The ONLY modes a chat may ever be in. Pentest 2026-07-25 F-02: the mode
+// arrives inside a peer's control message. It is authenticated (they signed it)
+// but it is not trusted — an unrecognised string used to be stored verbatim and
+// rendered into the padlocked mode indicator, while every behavioural check is
+// an exact `mode === "AES256"` compare. The result was a chat whose header
+// claimed "🔒 AES256 + <attacker text>" while no inner layer was applied and no
+// passphrase was ever requested. Reject anything off this list before it can be
+// stored, so an unknown mode can never reach the UI or the send path.
+export const MODES = Object.freeze(["SEALED", "AES256"]);
+
+export function isValidMode(mode) {
+  return MODES.includes(mode);
+}
+
+function requireValidMode(mode) {
+  if (!isValidMode(mode)) throw new Error(`unsupported chat mode: ${String(mode).slice(0, 40)}`);
+}
+
 export function list() {
   if (!chats) throw new Error("chat store is locked");
   return Object.values(chats)
@@ -165,6 +205,7 @@ export function get(username) {
 
 export async function ensure(username, mode = "SEALED") {
   if (!chats) throw new Error("chat store is locked");
+  requireValidMode(mode);
   if (!chats[username]) {
     chats[username] = { username, mode, messages: [], updatedAt: Date.now() };
     await persist();
@@ -193,6 +234,7 @@ export async function append(username, { dir, text, ts, id = null }) {
 // share them). Clears any pending proposal.
 export async function setMode(username, mode, { secret = null, salt = null } = {}) {
   if (!chats) throw new Error("chat store is locked");
+  requireValidMode(mode);
   if (!chats[username]) await ensure(username);
   const c = chats[username];
   c.mode = mode;
@@ -213,6 +255,7 @@ export async function setMode(username, mode, { secret = null, salt = null } = {
 // and await their accept; "in" = they proposed and we must accept/decline.
 export async function setPending(username, pending) {
   if (!chats) throw new Error("chat store is locked");
+  requireValidMode(pending && pending.mode);
   if (!chats[username]) await ensure(username);
   chats[username].pending = pending;
   await persist();

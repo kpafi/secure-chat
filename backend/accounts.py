@@ -116,6 +116,21 @@ def _b64decode_fixed(s: str, n: int) -> bytes:
     return raw
 
 
+def token_matches(provided: str, stored: str) -> bool:
+    """Constant-time lookup-token comparison that cannot be crashed by input.
+
+    Pentest 2026-07-25 F-04: `hmac.compare_digest` raises TypeError on `str`
+    arguments containing non-ASCII, and the provided token comes straight off
+    the query string — so `?t=ü` turned the token gate into an unhandled 500
+    (plus a traceback written to the journal on demand, against I2). Comparing
+    the UTF-8 BYTES accepts any input while keeping the constant-time property.
+
+    Callers must still pass a decoy `stored` for missing users so that a wrong
+    token and an unknown user remain indistinguishable (I1).
+    """
+    return hmac.compare_digest(provided.encode("utf-8"), stored.encode("utf-8"))
+
+
 def _ed25519_verify(pub_raw: bytes, sig: bytes, msg: bytes) -> bool:
     try:
         Ed25519PublicKey.from_public_bytes(pub_raw).verify(sig, msg)
@@ -342,7 +357,7 @@ def get_user(username: str, t: str = Query(default="", max_length=64)) -> dict:
             (username,),
         ).fetchone()
     stored = row["lookup_token"] if row is not None else secrets.token_urlsafe(config.LOOKUP_TOKEN_BYTES)
-    if not hmac.compare_digest(t, stored) or row is None:
+    if not token_matches(t, stored) or row is None:
         raise HTTPException(status_code=404, detail="no such user")
     # The public identity bundle others will pin + verify in person. Encryption
     # keys (bundle v2) are included when the account has published them.
@@ -504,7 +519,7 @@ def get_vouches(username: str, t: str = Query(default="", max_length=64)) -> dic
             "SELECT lookup_token FROM accounts WHERE username = ?", (username,)
         ).fetchone()
         stored = row["lookup_token"] if row is not None else secrets.token_urlsafe(config.LOOKUP_TOKEN_BYTES)
-        if not hmac.compare_digest(t, stored) or row is None:
+        if not token_matches(t, stored) or row is None:
             raise HTTPException(status_code=404, detail="no such user")
         rows = conn.execute(
             """

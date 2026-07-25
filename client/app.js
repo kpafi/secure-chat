@@ -1189,6 +1189,14 @@ async function pollMailbox() {
 // verified-enough contact can drive our chat state.
 async function handleControl(sender, opened) {
   const u = sender.username;
+  // Pentest 2026-07-25 F-02: `opened.mode` is peer-supplied. The sealed envelope
+  // proves they signed it, NOT that it is a mode we support — and every mode
+  // check downstream is an exact string compare, so an unrecognised value would
+  // silently take the plain-SEALED send path while the padlocked indicator
+  // rendered the attacker's string. Refuse it at the boundary.
+  if (opened.kind === "mode-propose" || opened.kind === "mode-accept") {
+    if (!chats.isValidMode(opened.mode)) return false;
+  }
   if (opened.kind === "mode-propose") {
     await chats.setPending(u, { mode: opened.mode, dir: "in", salt: opened.salt || null });
     if (activeChat === u) renderConversation();

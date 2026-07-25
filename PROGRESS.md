@@ -3,6 +3,61 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
+## ⮕ RESUME HERE (snapshot as of 2026-07-25, in-depth pentest: 2 of 8 fixed)
+**Full-stack pentest run against `4b9f270`; report in
+`secure-chat-pentest-2026-07-25.md`. The crypto core held — nothing broke in
+the handshake, ratchet, OTP, sealed envelope or web-of-trust. Every finding is
+in the layer ABOVE the crypto: the async mailbox treats AUTHENTICATED data (the
+sender really signed it) as TRUSTED (they are who they claim, and their values
+are well-formed).** Deps clean (`npm audit` 0, `pip-audit` 0); starlette 1.3.1 /
+fastapi 0.139.2 / cryptography 49.0.0 close the 2026-07-18 M-01/M-02/L-03.
+
+**FIXED + committed this session (both re-verified against their own PoCs):**
+- **F-02 (Medium) — chat mode string was unvalidated.** A peer could propose an
+  arbitrary `mode`; on accept the header rendered `🔒 AES256 + verified by
+  secure-chat` while `hasSecret:false` and NO inner layer was applied (every
+  check is an exact `=== "AES256"`). Fix: `chats.MODES`/`isValidMode`
+  allow-list, enforced in `setMode`/`setPending`/`ensure` AND dropped at the
+  boundary in `app.js handleControl`; `chats.unlock()` sanitises an
+  already-poisoned store (bogus mode → SEALED, phantom secret/salt dropped) so
+  a victim heals on next unlock. New `client/chats.test.mjs`.
+- **F-04 (Low) — `?t=ü` → HTTP 500 + traceback** on `/api/users/{u}`,
+  `/api/users/{u}/vouches` and `/api/mailbox/{u}`: `hmac.compare_digest` raises
+  TypeError on non-ASCII `str`. Not an existence oracle (both branches raised
+  identically), but it broke fail-closed on the token gate and let anyone write
+  tracebacks to the journal on demand (vs. I2). Fix: `accounts.token_matches()`
+  compares UTF-8 **bytes** — constant-time preserved, decoy preserved. New
+  `backend/tests/test_token_gate.py` (22 parametrised cases).
+
+**STILL OPEN (highest first):**
+- **F-01 (Medium) — contact injection.** `app.js:1142` derives a new contact's
+  USERNAME from the attacker-chosen sealed `name`. PoC put contacts called
+  `bank-support` and `alice` (attacker's keys) into the victim's Users+Chats
+  lists, needing only the victim's public handle and no registered account. ⚪
+  is shown correctly and is the real mitigation. Fix: use the neutral
+  key-derived `fallback` name and show the claimed handle as an explicitly
+  untrusted "claims to be …" field.
+- **F-03 (Medium, deployment-gated) — rate-limit bypass off the proxy.**
+  Rotating `X-Forwarded-For` gives a fresh bucket per request (16/16 allowed vs
+  10-then-429). **Production is safe** (Caddy appends the real IP; uvicorn 0.51
+  resolves rightmost-untrusted). The exposure is the planned `.onion` deploy,
+  which forwards onion→127.0.0.1:8000 with no Caddy. Fix BEFORE that ships:
+  `--forwarded-allow-ips=` when not behind a trusted proxy.
+- **F-05/F-06 (Low)** — uncapped auto-created contacts (~5.9 KB each, ~880 to
+  5 MB) and delete-on-read mail vs. unguarded batch processing. NOTE: I tried
+  and **failed** to demonstrate the terminal failure for both — treat as
+  resilience hardening, not confirmed defects.
+- **F-07/F-08 (Info)** — `_bundleBytes` lacks per-field length checks (safe
+  today because sizes are fixed); the phone runs the DEBUG APK so WebView
+  debugging is live, and the Android passphrase masking is a `contains
+  ("passphrase")` string match.
+
+**Verified after the fixes:** backend **99 passed** (was 77; +22 new), client
+`npm test` all green incl. the new chats suite, F-02 PoC no longer produces a
+proposal, F-04 endpoints return 404 with no traceback, and the LEGITIMATE
+AES256 negotiation (propose → accept → inner-layer round trip between two
+honest peers) still works. Live-room + async-chat browser harnesses green.
+
 ## ⮕ RESUME HERE (snapshot as of 2026-07-25, redesign stage 2: hierarchy pass)
 **User asked to continue the redesign; chose "go deeper on the visual design"
 over shipping first. Stage 2 is BUILT and VERIFIED locally — deploy + APK

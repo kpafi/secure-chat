@@ -27,7 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 import config
 from relay import KeyedRateLimiter
-from accounts import _db, current_user, _check_username
+from accounts import _db, current_user, _check_username, token_matches
 
 _post_limiter = KeyedRateLimiter(config.MAILBOX_RATE_CAPACITY, config.MAILBOX_RATE_REFILL_PER_SEC)
 
@@ -81,7 +81,7 @@ def post_mail(recipient: str, req: PostReq, t: str = Query(default="", max_lengt
         # unknown recipient are the identical 404 (constant-time compare against
         # a decoy for missing users, same as the bundle lookup).
         stored = row["lookup_token"] if row is not None else secrets.token_urlsafe(config.LOOKUP_TOKEN_BYTES)
-        if not hmac.compare_digest(t, stored) or row is None:
+        if not token_matches(t, stored) or row is None:
             raise HTTPException(status_code=404, detail="no such user")
         total = conn.execute("SELECT COUNT(*) FROM mailbox").fetchone()[0]
         if total >= config.MAX_MAILBOX_TOTAL:
