@@ -187,7 +187,7 @@ h1 .sub {
 .u-mark { font-size: 0.74rem; color: var(--muted); }
 .u-mark.ok { color: var(--ok); }
 .u-mark.mid { color: var(--warn); }
-.u-fp { font-size: 0.72rem; color: var(--muted); margin: 0.35rem 0; word-break: break-word; }
+.u-fp { font-size: 0.78rem; color: var(--muted); margin: 0.35rem 0; word-break: break-word; }
 .u-fp.err { color: var(--err); }
 /* A sender's self-claimed handle. Deliberately quiet and marked as a claim —
    it is attacker-chosen text, never an identity (pentest F-01). */
@@ -403,7 +403,7 @@ button.ghost:hover { background: var(--panel-2); border-color: var(--border); co
 .alg-name { display: block; font-size: 0.9rem; color: var(--fg); margin-bottom: 0.15rem; font-weight: 600; }
 .alg-card:has(input:checked) .alg-name { color: var(--accent); }
 /* The description is a cipher spec — monospace, so it reads as one. */
-.alg-desc { display: block; font-family: var(--font-mono); font-size: 0.72rem; color: var(--muted); }
+.alg-desc { display: block; font-family: var(--font-mono); font-size: 0.76rem; color: var(--muted); }
 .badge {
   font-style: normal;
   font-size: 0.64rem;
@@ -459,7 +459,7 @@ button.ghost:hover { background: var(--panel-2); border-color: var(--border); co
 #log li.sys  { color: var(--muted); font-style: italic; }
 #log li .who { font-size: 0.72rem; color: var(--muted); margin-right: 0.4rem; }
 
-.hint { font-size: 0.78rem; color: var(--muted); margin: 0.5rem 0 0; min-height: 1em; }
+.hint { font-size: 0.84rem; color: var(--muted); margin: 0.5rem 0 0; min-height: 1em; }
 .hint.err { color: var(--err); }
 .hint.ok { color: var(--ok); }
 
@@ -584,7 +584,7 @@ button.danger:hover {
   margin: var(--sp-3) 0 0;
   padding-top: var(--sp-3);
   border-top: 1px solid var(--border-soft);
-  font-size: 0.72rem;
+  font-size: 0.78rem;
   color: var(--muted);
 }
 .legend-item { display: flex; align-items: baseline; gap: 0.35rem; }
@@ -613,3 +613,20 @@ button.danger:hover {
 /* Without `.ok` this holds the "register a username first" sentence, not a
    handle — prose belongs in the UI face. */
 .idhead-sub:not(.ok) { font-family: var(--font-ui); }
+
+/* Progressive disclosure for the encryption picker: the default is safe, so the
+   choice is available without being the first thing a newcomer must decide. */
+#algDetails > summary {
+  cursor: pointer;
+  font-size: 0.84rem;
+  font-weight: 550;
+  color: var(--fg);
+  padding: 0.45rem 0;
+  list-style-position: inside;
+}
+#algDetails > summary:hover { color: var(--accent); }
+#algDetails > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#algDetails[open] > summary { margin-bottom: var(--sp-2); }
+/* The step heading takes focus on navigation; never show a stray outline for it. */
+.step[tabindex]:focus { outline: none; }
+.step[tabindex]:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }

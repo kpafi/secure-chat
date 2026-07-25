@@ -10,11 +10,12 @@
 <body>
   <main>
     <header class="apphead">
-      <button id="menuBtn" type="button" class="ghost" aria-label="menu">☰</button>
+      <button id="menuBtn" type="button" class="ghost" aria-label="Menu"
+              aria-expanded="false" aria-controls="drawer">☰</button>
       <h1>secure-chat <span class="sub">end-to-end encrypted relay</span></h1>
     </header>
 
-    <nav id="drawer" class="drawer" hidden>
+    <nav id="drawer" class="drawer" aria-label="Views" hidden>
       <div class="drawer-head">
         <span class="mark">secure-chat</span>
         <span class="tag">end-to-end encrypted relay</span>
@@ -46,17 +47,17 @@
 
     <!-- Screen 1: identity + optional account directory -->
     <div id="scrIdentity" class="screen">
-      <p class="step">Step 1 of 3 — <strong>Identity</strong> · Room · Chat</p>
+      <p class="step" id="stepIdentity" tabindex="-1">Step 1 of 3 — <strong>Identity</strong> · Room · Chat</p>
 
       <section class="panel" id="identity">
         <div class="row">
-          <label>Your identity (verified in person by your contact)</label>
-          <p class="hint" id="idStatus">Checking for an identity on this device…</p>
+          <label>Your identity on this device</label>
+          <p class="hint" id="idStatus" aria-live="polite">Checking for an identity on this device…</p>
         </div>
         <div class="row" id="idPassRow">
-          <label for="idPass">Identity passphrase</label>
+          <label for="idPass">Passphrase</label>
           <input id="idPass" type="password" autocomplete="off"
-                 placeholder="protects your private keys on this device" />
+                 placeholder="protects your keys on this device — only you know it" />
         </div>
         <div class="row inline">
           <button id="idCreate" type="button">Create identity</button>
@@ -69,7 +70,7 @@
 
       <section class="panel" id="account" hidden>
         <div class="row">
-          <label for="username">Username — claim it so contacts can look up your identity</label>
+          <label for="username">Pick a username (optional) — lets people add you by name</label>
           <div class="inline">
             <input id="username" type="text" inputmode="latin" autocomplete="off"
                    spellcheck="false" maxlength="32" placeholder="3–32 chars: a-z 0-9 _ . -" />
@@ -77,9 +78,10 @@
             <button id="login" type="button">Log in</button>
           </div>
         </div>
-        <p class="hint" id="accountStatus"></p>
+        <p class="hint" id="accountStatus" aria-live="polite"></p>
       </section>
 
+      <p class="hint" id="idHint" aria-live="polite"></p>
       <div class="row nav">
         <button id="toRoom" type="button" class="primary">Continue →</button>
       </div>
@@ -87,20 +89,31 @@
 
     <!-- Screen 2: room + encryption setup -->
     <div id="scrRoom" class="screen" hidden>
-      <p class="step">Step 2 of 3 — Identity · <strong>Room</strong> · Chat</p>
+      <p class="step" id="stepRoom" tabindex="-1">Step 2 of 3 — Identity · <strong>Room</strong> · Chat</p>
 
       <section class="panel" id="setup">
         <div class="row">
-          <label for="room">Room id (64 hex chars)</label>
+          <label for="room">Your chat code — share it with the one person you want to talk to</label>
           <div class="inline">
             <input id="room" type="text" inputmode="latin" autocomplete="off"
-                   spellcheck="false" maxlength="64" placeholder="share this with one other person" />
-            <button id="gen" type="button">Generate</button>
+                   spellcheck="false" maxlength="80"
+                   aria-describedby="roomHelp"
+                   placeholder="a code is created for you automatically" />
+            <button id="copyCode" type="button">Copy</button>
+            <button id="gen" type="button">New code</button>
           </div>
+          <p class="hint" id="roomHelp">
+            Both of you must use the same code. Send it however you like — it is
+            useless on its own, because the messages are encrypted end-to-end.
+          </p>
         </div>
 
-        <div class="row">
-          <label>Encryption</label>
+        <details class="row" id="algDetails">
+          <summary id="algSummary">Security options — currently: DHKE (recommended)</summary>
+          <p class="hint">
+            Every option here is end-to-end encrypted. The default suits almost
+            everyone; change it only if you know you need to.
+          </p>
           <div id="algCards" class="alg-cards">
             <label class="alg-card">
               <input type="radio" name="alg" value="DHKE" checked />
@@ -128,7 +141,7 @@
               <span class="alg-desc">Pre-shared pad, exchanged in person</span>
             </label>
           </div>
-        </div>
+        </details>
 
         <div class="row" id="passRow" hidden>
           <label for="pass">Shared passphrase</label>
@@ -185,21 +198,26 @@
                 <button id="otpExport" type="button">Export selected pad…</button>
                 <button id="otpImport" type="button">Import pad file…</button>
               </div>
-              <input id="otpFile" type="file" accept="application/json,.json,.txt" hidden />
+              <input id="otpFile" type="file" accept="application/json,.json,.txt" aria-label="One-time pad file" hidden />
             </div>
           </details>
         </div>
 
         <div class="row" id="contactRow">
-          <label for="contact">Contact handle (optional — fetch &amp; pin their identity)</label>
+          <label for="contact">Who are you expecting? (optional)</label>
           <input id="contact" type="text" inputmode="latin" autocomplete="off"
-                 spellcheck="false" maxlength="99" placeholder="username#token (as your contact shared it)" />
+                 spellcheck="false" maxlength="99" placeholder="paste their handle, e.g. alice#a1b2c3…" />
+          <p class="hint">
+            If you paste the handle they gave you, we can check the person who joins
+            is really them. Leave it blank and you will compare a safety number instead.
+          </p>
         </div>
 
         <div class="row">
           <button id="connect" type="button" class="primary">Connect</button>
-          <span id="status" class="status">disconnected</span>
+          <span id="status" class="status" aria-live="polite">disconnected</span>
         </div>
+        <p class="hint" id="roomHint" aria-live="polite"></p>
       </section>
 
       <div class="row nav">
@@ -226,7 +244,7 @@
             you — do not send anything.
           </p>
         </div>
-        <p class="safety" id="safetyNumber"></p>
+        <p class="safety" id="safetyNumber" aria-live="polite" tabindex="0"></p>
         <p class="hint" id="peerFingerprint"></p>
         <div class="row inline">
           <button id="verifyOk" type="button" class="primary">It matches — unlock messaging</button>
@@ -237,7 +255,8 @@
       <section class="panel" id="chat">
         <ul id="log" aria-live="polite"></ul>
         <form id="sendForm" class="inline" autocomplete="off">
-          <input id="text" type="text" maxlength="2000" placeholder="ASCII only…" disabled />
+          <input id="text" type="text" maxlength="2000" aria-label="Message to send"
+                 placeholder="Type a message…" disabled />
           <button id="send" type="submit" class="primary" disabled>Send</button>
         </form>
         <p class="hint" id="hint"></p>
@@ -258,7 +277,7 @@
           </p>
           <div class="row inline unlock-row">
             <input id="profileUnlockPass" type="password" autocomplete="off"
-                   placeholder="identity passphrase" />
+                   aria-label="Identity passphrase" placeholder="identity passphrase" />
             <button id="profileUnlock" type="button" class="primary">Unlock</button>
           </div>
           <p class="hint" id="profileUnlockStatus"></p>
@@ -314,7 +333,7 @@
           </p>
           <div class="row inline unlock-row">
             <input id="usersUnlockPass" type="password" autocomplete="off"
-                   placeholder="identity passphrase" />
+                   aria-label="Identity passphrase" placeholder="identity passphrase" />
             <button id="usersUnlock" type="button" class="primary">Unlock</button>
           </div>
           <p class="hint" id="usersUnlockStatus"></p>
@@ -336,7 +355,7 @@
               <button id="addContact" type="button" class="primary">Add</button>
             </div>
           </div>
-          <p class="hint" id="usersStatus"></p>
+          <p class="hint" id="usersStatus" aria-live="polite"></p>
           <ul id="userList" class="userlist"></ul>
           <div class="legend">
             <span class="legend-item">🟢 <b>verified</b> — you compared the fingerprint in person</span>
@@ -359,14 +378,14 @@
           </p>
           <div class="row inline unlock-row">
             <input id="chatsUnlockPass" type="password" autocomplete="off"
-                   placeholder="identity passphrase" />
+                   aria-label="Identity passphrase" placeholder="identity passphrase" />
             <button id="chatsUnlock" type="button" class="primary">Unlock</button>
           </div>
           <p class="hint" id="chatsUnlockStatus"></p>
         </div>
 
         <div id="chatsUnlocked" hidden>
-          <p class="hint" id="chatsStatus"></p>
+          <p class="hint" id="chatsStatus" aria-live="polite"></p>
 
           <div id="chatListWrap">
             <div class="row">
@@ -385,7 +404,8 @@
               <span class="u-name" id="chatPeer"></span>
               <span class="u-mark" id="chatPeerMark"></span>
               <span class="chatmode" id="chatMode"></span>
-              <select id="chatModeSel" title="Propose an encryption mode for this chat">
+              <select id="chatModeSel" aria-label="Encryption mode for this chat"
+                      title="Propose an encryption mode for this chat">
                 <option value="SEALED">SEALED (default)</option>
                 <option value="AES256">AES-256 (extra passphrase)</option>
               </select>
@@ -393,10 +413,11 @@
             <div id="chatPending" class="pending" hidden></div>
             <ul id="chatLog"></ul>
             <form id="chatForm" class="inline" autocomplete="off">
-              <input id="chatText" type="text" maxlength="2000" placeholder="ASCII only…" />
+              <input id="chatText" type="text" maxlength="2000" aria-label="Message to send"
+                     placeholder="Type a message…" />
               <button id="chatSend" type="submit" class="primary">Send</button>
             </form>
-            <p class="hint" id="chatHint"></p>
+            <p class="hint" id="chatHint" aria-live="polite"></p>
           </div>
         </div>
       </section>

@@ -49,7 +49,10 @@ const els = {
   otpExport: $("otpExport"), otpImport: $("otpImport"), otpFile: $("otpFile"),
   // verification gate
   verify: $("verify"), verifyTitle: $("verifyTitle"), verifyHint: $("verifyHint"),
-  safetyNumber: $("safetyNumber"), peerFingerprint: $("peerFingerprint"),
+  safetyNumber: $("safetyNumber"),
+  idHint: $("idHint"), roomHint: $("roomHint"), roomHelp: $("roomHelp"),
+  stepIdentity: $("stepIdentity"), stepRoom: $("stepRoom"),
+  copyCode: $("copyCode"), algDetails: $("algDetails"), algSummary: $("algSummary"), peerFingerprint: $("peerFingerprint"),
   verifyOk: $("verifyOk"), verifyNo: $("verifyNo"),
   // chat
   chat: $("chat"), log: $("log"),
@@ -99,6 +102,17 @@ const els = {
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 const ROOM_RE = /^[0-9a-f]{64}$/;
+
+// A chat code is copied and pasted between people, so it arrives with stray
+// spaces, line breaks or capitals far more often than it arrives pristine.
+// Normalise on read rather than rejecting the user over whitespace.
+function roomCode() {
+  return els.room.value.replace(/\s+/g, "").toLowerCase();
+}
+function newRoomCode() {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
 
 // Relay location. The web client is served BY the relay, so it talks to it
 // same-origin (empty API base, ws:// to location.host). The Android app has no
@@ -215,7 +229,18 @@ function showScreen(name) {
   els.scrIdentity.hidden = name !== "identity";
   els.scrRoom.hidden = name !== "room";
   els.scrChat.hidden = name !== "chat";
+  clearHints();
+  // Move focus to the new screen's heading so a keyboard or screen-reader user
+  // lands where the content changed instead of staying on the button they left.
+  // NOT on the first paint: nobody navigated there, and focusing on load just
+  // paints a focus ring the user did not ask for.
+  if (screenShown) {
+    const head = { identity: els.stepIdentity, room: els.stepRoom, chat: els.roomShort }[name];
+    if (head && typeof head.focus === "function") head.focus();
+  }
+  screenShown = true;
 }
+let screenShown = false;
 
 // ---- drawer menu + top-level views ----------------------------------------
 // Three views: live (the 3-step room flow), users (contact list + trust),
@@ -225,6 +250,11 @@ function showScreen(name) {
 function setDrawer(open) {
   els.drawer.hidden = !open;
   els.scrim.hidden = !open;
+  els.menuBtn.setAttribute("aria-expanded", open ? "true" : "false");
+  if (open) {
+    const active = els.drawer.querySelector(".navitem.active");
+    if (active) active.focus();
+  }
 }
 
 function showView(name) {
@@ -233,7 +263,11 @@ function showView(name) {
   els.viewUsers.hidden = name !== "users";
   els.viewChats.hidden = name !== "chats";
   for (const b of els.drawer.querySelectorAll(".navitem")) {
-    b.classList.toggle("active", b.dataset.view === name);
+    const on = b.dataset.view === name;
+    b.classList.toggle("active", on);
+    // Which view is current was conveyed by colour alone; say it out loud too.
+    if (on) b.setAttribute("aria-current", "page");
+    else b.removeAttribute("aria-current");
   }
   setDrawer(false);
   if (name === "profile") renderProfile();
@@ -244,9 +278,33 @@ function showView(name) {
   }
 }
 
+// Feedback goes to whichever screen the user is actually LOOKING at.
+//
+// `#hint` lives inside screen 3 (chat), so every validation failure raised on
+// screen 2 — empty chat code, missing identity, bad contact handle, no OTP pad,
+// pad exhausted — wrote its message into a hidden element. Connect simply did
+// nothing, with no explanation. Routing by visible screen fixes all of those at
+// once, instead of leaving ten call sites to each remember the right target.
+function activeHintEl() {
+  if (!els.scrRoom.hidden) return els.roomHint;
+  if (!els.scrIdentity.hidden) return els.idHint;
+  return els.hint;
+}
+
 function hint(text, isErr = false) {
-  els.hint.textContent = text;
-  els.hint.className = "hint" + (isErr ? " err" : "");
+  const el = activeHintEl();
+  el.textContent = text;
+  el.className = "hint" + (isErr ? " err" : "");
+  // Errors are announced immediately; ordinary progress waits for a pause.
+  el.setAttribute("aria-live", isErr ? "assertive" : "polite");
+}
+
+// Clear stale feedback when moving between screens, so an old error can never
+// look like it belongs to the screen you just arrived at.
+function clearHints() {
+  for (const el of [els.idHint, els.roomHint, els.hint]) {
+    if (el) { el.textContent = ""; el.className = "hint"; }
+  }
 }
 
 function accountStatus(text, cls = "") {
@@ -311,6 +369,9 @@ async function showIdentityUnlocked() {
   // The account directory is only meaningful once we hold an identity to bind.
   els.account.hidden = false;
   els.toRoom.textContent = "Continue →";
+  els.toRoom.classList.add("primary");
+  els.idCreate.classList.remove("primary");
+  els.idUnlock.classList.remove("primary");
   const savedName = localStorage.getItem(LS_USERNAME);
   const savedToken = localStorage.getItem(LS_LOOKUP_TOKEN);
   // Opportunistically (re-)publish the bundle for registered users so the
@@ -345,15 +406,20 @@ function refreshIdentityUI() {
   els.idFingerprint.hidden = true;
   els.idExport.hidden = true;
   els.account.hidden = true;
-  els.toRoom.textContent = "Skip — no identity (AES-256 / OTP only) →";
+  // Without an identity the forward action is a fallback, not the thing to do:
+  // make Create/Unlock the primary and let "continue anyway" recede.
+  els.toRoom.textContent = "Continue without an identity →";
+  els.toRoom.classList.remove("primary");
+  els.idCreate.classList.toggle("primary", !stored);
+  els.idUnlock.classList.toggle("primary", !!stored);
   els.idPassRow.hidden = false;
   els.idCreate.hidden = !!stored;   // hide "Create" if one already exists
   els.idUnlock.hidden = !stored;
   els.idForget.hidden = !stored;
   if (stored) {
-    setIdentityStatus("A locked identity is stored on this device. Enter its passphrase to unlock.");
+    setIdentityStatus("Your identity is locked. Enter your passphrase to unlock it.");
   } else {
-    setIdentityStatus("No identity on this device yet. Create one (needed for DHKE / RSA).");
+    setIdentityStatus("No identity on this device yet. Create one so contacts can confirm it is really you.");
   }
 }
 
@@ -1398,14 +1464,14 @@ function startMailboxPolling() {
 // ---- connection lifecycle -------------------------------------------------
 
 async function connect() {
-  const room = els.room.value.trim();
+  const room = roomCode();
   const alg = algValue();
   if (!ROOM_RE.test(room)) {
-    hint("Room id must be exactly 64 hex characters. Use Generate.", true);
+    hint("That chat code does not look right — it should be 64 letters/numbers. Press \u201cNew code\u201d to create a valid one, or paste the code your contact sent you.", true);
     return;
   }
   if (algNeedsIdentity(alg) && !identity) {
-    hint("Create or unlock your identity above — it authenticates the " + alg + " key exchange.", true);
+    hint("This security option needs your identity. Go back to step 1 and create or unlock it \u2014 that is what proves to your contact it is really you.", true);
     return;
   }
 
@@ -1417,7 +1483,7 @@ async function connect() {
   if (algNeedsIdentity(alg) && contact) {
     const parsed = account.parseHandle(contact);
     if (!parsed) {
-      hint("Contact handle must look like username#token (as your contact shared it), or leave it blank to verify by safety number.", true);
+      hint("That handle does not look right \u2014 it should look like alice#a1b2c3. Paste it exactly as they sent it, or leave the field blank.", true);
       return;
     }
     setStatus("looking up contact…");
@@ -1429,7 +1495,7 @@ async function connect() {
       return;
     }
     if (!expectedPeerBundle) {
-      hint(`No directory entry for "${parsed.username}" with that token. Check the handle, or leave it blank to verify by safety number.`, true);
+      hint(`No one found for the handle "${parsed.username}#\u2026". Check you pasted it exactly, or leave the field blank and compare a safety number instead.`, true);
       setStatus("disconnected", "err");
       return;
     }
@@ -1443,14 +1509,14 @@ async function connect() {
   if (alg === "OTP") {
     const padId = els.otpSelect.value;
     if (!padId) {
-      hint("Select or generate a one-time pad first (Generate / share a pad).", true);
+      hint("Choose a one-time pad first, under Security options \u2192 Generate / share a pad.", true);
       return;
     }
     // Exclusive same-origin lock: a pad must be live in only ONE tab/window at a
     // time, or two sessions would draw the same keystream (two-time pad).
     otpLockRelease = await acquirePadLock(padId);
     if (!otpLockRelease) {
-      hint("This pad is already in use in another tab or window. Close it there before using the pad here.", true);
+      hint("This one-time pad is open in another tab or window. Close it there first \u2014 using a pad twice at once would break its security.", true);
       return;
     }
     try {
@@ -1464,7 +1530,7 @@ async function connect() {
     }
     if (otpRecord.regionSize - otpRecord.sendOffset < 64) {
       releaseOtpLock();
-      hint("This pad is exhausted for sending — exchange a fresh pad in person.", true);
+      hint("This one-time pad is used up. You and your contact need to exchange a fresh one in person.", true);
       return;
     }
     opts.pad = otpRecord;
@@ -1474,7 +1540,7 @@ async function connect() {
     cipher = makeCipher(alg, room, opts);
     await cipher.init();
   } catch (e) {
-    hint("Setup failed: " + e.message, true);
+    hint("Could not set up encryption: " + e.message, true);
     return;
   }
 
@@ -1842,7 +1908,7 @@ async function sendText(e) {
   els.send.disabled = true;
   try {
     const payload = await cipher.encrypt(text);
-    ws.send(JSON.stringify({ type: "msg", room: els.room.value.trim(), payload, alg: algValue() }));
+    ws.send(JSON.stringify({ type: "msg", room: roomCode(), payload, alg: algValue() }));
     addLine("me", "me", text);
     els.text.value = "";
     hint("");
@@ -2148,16 +2214,40 @@ wireViewUnlock(els.chatsUnlockPass, els.chatsUnlock,
   setUnlockStatus(els.chatsUnlockStatus), refreshChats);
 
 els.gen.addEventListener("click", () => {
-  const bytes = crypto.getRandomValues(new Uint8Array(32));
-  els.room.value = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-  hint("New 256-bit room id generated. Share it with exactly one person.");
+  els.room.value = newRoomCode();
+  hint("New chat code created. Send it to the one person you want to talk to.");
 });
 
+els.copyCode.addEventListener("click", async () => {
+  const code = roomCode();
+  if (!code) { hint("There is no code to copy yet — press New code.", true); return; }
+  try {
+    await navigator.clipboard.writeText(code);
+    hint("Chat code copied. Send it to your contact, then press Connect.");
+  } catch {
+    els.room.select();
+    hint("Could not reach the clipboard — the code is selected, copy it manually.", true);
+  }
+});
+
+// Keep the collapsed summary honest about what is actually selected, so
+// choosing a non-default mode and then collapsing the panel cannot hide it.
+const ALG_LABELS = {
+  DHKE: "DHKE (recommended)",
+  AES256: "AES-256 with a shared passphrase",
+  RSA: "RSA",
+  PQKEM: "post-quantum (ML-KEM-768)",
+  OTP: "one-time pad",
+};
 function syncAlgUI() {
   const alg = algValue();
   els.passRow.hidden = alg !== "AES256";
   els.contactRow.hidden = !algNeedsIdentity(alg); // lookup only aids DHKE/RSA
   els.otpPanel.hidden = alg !== "OTP";
+  els.algSummary.textContent = "Security options — currently: " + (ALG_LABELS[alg] || alg);
+  // A non-default choice needs the panel to stay open, or the setting becomes
+  // invisible the moment the user looks away.
+  if (alg !== "DHKE") els.algDetails.open = true;
 }
 els.algCards.addEventListener("change", syncAlgUI); // radio changes bubble here
 
@@ -2232,7 +2322,7 @@ els.disconnect.addEventListener("click", () => {
 });
 els.copyRoom.addEventListener("click", async () => {
   try {
-    await navigator.clipboard.writeText(els.room.value.trim());
+    await navigator.clipboard.writeText(roomCode());
     els.copyRoom.textContent = "Copied ✓";
   } catch {
     els.copyRoom.textContent = "Copy failed";
@@ -2252,8 +2342,16 @@ setupEntropyCanvas();
 refreshOtpPads();
 
 showScreen("identity");
+showView("live"); // establishes aria-current / active state on first paint
 syncAlgUI();
 refreshIdentityUI();
+
+// Start with a chat code already in the box. Pressing Connect on an empty field
+// used to fail a validation check whose message was written to a hidden element,
+// so the button appeared to do nothing at all. A code costs nothing until you
+// connect, and someone JOINING simply pastes over it — so the failure mode is
+// removed rather than merely explained.
+if (!els.room.value) els.room.value = newRoomCode();
 
 // Invite-link handling: an inbound `#add=<handle>` opens the Users view and
 // stages the handle for review (never auto-adds). The fragment is cleared from

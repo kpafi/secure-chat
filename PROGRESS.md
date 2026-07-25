@@ -3,7 +3,50 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (2026-07-25, live two-person test: 2 UX/delivery bugs fixed)
+## ⮕ RESUME HERE (2026-07-25, UX pass: comprehension + accessibility)
+**Feedback from a real user: "hard to understand at first, very technical", and
+"joining a live room without generating a code fails with no error message".**
+
+**The missing error was a bug CLASS, not a missing string.** `#hint` lives
+inside screen 3 (chat), which is `hidden` while you are on screen 2 — so all TEN
+validation failures in `connect()` (empty code, bad code, missing identity, bad
+contact handle, directory miss, no OTP pad, pad locked elsewhere, pad exhausted,
+setup failure) wrote their message into an invisible element. Only 3 also called
+`setStatus()`. **Fix:** `activeHintEl()` routes feedback to whichever screen is
+visible (`#idHint` / `#roomHint` / `#hint`), so every call site is fixed at once;
+`clearHints()` on screen change stops stale errors following you.
+
+**Scope chosen by the user: reword + progressive disclosure, same screens/flow**
+(not a full intent-first redesign — the safety-number gate and pentest fixes stay
+exactly where they are).
+- **The empty-code dead end is removed, not just explained**: a chat code is
+  generated on arrival. `roomCode()` also normalises pasted whitespace/capitals,
+  because a code that travels between two people arrives messy.
+- **"Room id (64 hex chars)" → "Your chat code — share it with the one person
+  you want to talk to"**, with Copy + New code buttons. The user called it a
+  "seed", which was the tell that the old term did not land.
+- **Encryption picker collapsed behind `<details>` "Security options — currently:
+  X"**. Default DHKE. Choosing a non-default mode force-opens the panel and the
+  summary names it, so a changed setting can never hide.
+- Plain-language labels/errors throughout; "Skip — no identity (AES-256 / OTP
+  only)" → "Continue without an identity", and the primary button moved to
+  Create/Unlock (it was emphasising the escape hatch).
+- **Accessibility:** 7 unlabelled inputs fixed — including `#text`/`#chatText`
+  (the two message fields) and the three unlock inputs I shipped unlabelled last
+  session. `aria-live` on all 10 status regions (only `#log` had it, so the
+  safety number was silent to screen readers). Drawer: `aria-label`,
+  `aria-expanded`, `aria-current`, focus into the drawer on open. Focus moves to
+  the step heading on navigation — but NOT on first paint (that just drew an
+  unrequested focus ring). Base text bumped (hints 0.78→0.84rem).
+  **Contrast was already fine** — every token pair passes WCAG AA (4.58:1 to
+  12.76:1), so the palette was left alone.
+
+**NEW: `e2e/no-dead-ends.mjs`** — walks every failure path on the room screen and
+asserts visible text appears, plus the a11y basics. 12/12. It deliberately reads
+ONLY the dynamic feedback elements: an earlier version passed by matching static
+help text, which proved nothing.
+
+## ⮕ (2026-07-25) live two-person test: 2 UX/delivery bugs fixed
 **A real test run with a second person found two bugs that every unit test and
 single-user harness had missed — both about the SECOND user's experience.** Both
 are fixed, and a reusable two-agent run now asserts them so they cannot regress.
