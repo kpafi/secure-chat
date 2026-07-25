@@ -65,7 +65,8 @@ const els = {
   viewProfile: $("viewProfile"),
   // profile view
   profileLocked: $("profileLocked"), profileUnlocked: $("profileUnlocked"),
-  profileName: $("profileName"), profileHandleText: $("profileHandleText"),
+  profileName: $("profileName"), profileAvatar: $("profileAvatar"),
+  profileHandleText: $("profileHandleText"),
   profileHandleActions: $("profileHandleActions"),
   profileCopyHandle: $("profileCopyHandle"), profileCopyInvite: $("profileCopyInvite"),
   profileQrRow: $("profileQrRow"), profileQr: $("profileQr"),
@@ -514,16 +515,18 @@ function inviteLink(handle) {
 
 // Render "your handle" into a text element + toggle its copy actions. Shared by
 // the Users view and the Profile view so both stay identical (one source).
+// Toggles `ok` rather than assigning className, so each call site keeps its own
+// base classes (the Users view is a `.hint`, the Profile view an `.idhead-sub`).
 function renderHandleInto(textEl, actionsEl) {
   const h = myHandle();
   if (h) {
     textEl.textContent = h;
-    textEl.className = "hint ok";
+    textEl.classList.add("ok");
     if (actionsEl) actionsEl.hidden = false;
   } else {
     textEl.textContent =
       "Register a username in the Live room (Step 1) to get a shareable handle.";
-    textEl.className = "hint";
+    textEl.classList.remove("ok");
     if (actionsEl) actionsEl.hidden = true;
   }
   return h;
@@ -542,10 +545,11 @@ function renderProfile() {
   els.profileUnlocked.hidden = !unlocked;
   if (!unlocked) return;
 
-  // Name (registered username, or not-yet-registered).
+  // Identity head: initial + name (registered username, or not-yet-registered).
   const name = localStorage.getItem(LS_USERNAME);
   els.profileName.textContent = name || "not registered yet";
-  els.profileName.className = "hint" + (name ? " ok" : "");
+  els.profileName.classList.toggle("none", !name);
+  els.profileAvatar.textContent = name ? name[0] : "·";
 
   // Handle + copy/invite (shared with the Users view) and the invite QR.
   const h = renderHandleInto(els.profileHandleText, els.profileHandleActions);
@@ -560,18 +564,34 @@ function renderProfile() {
   els.profileFingerprint.textContent = "…";
   identity.fingerprint().then((fp) => { els.profileFingerprint.textContent = fp; });
 
-  // Key details.
-  els.profileKeys.textContent =
-    "Signing: Ed25519 + ML-DSA-65 · Encryption: ECDH P-256 + ML-KEM-768";
+  // Key details, as a label/value grid.
+  els.profileKeys.textContent = "";
+  for (const [term, value] of [
+    ["Signing", "Ed25519 · ML-DSA-65"],
+    ["Encryption", "ECDH P-256 · ML-KEM-768"],
+  ]) {
+    const dt = document.createElement("dt");
+    dt.textContent = term;
+    const dd = document.createElement("dd");
+    dd.textContent = value;
+    els.profileKeys.append(dt, dd);
+  }
 
-  // Status line.
-  const parts = ["identity unlocked"];
-  parts.push(name ? "registered" : "not registered");
-  parts.push(apiToken ? "logged in (mailbox reachable)" : "not logged in");
+  // Status, as chips — each one on/off at a glance.
   let n = 0;
   try { if (contacts.isUnlocked()) n = contacts.list().length; } catch { /* locked */ }
-  parts.push(`${n} saved ${n === 1 ? "user" : "users"}`);
-  els.profileStatus.textContent = parts.join(" · ");
+  els.profileStatus.textContent = "";
+  for (const [label, on] of [
+    ["identity unlocked", true],
+    [name ? "registered" : "not registered", !!name],
+    [apiToken ? "logged in" : "not logged in", !!apiToken],
+    [`${n} saved ${n === 1 ? "user" : "users"}`, n > 0],
+  ]) {
+    const chip = document.createElement("span");
+    chip.className = "chip " + (on ? "on" : "off");
+    chip.textContent = label;
+    els.profileStatus.appendChild(chip);
+  }
 }
 
 // Render the invite link as a QR into the profile canvas (lean-qr, vendored —
@@ -604,11 +624,26 @@ function applyPendingInvite() {
   usersStatus("Someone shared this handle with you — review it and click Add (you still verify them in person to trust the key).");
 }
 
+// A deliberate empty state in the well the list will occupy, instead of the
+// list silently collapsing to nothing.
+function emptyRow(title, detail) {
+  const li = document.createElement("li");
+  li.className = "empty";
+  const t = document.createElement("span");
+  t.className = "empty-title";
+  t.textContent = title;
+  li.append(t, document.createTextNode(detail));
+  return li;
+}
+
 function renderUserList() {
   els.userList.textContent = "";
   const all = contacts.list().sort((a, b) => a.username.localeCompare(b.username));
   if (all.length === 0) {
-    usersStatus("No users saved yet. Add one with their username#token handle.");
+    els.userList.appendChild(emptyRow(
+      "No users yet",
+      "Add someone with their username#token handle above — then compare fingerprints in person to verify them.",
+    ));
     return;
   }
   for (const c of all) {
@@ -867,7 +902,14 @@ function renderChatList() {
   els.chatConvo.hidden = true;
   els.chatListWrap.hidden = false;
   els.chatList.textContent = "";
-  for (const chat of chats.list()) {
+  const open = chats.list();
+  if (open.length === 0) {
+    els.chatList.appendChild(emptyRow(
+      "No chats yet",
+      "Pick a saved user above and open a chat — messages are sealed end-to-end and wait on the relay until they fetch them.",
+    ));
+  }
+  for (const chat of open) {
     const c = contacts.get(chat.username);
     const li = document.createElement("li");
     li.className = "chatrow";
@@ -949,6 +991,7 @@ function renderPending(chat) {
   msg.textContent = `${chat.username} wants to switch this chat to ${p.mode}. `;
   const accept = document.createElement("button");
   accept.type = "button";
+  accept.className = "primary";
   accept.textContent = "Accept";
   accept.addEventListener("click", () => acceptModeChange(chat.username));
   const decline = document.createElement("button");

@@ -15,6 +15,10 @@
     </header>
 
     <nav id="drawer" class="drawer" hidden>
+      <div class="drawer-head">
+        <span class="mark">secure-chat</span>
+        <span class="tag">end-to-end encrypted relay</span>
+      </div>
       <button type="button" class="navitem" data-view="profile">
         <svg class="navicon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="5.2" r="2.7"/><path d="M2.9 13.4c.7-2.5 2.8-3.9 5.1-3.9s4.4 1.4 5.1 3.9"/></svg>
         <span>Profile</span>
@@ -31,6 +35,9 @@
         <svg class="navicon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13.4 8.6a1.9 1.9 0 0 1-1.9 1.9H8.2l-2.9 2.6v-2.6H4.5a1.9 1.9 0 0 1-1.9-1.9V5a1.9 1.9 0 0 1 1.9-1.9h7a1.9 1.9 0 0 1 1.9 1.9z"/></svg>
         <span>Chats</span>
       </button>
+      <p class="drawer-foot">
+        Keys never leave this device. The relay sees ciphertext only.
+      </p>
     </nav>
     <div id="scrim" class="scrim" hidden></div>
 
@@ -55,7 +62,7 @@
           <button id="idCreate" type="button">Create identity</button>
           <button id="idUnlock" type="button">Unlock</button>
           <button id="idExport" type="button" hidden>Copy backup</button>
-          <button id="idForget" type="button" hidden>Forget</button>
+          <button id="idForget" type="button" class="danger" hidden>Forget</button>
         </div>
         <p class="hint" id="idFingerprint" hidden></p>
       </section>
@@ -74,7 +81,7 @@
       </section>
 
       <div class="row nav">
-        <button id="toRoom" type="button">Continue →</button>
+        <button id="toRoom" type="button" class="primary">Continue →</button>
       </div>
     </div>
 
@@ -162,7 +169,7 @@
               <canvas id="otpEntropy" width="320" height="90" class="otp-entropy" aria-label="draw here to add entropy"></canvas>
               <p class="hint" id="otpEntropyStatus">Entropy from drawing: none yet (the OS random generator is used regardless).</p>
               <div class="row">
-                <button id="otpGenerate" type="button">Generate pad</button>
+                <button id="otpGenerate" type="button" class="primary">Generate pad</button>
               </div>
             </div>
 
@@ -190,7 +197,7 @@
         </div>
 
         <div class="row">
-          <button id="connect" type="button">Connect</button>
+          <button id="connect" type="button" class="primary">Connect</button>
           <span id="status" class="status">disconnected</span>
         </div>
       </section>
@@ -222,7 +229,7 @@
         <p class="safety" id="safetyNumber"></p>
         <p class="hint" id="peerFingerprint"></p>
         <div class="row inline">
-          <button id="verifyOk" type="button">It matches — unlock messaging</button>
+          <button id="verifyOk" type="button" class="primary">It matches — unlock messaging</button>
           <button id="verifyNo" type="button" class="danger">It differs — disconnect</button>
         </div>
       </section>
@@ -231,7 +238,7 @@
         <ul id="log" aria-live="polite"></ul>
         <form id="sendForm" class="inline" autocomplete="off">
           <input id="text" type="text" maxlength="2000" placeholder="ASCII only…" disabled />
-          <button id="send" type="submit" disabled>Send</button>
+          <button id="send" type="submit" class="primary" disabled>Send</button>
         </form>
         <p class="hint" id="hint"></p>
       </section>
@@ -251,17 +258,16 @@
           </p>
         </div>
         <div id="profileUnlocked" hidden>
-          <div class="row">
-            <label>Name</label>
-            <p class="hint" id="profileName"></p>
-          </div>
-          <div class="row myhandle">
-            <label>Your handle — share it so others can add you</label>
-            <p class="hint" id="profileHandleText"></p>
-            <div class="inline" id="profileHandleActions" hidden>
-              <button id="profileCopyHandle" type="button">Copy handle</button>
-              <button id="profileCopyInvite" type="button">Copy invite link</button>
+          <div class="idhead">
+            <span class="avatar" id="profileAvatar" aria-hidden="true"></span>
+            <div class="idhead-text">
+              <p class="idhead-name" id="profileName"></p>
+              <p class="idhead-sub" id="profileHandleText"></p>
             </div>
+          </div>
+          <div class="row inline" id="profileHandleActions" hidden>
+            <button id="profileCopyHandle" type="button">Copy handle</button>
+            <button id="profileCopyInvite" type="button">Copy invite link</button>
           </div>
           <div class="row" id="profileQrRow" hidden>
             <label>Invite QR — a contact scans this to add you</label>
@@ -277,13 +283,13 @@
           </div>
           <div class="row">
             <label>Keys</label>
-            <p class="hint" id="profileKeys"></p>
+            <dl class="kv" id="profileKeys"></dl>
           </div>
           <div class="row">
             <label>Status</label>
-            <p class="hint" id="profileStatus"></p>
+            <div class="chips" id="profileStatus"></div>
           </div>
-          <div class="inline">
+          <div class="row inline">
             <button id="profileExport" type="button">Copy backup</button>
             <button id="profileForget" type="button" class="danger">Forget identity</button>
           </div>
@@ -315,16 +321,16 @@
             <div class="inline">
               <input id="addHandle" type="text" inputmode="latin" autocomplete="off"
                      spellcheck="false" maxlength="99" placeholder="username#token (as they shared it)" />
-              <button id="addContact" type="button">Add</button>
+              <button id="addContact" type="button" class="primary">Add</button>
             </div>
           </div>
           <p class="hint" id="usersStatus"></p>
           <ul id="userList" class="userlist"></ul>
-          <p class="hint">
-            🟢 verified — you compared the fingerprint in person ·
-            🟡 vouched — someone you verified has verified them ·
-            ⚪ unverified
-          </p>
+          <div class="legend">
+            <span class="legend-item">🟢 <b>verified</b> — you compared the fingerprint in person</span>
+            <span class="legend-item">🟡 <b>vouched</b> — someone you verified has verified them</span>
+            <span class="legend-item">⚪ <b>unverified</b></span>
+          </div>
         </div>
       </section>
     </div><!-- /viewUsers -->
@@ -349,7 +355,7 @@
               <label for="chatNew">Start a chat with a saved user</label>
               <div class="inline">
                 <select id="chatNew"></select>
-                <button id="chatStart" type="button">Open</button>
+                <button id="chatStart" type="button" class="primary">Open</button>
               </div>
             </div>
             <ul id="chatList" class="userlist"></ul>
@@ -370,7 +376,7 @@
             <ul id="chatLog"></ul>
             <form id="chatForm" class="inline" autocomplete="off">
               <input id="chatText" type="text" maxlength="2000" placeholder="ASCII only…" />
-              <button id="chatSend" type="submit">Send</button>
+              <button id="chatSend" type="submit" class="primary">Send</button>
             </form>
             <p class="hint" id="chatHint"></p>
           </div>

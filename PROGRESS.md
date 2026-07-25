@@ -3,6 +3,73 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
+## ⮕ RESUME HERE (snapshot as of 2026-07-25, redesign stage 2: hierarchy pass)
+**User asked to continue the redesign; chose "go deeper on the visual design"
+over shipping first. Stage 2 is BUILT and VERIFIED locally — deploy + APK
+rebuild still PENDING (same rsync as every snapshot below; one rsync covers
+all of them).** Presentation-only again: no crypto, no protocol, no new deps,
+importmap untouched (`test_csp_hash.py` green).
+
+Where stage 1 (2026-07-19) refreshed *tokens* — colors, radii, shadows — this
+pass fixes *hierarchy*, which is what still read as cheap:
+
+- **Dual type stack (the big one).** `--font-ui` (system-ui — NOT a web font,
+  so `font-src` stays untouched and the CSP is unchanged) now carries labels,
+  prose, buttons and nav; `--font-mono` is reserved for material read or
+  compared character-by-character: fingerprints, safety numbers, room ids,
+  handles, usernames, cipher specs (`.alg-desc`, `.badge.pq`), `.kv dd`.
+  **User explicitly approved this** even though the stage-1 spec said "keep
+  monospace" — it's the single biggest reason the UI looked like a terminal
+  dump. Opt-in via a `.mono` selector list at the top of `style.css`.
+- **Button tiers.** The DEFAULT `button` is now the quiet secondary; a screen
+  earns at most ONE `.primary` (gradient blue) — Continue / Connect / Send /
+  Add / Open / "It matches — unlock messaging" / Generate pad / Accept. Before,
+  every "Copy handle" shouted as loud as "Connect". `.ghost` is now truly
+  fill-less; `.danger` is a tinted red OUTLINE instead of a solid red block
+  (every danger button is already confirm-gated in app.js). This DELETED the
+  per-id overrides (`button#gen`, `#idCreate`, `#idUnlock`, `#otpImport/Export`)
+  that existed only to undo the old loud default.
+- **Profile view restructured** — `.idhead` (initial avatar + name + handle)
+  replaces the flat "Name" row; Keys is a `<dl class="kv">` label/value grid;
+  Status is a row of `.chip`s (on/off) instead of a `·`-joined sentence.
+- **Drawer** gained a `.drawer-head` (wordmark) and a pinned `.drawer-foot`
+  ("Keys never leave this device. The relay sees ciphertext only.").
+- **Empty states**: new `emptyRow()` renders a dashed "No users yet" /
+  "No chats yet" block in the list well (Users no longer just sets a hint).
+- **Trust legend** is a 3-item `.legend` row, not a run-on paragraph.
+- **Latent bug fixed:** added a global `[hidden] { display: none !important }`.
+  `display:flex/grid` beats the `hidden` attribute's UA `display:none`, so any
+  flex container toggled via `.hidden` stayed visible — the drawer had a
+  one-off patch for this; the Profile copy-handle actions hit it the moment
+  they became `.inline`. Now enforced once, globally.
+- `renderHandleInto` switched from `className =` to `classList.toggle("ok")`
+  so both call sites keep their own base classes.
+
+**Verified** (harnesses in `scratchpad/verify/`, system Chromium via
+puppeteer-core — `shots.mjs`, `flow.mjs`, `live.mjs`):
+- Backend **77 passed** (unchanged), client offline `npm test` all green.
+- `flow.mjs`: two real peers register + log in against the local relay, add
+  each other by handle, verify (🟢), open an async SEALED chat — **bob received
+  alice's message**; screenshots of the populated user rows / chat list /
+  conversation, desktop + 390×844.
+- `live.mjs`: two contexts join one room on AES-256, **both directions
+  delivered**, disconnect clean. NOTE: the safety-number gate does NOT appear
+  for two fresh unpinned identities (it needs a pinned contact) — that's
+  by design; the harness treats it as optional.
+- **Zero horizontal overflow** in every view at both widths; no pageerrors.
+  Only console error is the known `/favicon.ico` 404.
+
+**PENDING (unchanged from below — permission-blocked, run by hand):** deploy
+and rebuild the APK. Client-only changed this session, so no `chown`/restart is
+needed *for this pass* — but the vouch-v2 backend fix below is STILL not live,
+so use the full recipe:
+`cd ~/secure-chat && rsync -az --exclude node_modules --exclude 'package*.json'
+--exclude '*.test.mjs' --exclude __pycache__ backend client
+root@138.199.144.35:/opt/secure-chat/ && ssh root@138.199.144.35 'chown -R
+securechat:securechat /opt/secure-chat/backend && systemctl restart
+secure-chat'`. (The box was unreachable by curl from this session's network —
+confirm it's up when you deploy.)
+
 ## ⮕ RESUME HERE (snapshot as of 2026-07-23, Android polish: icon + release signing)
 **Deploy is STILL PENDING** (blocked again this session by the Claude Code
 auto-mode permission classifier on SSH/rsync to the Hetzner box — same class of
@@ -1870,6 +1937,15 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
   live integration suites, backend `pytest` 48 passed.
 
 ## TODO / NEXT (suggested order)
+
+### ✅ DONE (2026-07-25): redesign stage 2 — hierarchy pass
+**SHIPPED (built + verified; deploy/APK pending) — see the top snapshot.**
+Dual type stack, button tiers, restructured Profile, drawer head/foot, empty
+states, trust legend, global `[hidden]` fix. Stage 1 fixed tokens; this fixed
+hierarchy. If a stage 3 is ever wanted, the remaining candidates are: the
+Live-room 3-step flow as a real progress affordance (it's still a text line),
+a mobile bottom-nav instead of the drawer, and the OTP panel (still the
+densest, least-designed surface in the app).
 
 ### ✅ DONE (2026-07-19): cosmetic polish pass ("make it look less cheap")
 **SHIPPED — see the 2026-07-19 snapshot at the top** (built + verified;
