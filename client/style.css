@@ -504,6 +504,10 @@ button.danger:hover {
 .otp-entropy { display: block; width: 100%; max-width: 340px; height: 90px; background: var(--panel); border: 1px dashed var(--border); border-radius: var(--r-s); touch-action: none; cursor: crosshair; }
 #otpForget { margin-left: 0.5rem; }
 
+/* In-place unlock row shown in a locked Profile / Users / Chats view. */
+.unlock-row { margin-top: var(--sp-3); }
+.unlock-row input { flex: 1; min-width: 0; }
+
 /* "Your handle" share block in the Users view */
 .myhandle { padding: 0.65rem 0.8rem; background: var(--inset); border: 1px solid var(--border-soft); border-radius: var(--r-m); }
 

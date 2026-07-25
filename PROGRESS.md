@@ -3,7 +3,37 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (snapshot as of 2026-07-25, pentest: ALL 8 findings fixed)
+## ⮕ RESUME HERE (2026-07-25, live two-person test: 2 UX/delivery bugs fixed)
+**A real test run with a second person found two bugs that every unit test and
+single-user harness had missed — both about the SECOND user's experience.** Both
+are fixed, and a reusable two-agent run now asserts them so they cannot regress.
+
+- **Async chat delivered NOTHING unless the recipient had clicked "Log in".**
+  `pollMailbox` needs a directory session (`apiToken`), and that was only ever
+  obtained from the explicit Log-in button — registering did not do it. Sending
+  worked, receiving did not, with no visible sign. **Fix:** `autoLogin()` runs
+  after registration AND after unlocking an already-registered identity, and
+  `pollMailbox` re-authenticates on a 401 (sessions last TOKEN_TTL_SEC = 1 h, so
+  mail used to stop arriving silently once it expired). `account.fetchMail` now
+  surfaces `err.status` so that is detectable.
+- **An invite link was unusable in the tab it opens.** A new tab shares
+  localStorage but NOT the in-memory unlocked identity, so it always started
+  locked — and the only unlock control lived on the Live-room screen. **Fix:**
+  Profile / Users / Chats each have an in-place unlock row (passphrase + Unlock,
+  Enter submits), sharing a new `unlockWithPassphrase()`; on success the pending
+  invite is applied so the handle is prefilled ready to Add.
+
+**NEW: `e2e/` — reusable two-agent end-to-end run** (`node e2e/two-user-flow.mjs`,
+relay must be running). Fixed passphrases in `e2e/test-users.json` (throwaway
+test values, committed deliberately) so a failing step can be re-driven by hand
+in a browser with the same accounts. Asserts: register-is-enough-to-receive,
+invite-link-unlockable-in-place, mail from a stranger delivered as ⚪ under a
+key-derived name, replies both ways, and 🟢 verification. **8/8 passing.**
+Gotcha for whoever extends it: an invite tab must be opened in the SAME
+puppeteer browser context (`newTab(label, alice.ctx)`) — a fresh context has no
+localStorage and so no identity blob at all, which tests nothing.
+
+## ⮕ (2026-07-25) pentest: ALL 8 findings fixed
 **The remaining six findings (F-01, F-03, F-05, F-06, F-07, F-08) are now fixed,
 tested and verified against their own PoCs.** See the updated
 `secure-chat-pentest-2026-07-25.md`. Backend **103 passed**, client `npm test`

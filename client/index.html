@@ -254,8 +254,14 @@
         <div id="profileLocked">
           <p class="hint">
             Your profile shows the identity stored on this device.
-            Unlock (or create) your identity in the Live room view first.
+            Enter your passphrase to unlock it here.
           </p>
+          <div class="row inline unlock-row">
+            <input id="profileUnlockPass" type="password" autocomplete="off"
+                   placeholder="identity passphrase" />
+            <button id="profileUnlock" type="button" class="primary">Unlock</button>
+          </div>
+          <p class="hint" id="profileUnlockStatus"></p>
         </div>
         <div id="profileUnlocked" hidden>
           <div class="idhead">
@@ -304,8 +310,14 @@
         <div id="usersLocked">
           <p class="hint">
             Contacts are stored encrypted under your identity passphrase.
-            Unlock (or create) your identity in the Live room view first.
+            Enter it to unlock them here.
           </p>
+          <div class="row inline unlock-row">
+            <input id="usersUnlockPass" type="password" autocomplete="off"
+                   placeholder="identity passphrase" />
+            <button id="usersUnlock" type="button" class="primary">Unlock</button>
+          </div>
+          <p class="hint" id="usersUnlockStatus"></p>
         </div>
         <div id="usersUnlocked" hidden>
           <div class="row myhandle" id="myHandleRow">
@@ -343,8 +355,14 @@
         <div id="chatsLocked">
           <p class="hint">
             Chats are stored encrypted under your identity passphrase.
-            Unlock (or create) your identity in the Live room view first.
+            Enter it to unlock them here.
           </p>
+          <div class="row inline unlock-row">
+            <input id="chatsUnlockPass" type="password" autocomplete="off"
+                   placeholder="identity passphrase" />
+            <button id="chatsUnlock" type="button" class="primary">Unlock</button>
+          </div>
+          <p class="hint" id="chatsUnlockStatus"></p>
         </div>
 
         <div id="chatsUnlocked" hidden>

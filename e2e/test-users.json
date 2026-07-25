@@ -1,0 +1,24 @@
+{
+  "_comment": [
+    "Fixed credentials for the two-agent end-to-end run (e2e/two-user-flow.mjs).",
+    "THROWAWAY TEST DATA ONLY — never use these passphrases for a real identity.",
+    "They are committed on purpose so a run is reproducible and a failing test can",
+    "be re-driven by hand in a browser with the same accounts.",
+    "Usernames get a per-run suffix because the directory refuses a name that is",
+    "already registered to a different identity; the passphrases stay constant."
+  ],
+  "relay": "http://127.0.0.1:8000/",
+  "users": [
+    {
+      "role": "alice",
+      "usernamePrefix": "e2e-alice",
+      "passphrase": "e2e alice identity passphrase — test only"
+    },
+    {
+      "role": "bob",
+      "usernamePrefix": "e2e-bob",
+      "passphrase": "e2e bob identity passphrase — test only"
+    }
+  ],
+  "chatPassphrase": "e2e shared chat passphrase — test only"
+}

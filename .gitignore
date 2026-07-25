@@ -19,3 +19,6 @@ android/*.keystore
 android/*.jks
 android/app/src/main/assets/web/
 .gradle/
+
+# e2e harness deps (install locally: npm i puppeteer-core)
+e2e/node_modules

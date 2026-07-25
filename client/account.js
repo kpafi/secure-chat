@@ -209,7 +209,13 @@ export async function fetchMail(base, sessionToken) {
   const res = await fetch(base + "/api/mailbox", {
     headers: { authorization: "Bearer " + sessionToken },
   });
-  if (!res.ok) throw new Error("mailbox fetch failed: " + (await asError(res)));
+  if (!res.ok) {
+    const err = new Error("mailbox fetch failed: " + (await asError(res)));
+    // Session tokens expire (TOKEN_TTL_SEC). Surface the status so the caller
+    // can re-login instead of silently never receiving mail again.
+    err.status = res.status;
+    throw err;
+  }
   return (await res.json()).messages;
 }
 

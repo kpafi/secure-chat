@@ -65,6 +65,12 @@ const els = {
   viewProfile: $("viewProfile"),
   // profile view
   profileLocked: $("profileLocked"), profileUnlocked: $("profileUnlocked"),
+  profileUnlockPass: $("profileUnlockPass"), profileUnlock: $("profileUnlock"),
+  profileUnlockStatus: $("profileUnlockStatus"),
+  usersUnlockPass: $("usersUnlockPass"), usersUnlock: $("usersUnlock"),
+  usersUnlockStatus: $("usersUnlockStatus"),
+  chatsUnlockPass: $("chatsUnlockPass"), chatsUnlock: $("chatsUnlock"),
+  chatsUnlockStatus: $("chatsUnlockStatus"),
   profileName: $("profileName"), profileAvatar: $("profileAvatar"),
   profileHandleText: $("profileHandleText"),
   profileHandleActions: $("profileHandleActions"),
@@ -316,7 +322,12 @@ async function showIdentityUnlocked() {
   }
   if (savedName && savedToken) {
     els.username.value = savedName;
-    accountStatus(`Your contact handle: ${savedName}#${savedToken} — share it so contacts can look you up. Log in to prove control.`);
+    accountStatus(`Your contact handle: ${savedName}#${savedToken} — share it so contacts can look you up.`);
+    // Async chats only DELIVER once we hold a directory session: pollMailbox
+    // needs it, and it is the only way mail is ever fetched. Requiring a
+    // separate "Log in" click meant a registered user could send messages that
+    // their contact silently never received — log in automatically instead.
+    autoLogin(savedName);
   } else if (savedName) {
     els.username.value = savedName;
     accountStatus(`Saved username: ${savedName}. Register (once) to get your shareable handle, or log in to prove control.`);
@@ -370,18 +381,14 @@ async function createIdentity() {
   }
 }
 
-async function unlockIdentity() {
-  const pass = els.idPass.value;
+// Unlock the stored identity with `pass`. Shared by the Live-room control and
+// the per-view unlock rows (Profile / Users / Chats), so a new tab opened from
+// an invite link can unlock where the user actually is instead of sending them
+// back to the Live room. Returns null on success, or an error message.
+async function unlockWithPassphrase(pass) {
   const blob = localStorage.getItem(LS_IDENTITY);
-  if (!blob) {
-    setIdentityStatus("Nothing to unlock — create an identity first.", "err");
-    return;
-  }
-  if (!pass) {
-    setIdentityStatus("Enter your identity passphrase to unlock.", "err");
-    return;
-  }
-  setIdentityStatus("Unlocking…");
+  if (!blob) return "Nothing to unlock — create an identity in the Live room first.";
+  if (!pass) return "Enter your identity passphrase to unlock.";
   try {
     identity = await Identity.import(blob, pass);
     if (identity.upgraded) {
@@ -390,12 +397,54 @@ async function unlockIdentity() {
       localStorage.setItem(LS_IDENTITY, await identity.export(pass));
     }
     await unlockContacts(pass); // contact store shares the identity passphrase
-    els.idPass.value = "";
     await showIdentityUnlocked();
+    return null;
   } catch (e) {
     identity = null;
-    setIdentityStatus("Wrong passphrase or corrupted identity.", "err");
+    return "Wrong passphrase or corrupted identity.";
   }
+}
+
+async function unlockIdentity() {
+  const pass = els.idPass.value;
+  if (!localStorage.getItem(LS_IDENTITY)) {
+    setIdentityStatus("Nothing to unlock — create an identity first.", "err");
+    return;
+  }
+  if (!pass) {
+    setIdentityStatus("Enter your identity passphrase to unlock.", "err");
+    return;
+  }
+  setIdentityStatus("Unlocking…");
+  const err = await unlockWithPassphrase(pass);
+  if (err) {
+    setIdentityStatus(err, "err");
+    return;
+  }
+  els.idPass.value = "";
+}
+
+// Wire an in-view unlock row. `render` re-draws that view once unlocked.
+function wireViewUnlock(passEl, btnEl, statusFn, render) {
+  const go = async () => {
+    const pass = passEl.value;
+    statusFn("Unlocking…");
+    const err = await unlockWithPassphrase(pass);
+    if (err) {
+      statusFn(err, true);
+      return;
+    }
+    passEl.value = "";
+    statusFn("");
+    // An invite link may have been waiting on the identity (Users view).
+    applyPendingInvite();
+    render();
+  };
+  btnEl.addEventListener("click", go);
+  // Enter in the passphrase field should submit, like every other password box.
+  passEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); go(); }
+  });
 }
 
 async function exportIdentity() {
@@ -436,12 +485,39 @@ async function registerAccount() {
     localStorage.setItem(LS_USERNAME, username);
     localStorage.setItem(LS_LOOKUP_TOKEN, lookup_token);
     accountStatus(`Registered. Your contact handle is ${username}#${lookup_token} — share it (username alone will not resolve).`, "ok");
+    // Registering is when a first-time user gets their handle, and it is the
+    // moment they expect chats to work. Take the directory session now, or they
+    // would send messages fine while silently receiving nothing until they
+    // happened to press "Log in".
+    await autoLogin(username);
   } catch (e) {
     if (e.status === 409) {
       accountStatus(`"${username}" is already taken. Pick another (or log in if it is yours).`, "err");
     } else {
       accountStatus("Registration failed: " + e.message, "err");
     }
+  }
+}
+
+// Silent directory login for an already-registered identity. Never shouts on
+// failure (offline, or the name belongs to another identity) — the explicit
+// "Log in" button is still there and reports properly.
+let autoLoginRunning = false;
+async function autoLogin(username) {
+  if (!identity || apiToken || autoLoginRunning) return false;
+  if (!account.isValidUsername(username)) return false;
+  autoLoginRunning = true;
+  try {
+    const { token } = await account.login(API_BASE, identity, username);
+    apiToken = token;
+    startMailboxPolling();
+    renderProfile();
+    if (!els.viewChats.hidden) refreshChats();
+    return true;
+  } catch {
+    return false;
+  } finally {
+    autoLoginRunning = false;
   }
 }
 
@@ -499,7 +575,7 @@ function refreshUsers() {
       ? "Contact store error: " + contactsError +
         " (Forget + recreate the identity resets it — contacts are bound to the identity passphrase.)"
       : "Contacts are stored encrypted under your identity passphrase. " +
-        "Unlock (or create) your identity in the Live room view first.";
+        "Enter it to unlock them here.";
     return;
   }
   renderMyHandle();
@@ -1148,8 +1224,16 @@ async function pollMailbox() {
   let batch;
   try {
     batch = await account.fetchMail(API_BASE, apiToken);
-  } catch {
-    return; // offline / expired session: next tick retries
+  } catch (e) {
+    // A directory session lasts TOKEN_TTL_SEC. When it expires the fetch 401s
+    // forever and mail stops arriving with no visible sign, so re-authenticate
+    // and let the next tick collect. Anything else: offline, just retry later.
+    if (e && e.status === 401) {
+      apiToken = null;
+      const savedName = localStorage.getItem(LS_USERNAME);
+      if (savedName) await autoLogin(savedName);
+    }
+    return;
   }
   let changed = false;
   for (const m of batch) {
@@ -2047,6 +2131,21 @@ els.idExport.addEventListener("click", exportIdentity);
 els.idForget.addEventListener("click", forgetIdentity);
 els.register.addEventListener("click", registerAccount);
 els.login.addEventListener("click", loginAccount);
+
+// Per-view unlock (Profile / Users / Chats). Opening an invite link spawns a
+// NEW tab, and an unlocked identity lives in memory per tab — so that tab
+// always started locked with no way to unlock without navigating to the Live
+// room. Each locked view now unlocks in place.
+const setUnlockStatus = (el) => (text, isErr = false) => {
+  el.textContent = text;
+  el.className = "hint" + (isErr ? " err" : "");
+};
+wireViewUnlock(els.profileUnlockPass, els.profileUnlock,
+  setUnlockStatus(els.profileUnlockStatus), renderProfile);
+wireViewUnlock(els.usersUnlockPass, els.usersUnlock,
+  setUnlockStatus(els.usersUnlockStatus), refreshUsers);
+wireViewUnlock(els.chatsUnlockPass, els.chatsUnlock,
+  setUnlockStatus(els.chatsUnlockStatus), refreshChats);
 
 els.gen.addEventListener("click", () => {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
