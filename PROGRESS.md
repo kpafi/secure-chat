@@ -2278,6 +2278,60 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
 
 ## TODO / NEXT (suggested order)
 
+### ⬜ OPEN from the 2026-07-26 pentest (everything else in it is fixed + shipped)
+Full detail per item in `secure-chat-pentest-2026-07-26.md` (§4-6 findings,
+§9 remediation). These are the deliberate leftovers, not forgotten work.
+
+1. **P-08 (Low) — room-slot squatting. ACCEPTED RISK, revisit only with a
+   protocol change.** Room entry is authorized solely by knowing the 256-bit
+   room id plus the numeric 2-slot cap (`MAX_ROOM_MEMBERS = 2`); there is no
+   cryptographic room-entry proof. Anyone who learns a room id can join an empty
+   room first and squat a slot, locking the real peer out with `room full`.
+   **Availability only** — confidentiality and integrity are untouched (the
+   signed handshake, per-session ratchet, identity pinning and safety-number
+   gate all still hold, and an uninvited joiner receives `{"joined"}` and nothing
+   else). Not fixed because a real fix means authenticated room membership (e.g.
+   a signed join tied to the expected participants), which is a protocol change
+   rather than a patch — and a hostile relay can deny service anyway by simply
+   dropping frames. If it is ever worth doing, do it as part of a group-chat
+   design, since that has to revisit `MAX_ROOM_MEMBERS` regardless.
+
+2. **Android L-10 (Low) — relay config fails SILENTLY on an older WebView.**
+   `MainActivity.kt:216-221` only calls `addDocumentStartJavaScript` when
+   `WebViewFeature.DOCUMENT_START_SCRIPT` is supported, with no `else`. On a
+   device without it, `window.__SECURE_CHAT_RELAY__` is never set, `RELAY` stays
+   null (`app.js`), the client silently falls back to same-origin, and every
+   fetch/WS goes to `https://secure-chat.internal` and fails with an opaque
+   error. Secondly, `promptSecret` only adds `SECRET_PROMPT_MARK` when `RELAY` is
+   truthy, so **passphrase masking degrades to the F-08 substring heuristic that
+   was explicitly retired**. Should fail loudly: detect the missing feature and
+   refuse to load with a clear dialog rather than loading a client that cannot
+   work. Needs an on-device build/verify cycle on an older WebView to test
+   properly — that is why it was deferred. (Its sibling L-11, the additive
+   `Copy` task shipping stale assets, IS fixed — `syncWebClient` is now a `Sync`.)
+
+3. **Info-level backlog (no urgency, listed so it is not lost):**
+   - `dilithium-py` upstream says *"under no circumstances should this be used
+     for cryptographic applications"*. Here it only VERIFIES signatures over
+     PUBLIC data (~6.5 ms, constant-time irrelevant), so the residual risk is
+     *correctness* of the PQ ownership proof, which nothing else re-checks.
+     Document the accepted risk; prefer liboqs bindings if they become viable.
+   - No `Cross-Origin-Opener/Resource/Embedder-Policy` (framing is already
+     covered by `frame-ancestors 'none'` + XFO) — cheap isolation win.
+   - No session revocation/logout: a leaked bearer token stays valid for the
+     full `TOKEN_TTL_SEC = 3600`. `/healthz` is unthrottled.
+   - `neutralName()` uses a case-folded 12-char (~62-bit) truncation of the
+     sender key as the contact store's PRIMARY KEY. Infeasible to grind today,
+     but a derived primary key should be a full-width hash.
+   - Dead code / naming: `_reimportExtractable()` is a no-op that asserts
+     behaviour it does not implement; unused exports `crypto.UNAVAILABLE`,
+     `contacts.hasStore` (now used by the P-02 fix), `account.me`; the v2
+     register domain is built with `.replace("/v1","/v2")` instead of a constant.
+   - `with sqlite3.connect(...)` commits but never `close()`s (refcount-dependent).
+   - One `console.error` in `app.js` reaches Android logcat; gate behind a debug flag.
+   - No passphrase policy anywhere; at-rest KDF is PBKDF2-SHA256 600k (correct
+     and salted, but GPU-friendly — Argon2id/scrypt would be materially better).
+
 ### ✅ DONE (2026-07-25): redesign stage 2 — hierarchy pass
 **SHIPPED (built + verified; deploy/APK pending) — see the top snapshot.**
 Dual type stack, button tiers, restructured Profile, drawer head/foot, empty
