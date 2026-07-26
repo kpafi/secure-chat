@@ -70,6 +70,34 @@ in-session `algValue()` reads; mailbox polling starving the shared /api bucket
 behind Tor (now its own bucket); and P-17's self-test now proving all four keys
 (KEM round-trip + ECDH point re-derivation), not just the signing pair.
 
+**SHIPPED 2026-07-26.** Committed on branch `pentest-2026-07-26-fixes`
+(`6fb2861`, NOT yet merged to master), APK rebuilt + installed on the phone, and
+**deployed to Hetzner** (backend + client, service restarted, 28 accounts intact
+before and after; pre-deploy backup `/root/accounts.db.bak-2026-07-26-0212` plus
+a full tree snapshot `/root/secure-chat-predeploy-2026-07-26-0212.tar.gz`).
+Verified live: `handshake/v3` served, all six dev-file paths 404 while the real
+assets 200, a two-peer PQKEM session + the 8/8 two-user flow both green against
+`https://138-199-144-35.sslip.io`, and the phone reaching the relay (`healthz
+200`, `phoneHandshake: v3`). The two e2e accounts that run created in the LIVE
+directory were removed afterwards (back to exactly 28).
+
+**⚠️ The handshake v3 bump is a BREAKING protocol change** — a v3 client cannot
+complete a handshake with a v2 one (the transcripts differ, so verification
+fails and it surfaces as the "this is what a MITM attempt looks like" error).
+Phone and website were therefore updated together, deliberately. Anyone still
+running an older bundled APK must update before they can chat.
+
+**Deploy gotchas confirmed this round:** the safe rsync recipe below is correct
+and still necessary (a dry-run showed only the 11 changed files transferring, no
+`accounts.db`). The APK must be built with `assembleDebug` — the installed app is
+debug-signed, so a release-signed APK is rejected as a signature mismatch and
+would force an uninstall, **destroying the on-device identity**; data was
+verified intact after the update (`sc.identity.v1`, `sc.contacts.v1`,
+`sc.chats.v1` all still present). The systemd unit already had both required env
+vars (`SECURE_CHAT_TRUSTED_PROXIES=127.0.0.1`, `SECURE_CHAT_EXTRA_ORIGINS=…`);
+the new P-15 origin validation was checked against those exact values BEFORE
+restarting, since a malformed one would now abort startup.
+
 **Green after fixes (both rounds):** backend 103 passed, client `npm test` green,
 two-user-flow 8/8, no-dead-ends 12/12, live PQKEM canary harness green, all
 four modes (DHKE/RSA/AES256/PQKEM) verified delivering in a real browser, and the
