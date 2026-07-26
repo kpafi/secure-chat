@@ -23,7 +23,17 @@
 
 import { Identity, b64, unb64, concat } from "./identity.js";
 
-const DOMAIN = new TextEncoder().encode("secure-chat/handshake/v2");
+// v3 (pentest 2026-07-26 P-03) additionally binds the SIGNER'S OWN identity
+// bundle into the transcript. Under v2 the bundle was only a verification key,
+// never signed input, so `idb.ecdh` / `idb.mlkem` — the long-term ENCRYPTION
+// keys used for async sealed mail — rode along unauthenticated. A relay could
+// rewrite those two base64 strings in a peer's `key` frame, forge nothing, and
+// still pass verification: the live session stayed genuinely secure and showed
+// no symptom, but confirming the contact pinned the RELAY's encryption keys and
+// every later sealed message went to the relay. Only the human safety-number
+// comparison caught it. Binding the bundle makes it a signature failure instead.
+// The domain is bumped so a v2 signature can never be read as a v3 one.
+const DOMAIN = new TextEncoder().encode("secure-chat/handshake/v3");
 const NONCE_BYTES = 32;
 
 // A fresh random per-connection nonce (base64). Generate one per connect().
@@ -49,15 +59,23 @@ function foldNonces(aB64, bB64) {
   return concat(unb64(x), unb64(y));
 }
 
-function transcript(roomId, nonces, ephemeralPubB64) {
+// `signerBundle` is the public identity bundle of whoever signs this transcript:
+// our own when signing, and the RECEIVED `idb` when verifying — so the bundle is
+// both the verification key source and a signed input (P-03). Its 32-byte digest
+// keeps every field fixed-width, so the concatenation cannot be respliced.
+async function transcript(roomId, nonces, ephemeralPubB64, signerBundle) {
   const [a, b] = nonces;
   if (!isValidNonce(a) || !isValidNonce(b)) {
     throw new Error("handshake transcript requires two valid session nonces");
+  }
+  if (!signerBundle || !signerBundle.ed || !signerBundle.mldsa) {
+    throw new Error("handshake transcript requires the signer's identity bundle");
   }
   return concat(
     DOMAIN,
     new TextEncoder().encode(roomId),
     foldNonces(a, b),
+    await Identity.bundleDigest(signerBundle),
     unb64(ephemeralPubB64),
   );
 }
@@ -65,14 +83,20 @@ function transcript(roomId, nonces, ephemeralPubB64) {
 // Produce the signature bundle for our ephemeral public key. `nonces` is the
 // pair [myNonce, peerNonce] (order irrelevant).
 export async function signHandshake(identity, roomId, nonces, ephemeralPubB64) {
-  return identity.sign(transcript(roomId, nonces, ephemeralPubB64));
+  return identity.sign(await transcript(roomId, nonces, ephemeralPubB64, identity.publicBundle()));
 }
 
 // Verify a peer's signed ephemeral key against the identity we pinned in
 // person. Returns true only if BOTH signatures are valid for THIS transcript —
-// same room, same pair of per-connection nonces, same ephemeral key.
+// same room, same pair of per-connection nonces, same ephemeral key, and the
+// same identity bundle the peer presented (so a swapped/stripped ecdh/mlkem
+// fails here instead of relying on the user to spot it).
 export async function verifyHandshake(peerBundle, roomId, nonces, ephemeralPubB64, sigBundle) {
-  return Identity.verify(peerBundle, transcript(roomId, nonces, ephemeralPubB64), sigBundle);
+  return Identity.verify(
+    peerBundle,
+    await transcript(roomId, nonces, ephemeralPubB64, peerBundle),
+    sigBundle,
+  );
 }
 
 export { b64, unb64 };

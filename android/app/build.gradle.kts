@@ -65,7 +65,14 @@ android {
 // into the app's assets at build time (excluding tests / package manifests) so
 // the APK always ships the exact reviewed files and the bundle can never drift
 // from the web deployment. The generated copy is gitignored.
-val syncWebClient = tasks.register<Copy>("syncWebClient") {
+// Pentest 2026-07-26 (Android L-11): this was a `Copy`, which is ADDITIVE — it
+// never removes files from the destination that no longer exist in the source.
+// A client module that was deleted or renamed therefore stayed in
+// src/main/assets/web and kept shipping inside the APK indefinitely, still
+// reachable at https://secure-chat.internal/... `Sync` mirrors the source
+// exactly, deleting stale files, so the bundle cannot drift from the reviewed
+// client. (Safe here: the destination holds nothing but this task's output.)
+val syncWebClient = tasks.register<Sync>("syncWebClient") {
     from(rootProject.file("../client")) {
         exclude("*.test.mjs", "*.integration.test.mjs", "package*.json", "node_modules")
     }

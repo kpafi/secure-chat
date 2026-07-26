@@ -150,6 +150,12 @@ let otpLockRelease = null; // releases this pad's exclusive same-origin lock
 const TAB_ID = Math.random().toString(36).slice(2) + Date.now().toString(36);
 let joined = false;
 let verified = false; // in-person gate passed; gates RECEIVING as well as sending
+// Pentest 2026-07-26 P-19: the room id and algorithm this session actually
+// negotiated, captured once at connect(). The send path used to re-read
+// roomCode()/algValue() from the live DOM, so any later UI change would have
+// been described on the wire as though it had always been the session's mode.
+let sessionRoom = null;
+let sessionAlg = null;
 
 let identity = null;       // unlocked Identity, or null
 let myBundle = null;       // identity.publicBundle(), or null
@@ -192,12 +198,25 @@ function unpackKey(b64) {
 // be planted to auto-unlock a MITM. These require the store to be unlocked,
 // which is guaranteed in the handshake modes (they need the identity anyway).
 
+// Pentest 2026-07-26 P-02: "no pin recorded" and "pins UNREADABLE" must not look
+// alike. unlockContacts() swallows a decrypt failure (corrupt/tampered/foreign
+// blob) into a string and returns normally, so the identity stayed fully usable
+// with the pin store locked — getPin() then returned null and the verification
+// gate showed the benign first-contact prompt instead of the loud
+// "identity key CHANGED" alarm. Overwriting sc.contacts.v1 with garbage was
+// therefore enough to strip TOFU change detection for every contact.
+function pinsReadable() {
+  return contacts.isUnlocked() || !contacts.hasStore();
+}
 function getPin(key) {
   return contacts.isUnlocked() ? contacts.getPin(key) : null;
 }
 function savePin(key, bundle) {
   if (contacts.isUnlocked()) return contacts.savePin(key, bundle);
-  return Promise.resolve();
+  // Rejecting (was: silently resolving) so the caller can tell the user their
+  // confirmation was NOT durably recorded — otherwise the next session shows
+  // "first contact" again and the change alarm never arms.
+  return Promise.reject(new Error("contact store is locked — the identity pin could not be saved"));
 }
 // Audit 2026-07-18 H-01: bundle equality covers ALL FOUR public keys,
 // normalized so missing and present never compare equal — a swapped or newly
@@ -613,12 +632,18 @@ let apiToken = null;      // directory session token (from Log in), memory only
 
 // Unlock the contact store with the identity passphrase. Called wherever the
 // identity itself is created/unlocked, BEFORE the passphrase field is cleared.
+// P-02: a failure here leaves the identity usable but the PIN STORE LOCKED,
+// which silently disables key-change detection. It is still not fatal (the user
+// may legitimately have a foreign blob and want to wipe it), but it must be
+// visible wherever it matters — so besides `contactsError` for the Users view,
+// the room screen warns and the verification gate refuses to auto-accept.
 async function unlockContacts(pass) {
   try {
     await contacts.unlock(pass);
     contactsError = null;
   } catch (e) {
     contactsError = e.message;
+    addLine("sys", "", "[contact store did not unlock — key-change warnings are OFF until it does]");
   }
   try {
     await chats.unlock(pass); // chat history shares the at-rest posture
@@ -1395,6 +1420,15 @@ async function processEnvelope(m) {
     });
   }
 
+  // P-13: de-duplicate EVERY envelope kind here, before it can act. The old
+  // dedup lived in chats.append (regular messages only) and scanned the trimmed
+  // display history, so control envelopes could be replayed by a hostile mailbox
+  // without limit and old messages could reappear once the 500-message window
+  // scrolled past. markSeen is backed by a ring kept independently of history.
+  if (opened.id && !(await chats.markSeen(sender.username, opened.id))) {
+    return false; // already processed this envelope
+  }
+
   // Control traffic (mode negotiation) vs a regular message.
   if (opened.kind && opened.kind !== "msg") {
     return await handleControl(sender, opened);
@@ -1434,6 +1468,11 @@ async function handleControl(sender, opened) {
     if (!chats.isValidMode(opened.mode)) return false;
   }
   if (opened.kind === "mode-propose") {
+    // P-06: the proposer chooses this PBKDF2 salt. Reject anything that is not
+    // the 16 random bytes newInnerSalt() mints, at the boundary, so a degenerate
+    // or shared salt never reaches storage or the KDF. AES256 needs one; SEALED
+    // carries none.
+    if (opened.mode === "AES256" && !chats.isValidInnerSalt(opened.salt)) return false;
     await chats.setPending(u, { mode: opened.mode, dir: "in", salt: opened.salt || null });
     if (activeChat === u) renderConversation();
     return true;
@@ -1463,7 +1502,32 @@ function startMailboxPolling() {
 
 // ---- connection lifecycle -------------------------------------------------
 
+// Pentest 2026-07-26 P-19: connect() awaits a directory fetch, a pad unlock
+// (600k PBKDF2) and RSA keygen before it disabled the button, so a double-click
+// ran two overlapping connects that fought over ws/cipher/otpRecord/
+// otpLockRelease — the second call's releaseOtpLock() dropped the lock the first
+// had just taken, and both opened sockets into a room capped at two members,
+// locking the real peer out. Claimed synchronously, before the first await.
+let connecting = false;
+
 async function connect() {
+  if (connecting) return;
+  connecting = true;
+  els.connect.disabled = true;
+  try {
+    await connectInner();
+  } finally {
+    connecting = false;
+    // connectInner keeps the button disabled for the life of a live socket (the
+    // onclose handler re-enables it). Re-enable here only when we never got that
+    // far — note `ws` may still hold a CLOSED socket from a previous session, so
+    // test the state rather than mere presence.
+    const live = ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN);
+    if (!live) els.connect.disabled = false;
+  }
+}
+
+async function connectInner() {
   const room = roomCode();
   const alg = algValue();
   if (!ROOM_RE.test(room)) {
@@ -1549,6 +1613,10 @@ async function connect() {
   myNonce = freshNonce();
   peerNonce = null;
   helloAnswered = false;
+  // P-19: freeze the session's room/alg now; the send path uses these, never the
+  // live DOM.
+  sessionRoom = room;
+  sessionAlg = alg;
   setStatus("connecting…");
   els.connect.disabled = true;
   try {
@@ -1614,7 +1682,7 @@ async function signedHandshake(room) {
 function sendSignedKey(room, reply) {
   return signedHandshake(room).then(({ pub, sig }) => {
     ws.send(JSON.stringify({
-      type: "key", room, alg: algValue(),
+      type: "key", room, alg: sessionAlg,
       payload: packKey({ pub, reply, idb: myBundle, sig }),
     }));
   });
@@ -1634,13 +1702,13 @@ async function handleMessage(room, raw) {
       els.roomShort.textContent = room.slice(0, 8) + "…" + room.slice(-8);
       showScreen("chat");
       setStatus("connected", "ok");
-      addLine("sys", "", `joined room — encryption: ${algValue()}`);
+      addLine("sys", "", `joined room — encryption: ${sessionAlg}`);
       // Phase 1: announce our fresh session nonce. For handshake modes the
       // signed handshake follows once we also know the peer's nonce; for
       // AES256 (usesNonces, no key material on the wire) the nonces alone fix
       // the session's ratchet chains, closing cross-session frame replay.
       ws.send(JSON.stringify({
-        type: "key", room, alg: algValue(),
+        type: "key", room, alg: sessionAlg,
         payload: packKey({ hello: true, n: myNonce, reply: false }),
       }));
       hint("Waiting for the other party to join / exchange keys…");
@@ -1669,7 +1737,7 @@ async function handleMessage(room, raw) {
           if (!p.reply && !helloAnswered) {
             helloAnswered = true;
             ws.send(JSON.stringify({
-              type: "key", room, alg: algValue(),
+              type: "key", room, alg: sessionAlg,
               payload: packKey({ hello: true, n: myNonce, reply: true }),
             }));
             if (cipher.needsHandshake) await sendSignedKey(room, false);
@@ -1767,7 +1835,13 @@ async function handleMessage(room, raw) {
       try {
         const text = await cipher.decrypt(m.payload);
         addLine("peer", "peer", text);
-        persistOtpProgress();
+        // P-04: recvHighWater must reach disk too — an unpersisted receive
+        // watermark lets an already-delivered frame be replayed after a reload.
+        try {
+          await persistOtpProgress();
+        } catch (err) {
+          otpPersistFailed(err);
+        }
       } catch {
         addLine("sys", "", "[undecryptable message — wrong key or tampered]");
       }
@@ -1805,6 +1879,25 @@ async function enterVerification(room, verifiedBundle) {
       "Do NOT proceed unless you confirm this safety number with them in person.";
     addLine("sys", "", `[directory mismatch for "${expectedPeerName}" — verification required]`);
     hint("Directory mismatch — confirm the safety number in person before proceeding.", true);
+    return;
+  }
+
+  // P-02: if a contact store EXISTS but will not open, we cannot tell a first
+  // contact from a changed key — so say exactly that, loudly, instead of
+  // rendering the reassuring first-contact prompt. Fail closed: no auto-accept
+  // path may run while pins are unreadable.
+  if (!pinsReadable()) {
+    els.verify.hidden = false;
+    els.verify.classList.add("changed");
+    els.verifyTitle.textContent = "⚠ Your saved contacts could not be opened — key changes cannot be detected";
+    els.verifyHint.textContent =
+      "Your contact store is locked or damaged" +
+      (contactsError ? ` (${contactsError})` : "") +
+      ", so this app cannot check whether this contact's key changed since last time. " +
+      "Treat this as an UNVERIFIED first contact: confirm the safety number below in person " +
+      "before you continue. Unlock your contacts on the Profile screen to restore key-change warnings.";
+    addLine("sys", "", "[contact store unreadable — pinned-key change detection is OFF]");
+    hint("Key-change detection is off — your saved contacts could not be opened.", true);
     return;
   }
 
@@ -1862,7 +1955,15 @@ function unlockMessaging() {
 
 async function onVerifyOk() {
   if (!peerBundle || !currentPinKey) return;
-  await savePin(currentPinKey, peerBundle);
+  // P-02: savePin now rejects when the store is locked. The user's in-person
+  // check still holds for THIS session, so messaging is allowed — but say
+  // plainly that it was not remembered, or they would expect a change warning
+  // next time that can never come.
+  try {
+    await savePin(currentPinKey, peerBundle);
+  } catch (e) {
+    addLine("sys", "", "[verified for this session only — the pin could NOT be saved: " + e.message + "]");
+  }
   // An in-person safety-number confirmation is the strongest trust signal we
   // have — mirror it into the Users list (🟢) when the peer is known by name.
   // Store the FULL bundle incl. the encryption keys the safety number covered
@@ -1908,11 +2009,28 @@ async function sendText(e) {
   els.send.disabled = true;
   try {
     const payload = await cipher.encrypt(text);
-    ws.send(JSON.stringify({ type: "msg", room: roomCode(), payload, alg: algValue() }));
+    // Pentest 2026-07-26 P-04: a one-time pad must record consumption DURABLY
+    // BEFORE the ciphertext is transmitted. This used to run after ws.send(),
+    // un-awaited, with failures downgraded to a hint — so a tab kill or a
+    // QuotaExceededError left the peer holding a frame at offset o while disk
+    // still said `sendOffset < o`, and the next message re-encrypted new
+    // plaintext under keystream the relay had already captured. Persisting first
+    // makes the failure mode OVER-consumption (wasted pad bytes), which is
+    // harmless; under-consumption is the one that breaks the pad.
+    try {
+      await persistOtpProgress();
+    } catch (err) {
+      // The pad bytes are already spent in memory; refusing to transmit means
+      // we merely waste them, which is the safe direction.
+      otpPersistFailed(err);
+      return;
+    }
+    // Session-captured room/alg (P-19): never re-read live UI state at send
+    // time — the envelope must describe the session we actually negotiated.
+    ws.send(JSON.stringify({ type: "msg", room: sessionRoom, payload, alg: sessionAlg }));
     addLine("me", "me", text);
     els.text.value = "";
     hint("");
-    persistOtpProgress();
   } catch (err) {
     hint("Encryption failed: " + err.message, true);
   } finally {
@@ -1941,12 +2059,40 @@ function fmtBytes(n) {
 // rest, with the cached key so there is no per-message PBKDF2). Called after
 // every send/receive so consumption survives a reload — reuse would be
 // catastrophic for a one-time pad.
-function persistOtpProgress() {
-  if (!otpRecord || !otpAtRest || !cipher || algValue() !== "OTP") return;
+// Pentest 2026-07-26 P-04: this is now awaited and it THROWS. A pad session that
+// cannot durably record what it has spent must stop, not carry on — so callers
+// treat a failure as fatal to the session (see otpPersistFailed). It no longer
+// gates on `algValue()` either (P-19): that read live UI state, so a mode change
+// mid-session would have silently stopped recording consumption — the one thing
+// that must never stop. `otpRecord`/`otpAtRest` are set only by an OTP connect()
+// and cleared on every connect, so they are the reliable signal.
+async function persistOtpProgress() {
+  if (!otpRecord || !otpAtRest || !cipher) return;
+  if (typeof cipher.sendOffset !== "number" || typeof cipher.recvHighWater !== "number") return;
   otpRecord.sendOffset = cipher.sendOffset;
   otpRecord.recvHighWater = cipher.recvHighWater;
-  otp.savePadProgress(otpRecord, otpAtRest).catch((e) => hint("Could not save pad progress: " + e.message, true));
+  await otp.savePadProgress(otpRecord, otpAtRest);
   updateOtpBudget();
+}
+
+// A pad whose consumption cannot be written to disk is unsafe to keep using:
+// every further message would risk reusing keystream after a reload. Stop the
+// session loudly instead of continuing with a hint.
+function otpPersistFailed(err) {
+  // Clear the gate BEFORE disabling the form: sendText's `finally` re-enables
+  // the Send button whenever `verified` is still true, so without this the stop
+  // was undone the moment this function returned (and ws.close() is async, so
+  // the onclose handler that also clears it has not run yet). Dropping the gate
+  // additionally makes the `case "msg"` receive path refuse further frames.
+  verified = false;
+  enableSend(false);
+  addLine("sys", "", "[could not save one-time-pad progress — stopping to prevent key reuse]");
+  hint(
+    "Could not save pad progress: " + err.message +
+    " — disconnecting so the pad cannot be reused. Free up storage, then reconnect.",
+    true,
+  );
+  if (ws) ws.close();
 }
 
 // ---- pad exclusive lock (one live session per pad) ------------------------

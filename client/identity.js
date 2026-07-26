@@ -40,6 +40,11 @@ function unb64(s) {
   for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
   return u;
 }
+// JWK coordinates are base64URL with the padding stripped (RFC 7515 §2).
+function unb64url(s) {
+  const pad = s.replace(/-/g, "+").replace(/_/g, "/");
+  return unb64(pad + "=".repeat((4 - (pad.length % 4)) % 4));
+}
 function concat(...arrs) {
   const total = arrs.reduce((n, a) => n + a.length, 0);
   const out = new Uint8Array(total);
@@ -227,7 +232,78 @@ export class Identity {
       })));
       id.upgraded = true;
     }
+    // Pentest 2026-07-26 P-17: prove the imported PUBLIC keys really belong to
+    // the imported PRIVATE keys. A truncated, mismatched or hand-edited backup
+    // otherwise yields an identity that signs with one key while publishing
+    // another: every signature it makes fails verification elsewhere, with no
+    // clue why, and the safety number shown to a contact describes a key it
+    // cannot actually use. Sign a fixed vector with both signing keys and verify
+    // against the stored public bundle — cheap, and it fails closed at import.
+    await id._assertKeypairsConsistent();
     return id;
+  }
+
+  // Self-test used by import(): prove that EVERY stored public key really
+  // corresponds to the stored private key beside it — signing keys by signing
+  // and verifying a probe, ML-KEM by an encapsulate/decapsulate round trip, and
+  // ECDH by re-deriving the public point from the private key. All four keys are
+  // trust anchors (the fingerprint and safety number hash all of them), so a
+  // backup that pairs one key with another's public half would show contacts a
+  // safety number for a key it cannot actually use.
+  async _assertKeypairsConsistent() {
+    const probe = new TextEncoder().encode("secure-chat/identity-selftest/v1");
+    let ok = false;
+    try {
+      ok = await Identity.verify(this.publicBundle(), probe, await this.sign(probe));
+    } catch {
+      ok = false;
+    }
+    if (!ok) {
+      throw new Error(
+        "identity backup is inconsistent: its signing public keys do not match its private keys — refusing to load it",
+      );
+    }
+    if (!this.ecdhPubRaw && !this.mlkemPub) return; // signing-only (pre-v2) identity
+
+    if (this.ecdhPubRaw.length !== ECDH_PUB_BYTES) {
+      throw new Error("identity backup has a malformed ECDH public key");
+    }
+    if (this.mlkemPub.length !== MLKEM768_PUB_BYTES) {
+      throw new Error("identity backup has a malformed ML-KEM public key");
+    }
+    // ML-KEM: encapsulating to the stored public key must produce a secret the
+    // stored secret key can recover.
+    let kemOk = false;
+    try {
+      const { cipherText, sharedSecret } = ml_kem768.encapsulate(this.mlkemPub);
+      const back = ml_kem768.decapsulate(cipherText, this._mlkemSecret);
+      kemOk = back.length === sharedSecret.length && back.every((b, i) => b === sharedSecret[i]);
+    } catch {
+      kemOk = false;
+    }
+    if (!kemOk) {
+      throw new Error(
+        "identity backup is inconsistent: its ML-KEM public key does not match its secret key — refusing to load it",
+      );
+    }
+    // ECDH: the private key's own public point must equal the stored one. The
+    // key is imported extractable, so JWK export gives x/y directly.
+    let ecdhOk = false;
+    try {
+      const jwk = await crypto.subtle.exportKey("jwk", this._ecdhPriv);
+      const x = unb64url(jwk.x);
+      const y = unb64url(jwk.y);
+      const derived = concat(new Uint8Array([0x04]), x, y); // uncompressed point
+      ecdhOk = derived.length === this.ecdhPubRaw.length &&
+        derived.every((b, i) => b === this.ecdhPubRaw[i]);
+    } catch {
+      ecdhOk = false;
+    }
+    if (!ecdhOk) {
+      throw new Error(
+        "identity backup is inconsistent: its ECDH public key does not match its private key — refusing to load it",
+      );
+    }
   }
 
   // ---- static verification (no private material needed) -------------------
@@ -280,8 +356,19 @@ export class Identity {
     return concat(...parts);
   }
 
+  // Fixed-length (32-byte) commitment to ALL public keys in a bundle. Pentest
+  // 2026-07-26 P-03: the handshake transcript binds the signer's own bundle
+  // through this rather than through `_bundleBytes` directly, because that
+  // function's output length VARIES (1984 bytes for a signing-only bundle, 3233
+  // once the encryption keys are present). Concatenating a variable-length field
+  // ahead of the ephemeral key would reintroduce exactly the splice ambiguity
+  // F-07 removed; a digest is constant-width, so the transcript stays unambiguous.
+  static async bundleDigest(publicBundle) {
+    return sha256(Identity._bundleBytes(publicBundle));
+  }
+
   static async fingerprintOf(publicBundle) {
-    const digest = await sha256(Identity._bundleBytes(publicBundle));
+    const digest = await Identity.bundleDigest(publicBundle);
     return groupHex(digest);
   }
 

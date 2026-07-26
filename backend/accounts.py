@@ -23,9 +23,16 @@ public key the registrant does not control. (Authenticity of the keys to a
 human still comes from the in-person safety number; this only stops a squatter
 binding someone else's PQ key into their own directory entry.)
 
-Anti-enumeration (I1): the username namespace is NOT enumerable. Lookups are
-gated by a per-account random token (`username#token` handle); challenge/verify
-no longer reveal whether a username exists. See `get_user` / `auth_*`.
+Anti-enumeration (I1): lookups are gated by a per-account random token
+(`username#token` handle), and challenge/verify do not reveal whether a username
+exists. See `get_user` / `auth_*`, and `mailbox.post_mail` for the same gate.
+
+  KNOWN EXCEPTION (pentest 2026-07-26 P-09): `register` necessarily answers
+  409 "taken" vs 200 "registered", so it IS an existence oracle for the
+  username namespace. That is inherent to first-come-first-served unique
+  names; it discloses only whether a name is in use — never the bundle, the
+  lookup token, or any message — and it is throttled by the strict challenge
+  bucket. Do not describe the namespace as strictly non-enumerable.
 """
 from __future__ import annotations
 
@@ -34,6 +41,7 @@ import hmac
 import re
 import secrets
 import sqlite3
+import threading
 import time
 
 from cryptography.exceptions import InvalidSignature
@@ -56,6 +64,11 @@ _lookup_limiter = KeyedRateLimiter(config.LOOKUP_RATE_CAPACITY, config.LOOKUP_RA
 
 # Dedicated, stricter bucket for minting login challenges (M-03).
 _challenge_limiter = KeyedRateLimiter(config.CHALLENGE_RATE_CAPACITY, config.CHALLENGE_RATE_REFILL_PER_SEC)
+
+# Dedicated bucket for registration (P-09): it is the one namespace-existence
+# oracle we cannot remove, so it is throttled like the other sensitive paths —
+# but on its own bucket, so registrations and logins cannot starve each other.
+_register_limiter = KeyedRateLimiter(config.REGISTER_RATE_CAPACITY, config.REGISTER_RATE_REFILL_PER_SEC)
 
 
 def client_key(request: Request) -> str:
@@ -94,6 +107,11 @@ def challenge_rate_limit(request: Request) -> None:
 
 def lookup_rate_limit(request: Request) -> None:
     if not _lookup_limiter.allow(client_key(request)):
+        raise HTTPException(status_code=429, detail="rate limited")
+
+
+def register_rate_limit(request: Request) -> None:
+    if not _register_limiter.allow(client_key(request)):
         raise HTTPException(status_code=429, detail="rate limited")
 
 
@@ -262,10 +280,21 @@ def init_db() -> None:
 _challenges: dict[str, tuple[str, float]] = {}  # challenge_b64 -> (username, expiry)
 _tokens: dict[str, tuple[str, float]] = {}      # token -> (username, expiry)
 
+# Pentest 2026-07-26 P-12: these endpoints are sync `def`s, so FastAPI runs them
+# in the anyio threadpool (40 workers by default) — genuinely concurrent, unlike
+# the single-threaded event loop the rest of the app assumes. `_prune` iterated
+# these dicts while other workers inserted into them, which can raise
+# "RuntimeError: dictionary changed size during iteration" -> an unhandled 500
+# plus a traceback on disk (against the I2 no-metadata-at-rest goal). The same
+# race made the `len(...) >= MAX_...` check-then-insert pairs non-atomic, so the
+# caps could be overshot. One lock guards both stores.
+_store_lock = threading.Lock()
+
 
 def _prune(store: dict[str, tuple[str, float]]) -> None:
+    """Drop expired entries. Caller MUST hold `_store_lock`."""
     now = time.monotonic()
-    for k in [k for k, (_, exp) in store.items() if exp < now]:
+    for k in [k for k, (_, exp) in list(store.items()) if exp < now]:
         store.pop(k, None)
 
 
@@ -302,8 +331,17 @@ def _check_username(u: str) -> None:
 
 # --- endpoints (sync defs run in a threadpool; sqlite stays off the loop) --
 
-@router.post("/register")
+@router.post("/register", dependencies=[Depends(register_rate_limit)])
 def register(req: RegisterReq) -> dict:
+    # Pentest 2026-07-26 P-09: registration is the one endpoint that still
+    # distinguishes an existing username (409) from a free one (200), so it is a
+    # namespace-existence oracle — the single exception to the I1 property the
+    # module docstring describes (see the note there). Making the responses
+    # indistinguishable is not possible without giving up first-come-first-served
+    # naming, so instead it is moved off the general 5/s bucket onto its own
+    # strict bucket (10 burst, 0.5/s sustained), matching the throttle on the
+    # other existence-sensitive paths. Probing a wordlist now costs ~2 s per name
+    # instead of 200 ms.
     _check_username(req.username)
     ed_raw = _b64decode_fixed(req.ed, config.ED25519_PUB_BYTES)
     mldsa_raw = _b64decode_fixed(req.mldsa, config.MLDSA65_PUB_BYTES)
@@ -395,19 +433,22 @@ def auth_challenge(req: ChallengeReq) -> dict:
     # whether or not it exists. A nonexistent account simply cannot produce a
     # valid signature at verify time, so this endpoint reveals nothing.
     _check_username(req.username)
-    _prune(_challenges)
-    if len(_challenges) >= config.MAX_PENDING_CHALLENGES:
-        raise HTTPException(status_code=503, detail="too many pending challenges")
     challenge = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
-    _challenges[challenge] = (req.username, time.monotonic() + config.CHALLENGE_TTL_SEC)
+    # Prune + cap-check + insert must be one atomic step (P-12).
+    with _store_lock:
+        _prune(_challenges)
+        if len(_challenges) >= config.MAX_PENDING_CHALLENGES:
+            raise HTTPException(status_code=503, detail="too many pending challenges")
+        _challenges[challenge] = (req.username, time.monotonic() + config.CHALLENGE_TTL_SEC)
     return {"challenge": challenge}
 
 
 @router.post("/auth/verify")
 def auth_verify(req: VerifyReq) -> dict:
     _check_username(req.username)
-    _prune(_challenges)
-    entry = _challenges.pop(req.challenge, None)  # one-time use
+    with _store_lock:
+        _prune(_challenges)
+        entry = _challenges.pop(req.challenge, None)  # one-time use (atomic: P-12)
     if entry is None or entry[0] != req.username:
         raise HTTPException(status_code=400, detail="unknown or expired challenge")
 
@@ -425,21 +466,23 @@ def auth_verify(req: VerifyReq) -> dict:
     if not _ed25519_verify(ed_raw, sig_raw, _login_message(challenge_raw)):
         raise HTTPException(status_code=401, detail="challenge signature invalid")
 
-    _prune(_tokens)
-    if len(_tokens) >= config.MAX_ACTIVE_TOKENS:
-        raise HTTPException(status_code=503, detail="too many active sessions")
     token = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
-    _tokens[token] = (req.username, time.monotonic() + config.TOKEN_TTL_SEC)
+    with _store_lock:
+        _prune(_tokens)
+        if len(_tokens) >= config.MAX_ACTIVE_TOKENS:
+            raise HTTPException(status_code=503, detail="too many active sessions")
+        _tokens[token] = (req.username, time.monotonic() + config.TOKEN_TTL_SEC)
     return {"token": token, "ttl": config.TOKEN_TTL_SEC}
 
 
 def current_user(authorization: str | None = Header(default=None)) -> str:
     """Resolve a Bearer token to a username, or 401."""
-    _prune(_tokens)
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="missing bearer token")
     token = authorization[len("Bearer "):]
-    entry = _tokens.get(token)
+    with _store_lock:
+        _prune(_tokens)
+        entry = _tokens.get(token)
     if entry is None:
         raise HTTPException(status_code=401, detail="invalid or expired token")
     return entry[0]

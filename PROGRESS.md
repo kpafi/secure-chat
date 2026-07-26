@@ -3,7 +3,79 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (2026-07-25, Android: duplicate title bar removed)
+## ⮕ RESUME HERE (2026-07-26, first full pentest of the final product — ALL FIXED)
+**Full pentest + remediation in one session.** Report:
+`secure-chat-pentest-2026-07-26.md` (findings in §4-6, remediation table in §9).
+Method: the two test agents (`e2e/two-user-flow.mjs`) plus a new PQKEM live-room
+canary harness drove two real browser peers while **tshark** captured loopback;
+four specialist agents then attacked in parallel (packet exploitation + live
+relay, whole-codebase review, backend pentest, client-crypto pentest). Every
+High/Medium was re-verified by hand — agents were wrong in places (e.g. two
+claimed static-path bypass vectors actually 404'd).
+
+**Packet capture result: E2EE was NOT broken.** Zero canary plaintext, keys or
+secrets recoverable; wire carries only public keys, dual signatures, random
+nonces and unique-IV AES-GCM ciphertext. Active attacks (room hijack, replay,
+handshake forgery/downgrade, CSWSH, oversized/malformed frames) all failed
+closed. What leaks is **metadata** (room id, usernames, tokens, `alg`, sizes,
+timing) — visible here only because loopback is un-TLS'd; in prod (wss/.onion) a
+network observer sees none of it, but **the relay operator inherently does**.
+
+**Counts: 0 Critical, 1 High, 6 Medium, 13 Low, 12 Info — all fixed** except
+**P-08** (room-slot squatting, availability-only, accepted: a cryptographic
+room-entry proof is a protocol change, and a hostile relay can DoS anyway) and
+the two Android Lows (need an on-device cycle).
+
+**The High (P-01) is worth remembering:** OTP pad `role`/`padId`/`regionSize`
+sat OUTSIDE the AES-GCM tag, so a one-byte localStorage edit (`"role":1`→`0`)
+pointed the sender at the peer's pad region — a full two-time pad, no passphrase
+needed — and re-keying a blob under a fresh `padId` walked around the M-01
+watermark. Stored blobs are now **v2**: everything security-relevant is inside
+the AEAD, `unlockPad` asserts `inner.padId === requestedId`, the watermark is
+keyed by the REQUESTED id, and v1 blobs migrate on first unlock. **Honest
+residual: migration cannot retroactively detect tampering done while a blob was
+still v1.**
+
+**Other notable fixes.** Handshake transcript → **v3**, now binding the signer's
+own bundle via a fixed-length `Identity.bundleDigest()` (a digest, not the raw
+`_bundleBytes`, whose length varies 1984↔3233 and would have reintroduced the
+F-07 splice ambiguity) — a relay swapping a peer's `ecdh`/`mlkem` now fails the
+signature instead of relying on the human safety-number check. OTP consumption is
+**write-ahead + fail-closed**. `forgetPad` KEEPS the watermark (forget+re-import
+was the easiest route to a two-time pad, reachable by accident). Contact-store
+unlock failure no longer silently disables key-change warnings.
+
+**Gotcha found while fixing:** `backend/tests/` had no `conftest.py`, so the
+module-global rate limiters leaked state between tests. The new conftest resets
+them **and** must set `SECURE_CHAT_DB` *before* anything imports `config` —
+otherwise a module-level import there resolves `DB_PATH` to the REAL
+`backend/accounts.db` and the suite reads/writes production data (this happened
+once; the 24 test accounts + 2 vouches inserted were identified by timestamp and
+removed, leaving the 109 genuine accounts intact).
+
+**An independent agent then reviewed the fix diff and caught a HIGH regression in
+the P-01 fix itself** (report §9.1). The migration decided "is this legacy?" from
+the OUTER, unauthenticated `v` byte — so deleting `"v"` from a v2 blob downgraded
+it back to the vulnerable path and handed `role` to the attacker again (PoC:
+`baseline role: 1 → ATTACK role: 0`). **Lesson worth keeping: a version/format
+discriminator is a security-relevant input; outside the AEAD it silently
+re-enabled the exact weakness the change removed.** Now discriminated on the
+AUTHENTICATED plaintext (a real v1 payload has no inner `padId`), with a
+regression test in `otp-rollback.test.mjs`. The review also produced 2 Medium +
+5 Low fixes: the same dict race still live in `KeyedRateLimiter._prune`
+(`relay.py` — every /api request hits it); unvalidated peer-chosen `seenIds`;
+origin validation crashing the relay at import on a trailing-slash typo (startup
+DoS); `otpPersistFailed`'s stop undone by `sendText`'s `finally`; 3 leftover
+in-session `algValue()` reads; mailbox polling starving the shared /api bucket
+behind Tor (now its own bucket); and P-17's self-test now proving all four keys
+(KEM round-trip + ECDH point re-derivation), not just the signing pair.
+
+**Green after fixes (both rounds):** backend 103 passed, client `npm test` green,
+two-user-flow 8/8, no-dead-ends 12/12, live PQKEM canary harness green, all
+four modes (DHKE/RSA/AES256/PQKEM) verified delivering in a real browser, and the
+P-01-downgrade + P-03-bundle-swap PoCs both failing as they should.
+
+## (2026-07-25, Android: duplicate title bar removed)
 The app showed TWO stacked "secure-chat" bars — the native ActionBar plus the
 web client's own header. **Fixed by dropping the native TITLE, not the bar:**
 `supportActionBar?.setDisplayShowTitleEnabled(false)`.

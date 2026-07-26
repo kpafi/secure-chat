@@ -5,6 +5,7 @@ disappear the moment they are empty, so there is no at-rest data to leak.
 """
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -61,27 +62,38 @@ class KeyedRateLimiter:
         self._refill = refill_per_sec
         self._buckets: dict[str, TokenBucket] = {}
         self._last_prune = time.monotonic()
+        # Pentest 2026-07-26 (fix review): these limiters back the /api HTTP
+        # endpoints, whose handlers are sync `def`s and therefore run in the
+        # anyio THREADPOOL — genuinely concurrent, unlike the single-event-loop
+        # assumption the WS relay is written against. `_prune` iterated
+        # `_buckets` while other worker threads inserted into it via `allow`,
+        # which can raise "dictionary changed size during iteration" -> an
+        # unhandled 500 plus a traceback on disk (against the I2 no-metadata-at-
+        # rest goal). The read-modify-write in `allow` was likewise not atomic,
+        # so two threads could each mint a bucket for the same key and one
+        # request would escape the limit. One lock covers both.
+        self._lock = threading.Lock()
 
-    def _prune(self) -> None:
-        now = time.monotonic()
+    def _prune(self, now: float) -> None:
+        """Drop fully-refilled idle buckets. Caller MUST hold `self._lock`."""
         if now - self._last_prune < 60.0:
             return
         self._last_prune = now
-        # Drop buckets that have fully refilled (idle long enough to be at cap).
         stale = [
-            k for k, b in self._buckets.items()
+            k for k, b in list(self._buckets.items())
             if b.tokens >= b.capacity and now - b.last > 60.0
         ]
         for k in stale:
             self._buckets.pop(k, None)
 
     def allow(self, key: str) -> bool:
-        self._prune()
-        bucket = self._buckets.get(key)
-        if bucket is None:
-            bucket = TokenBucket(capacity=self._capacity, refill_per_sec=self._refill)
-            self._buckets[key] = bucket
-        return bucket.allow()
+        with self._lock:
+            self._prune(time.monotonic())
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                bucket = TokenBucket(capacity=self._capacity, refill_per_sec=self._refill)
+                self._buckets[key] = bucket
+            return bucket.allow()
 
 
 @dataclass

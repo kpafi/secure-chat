@@ -65,6 +65,21 @@ let dataKey = null;
 let salt = null;
 let chats = null; // { username: chat } while unlocked
 
+// Pentest 2026-07-26 P-20: the store is keyed by a directory username, and the
+// server's charset (^[a-z0-9_.-]+$, 3-32) makes `__proto__` and `constructor`
+// registerable handles. On a normal object `chats["constructor"]` returns an
+// INHERITED value, so ensure()/append()/get() treated a non-existent chat as
+// existing and then threw a TypeError that escaped through the Chats view. A
+// null-prototype object has nothing to inherit, so every key is either an own
+// property or undefined.
+function newStore(from = null) {
+  const store = Object.create(null);
+  if (from && typeof from === "object") {
+    for (const k of Object.keys(from)) store[k] = from[k];
+  }
+  return store;
+}
+
 export function isUnlocked() {
   return dataKey !== null;
 }
@@ -81,7 +96,7 @@ export async function unlock(passphrase) {
   if (!raw) {
     salt = crypto.getRandomValues(new Uint8Array(16));
     dataKey = await deriveKey(passphrase, salt, KDF_ITERS);
-    chats = {};
+    chats = newStore();
     await persist();
     return;
   }
@@ -95,7 +110,9 @@ export async function unlock(passphrase) {
     lock();
     throw new Error("chat store does not decrypt with this passphrase (different identity, or tampered)");
   }
-  chats = JSON.parse(dec.decode(plain));
+  // P-20: JSON.parse yields a normal object (with a prototype); re-key it into a
+  // null-prototype store before anything indexes it by a username.
+  chats = newStore(JSON.parse(dec.decode(plain)));
   if (sanitizeModes()) await persist();
 }
 
@@ -141,7 +158,31 @@ export function wipe() {
 // BEFORE it is sealed (and after it is opened). PBKDF2 salt is fixed per chat
 // (agreed at negotiation) so both sides derive the same key.
 
+// The inner salt arrives inside a PEER's `mode-propose` control message.
+// Pentest 2026-07-26 P-06: it used to be stored verbatim and fed straight into
+// PBKDF2 with no validation — while this very file bounds salt length and
+// iteration count for its OWN at-rest KDF a few lines above. A peer could send
+// an empty salt, one fixed constant reused across all their victims (removing
+// the per-chat separation that makes 600k iterations worth running, and enabling
+// precomputation against the shared passphrase), or a multi-megabyte string.
+// Enforce exactly the 16 random bytes `newInnerSalt` produces.
+const INNER_SALT_BYTES = 16;
+
+export function isValidInnerSalt(saltB64) {
+  if (typeof saltB64 !== "string" || saltB64.length > 64) return false;
+  let raw;
+  try {
+    raw = unb64(saltB64);
+  } catch {
+    return false;
+  }
+  return raw.length === INNER_SALT_BYTES;
+}
+
 async function innerKey(secret, saltB64) {
+  if (!isValidInnerSalt(saltB64)) {
+    throw new Error("invalid chat salt (expected 16 random bytes) — refusing to derive a key");
+  }
   const base = await crypto.subtle.importKey("raw", enc.encode(secret), "PBKDF2", false, ["deriveKey"]);
   return crypto.subtle.deriveKey(
     { name: "PBKDF2", salt: unb64(saltB64), iterations: KDF_ITERS, hash: "SHA-256" },
@@ -153,7 +194,7 @@ async function innerKey(secret, saltB64) {
 }
 
 export function newInnerSalt() {
-  return b64(crypto.getRandomValues(new Uint8Array(16)));
+  return b64(crypto.getRandomValues(new Uint8Array(INNER_SALT_BYTES)));
 }
 
 export async function innerEncrypt(secret, saltB64, text) {
@@ -207,10 +248,47 @@ export async function ensure(username, mode = "SEALED") {
   if (!chats) throw new Error("chat store is locked");
   requireValidMode(mode);
   if (!chats[username]) {
-    chats[username] = { username, mode, messages: [], updatedAt: Date.now() };
+    chats[username] = { username, mode, messages: [], seenIds: [], updatedAt: Date.now() };
     await persist();
   }
   return get(username);
+}
+
+// Pentest 2026-07-26 P-13: envelope de-duplication used to be a scan of
+// `c.messages`, which MAX_MESSAGES_PER_CHAT trims — so once a conversation
+// passed 500 messages a hostile mailbox could re-deliver an old envelope and it
+// would be appended at the END (render order is array order), making an old
+// "yes, go ahead" look like the newest message. Worse, CONTROL envelopes never
+// reached that check at all, so a mailbox could replay mode-propose/decline
+// frames indefinitely. The seen-id ring is kept independently of the display
+// history and covers every envelope kind.
+const MAX_SEEN_IDS = 2000;
+
+// The envelope id is chosen by the SENDER, so it is peer-controlled data that we
+// are about to write to disk. `newEnvelopeId` mints 16 random bytes as base64
+// (24 chars); anything longer is either a bug or an attempt to inflate the store
+// (and the ring holds MAX_SEEN_IDS of them). Cap it rather than trusting it —
+// the same reasoning that validates the peer-supplied PBKDF2 salt above.
+const MAX_ENVELOPE_ID_CHARS = 64;
+
+function isStorableId(id) {
+  return typeof id === "string" && id.length > 0 && id.length <= MAX_ENVELOPE_ID_CHARS;
+}
+
+// Record `id` as seen for this chat. Returns false if it was already seen (i.e.
+// the caller should DROP the envelope as a replay/duplicate).
+export async function markSeen(username, id) {
+  if (!chats) throw new Error("chat store is locked");
+  if (!id) return true;              // no id to dedup on: caller decides
+  if (!isStorableId(id)) return false; // implausible id: drop, and store nothing
+  if (!chats[username]) await ensure(username);
+  const c = chats[username];
+  if (!Array.isArray(c.seenIds)) c.seenIds = [];
+  if (c.seenIds.includes(id)) return false;
+  c.seenIds.push(id);
+  if (c.seenIds.length > MAX_SEEN_IDS) c.seenIds = c.seenIds.slice(-MAX_SEEN_IDS);
+  await persist();
+  return true;
 }
 
 // Append a message. Inbound messages carry the envelope id — a duplicate id is

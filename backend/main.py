@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import os
+import posixpath
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -106,11 +107,38 @@ app.include_router(mailbox.router)
 # served to the public (L-02). StaticFiles would otherwise expose them; this
 # guard 404s them regardless of what is on disk (defense in depth alongside the
 # deploy excludes). Exact paths + a suffix rule for test modules.
-_BLOCKED_STATIC = {"/package.json", "/package-lock.json"}
+_BLOCKED_BASENAMES = {"package.json", "package-lock.json"}
+# Whole subtrees that must never be reachable, matched on normalized path
+# segments (not string prefixes).
+_BLOCKED_SEGMENTS = {"node_modules"}
 
 
 def _is_blocked_static(path: str) -> bool:
-    return path in _BLOCKED_STATIC or path.endswith(".test.mjs")
+    """True if `path` names a development/tooling file that must not be served.
+
+    Pentest 2026-07-26 P-10: this used to compare the raw path against an EXACT
+    set ({"/package.json", ...}). StaticFiles normalizes the path before
+    resolving the file, so every non-canonical spelling of the same file sailed
+    past the gate and returned real content — `//package.json`, `/package.json/`,
+    and any nested copy such as `/vendor/lean-qr/package.json`. The entire
+    `client/node_modules/` tree (including `.package-lock.json`, precisely the
+    file class L-02 set out to block) was never covered at all. We now normalize
+    first and match on path SEGMENTS + basenames, so spelling variants and nested
+    copies are all caught, and the control no longer depends on the deploy-time
+    excludes being right.
+    """
+    # Collapse "//", "/./" and any "/x/../" the way the static mount will.
+    normalized = posixpath.normpath("/" + path.strip("/"))
+    segments = [s for s in normalized.split("/") if s]
+    if any(s in _BLOCKED_SEGMENTS for s in segments):
+        return True
+    basename = segments[-1] if segments else ""
+    # Dotfiles (.package-lock.json, .env, .git*) are never client assets.
+    return (
+        basename in _BLOCKED_BASENAMES
+        or basename.startswith(".")
+        or basename.endswith(".test.mjs")
+    )
 
 
 @app.middleware("http")

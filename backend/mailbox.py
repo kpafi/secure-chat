@@ -30,11 +30,26 @@ from relay import KeyedRateLimiter
 from accounts import _db, current_user, _check_username, token_matches, client_key
 
 _post_limiter = KeyedRateLimiter(config.MAILBOX_RATE_CAPACITY, config.MAILBOX_RATE_REFILL_PER_SEC)
+_fetch_limiter = KeyedRateLimiter(
+    config.MAILBOX_FETCH_RATE_CAPACITY, config.MAILBOX_FETCH_RATE_REFILL_PER_SEC
+)
 
 # Envelopes are JSON of base64 fields — printable ASCII by construction.
 _ASCII_RE = re.compile(r"^[\x20-\x7e]+$")
 
 router = APIRouter(prefix="/api/mailbox", tags=["mailbox"])
+
+
+def _fetch_rate_limit(request: Request) -> None:
+    # Pentest 2026-07-26 P-11: `GET /api/mailbox` was the only /api endpoint with
+    # NO limiter (POST had its own bucket; the accounts router limits everything
+    # it owns). Each fetch runs a full-table TTL prune plus a SELECT that can
+    # return up to MAX_MAILBOX_PER_RECIPIENT * MAX_ENVELOPE_BYTES (~12.8 MB), so
+    # an authenticated user could hammer it unthrottled. It gets its OWN generous
+    # bucket rather than the shared /api one, because clients poll this endpoint
+    # every 6 s and behind Tor they all share a single bucket.
+    if not _fetch_limiter.allow(client_key(request)):
+        raise HTTPException(status_code=429, detail="rate limited")
 
 
 def _post_rate_limit(request: Request) -> None:
@@ -98,7 +113,7 @@ def post_mail(recipient: str, req: PostReq, t: str = Query(default="", max_lengt
     return {"status": "queued"}
 
 
-@router.get("")
+@router.get("", dependencies=[Depends(_fetch_rate_limit)])
 def fetch_mail(username: str = Depends(current_user)) -> dict:
     """Return AND DELETE the queued envelopes for the authenticated user.
 
@@ -110,9 +125,12 @@ def fetch_mail(username: str = Depends(current_user)) -> dict:
     """
     with _db() as conn:
         _prune(conn)
+        # Bound the response explicitly (P-11) rather than relying on the
+        # per-inbox insert cap to be the only limit. Anything beyond this stays
+        # queued for the next fetch.
         rows = conn.execute(
-            "SELECT id, envelope, created_at FROM mailbox WHERE recipient = ? ORDER BY id",
-            (username,),
+            "SELECT id, envelope, created_at FROM mailbox WHERE recipient = ? ORDER BY id LIMIT ?",
+            (username, config.MAX_MAILBOX_PER_RECIPIENT),
         ).fetchall()
         if rows:
             ids = [r["id"] for r in rows]

@@ -170,7 +170,14 @@ class RatchetChannel {
     );
     this.recvChain = step.chain; // commit: skipped/used keys are unrecoverable
     this.recvSeq = m.n;
-    return dec.decode(pt);
+    const text = dec.decode(pt);
+    // Pentest 2026-07-26 P-18: enforce the project's printable-ASCII invariant
+    // here too. OtpPad._decrypt and both send paths already check it; this path
+    // returned whatever TextDecoder produced, and TextDecoder is non-fatal by
+    // default, so invalid UTF-8 became U+FFFD silently. Not exploitable (every
+    // render path is textContent), but the invariant should hold everywhere.
+    if (!isAscii(text)) throw new Error("decrypted content is not ASCII");
+    return text;
   }
 }
 
@@ -388,6 +395,11 @@ async function sha256Hex(bytes) {
 const RSA_CHAIN_INFO = "secure-chat/rsa-fs/v1|";
 const RSA_MSG_DOMAIN = "secure-chat/rsa-msg/v2";
 
+// Smallest peer modulus we will wrap a root secret to (P-16). Matches the size
+// we generate; 2048 is today's floor rather than a recommendation, which is why
+// DHKE/PQKEM are the preferred modes.
+const RSA_MIN_MODULUS_BITS = 2048;
+
 class Rsa {
   constructor(roomId) {
     this.roomId = roomId;
@@ -428,9 +440,17 @@ class Rsa {
     // share a keypair, and identical pubs would collapse the direction chains.
     if (m.pub === this.myPub) throw new Error("reflected handshake rejected");
     if (m.pub && this.peerPubB64 === null) { // first key wins
-      this.peerPub = await crypto.subtle.importKey(
+      const peerPub = await crypto.subtle.importKey(
         "spki", b64ToBuf(m.pub), { name: "RSA-OAEP", hash: "SHA-256" }, false, ["encrypt"],
       );
+      // Pentest 2026-07-26 P-16: we are about to RSA-OAEP-encrypt this session's
+      // 32-byte root secret to this key, so refuse a short modulus outright
+      // rather than trusting the counterparty to have picked a sane size.
+      const bits = peerPub.algorithm && peerPub.algorithm.modulusLength;
+      if (typeof bits !== "number" || bits < RSA_MIN_MODULUS_BITS) {
+        throw new Error(`peer RSA key is too small (${bits} bits; minimum ${RSA_MIN_MODULUS_BITS})`);
+      }
+      this.peerPub = peerPub;
       this.peerPubB64 = m.pub;
     }
     if (this.peerPubB64 === null) throw new Error("malformed RSA handshake message");
@@ -693,6 +713,13 @@ class Pqkem {
 const OTP_MSG_DOMAIN = "secure-chat/otp-msg/v1";
 const OTP_MAC_BYTES = 32;
 
+// True if every byte in [start, end) is zero — i.e. that pad span has already
+// been consumed and wiped (see the P-01 guard in OtpPad._encrypt).
+function isAllZero(u8, start, end) {
+  for (let i = start; i < end; i++) if (u8[i] !== 0) return false;
+  return true;
+}
+
 class OtpPad {
   constructor(roomId, pad) {
     if (!pad || !(pad.bytes instanceof Uint8Array)) {
@@ -740,6 +767,18 @@ class OtpPad {
     const o = this.sendOffset;
     const base = this.role * this.regionSize;
     const abs = base + o;
+    // Pentest 2026-07-26 P-01 (defense in depth): consumed pad bytes are zeroed
+    // in place, so an all-zero span means we are about to "encrypt" with spent
+    // keystream — `ct = pt XOR 0` hands the plaintext to the relay. The only way
+    // to reach this with a well-formed record is a corrupted/tampered `role` or
+    // offset pointing us at the PEER's already-consumed region. Fail closed
+    // rather than emit the plaintext. (A genuine unused span is random; the odds
+    // of it being 32+ zero bytes are negligible.)
+    if (isAllZero(this.pad, abs, abs + need)) {
+      throw new Error(
+        "refusing to send: this pad region is already spent (the pad's role/offset state looks wrong) — exchange a fresh pad in person",
+      );
+    }
     const macKeyBytes = this.pad.slice(abs, abs + OTP_MAC_BYTES); // copy (independent of zeroing)
     const ks = this.pad.subarray(abs + OTP_MAC_BYTES, abs + need); // live view, read before zeroing
     const ct = new Uint8Array(len);

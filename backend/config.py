@@ -7,6 +7,7 @@ Changing a limit is a security-relevant decision.
 from __future__ import annotations
 
 import os
+import re
 
 # --- Network / app ---------------------------------------------------------
 # Loopback only for local testing. Production (.onion) binding is configured
@@ -93,6 +94,21 @@ API_RATE_REFILL_PER_SEC = 5.0 # sustained requests/second
 CHALLENGE_RATE_CAPACITY = 10        # burst allowance (challenges)
 CHALLENGE_RATE_REFILL_PER_SEC = 0.5 # sustained challenges/second
 
+# Dedicated bucket for REGISTRATION (pentest 2026-07-26 P-09). Registration is
+# the one endpoint that must distinguish a taken username (409) from a free one
+# (200), so it is an existence oracle for the namespace — inherent to unique
+# first-come-first-served names. On the general 5/s bucket a wordlist could be
+# walked at 5 names/second; this throttles it to ~1 name every 2 s. It gets its
+# OWN bucket rather than sharing the challenge one so that a registration flood
+# cannot throttle legitimate logins (or vice versa).
+# Deliberately more generous than the lookup/challenge buckets: behind Tor the
+# keying collapses to ONE GLOBAL bucket, so an over-tight limit here would let
+# anyone hold the whole service's onboarding shut. Rate limiting cannot remove an
+# oracle that is inherent to unique names — it only slows probing (5/s -> 1/s) —
+# so it is not worth trading registration availability for a bigger slowdown.
+REGISTER_RATE_CAPACITY = 20        # burst allowance (registrations)
+REGISTER_RATE_REFILL_PER_SEC = 1.0 # sustained registrations/second
+
 # Hard caps so a flood cannot exhaust memory/disk even within TTL windows.
 MAX_ACCOUNTS = 100_000           # total rows in the directory
 MAX_PENDING_CHALLENGES = 10_000  # outstanding login challenges
@@ -124,7 +140,41 @@ APP_WEBVIEW_ORIGIN = "https://secure-chat.internal"
 # Extra origins can be added at deploy time WITHOUT editing this file, via
 # SECURE_CHAT_EXTRA_ORIGINS (comma-separated) — e.g. the production .onion
 # origin. They are added to both the WS allow-list and the HTTP CORS list.
-_EXTRA_ORIGINS = [o.strip() for o in os.environ.get("SECURE_CHAT_EXTRA_ORIGINS", "").split(",") if o.strip()]
+# Pentest 2026-07-26 P-15: these values land in BOTH the CORS allow-list and the
+# WS origin allow-list. CORSMiddleware treats a literal "*" as a wildcard, so one
+# typo or copy-paste at deploy time would open /api to every origin — in a file
+# whose stated purpose is to fail closed. Accept only well-formed scheme://host
+# [:port] origins and drop anything else (a malformed entry is a deploy mistake;
+# silently trusting it is the one outcome we must avoid).
+_ORIGIN_RE = re.compile(r"^(https?|wss?)://[A-Za-z0-9.\-]+(:\d{1,5})?$")
+
+
+def _valid_origins(raw: str) -> list[str]:
+    """Parse SECURE_CHAT_EXTRA_ORIGINS into a list of exact origins.
+
+    A trailing slash is the one malformation we normalize rather than reject:
+    `https://x.onion/` is what a browser address bar shows and what an operator
+    will paste, it is unambiguous, and an exception here takes the whole relay
+    down at import (uvicorn cannot load the app) — a startup DoS is a worse
+    outcome than quietly accepting an obvious typo. Anything genuinely ambiguous
+    still raises, because silently DROPPING an entry would leave the operator
+    with a relay their .onion cannot reach and no explanation.
+    """
+    out = []
+    for o in (p.strip() for p in raw.split(",")):
+        if not o:
+            continue
+        o = o.rstrip("/")
+        if not _ORIGIN_RE.match(o):
+            raise ValueError(
+                f"SECURE_CHAT_EXTRA_ORIGINS contains an invalid origin: {o!r} "
+                "(expected e.g. https://example.onion or http://127.0.0.1:8000)"
+            )
+        out.append(o)
+    return out
+
+
+_EXTRA_ORIGINS = _valid_origins(os.environ.get("SECURE_CHAT_EXTRA_ORIGINS", ""))
 
 ALLOWED_WS_ORIGINS = {
     "http://127.0.0.1:8000",
@@ -180,6 +230,16 @@ MAX_MAILBOX_TOTAL = 100_000           # queued envelopes server-wide
 MAILBOX_TTL_SEC = 14 * 24 * 3600      # unfetched mail expires
 MAILBOX_RATE_CAPACITY = 30            # burst posts per host
 MAILBOX_RATE_REFILL_PER_SEC = 1.0     # sustained posts/second per host
+
+# Dedicated bucket for FETCHING mail (pentest 2026-07-26 P-11). GET used to have
+# no limiter at all; putting it on the shared /api bucket closed that but created
+# a worse problem — clients poll every 6 s, and behind Tor every client shares one
+# bucket, so ~30 concurrent users would have exhausted the general 5/s budget and
+# starved registration/lookup for everyone. This bucket is sized for polling
+# (~180 concurrent pollers) while still bounding a flood, and it cannot starve
+# the other endpoints because it is separate.
+MAILBOX_FETCH_RATE_CAPACITY = 120     # burst fetches
+MAILBOX_FETCH_RATE_REFILL_PER_SEC = 30.0  # sustained fetches/second
 
 # --- Web-of-trust vouches --------------------------------------------------
 # A vouch is a dual-signed public statement "voucher has verified target's

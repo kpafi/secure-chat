@@ -201,6 +201,15 @@ export async function importPad(fileText, passphrase) {
   if (!looksRandom(bytes)) {
     throw new Error("this pad is not random enough to be safe (all-zero or low-entropy) — do not use it");
   }
+  // Pentest 2026-07-26 P-05: an export file is always pristine, so re-importing
+  // one this device has already consumed would rewind sendOffset to 0 and reuse
+  // keystream the peer has already seen. The watermark survives `forgetPad`
+  // precisely so this check can fire.
+  if (padWasUsed(o.padId)) {
+    throw new Error(
+      "this pad has already been used on this device — importing it again would reuse key material. Generate and exchange a fresh pad in person.",
+    );
+  }
   return {
     padId: o.padId,
     label: o.label || "imported pad",
@@ -277,11 +286,30 @@ export function padMeta(padId) {
   return readIndex().find((e) => e.padId === padId) || null;
 }
 
-// Encrypt {bytes, offsets} under `key` (a cached AES-GCM CryptoKey) with a fresh
+// Stored-blob format version. v1 kept padId/label/regionSize/role OUTSIDE the
+// AES-GCM ciphertext; v2 puts every security-relevant field inside it (P-01).
+const PAD_BLOB_V = 2;
+
+// Encrypt the WHOLE record under `key` (a cached AES-GCM CryptoKey) with a fresh
 // IV and persist, keeping the stored salt/iters so the same key still unlocks it.
+//
+// Pentest 2026-07-26 P-01: `role`, `padId` and `regionSize` used to sit in the
+// outer plaintext JSON and were read straight back by unlockPad. `OtpPad`
+// derives the send region as `role * regionSize`, so flipping one stored byte
+// (`"role":1` -> `"role":0`) pointed the sender at the PEER's region and
+// produced a full two-time pad — with no passphrase and no key material. The
+// same outer `padId` also keyed the M-01 rollback watermark, so re-keying an old
+// blob under a fresh id walked around that control. Everything now lives inside
+// the AEAD; only the KDF parameters and the ciphertext are outside (they cannot
+// redirect key material, and the tag covers the rest).
 async function writePadBlob(record, key, salt, iters) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const plain = encU.encode(JSON.stringify({
+    padId: record.padId,
+    label: record.label,
+    regionSize: record.regionSize,
+    role: record.role,
+    createdAt: record.createdAt,
     bytes: b64(record.bytes),
     sendOffset: record.sendOffset,
     recvHighWater: record.recvHighWater,
@@ -289,11 +317,7 @@ async function writePadBlob(record, key, salt, iters) {
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain));
   plain.fill(0);
   localStorage.setItem(padKey(record.padId), JSON.stringify({
-    padId: record.padId,
-    label: record.label,
-    regionSize: record.regionSize,
-    role: record.role,
-    createdAt: record.createdAt,
+    v: PAD_BLOB_V,
     kdf: { salt: b64(salt), iters },
     iv: b64(iv),
     ct: b64(ct),
@@ -337,21 +361,65 @@ export async function unlockPad(padId, passphrase) {
   plain.fill(0);
   const sendOffset = inner.sendOffset | 0;
   // M-01: refuse a pad whose consumption has been rolled back below the highest
-  // offset we ever recorded — that would reuse already-spent keystream.
-  if (sendOffset < readHW(o.padId)) {
+  // offset we ever recorded — that would reuse already-spent keystream. P-01:
+  // the watermark is looked up by the REQUESTED id (the storage key the caller
+  // asked for), never by an id read out of the blob being validated — otherwise
+  // re-keying an old blob under a fresh id reads a watermark of 0 and the
+  // rollback sails through.
+  if (sendOffset < readHW(padId)) {
     throw new Error("pad state was rolled back (consumed key material) — refusing to use it; exchange a fresh pad");
   }
+  // P-01: take every security-relevant field from INSIDE the AEAD. A v1 blob
+  // kept them outside; it is migrated to v2 on first unlock (below), which binds
+  // them from here on.
+  //
+  // The legacy discriminator MUST come from the authenticated plaintext, never
+  // from the outer JSON. A first cut of this fix tested `(o.v || 1) < PAD_BLOB_V`
+  // — an outer, unauthenticated byte — so simply DELETING `"v"` from a stored v2
+  // blob (leaving kdf/iv/ct untouched, so it still decrypts under the victim's
+  // real passphrase) downgraded it back onto the legacy path, handing `role`
+  // back to the attacker and skipping the padId binding check: a full two-time
+  // pad, exactly what this fix removes. A genuine v1 plaintext has no `padId`
+  // inside the ciphertext, and forging that would require breaking AES-GCM, so
+  // the inner shape is a discriminator an attacker cannot influence.
+  const legacy = inner.padId === undefined;
+  const src = legacy ? o : inner;
+  if (!legacy && inner.padId !== padId) {
+    throw new Error("stored pad does not match its storage key — refusing to use it");
+  }
+  const regionSize = src.regionSize;
+  const role = src.role;
+  if (role !== 0 && role !== 1) throw new Error("stored pad has an invalid role");
+  if (!Number.isInteger(regionSize) || regionSize <= 0) {
+    throw new Error("stored pad has an invalid region size");
+  }
+  const bytes = unb64(inner.bytes);
+  if (bytes.length !== 2 * regionSize) {
+    throw new Error("stored pad is internally inconsistent — refusing to use it");
+  }
   const record = {
-    padId: o.padId,
-    label: o.label,
-    regionSize: o.regionSize,
-    role: o.role,
-    createdAt: o.createdAt,
-    bytes: unb64(inner.bytes),
+    padId,
+    label: src.label,
+    regionSize,
+    role,
+    createdAt: src.createdAt,
+    bytes,
     sendOffset,
     recvHighWater: inner.recvHighWater | 0,
   };
-  return { record, atRest: { key, salt, iters } };
+  const atRest = { key, salt, iters };
+  // Rewrite a genuine legacy blob in the v2 (fully authenticated) format
+  // immediately, so the window in which its metadata is unauthenticated is one
+  // unlock long and it can never be downgraded again.
+  //
+  // HONEST RESIDUAL, limited to blobs written before this fix: a v1 blob's
+  // role/regionSize genuinely live outside the AEAD, so tampering done while it
+  // was still v1 cannot be detected retroactively — no change here can recover
+  // information that was never authenticated. What IS now guaranteed: a v2 blob
+  // cannot be downgraded to obtain that weakness, and every blob becomes v2 on
+  // its first unlock.
+  if (legacy) await writePadBlob(record, key, salt, iters);
+  return { record, atRest };
 }
 
 // Record that a pad has been exported (shared). Used to warn on re-export, which
@@ -361,8 +429,22 @@ export function markExported(padId) {
   if (meta) writeIndexEntry(meta, { exported: true });
 }
 
+// Forget a pad locally. Pentest 2026-07-26 P-05: the rollback watermark is
+// deliberately KEPT. It used to be deleted here, which made "Forget pad" the
+// easiest route to a two-time pad: an export file is always pristine
+// (`exportPad` refuses a used pad), and the duplicate-import guard is an index
+// lookup this function clears — so *Forget → re-import the same file* resurrected
+// the pad at sendOffset 0 with a clean tripwire and every later message reused
+// keystream the peer had already seen. That path is reachable by accident ("it
+// wasn't working, let me re-import"), not just by an attacker. The watermark is
+// a few bytes; keeping it lets `importPad`/`unlockPad` refuse the resurrection.
 export function forgetPad(padId) {
   localStorage.removeItem(padKey(padId));
-  localStorage.removeItem(hwKey(padId)); // clear the rollback tripwire too (M-01)
   localStorage.setItem(LS_INDEX, JSON.stringify(readIndex().filter((e) => e.padId !== padId)));
+}
+
+// True if this device has ever recorded consumption for `padId` — i.e. the pad
+// was used here before, so re-importing the pristine file would rewind it.
+export function padWasUsed(padId) {
+  return readHW(padId) > 0;
 }
