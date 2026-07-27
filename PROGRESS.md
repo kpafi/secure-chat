@@ -12,9 +12,33 @@ Implemented, pentested by a separate agent, and driven by two real browser peers
 **BREAKING protocol change** (like handshake v3): relay and client must be
 updated together. A new client refuses an old relay's bare `{"joined"}` — no
 `role` means no admission control, and silently running the protocol this fix
-removes would be the worse failure. Committed 2026-07-27 (`c753535`, on
-`master`, not pushed). NOT yet deployed to Hetzner, NOT on the phone — and
-because it is breaking, the relay and both clients have to move together.
+removes would be the worse failure. Committed and pushed 2026-07-27
+(`c753535` + `4a75769` on `master`), and **deployed to Hetzner** (see below).
+
+**⚠️ THE PHONE IS NOW BEHIND THE RELAY.** The APK bundles its own copy of
+`client/`, so the installed app is still the pre-P-08 client talking to a
+post-P-08 relay: its `join` into an occupied room is answered `{"type":
+"pending"}`, which the old client does not understand, so it waits forever and
+never chats. **Rebuild + reinstall before using the phone:**
+`cd ~/secure-chat/android && ANDROID_HOME=$HOME/android-sdk ./gradlew
+assembleDebug -Dorg.gradle.java.home=$HOME/jdk-21.0.4+7 && adb install -r
+app/build/outputs/apk/debug/app-debug.apk` (`assembleDebug` — a release-signed
+APK is rejected as a signature mismatch and forces an uninstall, destroying the
+on-device identity).
+
+**DEPLOYED to Hetzner 2026-07-27** (backend + client via the safe rsync recipe
+below, `chown securechat` + `systemctl restart`). Pre-deploy backups on the box:
+`/root/accounts.db.bak-2026-07-27-p08` and
+`/root/secure-chat-predeploy-2026-07-27-p08.tar.gz`; **28 accounts before and
+after**, journal clean, `/` and `/healthz` 200. Verified live against
+`wss://138-199-144-35.sslip.io/ws` with a three-step smoke check: owner join →
+`{"type":"joined","role":"owner"}`, second join → `{"type":"pending"}` (no
+`role`, no member slot), the knock reaching the owner with a 16-hex `jid`, a
+waiting socket's `msg` refused `not in room`, and `deny` → `{"type":"denied"}`
++ close. The served assets are the new ones (`admittedBundle` in `app.js`,
+`#admitOk` in `index.html`). Backend suite re-run before deploying: **121
+passed** (needs a venv from `backend/requirements.lock` — the old one was in a
+deleted scratchpad, same trap as `e2e/node_modules`).
 
 **What actually fixes P-08: waiting costs the room nothing.** Membership was
 first-come-first-served, so anyone with the room id could take one of the two
@@ -2465,7 +2489,8 @@ Full detail per item in `secure-chat-pentest-2026-07-26.md` (§4-6 findings,
    takes the room from the invited peer. **Residual, deliberate:** whoever joins
    an empty room FIRST owns it, and a visible queue can still be filled — both
    availability-only, both needing the cryptographic room-entry proof this
-   finding always said it would take. **Committed (`c753535`); not deployed.**
+   finding always said it would take. **Committed (`c753535`) and deployed
+   2026-07-27; the phone still needs an APK rebuild.**
 
 2. ~~**Android L-10 (Low) — relay config fails SILENTLY on an older WebView.**~~
    **FIXED 2026-07-27 — see the snapshot at the top of this file.** (Its sibling
