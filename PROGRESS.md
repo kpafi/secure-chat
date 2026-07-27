@@ -15,16 +15,30 @@ updated together. A new client refuses an old relay's bare `{"joined"}` — no
 removes would be the worse failure. Committed and pushed 2026-07-27
 (`c753535` + `4a75769` on `master`), and **deployed to Hetzner** (see below).
 
-**⚠️ THE PHONE IS NOW BEHIND THE RELAY.** The APK bundles its own copy of
-`client/`, so the installed app is still the pre-P-08 client talking to a
-post-P-08 relay: its `join` into an occupied room is answered `{"type":
-"pending"}`, which the old client does not understand, so it waits forever and
-never chats. **Rebuild + reinstall before using the phone:**
+**PHONE UPDATED 2026-07-27** — it had to be, in the same session: the APK
+bundles its own copy of `client/` (gradle copies `../client` into assets), so
+between the deploy and the reinstall the installed app was a pre-P-08 client
+against a post-P-08 relay — a `join` into an occupied room is answered
+`{"type":"pending"}`, which the old client does not understand, so it would
+wait forever and never chat. Rebuilt and installed over the top:
 `cd ~/secure-chat/android && ANDROID_HOME=$HOME/android-sdk ./gradlew
 assembleDebug -Dorg.gradle.java.home=$HOME/jdk-21.0.4+7 && adb install -r
 app/build/outputs/apk/debug/app-debug.apk` (`assembleDebug` — a release-signed
 APK is rejected as a signature mismatch and forces an uninstall, destroying the
-on-device identity).
+on-device identity). Verified: the APK's `assets/web/app.js` carries
+`admittedBundle` BEFORE installing, `adb install -r` → Success, app launches
+clean (no `AndroidRuntime` exception), **`sc.identity.v1` / `sc.contacts.v1` /
+`sc.chats.v1` all still present** in the WebView leveldb (`adb shell run-as
+org.securechat.app`, path is `app_webview/Default/Local Storage/leveldb` — the
+`Default/` segment is new vs. what older notes imply), Step 1 renders with the
+stored identity LOCKED, and the phone reaches the deployed relay
+(`secure_chat_prefs.xml` → `https://138-199-144-35.sslip.io`, `healthz` 200
+from the device shell). NOT driven through a full chat on-device — that needs
+the identity passphrase, which is the user's.
+
+Incidentally, the 2026-07-25 UI nit below (Unlock should be the primary on a
+locked Step 1, not "Continue without an identity") is FIXED — the on-device
+screenshot shows Unlock as the blue primary.
 
 **DEPLOYED to Hetzner 2026-07-27** (backend + client via the safe rsync recipe
 below, `chown securechat` + `systemctl restart`). Pre-deploy backups on the box:
