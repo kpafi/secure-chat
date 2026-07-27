@@ -12,8 +12,9 @@ Implemented, pentested by a separate agent, and driven by two real browser peers
 **BREAKING protocol change** (like handshake v3): relay and client must be
 updated together. A new client refuses an old relay's bare `{"joined"}` — no
 `role` means no admission control, and silently running the protocol this fix
-removes would be the worse failure. NOT yet deployed to Hetzner, NOT on the
-phone, NOT committed — see "state" below.
+removes would be the worse failure. Committed 2026-07-27 (`c753535`, on
+`master`, not pushed). NOT yet deployed to Hetzner, NOT on the phone — and
+because it is breaking, the relay and both clients have to move together.
 
 **What actually fixes P-08: waiting costs the room nothing.** Membership was
 first-come-first-served, so anyone with the room id could take one of the two
@@ -2464,7 +2465,7 @@ Full detail per item in `secure-chat-pentest-2026-07-26.md` (§4-6 findings,
    takes the room from the invited peer. **Residual, deliberate:** whoever joins
    an empty room FIRST owns it, and a visible queue can still be filled — both
    availability-only, both needing the cryptographic room-entry proof this
-   finding always said it would take. **Not deployed/committed yet.**
+   finding always said it would take. **Committed (`c753535`); not deployed.**
 
 2. ~~**Android L-10 (Low) — relay config fails SILENTLY on an older WebView.**~~
    **FIXED 2026-07-27 — see the snapshot at the top of this file.** (Its sibling
