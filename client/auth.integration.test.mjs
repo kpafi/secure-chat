@@ -12,7 +12,9 @@
 import assert from "node:assert";
 import { makeCipher, bufToB64, b64ToBuf } from "./crypto.js";
 import { Identity } from "./identity.js";
-import { signHandshake, verifyHandshake, freshNonce, isValidNonce } from "./auth.js";
+import {
+  signHandshake, verifyHandshake, freshNonce, isValidNonce, signKnock, verifyKnock,
+} from "./auth.js";
 
 const URL = "ws://127.0.0.1:8000/ws";
 const enc = new TextEncoder();
@@ -40,6 +42,7 @@ function makePeer(name, room, alg, identity, peerPinnedBundle, onText) {
   const myNonce = freshNonce();
   let peerNonce = null;
   let helloAnswered = false;
+  let admitted = null; // the identity this peer let into the room (owner side)
 
   // Computed fresh each call (no caching): PQKEM's and RSA's offer and answer
   // are different payloads and each needs its own signature.
@@ -61,6 +64,27 @@ function makePeer(name, room, alg, identity, peerPinnedBundle, onText) {
 
   ws.addEventListener("message", async (ev) => {
     const m = JSON.parse(ev.data);
+    // P-08 admission. The knock carries the SIGNED identity, and the owner
+    // admits only the bundle it pinned in person — so this harness also covers
+    // the client-side rule that the admitted key must be the expected one.
+    if (m.type === "pending") {
+      signKnock(identity, room).then((sig) => {
+        ws.send(JSON.stringify({ type: "knock", room, payload: packKey({ idb: myBundle, sig }) }));
+      });
+      return;
+    }
+    if (m.type === "knock") {
+      const p = unpackKey(m.payload);
+      const okKnock = await verifyKnock(p.idb, room, p.sig);
+      assert.strictEqual(okKnock, true, `${name}: knock signature must verify`);
+      assert.deepStrictEqual(p.idb, peerPinnedBundle, `${name}: only the pinned peer is admitted`);
+      admitted = p.idb;
+      ws.send(JSON.stringify({ type: "admit", room, jid: m.jid }));
+      return;
+    }
+    if (m.type === "denied") {
+      throw new Error(`${name}: unexpectedly denied entry`);
+    }
     if (m.type === "joined") {
       joined.resolve();
       ws.send(JSON.stringify({ type: "key", room, alg, payload: packKey({ hello: true, n: myNonce, reply: false }) }));
@@ -82,6 +106,11 @@ function makePeer(name, room, alg, identity, peerPinnedBundle, onText) {
       const ok = await verifyHandshake(peerPinnedBundle, room, [myNonce, peerNonce], pub, sig);
       assert.strictEqual(ok, true, `${name}: peer handshake signature must verify against the pin`);
       assert.deepStrictEqual(idb, peerPinnedBundle, `${name}: received bundle must equal the pinned bundle`);
+      // P-08: the peer that completes the handshake must be the identity we let
+      // in — the rule that stops "admit Alice, route Mallory".
+      if (admitted) {
+        assert.deepStrictEqual(idb, admitted, `${name}: handshake peer must be the admitted identity`);
+      }
       await cipher.onPeerKey(pub);
       if (!reply) {
         await sendSignedKey(true);
@@ -182,6 +211,12 @@ async function testCrossSessionReplayLive() {
     victim.addEventListener("message", async (ev) => {
       const m = JSON.parse(ev.data);
       if (m.type === "joined") r();
+      // Mallory is modelled as a hostile peer the victim DOES let in — the
+      // point of the test is that the replayed handshake fails anyway.
+      if (m.type === "knock") {
+        victim.send(JSON.stringify({ type: "admit", room, jid: m.jid }));
+        return;
+      }
       if (m.type !== "key") return;
       const p = unpackKey(m.payload);
       if (p.hello) {
@@ -198,7 +233,11 @@ async function testCrossSessionReplayLive() {
   const mallory = new WebSocket(URL);
   await new Promise((r) => {
     mallory.addEventListener("message", (ev) => {
-      if (JSON.parse(ev.data).type === "joined") r();
+      const m = JSON.parse(ev.data);
+      if (m.type === "pending") {
+        mallory.send(JSON.stringify({ type: "knock", room, payload: packKey({ anon: true }) }));
+      }
+      if (m.type === "joined") r();
     });
     mallory.addEventListener("open", () => mallory.send(JSON.stringify({ type: "join", room })));
   });

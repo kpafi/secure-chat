@@ -234,6 +234,26 @@
         <button id="disconnect" type="button" class="danger">Disconnect</button>
       </div>
 
+      <!-- Someone is asking to join the chat you created. Only you can let
+           them in; until you do, they are in no room and receive nothing. -->
+      <section class="panel" id="admit" hidden>
+        <div class="row">
+          <label id="admitTitle">Someone wants to join this chat</label>
+          <p class="hint" id="admitHint">
+            They know your chat code. Let them in only if you are expecting
+            them — check the key fingerprint below against the person you
+            invited.
+          </p>
+        </div>
+        <p class="safety" id="admitFingerprint" aria-live="polite" tabindex="0"></p>
+        <p class="hint" id="admitWho"></p>
+        <p class="hint" id="admitWarn"></p>
+        <div class="row inline">
+          <button id="admitOk" type="button" class="primary">Let them in</button>
+          <button id="admitNo" type="button" class="danger">Deny</button>
+        </div>
+      </section>
+
       <section class="panel" id="verify" hidden>
         <div class="row">
           <label id="verifyTitle">Verify your contact — in person</label>

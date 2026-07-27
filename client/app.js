@@ -20,7 +20,9 @@
 
 import { makeCipher, isAscii, bufToB64, b64ToBuf } from "./crypto.js";
 import { Identity } from "./identity.js";
-import { signHandshake, verifyHandshake, freshNonce, isValidNonce } from "./auth.js";
+import {
+  signHandshake, verifyHandshake, freshNonce, isValidNonce, signKnock, verifyKnock,
+} from "./auth.js";
 import * as account from "./account.js";
 import * as otp from "./otp.js";
 import * as contacts from "./contacts.js";
@@ -50,6 +52,9 @@ const els = {
   // verification gate
   verify: $("verify"), verifyTitle: $("verifyTitle"), verifyHint: $("verifyHint"),
   safetyNumber: $("safetyNumber"),
+  // room admission (owner approves who may join)
+  admit: $("admit"), admitFingerprint: $("admitFingerprint"), admitWho: $("admitWho"),
+  admitWarn: $("admitWarn"), admitOk: $("admitOk"), admitNo: $("admitNo"),
   idHint: $("idHint"), roomHint: $("roomHint"), roomHelp: $("roomHelp"),
   stepIdentity: $("stepIdentity"), stepRoom: $("stepRoom"),
   copyCode: $("copyCode"), algDetails: $("algDetails"), algSummary: $("algSummary"), peerFingerprint: $("peerFingerprint"),
@@ -156,6 +161,18 @@ let verified = false; // in-person gate passed; gates RECEIVING as well as sendi
 // been described on the wire as though it had always been the session's mode.
 let sessionRoom = null;
 let sessionAlg = null;
+
+// ---- room admission (pentest 2026-07-26 P-08) ------------------------------
+// Knowing a room id used to be enough to TAKE a slot, which let anyone lock the
+// invited peer out. Now the first party in owns the room and everyone else
+// waits; the owner sees who is knocking (key fingerprint + trust mark) and
+// decides. The relay enforces the slots, but the decision — and the check that
+// the peer who then completes the handshake is the one that was let in — is
+// entirely client-side, because the relay is not trusted with either.
+let roomRole = null;       // "owner" | "guest" for this connection
+let admittedBundle = null; // the identity WE let in (owner side), or null
+let admittedAnon = false;  // we let in someone with no identity at all
+let knockQueue = [];       // [{jid, bundle, anon}] waiting for our verdict
 
 let identity = null;       // unlocked Identity, or null
 let myBundle = null;       // identity.publicBundle(), or null
@@ -1613,6 +1630,11 @@ async function connectInner() {
   myNonce = freshNonce();
   peerNonce = null;
   helloAnswered = false;
+  roomRole = null;
+  admittedBundle = null;
+  admittedAnon = false;
+  knockQueue = [];
+  hideAdmitPrompt();
   // P-19: freeze the session's room/alg now; the send path uses these, never the
   // live DOM.
   sessionRoom = room;
@@ -1656,6 +1678,11 @@ async function connectInner() {
     if (joined) addLine("sys", "", "disconnected");
     joined = false;
     verified = false;
+    roomRole = null;
+    admittedBundle = null;
+    admittedAnon = false;
+    knockQueue = [];
+    hideAdmitPrompt();
     enableSend(false);
     els.verify.hidden = true;
     showScreen("room");
@@ -1664,6 +1691,142 @@ async function connectInner() {
   };
 
   ws.onerror = () => setStatus("connection error", "err");
+}
+
+// ---- room admission, client side (P-08) ------------------------------------
+
+// Our introduction to the room owner. Anonymous sessions (AES256/OTP without an
+// identity) have nothing to prove, and say so plainly rather than omitting the
+// field and looking like a stripped bundle.
+async function knockIntro(room) {
+  if (!identity || !myBundle) return { anon: true };
+  return { idb: myBundle, sig: await signKnock(identity, room) };
+}
+
+// Owner side: file an inbound knock for a human decision. Everything here is
+// UNTRUSTED input from the relay — validate it, never render it as markup, and
+// never let it decide anything by itself.
+async function queueKnock(m) {
+  if (roomRole !== "owner") return; // only the owner is asked; ignore the rest
+  if (typeof m.jid !== "string" || !/^[0-9a-f]{16}$/.test(m.jid)) return;
+  if (knockQueue.some((k) => k.jid === m.jid)) return;
+  let p;
+  try {
+    p = unpackKey(m.payload);
+  } catch {
+    return;
+  }
+  let entry = { jid: m.jid, bundle: null, anon: true };
+  if (p && p.idb && p.sig) {
+    // A bundle that does not verify is worse than no bundle: it is someone
+    // claiming keys they cannot use. Show it as unproven rather than dropping
+    // the knock silently, so the owner sees the attempt.
+    const ok = await verifyKnock(p.idb, sessionRoom, p.sig).catch(() => false);
+    entry = { jid: m.jid, bundle: ok ? p.idb : null, anon: false, unproven: !ok };
+  }
+  knockQueue.push(entry);
+  await showNextKnock();
+}
+
+async function showNextKnock() {
+  if (!knockQueue.length) {
+    hideAdmitPrompt();
+    return;
+  }
+  const k = knockQueue[0];
+  els.admitWarn.textContent = "";
+  els.admitWarn.className = "hint";
+  if (k.bundle) {
+    els.admitFingerprint.textContent = await Identity.fingerprintOf(k.bundle);
+    // Who is this, in OUR terms? Matched on the keys themselves — never on a
+    // name the other side chose (F-01).
+    const known = contacts.isUnlocked()
+      ? contacts.list().find((c) => c.ed === k.bundle.ed && c.mldsa === k.bundle.mldsa)
+      : null;
+    els.admitWho.textContent = known
+      ? `${dirName(known)} — ${contactMark(known)}`
+      : (pinsReadable()
+        ? "Not in your users list — ⚪ you have never verified this key"
+        : "Unknown — your saved users could not be read, so trust cannot be checked");
+    // If this session was aimed at a specific contact, say whether it is them.
+    if (expectedPeerBundle && !sameBundle(expectedPeerBundle, k.bundle)) {
+      els.admitWarn.textContent =
+        "⚠ This is NOT the user you selected for this session. Deny unless you know why.";
+      els.admitWarn.className = "hint err";
+    }
+  } else if (k.unproven) {
+    els.admitFingerprint.textContent = "—";
+    els.admitWho.textContent = "Presented an identity it could not prove.";
+    els.admitWarn.textContent =
+      "⚠ The signature over their claimed keys is invalid. Deny: this is what an impersonation attempt looks like.";
+    els.admitWarn.className = "hint err";
+  } else {
+    els.admitFingerprint.textContent = "—";
+    els.admitWho.textContent =
+      "No identity — they are connecting without one (passphrase or one-time-pad modes only).";
+    els.admitWarn.textContent =
+      "There is no key to compare here. Only let them in if the shared secret you agreed on is what protects this chat.";
+  }
+  // One admit per session. A chat holds two people, so a second admit is
+  // refused by the relay anyway — but the pin would already have moved to a
+  // knocker that never arrives, and the peer in the room would then fail our
+  // own identity check. Note we cannot say "the room is full": a peer that quit
+  // frees its slot without the relay telling us, so the honest statement is
+  // about what WE did, not about the room's current occupancy.
+  els.admitOk.disabled = admittedSomeone();
+  if (els.admitOk.disabled) {
+    els.admitWarn.textContent =
+      "You have already let someone into this chat. You can turn this one away; " +
+      "to talk to a different person, disconnect and start a new chat.";
+    els.admitWarn.className = "hint";
+  }
+  els.admit.hidden = false;
+  if (knockQueue.length > 1) {
+    els.admitWarn.textContent +=
+      (els.admitWarn.textContent ? " " : "") +
+      `(${knockQueue.length - 1} more waiting — decide one at a time.)`;
+  }
+}
+
+function hideAdmitPrompt() {
+  els.admit.hidden = true;
+  els.admitOk.disabled = false;
+  els.admitFingerprint.textContent = "";
+  els.admitWho.textContent = "";
+  els.admitWarn.textContent = "";
+}
+
+// The verdict. Admitting PINS the identity we let in: the handshake below
+// refuses anyone else, so a relay that admits one peer and routes another fails
+// closed instead of quietly connecting us to a stranger.
+//
+// Post-fix review: this used to overwrite the pin on EVERY admit click. A chat
+// holds two people, so a second admit is refused by the relay ("room full") —
+// but the pin had already moved to the second knocker, and the peer already in
+// the room then failed the identity check and was disconnected by its own
+// owner. One admit per session; the button is disabled once someone is in.
+function decideKnock(allow) {
+  if (!knockQueue.length || !ws) return;
+  if (allow && admittedSomeone()) return; // guarded in the UI too; belt and braces
+  const k = knockQueue.shift();
+  if (allow) {
+    admittedBundle = k.bundle;
+    admittedAnon = !k.bundle;
+    addLine("sys", "", k.bundle
+      ? "you let someone in — their key is now pinned for this session"
+      : "you let someone in — they have no identity to pin");
+  }
+  ws.send(JSON.stringify({
+    type: allow ? "admit" : "deny", room: sessionRoom, jid: k.jid,
+  }));
+  if (!allow) addLine("sys", "", "you denied someone who asked to join");
+  showNextKnock();
+}
+
+// True once this session has let someone in. The chat holds two people, so from
+// here on the only meaningful verdict is "deny".
+function admittedSomeone() {
+  return admittedBundle !== null || admittedAnon;
 }
 
 // Produce + sign the next handshake payload. Computed fresh each call (not
@@ -1697,12 +1860,72 @@ async function handleMessage(room, raw) {
   }
 
   switch (m.type) {
+    // We are waiting for the room owner to let us in (P-08). Nothing of ours
+    // reaches the room until they do — not even the session nonce — so the
+    // only thing to send now is the introduction they will judge us by.
+    case "pending": {
+      // Write-once, like the peer identity pin: a relay must not be able to
+      // re-cast us mid-session (an owner told "you are a guest" would stop
+      // being asked to approve anyone).
+      if (roomRole !== null) break;
+      roomRole = "guest";
+      els.roomShort.textContent = room.slice(0, 8) + "…" + room.slice(-8);
+      showScreen("chat");
+      setStatus("waiting for approval");
+      addLine("sys", "", "waiting — the person who created this chat has to let you in");
+      hint("Waiting for the other person to approve you. They see the fingerprint of your key and decide.");
+      ws.send(JSON.stringify({
+        type: "knock", room, payload: packKey(await knockIntro(room)),
+      }));
+      break;
+    }
+
+    // The owner declined us (or the relay says so). Either way we are not in.
+    case "denied": {
+      addLine("sys", "", "[the other person did not let you in]");
+      hint("They declined. If you expected to be let in, check with them out of band that you are both using the same chat code.", true);
+      break;
+    }
+
+    // Owner side: someone is asking to be let in. NEVER auto-admit — the whole
+    // point is that a human looks at the key.
+    case "knock": {
+      await queueKnock(m);
+      break;
+    }
+
     case "joined": {
       joined = true;
+      // An older relay answers `join` with a bare {"joined"} — no role, no
+      // admission control. Refusing beats silently running the protocol this
+      // fix removed: the room would again be first-come-first-served and the
+      // approval prompt would never appear, with nothing on screen to say so.
+      if (m.role !== "owner" && m.role !== "guest") {
+        addLine("sys", "", "[this relay does not support join approval — refusing]");
+        hint("This relay is running an older protocol without the join-approval step. Update the relay (or your app) before using it.", true);
+        if (ws) ws.close();
+        return;
+      }
+      // Write-once (see `pending`). The only legitimate sequence for a guest is
+      // pending -> joined:guest, so a role that CHANGES is the relay re-casting
+      // us: a guest told it is the owner would start approving people into a
+      // room it does not control, an owner told it is a guest would stop being
+      // asked. Neither is recoverable, so fail closed.
+      if (roomRole === null) {
+        roomRole = m.role;
+      } else if (roomRole !== m.role) {
+        addLine("sys", "", "[the relay changed our role mid-session — refusing]");
+        hint("The relay tried to change your role in this room. Disconnecting.", true);
+        if (ws) ws.close();
+        return;
+      }
       els.roomShort.textContent = room.slice(0, 8) + "…" + room.slice(-8);
       showScreen("chat");
       setStatus("connected", "ok");
       addLine("sys", "", `joined room — encryption: ${sessionAlg}`);
+      if (roomRole === "owner") {
+        addLine("sys", "", "you created this chat — you decide who is let in");
+      }
       // Phase 1: announce our fresh session nonce. For handshake modes the
       // signed handshake follows once we also know the peer's nonce; for
       // AES256 (usesNonces, no key material on the wire) the nonces alone fix
@@ -1784,6 +2007,31 @@ async function handleMessage(room, raw) {
         if (!ok) {
           addLine("sys", "", "[handshake signature INVALID — refusing to connect; a relay may be tampering with the key exchange]");
           hint("Authentication failed — disconnecting. This is what a MITM attempt looks like.", true);
+          if (ws) ws.close();
+          return;
+        }
+
+        // P-08: if WE admitted this peer, the handshake must come from the
+        // identity we were shown and approved. This is the binding that makes
+        // the approval prompt more than decoration: the relay picks who is
+        // routed to us, so without it a relay could show the owner a knock from
+        // a trusted contact and then hand the seat to someone else. (The guest
+        // side has no such check — it approved nobody — and keeps relying on
+        // the safety number and the pin, exactly as before.)
+        // Keyed on admittedBundle ALONE, never on roomRole: the role comes from
+        // the relay, so gating the check on it would let a relay switch the
+        // check off by re-sending `joined` with role "guest".
+        if (admittedBundle && !sameBundle(admittedBundle, idb)) {
+          addLine("sys", "", "[the peer that connected is NOT the one you let in — refusing]");
+          hint("The identity that completed the key exchange differs from the one you approved. Disconnecting.", true);
+          if (ws) ws.close();
+          return;
+        }
+        // Admitting someone who showed no identity, then receiving a signed
+        // handshake, means the socket changed its story between the two steps.
+        if (admittedAnon) {
+          addLine("sys", "", "[the peer you let in had no identity but now sends one — refusing]");
+          hint("This peer introduced itself without an identity and then produced one. Disconnecting.", true);
           if (ws) ws.close();
           return;
         }
@@ -2401,6 +2649,8 @@ els.connect.addEventListener("click", connect);
 els.form.addEventListener("submit", sendText);
 els.verifyOk.addEventListener("click", onVerifyOk);
 els.verifyNo.addEventListener("click", onVerifyNo);
+els.admitOk.addEventListener("click", () => decideKnock(true));
+els.admitNo.addEventListener("click", () => decideKnock(false));
 
 // drawer menu + views
 els.menuBtn.addEventListener("click", () => setDrawer(els.drawer.hidden));

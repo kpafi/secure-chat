@@ -29,8 +29,23 @@ MAX_PAYLOAD_CHARS = 48 * 1024  # ~48 KiB base64 (~36 KiB binary)
 # bits of entropy, making room ids effectively unguessable.
 ROOM_ID_LENGTH = 64
 
-# Maximum simultaneous members in one room.
+# Maximum simultaneous ADMITTED members in one room.
 MAX_ROOM_MEMBERS = 2  # pairwise chat for now; raise later for group chat
+
+# Maximum sockets WAITING for the room owner's approval at once (pentest
+# 2026-07-26 P-08). Waiting does NOT consume a member slot — that separation is
+# the actual fix: knowing a room id no longer lets anyone occupy the room, only
+# ask to be let in. The cap bounds the queue an owner can be shown (and the
+# memory a knocker can cost). Past it a newcomer displaces the oldest waiter
+# that has not introduced itself, and only if there is none is the join refused
+# — see KNOCK_TIMEOUT_SEC and RoomRegistry.join.
+MAX_ROOM_PENDING = 4
+
+# Length (hex chars) of the server-issued join id naming one waiting socket in
+# an admit/deny. 16 hex = 64 bits from os.urandom: not a secret (it never
+# authorizes anything on its own — the server also checks that the sender IS the
+# room owner), but unguessable so one waiting peer cannot name another's slot.
+JOIN_ID_LENGTH = 16
 
 # Maximum concurrent rooms server-wide (bounds total memory).
 MAX_ROOMS = 1000
@@ -58,6 +73,32 @@ IDLE_TIMEOUT_SEC = 900  # 15 minutes
 # holds a connection slot while contributing nothing, so squatters are dropped
 # fast (whereas a joined, idle-but-reading peer gets the generous idle window).
 JOIN_TIMEOUT_SEC = 30
+
+# Approval deadline (seconds). A socket that has INTRODUCED itself (knocked) is
+# dropped if the owner has not decided within this window. Long enough that a
+# human can look at the approval prompt and choose.
+PENDING_TIMEOUT_SEC = 120
+
+# Introduction deadline (seconds). A socket that is queued but has not knocked
+# is waiting for nobody: the owner has not even been told it exists, so it
+# cannot be denied. Post-fix review of P-08 showed that MAX_ROOM_PENDING silent
+# sockets therefore re-created the original lockout — invisibly, and for the
+# full approval window. A queue place must be *held* only by something the owner
+# can see and refuse, so an un-knocked socket gets seconds, not minutes (and is
+# also the first thing evicted when the queue is under pressure).
+KNOCK_TIMEOUT_SEC = 10
+
+# Grace before a waiter may be displaced (seconds). Displacement was added to
+# stop silent squatters holding the queue, but it is a primitive that can be
+# AIMED: every honest peer is briefly un-knocked too — between being told
+# `pending` and its knock landing — and an attacker holding the rest of the
+# queue could fire a join in exactly that window to evict the invited peer
+# before it could introduce itself. One round trip is milliseconds on loopback
+# but hundreds over an .onion, so the window is real. A waiter younger than this
+# is never displaced; if nothing else is displaceable the newcomer is refused
+# instead. Comfortably longer than a knock round trip, far shorter than the
+# 120 s a knocked waiter may hold.
+KNOCK_GRACE_SEC = 2.0
 
 # --- Trusted reverse proxies (rate-limit keying) --------------------------
 # Pentest 2026-07-25 F-03: every /api limiter keys on the client address. When

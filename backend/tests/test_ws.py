@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 # Point the app at a throwaway DB before importing it (accounts.init_db runs at
@@ -46,18 +47,42 @@ def _join(ws, room: str) -> dict:
     return _recv(ws)
 
 
+def _knock(ws, room: str, payload: str = "aGk=") -> None:
+    ws.send_text(json.dumps({"type": "knock", "room": room, "payload": payload}))
+
+
+def _admit(owner, room: str, jid: str) -> None:
+    owner.send_text(json.dumps({"type": "admit", "room": room, "jid": jid}))
+
+
+def _pair(owner, guest, room: str) -> str:
+    """Run the full admission dance and return the guest's join id.
+
+    P-08: the second party no longer just walks in — it waits, introduces
+    itself, and the owner admits it. Every test that needs two peers in a room
+    goes through this, so the tests exercise the real path.
+    """
+    assert _join(owner, room) == {"type": "joined", "role": "owner"}
+    assert _join(guest, room) == {"type": "pending"}
+    _knock(guest, room)
+    knock = _recv(owner)
+    assert knock["type"] == "knock" and knock["payload"] == "aGk="
+    _admit(owner, room, knock["jid"])
+    assert _recv(guest) == {"type": "joined", "role": "guest"}
+    return knock["jid"]
+
+
 # ---- happy paths ----------------------------------------------------------
 
-def test_join_returns_joined():
+def test_join_returns_joined_as_owner():
     with client.websocket_connect("/ws") as ws:
-        assert _join(ws, _room()) == {"type": "joined"}
+        assert _join(ws, _room()) == {"type": "joined", "role": "owner"}
 
 
 def test_msg_relayed_verbatim_between_peers():
     room = _room()
     with client.websocket_connect("/ws") as a, client.websocket_connect("/ws") as b:
-        assert _join(a, room)["type"] == "joined"
-        assert _join(b, room)["type"] == "joined"
+        _pair(a, b, room)
         a.send_text(json.dumps({"type": "msg", "room": room, "payload": "QUJD", "alg": "DHKE"}))
         relayed = _recv(b)
         # The server forwards the opaque payload unchanged; it never decrypts.
@@ -69,8 +94,7 @@ def test_msg_relayed_verbatim_between_peers():
 def test_key_handshake_relayed():
     room = _room()
     with client.websocket_connect("/ws") as a, client.websocket_connect("/ws") as b:
-        _join(a, room)
-        _join(b, room)
+        _pair(a, b, room)
         a.send_text(json.dumps({"type": "key", "room": room, "payload": "QUJD"}))
         relayed = _recv(b)
         assert relayed["type"] == "key"
@@ -100,14 +124,18 @@ def test_msg_to_other_room_rejected():
         assert _recv(ws) == {"type": "error", "reason": "not in room"}
 
 
-def test_room_full_third_member_rejected():
+def test_third_party_waits_and_cannot_be_seated_in_a_full_room():
     room = _room()
     with client.websocket_connect("/ws") as a, client.websocket_connect("/ws") as b:
-        _join(a, room)
-        _join(b, room)
+        _pair(a, b, room)
         with client.websocket_connect("/ws") as c:
-            c.send_text(json.dumps({"type": "join", "room": room}))
-            assert _recv(c) == {"type": "error", "reason": "room full"}
+            # A third party is queued, not refused outright...
+            assert _join(c, room) == {"type": "pending"}
+            _knock(c, room)
+            knock = _recv(a)
+            # ...and the owner cannot seat it, because both slots are taken.
+            _admit(a, room, knock["jid"])
+            assert _recv(a) == {"type": "error", "reason": "room full"}
 
 
 def test_leave_closes_connection():
@@ -117,6 +145,298 @@ def test_leave_closes_connection():
         ws.send_text(json.dumps({"type": "leave", "room": room}))
         with pytest.raises(WebSocketDisconnect):
             ws.receive_text()
+
+
+# ---- room admission (pentest 2026-07-26 P-08) -----------------------------
+#
+# The finding: room entry was authorized solely by knowing the room id, so
+# anyone who learned it could take a slot and lock the invited peer out with
+# "room full". These tests pin the property that fixes it — WAITING COSTS THE
+# ROOM NOTHING — plus the rules that keep the approval itself meaningful.
+
+def test_squatter_cannot_lock_the_invited_peer_out():
+    """The finding itself: a squatter in the queue must not deny the real peer.
+
+    The attacker knows the room id and joins first-but-second (the owner is
+    already there). Previously that consumed the last slot. Now the owner can
+    still admit the peer it actually invited, and the squatter is left waiting.
+    """
+    room = _room()
+    with client.websocket_connect("/ws") as owner, \
+         client.websocket_connect("/ws") as squatter, \
+         client.websocket_connect("/ws") as invited:
+        assert _join(owner, room) == {"type": "joined", "role": "owner"}
+        assert _join(squatter, room) == {"type": "pending"}
+        _knock(squatter, room)
+        squat_knock = _recv(owner)
+        assert _join(invited, room) == {"type": "pending"}
+        _knock(invited, room)
+        invited_knock = _recv(owner)
+        assert squat_knock["jid"] != invited_knock["jid"]
+
+        # The owner admits the peer it wanted and denies the squatter.
+        _admit(owner, room, invited_knock["jid"])
+        assert _recv(invited) == {"type": "joined", "role": "guest"}
+        owner.send_text(json.dumps({"type": "deny", "room": room, "jid": squat_knock["jid"]}))
+        assert _recv(squatter) == {"type": "denied"}
+        with pytest.raises(WebSocketDisconnect):
+            squatter.receive_text()
+
+        # And the real session works.
+        owner.send_text(json.dumps({"type": "msg", "room": room, "payload": "QUJD"}))
+        assert _recv(invited)["payload"] == "QUJD"
+
+
+def test_waiting_peer_receives_nothing_before_admission():
+    """A knocker must not harvest the handshake while it waits."""
+    room = _room()
+    with client.websocket_connect("/ws") as owner, \
+         client.websocket_connect("/ws") as guest, \
+         client.websocket_connect("/ws") as lurker:
+        _pair(owner, guest, room)
+        assert _join(lurker, room) == {"type": "pending"}
+        _knock(lurker, room)
+        _recv(owner)  # the knock notification
+        owner.send_text(json.dumps({"type": "key", "room": room, "payload": "QUJD"}))
+        # The admitted guest gets it; the waiter must not.
+        assert _recv(guest)["payload"] == "QUJD"
+        lurker.send_text(json.dumps({"type": "msg", "room": room, "payload": "QUJD"}))
+        assert _recv(lurker) == {"type": "error", "reason": "not in room"}
+
+
+def test_waiting_peer_cannot_send_before_admission():
+    room = _room()
+    with client.websocket_connect("/ws") as owner, client.websocket_connect("/ws") as guest:
+        _join(owner, room)
+        assert _join(guest, room) == {"type": "pending"}
+        for frame in (
+            {"type": "msg", "room": room, "payload": "QUJD"},
+            {"type": "key", "room": room, "payload": "QUJD"},
+        ):
+            guest.send_text(json.dumps(frame))
+            assert _recv(guest) == {"type": "error", "reason": "not in room"}
+
+
+def test_only_the_owner_may_admit():
+    """The second member must not be able to decide who else comes in."""
+    room = _room()
+    with client.websocket_connect("/ws") as owner, \
+         client.websocket_connect("/ws") as guest, \
+         client.websocket_connect("/ws") as third:
+        _pair(owner, guest, room)
+        assert _join(third, room) == {"type": "pending"}
+        _knock(third, room)
+        knock = _recv(owner)
+        _admit(guest, room, knock["jid"])
+        assert _recv(guest) == {"type": "error", "reason": "not the room owner"}
+
+
+def test_waiting_peer_cannot_admit_itself():
+    room = _room()
+    with client.websocket_connect("/ws") as owner, client.websocket_connect("/ws") as guest:
+        _join(owner, room)
+        _join(guest, room)
+        _knock(guest, room)
+        knock = _recv(owner)
+        # Even holding its own (server-issued) jid, a waiter is not in the room.
+        _admit(guest, room, knock["jid"])
+        assert _recv(guest) == {"type": "error", "reason": "not in room"}
+
+
+def test_unknown_jid_rejected():
+    room = _room()
+    with client.websocket_connect("/ws") as owner:
+        _join(owner, room)
+        _admit(owner, room, "0" * config.JOIN_ID_LENGTH)
+        assert _recv(owner) == {"type": "error", "reason": "no such waiting peer"}
+
+
+def test_jid_from_another_room_does_not_transfer():
+    """A jid names a slot in ONE room; it must not be replayable into another."""
+    room_a, room_b = _room(), _room()
+    with client.websocket_connect("/ws") as owner_a, \
+         client.websocket_connect("/ws") as owner_b, \
+         client.websocket_connect("/ws") as guest:
+        _join(owner_a, room_a)
+        _join(owner_b, room_b)
+        _join(guest, room_a)
+        _knock(guest, room_a)
+        knock = _recv(owner_a)
+        _admit(owner_b, room_b, knock["jid"])
+        assert _recv(owner_b) == {"type": "error", "reason": "no such waiting peer"}
+
+
+def test_one_knock_per_socket():
+    """A knocker cannot flood the owner's approval prompt with identities."""
+    room = _room()
+    with client.websocket_connect("/ws") as owner, client.websocket_connect("/ws") as guest:
+        _join(owner, room)
+        _join(guest, room)
+        _knock(guest, room)
+        _recv(owner)
+        _knock(guest, room, "QUJD")
+        assert _recv(guest) == {"type": "error", "reason": "already knocked"}
+
+
+def test_knock_before_join_rejected():
+    with client.websocket_connect("/ws") as ws:
+        _knock(ws, _room())
+        assert _recv(ws) == {"type": "error", "reason": "not waiting"}
+
+
+def test_owner_cannot_knock():
+    room = _room()
+    with client.websocket_connect("/ws") as owner:
+        _join(owner, room)
+        _knock(owner, room)
+        assert _recv(owner) == {"type": "error", "reason": "not waiting"}
+
+
+def test_waiters_are_closed_when_the_owner_leaves():
+    """No owner means nobody can approve: the queue is ended, not left hanging."""
+    room = _room()
+    with client.websocket_connect("/ws") as guest:
+        with client.websocket_connect("/ws") as owner:
+            _join(owner, room)
+            assert _join(guest, room) == {"type": "pending"}
+        assert _recv(guest) == {"type": "error", "reason": "room closed"}
+        with pytest.raises(WebSocketDisconnect):
+            guest.receive_text()
+
+
+def test_room_with_no_members_admits_nobody():
+    """After everyone leaves, a room id is free again — not a haunted queue."""
+    room = _room()
+    with client.websocket_connect("/ws") as first:
+        _join(first, room)
+    with client.websocket_connect("/ws") as second:
+        # The room was torn down, so this join creates it fresh and owns it.
+        assert _join(second, room) == {"type": "joined", "role": "owner"}
+
+
+def test_denied_peer_can_retry_but_still_takes_no_slot():
+    """Denial is not a ban — but a retry is still only a knock, never a seat."""
+    room = _room()
+    with client.websocket_connect("/ws") as owner, client.websocket_connect("/ws") as guest:
+        _join(owner, room)
+        _join(guest, room)
+        _knock(guest, room)
+        knock = _recv(owner)
+        owner.send_text(json.dumps({"type": "deny", "room": room, "jid": knock["jid"]}))
+        assert _recv(guest) == {"type": "denied"}
+    with client.websocket_connect("/ws") as owner2, client.websocket_connect("/ws") as retry:
+        _join(owner2, room)
+        assert _join(retry, room) == {"type": "pending"}
+
+
+def test_silent_waiters_cannot_lock_out_the_invited_peer(monkeypatch):
+    """Post-fix review of P-08: the queue must not become the new lockout.
+
+    A socket that joins and never knocks is invisible to the owner, so it cannot
+    be denied. MAX_ROOM_PENDING of them used to reproduce the original "room
+    full" lockout for the full approval window. A newcomer now displaces the
+    oldest silent waiter instead of being refused — once that waiter is past the
+    grace it gets to introduce itself in (see the next test).
+    """
+    monkeypatch.setattr(config, "KNOCK_GRACE_SEC", 0.01)
+    room = _room()
+    with client.websocket_connect("/ws") as owner:
+        _join(owner, room)
+        silent = [client.websocket_connect("/ws") for _ in range(config.MAX_ROOM_PENDING)]
+        opened = [s.__enter__() for s in silent]
+        try:
+            for s in opened:
+                assert _join(s, room) == {"type": "pending"}
+            time.sleep(0.02)  # let the squatters age past the grace
+            with client.websocket_connect("/ws") as invited:
+                # The invited peer gets in the queue...
+                assert _join(invited, room) == {"type": "pending"}
+                # ...at the cost of the oldest silent squatter, which is closed.
+                assert _recv(opened[0]) == {"type": "error", "reason": "approval timeout"}
+                # And it can still be admitted for real.
+                _knock(invited, room)
+                knock = _recv(owner)
+                _admit(owner, room, knock["jid"])
+                assert _recv(invited) == {"type": "joined", "role": "guest"}
+        finally:
+            for s in silent:
+                s.__exit__(None, None, None)
+
+
+def test_a_waiter_inside_the_grace_is_never_displaced():
+    """The displacement primitive must not be aimable at the invited peer.
+
+    Post-fix pentest (G-3): every honest peer is un-knocked for one round trip
+    too — between being told `pending` and its knock landing. An attacker
+    holding the rest of the queue could fire a join in exactly that window and
+    evict the invited peer before it could introduce itself (milliseconds on
+    loopback, hundreds over an .onion). Nothing is displaced inside the grace,
+    so the newcomer is refused instead of an innocent waiter dropped.
+    """
+    room = _room()
+    with client.websocket_connect("/ws") as owner:
+        _join(owner, room)
+        waiters = [client.websocket_connect("/ws") for _ in range(config.MAX_ROOM_PENDING)]
+        opened = [w.__enter__() for w in waiters]
+        try:
+            for w in opened:
+                assert _join(w, room) == {"type": "pending"}
+            # The last one in stands for the invited peer, still pre-knock.
+            with client.websocket_connect("/ws") as attacker:
+                assert _join(attacker, room) == {"type": "error", "reason": "room full"}
+            # It is still queued, and can still introduce itself.
+            _knock(opened[-1], room)
+            knock = _recv(owner)
+            _admit(owner, room, knock["jid"])
+            assert _recv(opened[-1]) == {"type": "joined", "role": "guest"}
+        finally:
+            for w in waiters:
+                w.__exit__(None, None, None)
+
+
+def test_knockers_are_not_displaced_by_a_newcomer():
+    """Only SILENT waiters yield: a peer the owner can see keeps its place."""
+    room = _room()
+    with client.websocket_connect("/ws") as owner:
+        _join(owner, room)
+        waiters = [client.websocket_connect("/ws") for _ in range(config.MAX_ROOM_PENDING)]
+        opened = [w.__enter__() for w in waiters]
+        try:
+            for w in opened:
+                _join(w, room)
+                _knock(w, room)
+                _recv(owner)  # the owner is shown each one
+            with client.websocket_connect("/ws") as extra:
+                assert _join(extra, room) == {"type": "error", "reason": "room full"}
+            # No knocker was evicted.
+            for w in opened:
+                w.send_text(json.dumps({"type": "knock", "room": room, "payload": "QUJD"}))
+                assert _recv(w) == {"type": "error", "reason": "already knocked"}
+        finally:
+            for w in waiters:
+                w.__exit__(None, None, None)
+
+
+def test_silent_waiter_gets_the_short_deadline(monkeypatch):
+    """A queue place is only HELD by an introduction the owner can refuse."""
+    monkeypatch.setattr(config, "KNOCK_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(config, "PENDING_TIMEOUT_SEC", 30)
+    room = _room()
+    with client.websocket_connect("/ws") as owner, client.websocket_connect("/ws") as silent:
+        _join(owner, room)
+        assert _join(silent, room) == {"type": "pending"}
+        assert _recv(silent) == {"type": "error", "reason": "approval timeout"}
+
+
+def test_approval_timeout_drops_a_silent_waiter(monkeypatch):
+    monkeypatch.setattr(config, "PENDING_TIMEOUT_SEC", 0.05)
+    room = _room()
+    with client.websocket_connect("/ws") as owner, client.websocket_connect("/ws") as guest:
+        _join(owner, room)
+        assert _join(guest, room) == {"type": "pending"}
+        assert _recv(guest) == {"type": "error", "reason": "approval timeout"}
+        with pytest.raises(WebSocketDisconnect):
+            guest.receive_text()
 
 
 # ---- front-door rejections ------------------------------------------------

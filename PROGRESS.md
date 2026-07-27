@@ -3,7 +3,119 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (2026-07-27, Android L-10 fixed — NOT yet installed on the phone)
+## ⮕ RESUME HERE (2026-07-27, P-08 fixed: room entry is now owner-approved)
+**User-designed fix for the last accepted-risk finding.** Their proposal: a peer
+who joins a chat code it did not create does not get in — the creator gets a
+prompt showing that peer's public key and web-of-trust rating and decides.
+Implemented, pentested by a separate agent, and driven by two real browser peers.
+
+**BREAKING protocol change** (like handshake v3): relay and client must be
+updated together. A new client refuses an old relay's bare `{"joined"}` — no
+`role` means no admission control, and silently running the protocol this fix
+removes would be the worse failure. NOT yet deployed to Hetzner, NOT on the
+phone, NOT committed — see "state" below.
+
+**What actually fixes P-08: waiting costs the room nothing.** Membership was
+first-come-first-served, so anyone with the room id could take one of the two
+slots and lock the invited peer out with `room full`. Now the first joiner OWNS
+the room; every later joiner is QUEUED (`{"pending"}`) and consumes no member
+slot. `MAX_ROOM_MEMBERS` is enforced at ADMISSION, not at join — that separation
+is the fix, not the prompt. Wire: `join` → `{"joined","role":"owner"}` or
+`{"pending"}`; the waiter sends `knock` (its opaque self-introduction, forwarded
+verbatim with a server-issued 64-bit `jid`); the owner answers `admit`/`deny`.
+Relay-side state is a `Conn` object, not the read loop's locals, because a guest
+is admitted by the OWNER's coroutine.
+
+**The prompt is not the security boundary — the pin is.** `admittedBundle`
+records the identity the owner approved, and the handshake REFUSES any other
+identity (`app.js`). Without that, a relay could show the owner a knock from a
+trusted contact and then hand the seat to someone else. The knock signature
+(`secure-chat/knock/v1`, its own domain so it can never be read as a handshake)
+has **no freshness and cannot get any**: the only party who could issue a
+challenge is the relay, i.e. the party being constrained. So a hostile relay CAN
+replay a genuine knock and make the owner see a real fingerprint — it just
+cannot complete that identity's handshake afterwards. The comments say so.
+
+**Three agent-found bugs in my own fix, all real, all fixed** (two rounds — the
+agent re-attacked the fixes and found that the first fix had itself introduced a
+new primitive):
+- **The queue became the new lockout.** A socket that joins and never knocks is
+  invisible to the owner — no prompt, no jid, nothing to deny — so 4 silent
+  sockets reproduced the exact `room full` lockout for the full 120 s approval
+  window. Reproduced by hand before fixing (`INVITED -> room full`). Fixed: a
+  queue place is only HELD by an introduction. Un-knocked waiters get
+  `KNOCK_TIMEOUT_SEC = 10`, and when the queue is full a newcomer DISPLACES the
+  oldest un-knocked waiter; only if every waiter has knocked is a join refused.
+  Re-verified: the same PoC now ends `INVITED -> pending`.
+- **`decideKnock` moved the pin on every click.** A chat holds two people, so a
+  second admit is refused by the relay — but the client had already re-pinned to
+  the second knocker, and the peer already in the room then failed the identity
+  check and was disconnected *by its own owner*. Fixed: one admit per session
+  (`admittedSomeone()` guard + `#admitOk` disabled once someone is in, with the
+  reason on screen). The agent flagged this without reproducing it end-to-end and
+  said so — it was right on the code.
+- **The eviction fix became a weapon of its own (found in round two).** Every
+  honest peer is un-knocked for one round trip too — between being told
+  `pending` and its knock landing — so an attacker holding the rest of the queue
+  could time a join to evict the INVITED peer inside exactly that window,
+  before it could introduce itself. ~1 ms on loopback, hundreds of ms over the
+  .onion this is meant to run on. Fixed with `KNOCK_GRACE_SEC = 2.0`: nothing is
+  displaced before it has had a fair chance to knock, and if that leaves nothing
+  displaceable the NEWCOMER is refused rather than an innocent waiter dropped.
+  Verified dead by hand: `attacker -> room full`, `invited survived`, and the
+  invited peer still completes (`joined, role: guest`).
+
+**One more of my own, found while reading the diff:** the handshake identity
+check was gated on `roomRole === "owner"`, and the role comes from the RELAY —
+so re-sending `joined` with `role:"guest"` would have switched the check off.
+It now keys on `admittedBundle` alone (only ever set by our own click), and the
+role is write-once: a role that CHANGES mid-session disconnects.
+
+**Known limits, deliberate (documented, not silently accepted):**
+- whoever joins an EMPTY room first owns it, so an attacker who learns a code
+  and wins the race owns the room and can refuse everyone;
+- four sockets that each knock once still fill the queue and the invited peer
+  gets `room full`. The improvement is that this is now VISIBLE and deniable
+  (the owner sees four knocks) and costs real connections, where before it was a
+  silent 120 s hold — but an automated attacker refills faster than a human
+  clicks, so it is mitigation, not closure;
+- the owner cannot admit a REPLACEMENT after its peer leaves (one admit per
+  session) — the relay sends no "peer left" signal, so the client cannot know
+  the slot is free. The UI says to disconnect and start a new chat. Safe, and
+  stated rather than silently broken.
+
+All availability-only, all needing the cryptographic room-entry proof P-08 said
+it would take. Confidentiality and integrity never depended on any of this.
+
+**What the agent attacked and could NOT break:** waiting-socket isolation (a
+knocker receives no `key`/`msg` and cannot send), non-owner and self admit,
+forged/cross-room/unknown jids, the envelope rules (`jid` anywhere else is a bad
+envelope), knock flooding, the admitted-identity binding ("admit A, route B"
+fails closed), client injection via the attacker-controlled knock payload
+(every sink is `textContent`, and a bundle is only rendered if `verifyKnock`
+passes), protocol skew (old relay refused), I2 (no room ids/payloads/jids
+logged), and the eviction path under a 20-socket churn storm (no
+use-after-free, no double-close, no admit-vs-evict race — eviction only ever
+targets un-knocked sockets, and an admit only ever names a knocked one).
+
+**Green:** backend **121 passed** (was 103; +18 admission tests incl. the
+squatter scenario, silent-waiter eviction, the grace that stops eviction being
+aimed, non-owner admit, cross-room jid, waiting-peer isolation), client
+`npm test` green, both live integration suites
+green through the new dance, **`e2e/room-admission.mjs` 13/13** (new: three real
+browser peers — owner, invited peer, squatter-who-knocks-first — asserting the
+owner sees the knocker's true fingerprint, a waiter gets no key exchange and
+cannot send, the squatter is denied, and the invited peer still completes),
+two-user-flow 8/8, no-dead-ends 12/12.
+
+**Gotchas for next time.** (1) `e2e/node_modules` was a symlink into a DELETED
+session scratchpad — reinstall with `cd e2e && npm install --no-save
+puppeteer-core` (it is gitignored). (2) The read loop must re-read `conn` state
+AFTER `await receive_text()`: the pre-await snapshot left a just-admitted guest
+unable to send, which `test_only_the_owner_may_admit` caught. (3) `#idFingerprint`
+carries a `"Your fingerprint: "` label — strip it before comparing in tests.
+
+## (2026-07-27, Android L-10 fixed — installed on the phone)
 **The last open code item from the 2026-07-26 pentest is fixed.** `MainActivity`
 used to call `addDocumentStartJavaScript` only `if` the WebView supports
 `DOCUMENT_START_SCRIPT`, with **no `else`** — on an older WebView the relay
@@ -2346,19 +2458,13 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
 Full detail per item in `secure-chat-pentest-2026-07-26.md` (§4-6 findings,
 §9 remediation). These are the deliberate leftovers, not forgotten work.
 
-1. **P-08 (Low) — room-slot squatting. ACCEPTED RISK, revisit only with a
-   protocol change.** Room entry is authorized solely by knowing the 256-bit
-   room id plus the numeric 2-slot cap (`MAX_ROOM_MEMBERS = 2`); there is no
-   cryptographic room-entry proof. Anyone who learns a room id can join an empty
-   room first and squat a slot, locking the real peer out with `room full`.
-   **Availability only** — confidentiality and integrity are untouched (the
-   signed handshake, per-session ratchet, identity pinning and safety-number
-   gate all still hold, and an uninvited joiner receives `{"joined"}` and nothing
-   else). Not fixed because a real fix means authenticated room membership (e.g.
-   a signed join tied to the expected participants), which is a protocol change
-   rather than a patch — and a hostile relay can deny service anyway by simply
-   dropping frames. If it is ever worth doing, do it as part of a group-chat
-   design, since that has to revisit `MAX_ROOM_MEMBERS` regardless.
+1. ~~**P-08 (Low) — room-slot squatting.**~~ **FIXED 2026-07-27** with
+   owner-approved room entry (user-designed) — see the snapshot at the top.
+   Waiting no longer consumes a member slot, so knowing a room id no longer
+   takes the room from the invited peer. **Residual, deliberate:** whoever joins
+   an empty room FIRST owns it, and a visible queue can still be filled — both
+   availability-only, both needing the cryptographic room-entry proof this
+   finding always said it would take. **Not deployed/committed yet.**
 
 2. ~~**Android L-10 (Low) — relay config fails SILENTLY on an older WebView.**~~
    **FIXED 2026-07-27 — see the snapshot at the top of this file.** (Its sibling

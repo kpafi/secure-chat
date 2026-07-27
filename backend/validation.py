@@ -12,7 +12,7 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from config import MAX_PAYLOAD_CHARS, ROOM_ID_LENGTH
+from config import JOIN_ID_LENGTH, MAX_PAYLOAD_CHARS, ROOM_ID_LENGTH
 
 # Printable ASCII only (0x20-0x7E): no control chars, no Unicode. Enforces the
 # project rule that only ASCII is allowed, checked on the raw frame.
@@ -25,6 +25,12 @@ _B64_RE = re.compile(r"^[A-Za-z0-9+/]*={0,2}$")
 # Room id: exactly ROOM_ID_LENGTH lowercase hex characters.
 _ROOM_RE = re.compile(r"^[0-9a-f]{%d}$" % ROOM_ID_LENGTH)
 
+# Join id: the server-issued handle for one waiting socket, quoted back by the
+# owner in admit/deny. Server-generated and never a secret — it only has to be
+# unguessable enough that a *waiting* peer cannot name someone else's slot, and
+# well-formed enough that it can never be used as an injection vector.
+_JID_RE = re.compile(r"^[0-9a-f]{%d}$" % JOIN_ID_LENGTH)
+
 
 def is_ascii_printable(s: str) -> bool:
     """True if every character is printable ASCII (space..~)."""
@@ -36,6 +42,14 @@ class MsgType(str, Enum):
     leave = "leave"
     key = "key"  # key-exchange handshake material (opaque to the server)
     msg = "msg"  # encrypted chat message (opaque to the server)
+    # Room admission (pentest 2026-07-26 P-08). A join into an occupied room no
+    # longer takes a slot; it waits, and the OWNER decides. `knock` carries the
+    # waiting party's self-introduction (an opaque blob the server forwards
+    # verbatim, like every other payload); `admit`/`deny` are the owner's
+    # verdict and name a waiting socket by the server-issued join id.
+    knock = "knock"
+    admit = "admit"
+    deny = "deny"
 
 
 class Algorithm(str, Enum):
@@ -66,6 +80,8 @@ class Envelope(BaseModel):
     room: str = Field(min_length=ROOM_ID_LENGTH, max_length=ROOM_ID_LENGTH)
     payload: str = Field(default="", max_length=MAX_PAYLOAD_CHARS)
     alg: Optional[Algorithm] = None
+    # Only ever present on an owner's admit/deny; the server issues the value.
+    jid: Optional[str] = Field(default=None, max_length=JOIN_ID_LENGTH)
 
     @field_validator("room")
     @classmethod
@@ -81,11 +97,29 @@ class Envelope(BaseModel):
             raise ValueError("payload must be base64")
         return v
 
+    @field_validator("jid")
+    @classmethod
+    def _jid_format(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not _JID_RE.match(v):
+            raise ValueError("invalid join id")
+        return v
+
     @model_validator(mode="after")
     def _payload_presence(self) -> "Envelope":
-        # msg/key must carry a payload; join/leave must not.
-        if self.type in (MsgType.msg, MsgType.key) and not self.payload:
-            raise ValueError("payload required for msg/key")
-        if self.type in (MsgType.join, MsgType.leave) and self.payload:
-            raise ValueError("payload not allowed for join/leave")
+        # msg/key must carry a payload; join/leave must not. `knock` carries the
+        # waiting party's opaque self-introduction, so it is payload-bearing
+        # like msg/key; admit/deny carry a jid and nothing else.
+        if self.type in (MsgType.msg, MsgType.key, MsgType.knock) and not self.payload:
+            raise ValueError("payload required for msg/key/knock")
+        if self.type in (
+            MsgType.join, MsgType.leave, MsgType.admit, MsgType.deny,
+        ) and self.payload:
+            raise ValueError("payload not allowed for join/leave/admit/deny")
+        # A verdict must name exactly one waiting socket; nothing else may carry
+        # a jid (an unused-but-accepted field is a free covert channel through
+        # the relay, and this envelope is deliberately the whole vocabulary).
+        if self.type in (MsgType.admit, MsgType.deny) and not self.jid:
+            raise ValueError("jid required for admit/deny")
+        if self.type not in (MsgType.admit, MsgType.deny) and self.jid is not None:
+            raise ValueError("jid only allowed on admit/deny")
         return self

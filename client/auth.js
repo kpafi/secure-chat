@@ -99,4 +99,45 @@ export async function verifyHandshake(peerBundle, roomId, nonces, ephemeralPubB6
   );
 }
 
+// ---- room admission (pentest 2026-07-26 P-08) ------------------------------
+// The knock is the introduction a waiting party sends to the room owner, who
+// decides whether to let them in. It is signed so the claim "these are my keys"
+// costs the sender their private key rather than a copy-paste of someone
+// else's public bundle.
+//
+// HONEST LIMITS, because this signature is weaker than the handshake one and
+// must not be mistaken for it:
+//   * There is no freshness. The signer and the owner share no nonce yet, and
+//     any challenge would come from the relay — the exact party this is meant
+//     to constrain. A hostile relay can therefore REPLAY a knock it saw earlier
+//     in this room and make the owner see a genuine peer's fingerprint.
+//   * It proves nothing about who is on the other end of the socket.
+// What actually binds the admission is client-side: app.js pins the bundle it
+// admitted and refuses any handshake from a different identity (see
+// admittedBundle). This signature only raises the cost of the *claim*, and
+// stops one waiting peer from parroting another's bundle within a room.
+//
+// Its own domain, so a knock signature can never be replayed as a handshake
+// signature (or vice versa) — the two transcripts must live in disjoint spaces.
+const KNOCK_DOMAIN = new TextEncoder().encode("secure-chat/knock/v1");
+
+async function knockTranscript(roomId, signerBundle) {
+  if (!signerBundle || !signerBundle.ed || !signerBundle.mldsa) {
+    throw new Error("knock transcript requires the signer's identity bundle");
+  }
+  return concat(
+    KNOCK_DOMAIN,
+    new TextEncoder().encode(roomId),
+    await Identity.bundleDigest(signerBundle),
+  );
+}
+
+export async function signKnock(identity, roomId) {
+  return identity.sign(await knockTranscript(roomId, identity.publicBundle()));
+}
+
+export async function verifyKnock(peerBundle, roomId, sigBundle) {
+  return Identity.verify(peerBundle, await knockTranscript(roomId, peerBundle), sigBundle);
+}
+
 export { b64, unb64 };

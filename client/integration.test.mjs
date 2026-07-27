@@ -37,6 +37,17 @@ function makePeer(name, room, alg, onText) {
 
   ws.addEventListener("message", async (ev) => {
     const m = JSON.parse(ev.data);
+    // P-08 admission: the second peer waits and introduces itself; the owner
+    // admits whoever knocks. These harness peers trust each other by
+    // construction — the identity checks live in auth.integration.test.mjs.
+    if (m.type === "pending") {
+      ws.send(JSON.stringify({ type: "knock", room, payload: packKey({ anon: true }) }));
+      return;
+    }
+    if (m.type === "knock") {
+      ws.send(JSON.stringify({ type: "admit", room, jid: m.jid }));
+      return;
+    }
     if (m.type === "joined") {
       joined.resolve();
       if (cipher.needsHandshake) {

@@ -37,7 +37,7 @@ from starlette.websockets import WebSocketState
 import accounts
 import config
 import mailbox
-from relay import ConnectionLimiter, RoomRegistry, TokenBucket
+from relay import Conn, ConnectionLimiter, JoinResult, RoomRegistry, TokenBucket
 from validation import Envelope, MsgType, is_ascii_printable
 
 
@@ -196,6 +196,20 @@ async def _safe_send(ws: WebSocket, text: str) -> None:
             pass
 
 
+async def _safe_close(ws: WebSocket) -> None:
+    """Close someone else's socket without raising into this loop.
+
+    Used when one connection ends another (a denied knocker, a waiter orphaned
+    by its owner leaving): the target's own read loop then raises
+    WebSocketDisconnect and runs its normal cleanup.
+    """
+    if ws.application_state == WebSocketState.CONNECTED:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket) -> None:
     # CSWSH protection: reject a present-but-disallowed browser Origin before
@@ -213,18 +227,46 @@ async def ws_endpoint(ws: WebSocket) -> None:
 
     await ws.accept()
     bucket = TokenBucket()
-    joined_room: str | None = None
+    # Connection state lives in a shared object, not in locals: a guest is
+    # admitted by the OWNER's coroutine, which has to be able to flip this
+    # socket's "am I in?" state (see relay.Conn).
+    conn = Conn(ws=ws)
     try:
         while True:
+            # State for the TIMEOUT decision only. It must be re-read after the
+            # await below: this socket may be admitted by the owner's coroutine
+            # while we are blocked in receive_text(), and acting on the
+            # pre-await snapshot would leave a just-admitted guest unable to
+            # send anything until its next frame.
+            joined_room = conn.room if conn.admitted else None
+            waiting_room = conn.waiting_room
             # Read timeout: a short JOIN deadline before the socket has joined a
-            # room (drops "connect but never join" slot squatters fast), then the
-            # generous IDLE window once joined (so a quiet-but-reading peer is not
-            # dropped). Either way, half-open / zombie sockets are reaped.
-            timeout = config.IDLE_TIMEOUT_SEC if joined_room else config.JOIN_TIMEOUT_SEC
+            # room (drops "connect but never join" slot squatters fast), the
+            # APPROVAL deadline while it waits in a room's pending queue (so a
+            # knocker cannot hold a queue place forever), then the generous IDLE
+            # window once admitted (so a quiet-but-reading peer is not dropped).
+            # Either way, half-open / zombie sockets are reaped.
+            if joined_room:
+                timeout = config.IDLE_TIMEOUT_SEC
+            elif waiting_room:
+                # A waiter that has not introduced itself is waiting for nobody
+                # — the owner has not been told it exists and so cannot deny it.
+                # It gets seconds; only a knock buys the human-length window.
+                timeout = (
+                    config.PENDING_TIMEOUT_SEC if conn.knocked
+                    else config.KNOCK_TIMEOUT_SEC
+                )
+            else:
+                timeout = config.JOIN_TIMEOUT_SEC
             try:
                 raw = await asyncio.wait_for(ws.receive_text(), timeout=timeout)
             except asyncio.TimeoutError:
-                reason = "idle timeout" if joined_room else "join timeout"
+                if joined_room:
+                    reason = "idle timeout"
+                elif waiting_room:
+                    reason = "approval timeout"
+                else:
+                    reason = "join timeout"
                 await _safe_send(ws, '{"type":"error","reason":"' + reason + '"}')
                 await ws.close(code=1001)  # going away
                 break
@@ -252,21 +294,87 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 await _safe_send(ws, '{"type":"error","reason":"bad envelope"}')
                 continue
 
-            # 5) Dispatch.
+            # 5) Dispatch — against the CURRENT state, not the pre-await one.
+            joined_room = conn.room if conn.admitted else None
+            waiting_room = conn.waiting_room
+
             if env.type == MsgType.join:
-                if joined_room is not None:
+                if joined_room is not None or waiting_room is not None:
                     await _safe_send(ws, '{"type":"error","reason":"already joined"}')
                     continue
-                if not registry.join(env.room, ws):
+                result, evicted = registry.join(env.room, conn)
+                if evicted is not None:
+                    await _safe_send(evicted.ws, '{"type":"error","reason":"approval timeout"}')
+                    await _safe_close(evicted.ws)
+                if result is JoinResult.admitted:
+                    # First in: this connection created the room and owns it.
+                    # `role` also tells the client the relay speaks this
+                    # protocol at all — an old relay answers without it.
+                    await _safe_send(ws, '{"type":"joined","role":"owner"}')
+                elif result is JoinResult.waiting:
+                    # P-08: waiting takes NO member slot. Nothing is forwarded
+                    # to or from this socket until the owner admits it.
+                    await _safe_send(ws, '{"type":"pending"}')
+                else:
                     await _safe_send(ws, '{"type":"error","reason":"room full"}')
-                    continue
-                joined_room = env.room
-                await _safe_send(ws, '{"type":"joined"}')
                 continue
 
-            # Every non-join type requires an active room matching the envelope.
+            # A waiting socket may do exactly one thing: introduce itself to the
+            # owner. Everything else is refused until it is admitted.
+            if env.type == MsgType.knock:
+                if waiting_room is None or env.room != waiting_room:
+                    await _safe_send(ws, '{"type":"error","reason":"not waiting"}')
+                    continue
+                if conn.knocked:
+                    # One introduction per socket, so a knocker cannot flood the
+                    # owner's approval prompt with a stream of identities.
+                    await _safe_send(ws, '{"type":"error","reason":"already knocked"}')
+                    continue
+                owner = registry.owner_of(waiting_room)
+                if owner is None:
+                    await _safe_send(ws, '{"type":"error","reason":"not in room"}')
+                    continue
+                conn.knocked = True
+                # Forwarded verbatim: the introduction is opaque to the relay,
+                # exactly like every other payload. The jid is the server's own.
+                await _safe_send(owner.ws, json.dumps({
+                    "type": "knock", "jid": conn.jid, "payload": env.payload,
+                }))
+                continue
+
+            # Every remaining type requires ADMITTED membership of the room in
+            # the envelope. A waiting socket falls through to here and is
+            # refused, so it can neither send nor provoke a relay.
             if joined_room is None or env.room != joined_room:
                 await _safe_send(ws, '{"type":"error","reason":"not in room"}')
+                continue
+
+            if env.type in (MsgType.admit, MsgType.deny):
+                # Only the room owner decides. Membership alone is not enough:
+                # in a 2-slot room the second member could otherwise admit or
+                # deny on the owner's behalf.
+                if not registry.is_owner(joined_room, conn):
+                    await _safe_send(ws, '{"type":"error","reason":"not the room owner"}')
+                    continue
+                if env.type == MsgType.admit:
+                    if not registry.has_free_slot(joined_room):
+                        # Distinct from "no such waiting peer" so the owner is
+                        # told the truth: the knocker is still there, the room
+                        # is not. (The knocker stays queued either way.)
+                        await _safe_send(ws, '{"type":"error","reason":"room full"}')
+                        continue
+                    seated = registry.admit(joined_room, env.jid)
+                    if seated is None:
+                        await _safe_send(ws, '{"type":"error","reason":"no such waiting peer"}')
+                        continue
+                    await _safe_send(seated.ws, '{"type":"joined","role":"guest"}')
+                else:
+                    denied = registry.deny(joined_room, env.jid)
+                    if denied is None:
+                        await _safe_send(ws, '{"type":"error","reason":"no such waiting peer"}')
+                        continue
+                    await _safe_send(denied.ws, '{"type":"denied"}')
+                    await _safe_close(denied.ws)
                 continue
 
             if env.type == MsgType.leave:
@@ -275,8 +383,8 @@ async def ws_endpoint(ws: WebSocket) -> None:
 
             # type is msg or key: relay the opaque payload to peers verbatim.
             out = env.model_dump_json(exclude_none=True)
-            for peer in registry.peers(joined_room, exclude=ws):
-                await _safe_send(peer, out)
+            for peer in registry.peers(joined_room, exclude=conn):
+                await _safe_send(peer.ws, out)
 
     except WebSocketDisconnect:
         pass
@@ -284,8 +392,13 @@ async def ws_endpoint(ws: WebSocket) -> None:
         log.exception("unexpected error in ws loop")
     finally:
         connections.release()
-        if joined_room is not None:
-            registry.leave(joined_room, ws)
+        room = conn.room or conn.waiting_room
+        if room is not None:
+            # Waiters left with nobody to approve them are closed rather than
+            # left to time out (the owner's departure ends the room).
+            for orphan in registry.leave(room, conn):
+                await _safe_send(orphan.ws, '{"type":"error","reason":"room closed"}')
+                await _safe_close(orphan.ws)
 
 
 # Serve the static web client same-origin. Mounted last so the explicit /ws and

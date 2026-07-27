@@ -39,6 +39,13 @@ Client A --[ciphertext]--> Relay server --[ciphertext]--> Client B
 ```
 - Transport: WebSocket (`/ws`).
 - Rooms: 256-bit random hex ids, max 2 members, vanish when empty.
+- **Entry is owner-approved.** The first party in owns the room; anyone else who
+  has the code is queued and must be let in by the owner, who is shown that
+  peer's key fingerprint and trust mark. Waiting occupies no member slot, so
+  knowing a code no longer lets a stranger take the room from the person you
+  invited (pentest P-08). The approval is only as good as its binding: the
+  client pins the identity it admitted and refuses a handshake from any other,
+  because the relay chooses who is routed to whom.
 - Wire format: strict JSON envelope, printable ASCII only, validated by pydantic.
 - The encryption menu (RSA / AES-256 / DHKE / post-quantum KEM / OTP) is a
   **client** concern; the `alg` field is just an advisory tag the server relays.
