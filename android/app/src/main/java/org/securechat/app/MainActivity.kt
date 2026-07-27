@@ -43,6 +43,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private lateinit var assetLoader: WebViewAssetLoader
     private var relayScript: ScriptHandler? = null
+    // Latched once the "this WebView cannot run us" dialog is up, so the blank
+    // page we load behind it cannot re-trigger the check and stack dialogs.
+    private var refusedToRun = false
 
     // Local secure origin the bundled client is served from. Treated as a secure
     // context by WebView, so window.crypto.subtle is available. We set an
@@ -88,6 +91,18 @@ class MainActivity : AppCompatActivity() {
 
         configureWebView()
 
+        // Pentest 2026-07-26 L-10: injecting the relay config is not optional.
+        // Without DOCUMENT_START_SCRIPT the client loads with RELAY == null and
+        // FAILS SILENTLY in two ways: every fetch/WS goes to the app's own
+        // virtual origin (secure-chat.internal, which does not resolve) with an
+        // opaque error, and promptSecret() stops marking secret prompts, so
+        // passphrase masking degrades to the substring guess F-08 retired.
+        // Refuse to run rather than hand the user a client that cannot work.
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            refuseToRun()
+            return
+        }
+
         val relay = Prefs.relay(this)
         if (relay == null) promptForRelay(initial = true) else loadWithRelay(relay)
     }
@@ -131,6 +146,12 @@ class MainActivity : AppCompatActivity() {
                 val url = request.url
                 val sameOrigin = url.scheme == "https" && url.host == appHost
                 return !sameOrigin
+            }
+
+            // Only the client page is checked: about:blank (loaded by
+            // refuseToRun) must not re-enter the check.
+            override fun onPageFinished(view: WebView, url: String?) {
+                if (url == indexUrl) verifyRelayConfig()
             }
         }
 
@@ -213,12 +234,49 @@ class MainActivity : AppCompatActivity() {
             .put("api", relay.httpOrigin)
             .put("ws", "${relay.wsOrigin}/ws")
         val js = "window.__SECURE_CHAT_RELAY__ = $config;"
-        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-            relayScript = WebViewCompat.addDocumentStartJavaScript(
-                binding.webview, js, setOf(appOrigin),
-            )
+        // Checked in onCreate too; re-checked here because promptForRelay() also
+        // reaches this path, and loading the client without the config is the
+        // silent failure L-10 is about.
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            refuseToRun()
+            return
         }
+        relayScript = WebViewCompat.addDocumentStartJavaScript(
+            binding.webview, js, setOf(appOrigin),
+        )
         binding.webview.loadUrl(indexUrl)
+    }
+
+    /**
+     * Verify the injected config actually reached the page (L-10). The feature
+     * check above covers the known cause, but this catches any other reason the
+     * script did not run — an origin-allow-list mismatch, a WebView that
+     * advertises the feature and drops it — by asking the loaded page itself.
+     * evaluateJavascript is a shell-level injection, so the page CSP does not
+     * block it.
+     */
+    private fun verifyRelayConfig() {
+        binding.webview.evaluateJavascript(
+            "!!window.__SECURE_CHAT_RELAY__",
+        ) { result -> if (result != "true") refuseToRun() }
+    }
+
+    /**
+     * Fail LOUDLY: blank the WebView so no half-configured client is left usable
+     * behind the dialog, explain why, and close on acknowledgement.
+     */
+    private fun refuseToRun() {
+        // verifyRelayConfig's callback is asynchronous, so the activity may be
+        // gone by the time we get here; showing a dialog on a dead window throws.
+        if (refusedToRun || isFinishing || isDestroyed) return
+        refusedToRun = true
+        binding.webview.loadUrl("about:blank")
+        AlertDialog.Builder(this)
+            .setTitle(R.string.webview_unsupported_title)
+            .setMessage(R.string.webview_unsupported_msg)
+            .setCancelable(false)
+            .setPositiveButton(R.string.close) { _, _ -> finish() }
+            .show()
     }
 
     private fun csp(relay: RelayUrls?): String {

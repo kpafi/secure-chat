@@ -3,7 +3,62 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (2026-07-26, first full pentest of the final product — ALL FIXED)
+## ⮕ RESUME HERE (2026-07-27, Android L-10 fixed — NOT yet installed on the phone)
+**The last open code item from the 2026-07-26 pentest is fixed.** `MainActivity`
+used to call `addDocumentStartJavaScript` only `if` the WebView supports
+`DOCUMENT_START_SCRIPT`, with **no `else`** — on an older WebView the relay
+config was never injected, `RELAY` stayed null, and the client loaded anyway:
+every fetch/WS went to the app's own unresolvable virtual origin
+(`secure-chat.internal`) with an opaque error, and `promptSecret()` stopped
+adding `SECRET_PROMPT_MARK`, so **passphrase masking silently degraded to the
+substring heuristic F-08 retired**. Two silent failures, one of them security-
+relevant.
+
+**Now it refuses to run.** The feature check moved to `onCreate` (before the
+relay prompt — it is a device capability, not a relay question) and is re-checked
+in `loadWithRelay`, since "Relay settings" re-enters that path. `refuseToRun()`
+blanks the WebView to `about:blank` so no half-configured client is left usable
+behind the dialog, then shows a non-cancelable dialog naming the cause ("update
+Android System WebView") whose only button finishes the activity.
+
+**Plus a belt-and-braces check the finding did not ask for:** `onPageFinished`
+evaluates `!!window.__SECURE_CHAT_RELAY__` and refuses if it is not `true`. The
+feature check covers the known cause; this covers *any* reason the script did not
+run (origin-allow-list mismatch, a WebView that advertises the feature and drops
+it) by asking the loaded page itself. `evaluateJavascript` is a shell-level
+injection, so the page CSP does not block it. It is scoped to `url == indexUrl`
+and latched by `refusedToRun`, so the `about:blank` load cannot re-enter it and
+stack dialogs; `refuseToRun` also bails on `isFinishing/isDestroyed` because that
+callback is asynchronous.
+
+**NEW test: `UnsupportedWebViewTest`** (Robolectric — its WebView provider
+advertises no androidx.webkit features, so simply starting the activity
+exercises the unsupported path). Asserts the dialog is shown, that it is OUR
+dialog (compares the rendered `android.R.id.message` text — an earlier version
+could have passed on the relay-address prompt), and that the WebView loaded
+`about:blank` rather than the client. **Verified as a real regression guard:
+reverting the fix makes it fail, restoring it makes it pass** (12 tests, 0
+failures; the negative control ran both ways).
+
+**Two gotchas worth keeping.** (1) Robolectric could not inflate the activity at
+all until `testOptions { unitTests.isIncludeAndroidResources = true }` was added
+to `app/build.gradle.kts` — without merged resources it runs in legacy mode and
+AppCompat's own drawables are missing (`Resources$NotFoundException` deep inside
+`checkVectorDrawableSetup`); `@Config(sdk = [34])` alone did not help. (2) The
+dialog is an **androidx** `AlertDialog`, which `ShadowAlertDialog` does not
+track — `ShadowDialog.getLatestDialog()` is the one that sees it.
+
+**NOT SHIPPED.** `assembleDebug` is green and the APK is built
+(`android/app/build/outputs/apk/debug/app-debug.apk`), but **no device was
+attached** (`adb devices` empty), so nothing was installed or verified on the
+phone, and nothing was committed/pushed/deployed. Nothing here touches the
+backend or the web client, so **no Hetzner deploy is needed** — this is
+Android-shell-only. To finish: `adb install -r` the debug APK (debug-signed, as
+always — a release-signed APK is rejected and would force an uninstall,
+destroying the on-device identity), confirm the app still starts normally on the
+phone's current WebView, and commit.
+
+## (2026-07-26, first full pentest of the final product — ALL FIXED)
 **Full pentest + remediation in one session.** Report:
 `secure-chat-pentest-2026-07-26.md` (findings in §4-6, remediation table in §9).
 Method: the two test agents (`e2e/two-user-flow.mjs`) plus a new PQKEM live-room
@@ -2296,19 +2351,11 @@ Full detail per item in `secure-chat-pentest-2026-07-26.md` (§4-6 findings,
    dropping frames. If it is ever worth doing, do it as part of a group-chat
    design, since that has to revisit `MAX_ROOM_MEMBERS` regardless.
 
-2. **Android L-10 (Low) — relay config fails SILENTLY on an older WebView.**
-   `MainActivity.kt:216-221` only calls `addDocumentStartJavaScript` when
-   `WebViewFeature.DOCUMENT_START_SCRIPT` is supported, with no `else`. On a
-   device without it, `window.__SECURE_CHAT_RELAY__` is never set, `RELAY` stays
-   null (`app.js`), the client silently falls back to same-origin, and every
-   fetch/WS goes to `https://secure-chat.internal` and fails with an opaque
-   error. Secondly, `promptSecret` only adds `SECRET_PROMPT_MARK` when `RELAY` is
-   truthy, so **passphrase masking degrades to the F-08 substring heuristic that
-   was explicitly retired**. Should fail loudly: detect the missing feature and
-   refuse to load with a clear dialog rather than loading a client that cannot
-   work. Needs an on-device build/verify cycle on an older WebView to test
-   properly — that is why it was deferred. (Its sibling L-11, the additive
-   `Copy` task shipping stale assets, IS fixed — `syncWebClient` is now a `Sync`.)
+2. ~~**Android L-10 (Low) — relay config fails SILENTLY on an older WebView.**~~
+   **FIXED 2026-07-27 — see the snapshot at the top of this file.** (Its sibling
+   L-11, the additive `Copy` task shipping stale assets, was already fixed —
+   `syncWebClient` is a `Sync`.) **Still needs the on-device install** — the APK
+   is built and the unit test passes, but nothing has been run on the phone.
 
 3. **Info-level backlog (no urgency, listed so it is not lost):**
    - `dilithium-py` upstream says *"under no circumstances should this be used

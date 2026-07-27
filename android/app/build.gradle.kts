@@ -59,6 +59,13 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    testOptions {
+        // Robolectric needs the MERGED resources to inflate an activity — without
+        // this it runs in legacy mode and AppCompat's own drawables are missing,
+        // so MainActivity cannot be started in a unit test (UnsupportedWebViewTest).
+        unitTests.isIncludeAndroidResources = true
+    }
 }
 
 // Single source of truth: the audited web client lives in ../../client. Copy it
