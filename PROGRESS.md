@@ -48,15 +48,24 @@ AppCompat's own drawables are missing (`Resources$NotFoundException` deep inside
 dialog is an **androidx** `AlertDialog`, which `ShadowAlertDialog` does not
 track — `ShadowDialog.getLatestDialog()` is the one that sees it.
 
-**NOT SHIPPED.** `assembleDebug` is green and the APK is built
-(`android/app/build/outputs/apk/debug/app-debug.apk`), but **no device was
-attached** (`adb devices` empty), so nothing was installed or verified on the
-phone, and nothing was committed/pushed/deployed. Nothing here touches the
-backend or the web client, so **no Hetzner deploy is needed** — this is
-Android-shell-only. To finish: `adb install -r` the debug APK (debug-signed, as
-always — a release-signed APK is rejected and would force an uninstall,
-destroying the on-device identity), confirm the app still starts normally on the
-phone's current WebView, and commit.
+**INSTALLED ON THE PHONE 2026-07-27** (`adb install -r` of the debug APK —
+Success), committed on branch `android-l10-fail-loud` (`2ebb0f0`), **not merged
+to master and not pushed**. Nothing here touches the backend or the web client,
+so **no Hetzner deploy is needed** — this is Android-shell-only. Verified
+on-device: the app starts normally on the phone's current WebView (step 1 of 3,
+no refusal dialog) and the existing identity survived the update ("Your identity
+is locked" — `sc.identity.v1` intact), which is the point of installing
+debug-signed; a release-signed APK is rejected as a signature mismatch and would
+force an uninstall, destroying the on-device identity.
+
+**What on-device testing did NOT prove.** This phone's WebView supports
+`DOCUMENT_START_SCRIPT`, so the refusal path never fired — it is covered only by
+`UnsupportedWebViewTest`. And a normal-looking start is equally consistent with
+"`verifyRelayConfig` ran and passed" and "it never ran" (e.g. if the
+`url == indexUrl` match were ever wrong), because both look identical from
+outside. Proving the belt-and-braces check actually fires needs a deliberately
+broken build installed temporarily — not done, since it would leave the phone
+running a broken app for the duration.
 
 ## (2026-07-26, first full pentest of the final product — ALL FIXED)
 **Full pentest + remediation in one session.** Report:
