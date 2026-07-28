@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import base64
 import hmac
+import logging
 import re
 import secrets
 import sqlite3
@@ -86,13 +87,57 @@ def client_key(request: Request) -> str:
 
     Requires uvicorn to run with --no-proxy-headers; otherwise its middleware
     rewrites request.client before we ever see it.
+
+    Pentest 2026-07-27 H-4: that requirement used to be a comment plus a CLI
+    flag in run.sh, and the in-repo `python main.py` launcher — how the live
+    instance was actually started — did not pass it, silently reintroducing the
+    bypass F-03 closed. main.py now passes proxy_headers=False, but a launcher
+    is a configuration knob and this function is the control, so it also
+    DETECTS the rewrite and fails closed: if uvicorn honoured a forwarded
+    header, the address we are handed is by construction one of the hops in
+    that header. When the peer is not a trusted proxy and yet matches a hop the
+    client itself supplied, the address is attacker-chosen — key everything on
+    one shared bucket instead (throttled, the safe direction) rather than
+    handing out a fresh bucket per forged header.
     """
     peer = request.client.host if request.client else "unknown"
-    if peer not in config.TRUSTED_PROXY_IPS:
-        return peer
     forwarded = request.headers.get("x-forwarded-for", "")
     hops = [h.strip() for h in forwarded.split(",") if h.strip()]
+    if peer not in config.TRUSTED_PROXY_IPS:
+        if peer in hops:
+            _warn_proxy_headers_trusted()
+            return _UNTRUSTED_FORWARDED_KEY
+        return peer
     return hops[-1] if hops else peer
+
+
+# One shared bucket for every request whose source address we cannot trust. A
+# constant, so a forged X-Forwarded-For cannot buy an attacker a private bucket.
+_UNTRUSTED_FORWARDED_KEY = "!untrusted-forwarded"
+
+_proxy_warning_lock = threading.Lock()
+_proxy_warning_emitted = False
+
+
+def _warn_proxy_headers_trusted() -> None:
+    """Log ONCE that the server is trusting client-supplied forwarded headers.
+
+    Content-free (no address, no path, no timing of a specific user's request)
+    so it does not violate I2, and rate-limited to a single line for the process
+    lifetime so it cannot itself be used as a log-amplification lever.
+    """
+    global _proxy_warning_emitted
+    if _proxy_warning_emitted:
+        return
+    with _proxy_warning_lock:
+        if _proxy_warning_emitted:
+            return
+        _proxy_warning_emitted = True
+    logging.getLogger("relay").warning(
+        "proxy headers appear to be TRUSTED by the ASGI server while no trusted "
+        "proxy is configured; rate limiting has fallen back to a single shared "
+        "bucket. Relaunch with proxy_headers=False / --no-proxy-headers.",
+    )
 
 
 def rate_limit(request: Request) -> None:
@@ -143,7 +188,21 @@ def _login_message(challenge_raw: bytes) -> bytes:
 # --- low-level helpers -----------------------------------------------------
 
 def _b64decode_fixed(s: str, n: int) -> bytes:
-    """Strictly decode base64 to exactly n bytes, else raise 422."""
+    """Strictly decode CANONICAL base64 to exactly n bytes, else raise 422.
+
+    Pentest 2026-07-27 H-1 (server half). `validate=True` only rejects
+    characters outside the alphabet; like the browser's `atob` it silently
+    DISCARDS the trailing slack bits, so four distinct strings decode to the
+    same 32-byte Ed25519 key. Every key size here is ≡ 2 (mod 3), so every key
+    has four spellings. The signature checks below operate on the decoded
+    BYTES, but what this table stores — and hands to the client as the
+    directory's answer — is the STRING. Without this check a registrant could
+    park a non-canonical spelling of their own key in the directory, and every
+    client-side comparison against the live handshake bundle (which the client
+    canonicalizes) would report a mismatch: a self-inflicted permanent
+    "directory mismatch" the user cannot explain or clear. Canonicalize at the
+    boundary so only one spelling per key can ever be stored.
+    """
     if not _B64_RE.match(s or ""):
         raise HTTPException(status_code=422, detail="invalid base64")
     try:
@@ -152,6 +211,8 @@ def _b64decode_fixed(s: str, n: int) -> bytes:
         raise HTTPException(status_code=422, detail="invalid base64")
     if len(raw) != n:
         raise HTTPException(status_code=422, detail="unexpected key/sig length")
+    if base64.b64encode(raw).decode("ascii") != s:
+        raise HTTPException(status_code=422, detail="base64 is not canonical")
     return raw
 
 

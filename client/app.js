@@ -22,6 +22,7 @@ import { makeCipher, isAscii, bufToB64, b64ToBuf } from "./crypto.js";
 import { Identity } from "./identity.js";
 import {
   signHandshake, verifyHandshake, freshNonce, isValidNonce, signKnock, verifyKnock,
+  unb64,
 } from "./auth.js";
 import * as account from "./account.js";
 import * as otp from "./otp.js";
@@ -172,6 +173,7 @@ let sessionAlg = null;
 let roomRole = null;       // "owner" | "guest" for this connection
 let admittedBundle = null; // the identity WE let in (owner side), or null
 let admittedAnon = false;  // we let in someone with no identity at all
+let wasPending = false;    // we sat in the approval queue (M-2, guest side)
 let knockQueue = [];       // [{jid, bundle, anon}] waiting for our verdict
 
 let identity = null;       // unlocked Identity, or null
@@ -238,15 +240,52 @@ function savePin(key, bundle) {
 // Audit 2026-07-18 H-01: bundle equality covers ALL FOUR public keys,
 // normalized so missing and present never compare equal — a swapped or newly
 // appeared ecdh/mlkem pair must never ride under an existing match.
+//
+// Pentest 2026-07-27 H-1: compare the KEYS, not their spelling. `atob` used to
+// accept several base64 strings per key, so a relay flipping one character
+// produced a bundle that verified, digested and safety-numbered identically yet
+// compared UNEQUAL here — a free "⚠ identity key CHANGED" alarm on a genuine
+// peer, and a route to getting a non-canonical string pinned. Decoding is
+// canonical now, so `field` also rejects a re-spelled key outright; comparing
+// decoded bytes makes that independent of where the value came from.
+function sameKey(x, y) {
+  if (x == null || y == null) return x == null && y == null;
+  let a, b;
+  try {
+    a = unb64(x);
+    b = unb64(y);
+  } catch {
+    return false; // a non-canonical spelling is not equal to anything
+  }
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
 function sameBundle(a, b) {
-  return !!a && !!b && a.ed === b.ed && a.mldsa === b.mldsa &&
-    (a.ecdh ?? null) === (b.ecdh ?? null) &&
-    (a.mlkem ?? null) === (b.mlkem ?? null);
+  return !!a && !!b && sameKey(a.ed, b.ed) && sameKey(a.mldsa, b.mldsa) &&
+    sameKey(a.ecdh ?? null, b.ecdh ?? null) &&
+    sameKey(a.mlkem ?? null, b.mlkem ?? null);
 }
 // Signing-only equality, used ONLY to tell "same identity, pin predates
 // encryption-key coverage" apart from a full identity change in the pin flow.
 function sameSigning(a, b) {
-  return !!a && !!b && a.ed === b.ed && a.mldsa === b.mldsa;
+  return !!a && !!b && sameKey(a.ed, b.ed) && sameKey(a.mldsa, b.mldsa);
+}
+// Re-spell every key of a received bundle in canonical base64 — i.e. reject any
+// that is not already canonical. Anything PERSISTED (a pin, a contact record) or
+// re-signed (sealed.js signs the stored string) must go through this, so the
+// stored form is the one spelling of the bytes the user actually verified.
+function canonicalBundle(b) {
+  if (!b || typeof b !== "object") throw new Error("malformed identity bundle");
+  const out = {};
+  for (const f of ["ed", "mldsa", "ecdh", "mlkem"]) {
+    if (b[f] == null) continue;
+    out[f] = bufToB64(unb64(b[f])); // unb64 throws on a non-canonical spelling
+  }
+  if (!out.ed || !out.mldsa) throw new Error("malformed identity bundle");
+  return out;
 }
 
 // ---- UI helpers -----------------------------------------------------------
@@ -567,6 +606,16 @@ function forgetIdentity() {
   localStorage.removeItem(LS_IDENTITY);
   contacts.wipe(); // bound to the identity passphrase; unusable without it
   chats.wipe();
+  // Pentest 2026-07-27 L-4: the handle and the lookup token are PLAINTEXT and
+  // used to survive this. "Forget identity" is the control a user reaches for
+  // when handing the device on or when they think they are compromised, and it
+  // left behind both the directory name that says who used this device and a
+  // live capability: the lookup token gates fetching that account's bundle and
+  // posting mail to it, and it stays valid until the account is re-registered.
+  // They belong to the identity, so they go with it.
+  localStorage.removeItem(LS_USERNAME);
+  localStorage.removeItem(LS_LOOKUP_TOKEN);
+  apiToken = null;
   identity = null;
   myBundle = null;
   refreshIdentityUI();
@@ -1454,8 +1503,8 @@ async function processEnvelope(m) {
   // Regular message. Decrypt the inner AES256 layer if this chat is in that
   // mode; a mode mismatch (peer still on the old mode) shows a system note.
   let text = opened.msg;
+  const chat = chats.get(sender.username);
   if (opened.enc !== undefined) {
-    const chat = chats.get(sender.username);
     if (chat && chat.mode === "AES256" && chat.secret && chat.salt) {
       try {
         text = await chats.innerDecrypt(chat.secret, chat.salt, opened.enc);
@@ -1465,6 +1514,16 @@ async function processEnvelope(m) {
     } else {
       text = "[AES256 message but this chat isn't in AES256 mode here]";
     }
+  } else if (chat && chat.mode === "AES256") {
+    // Pentest 2026-07-27 L-2: the OTHER direction of the same mismatch was
+    // silent. This chat is agreed to carry a second, passphrase-derived layer
+    // inside the sealed envelope, and this message arrived without it — either
+    // the peer's chat store was rolled back to before the mode change (there is
+    // no generation marker to stop that) or someone is stripping the layer. The
+    // envelope is still authenticated end-to-end, so nothing is forged; what is
+    // lost is the extra layer the two of you agreed on, and saying so is the
+    // difference between a downgrade you notice and one you do not.
+    text = "[arrived WITHOUT the agreed AES256 layer — the other side may have lost the shared passphrase] " + text;
   }
   return await chats.append(sender.username, {
     dir: "in", text, ts: opened.ts, id: opened.id,
@@ -1633,6 +1692,10 @@ async function connectInner() {
   roomRole = null;
   admittedBundle = null;
   admittedAnon = false;
+  wasPending = false;
+  confirmSent = false;
+  peerConfirm = null;
+  confirmDone = false;
   knockQueue = [];
   hideAdmitPrompt();
   // P-19: freeze the session's room/alg now; the send path uses these, never the
@@ -1681,6 +1744,10 @@ async function connectInner() {
     roomRole = null;
     admittedBundle = null;
     admittedAnon = false;
+    wasPending = false;
+    confirmSent = false;
+    peerConfirm = null;
+    confirmDone = false;
     knockQueue = [];
     hideAdmitPrompt();
     enableSend(false);
@@ -1721,8 +1788,18 @@ async function queueKnock(m) {
     // A bundle that does not verify is worse than no bundle: it is someone
     // claiming keys they cannot use. Show it as unproven rather than dropping
     // the knock silently, so the owner sees the attempt.
-    const ok = await verifyKnock(p.idb, sessionRoom, p.sig).catch(() => false);
-    entry = { jid: m.jid, bundle: ok ? p.idb : null, anon: false, unproven: !ok };
+    // H-1: the introduction is what `admittedBundle` is compared against later,
+    // so canonicalize its spelling here — a re-spelled key would otherwise show
+    // the right fingerprint at the prompt and then fail the identity binding
+    // when the very same peer completes the handshake.
+    let idb = null;
+    try {
+      idb = canonicalBundle(p.idb);
+    } catch {
+      idb = null;
+    }
+    const ok = idb ? await verifyKnock(idb, sessionRoom, p.sig).catch(() => false) : false;
+    entry = { jid: m.jid, bundle: ok ? idb : null, anon: false, unproven: !ok };
   }
   knockQueue.push(entry);
   await showNextKnock();
@@ -1851,6 +1928,77 @@ function sendSignedKey(room, reply) {
   });
 }
 
+// ---- key confirmation (pentest 2026-07-27 M-5) ------------------------------
+// `cipher.ready` only ever meant "I derived chains" — never "my peer derived the
+// SAME chains". Two peers could reach that state holding different key material,
+// show IDENTICAL safety numbers (those cover long-term identities, not the
+// session key), pass the in-person gate, and unlock a chat in which one
+// direction is permanently undeliverable. The finding named two routes there,
+// both driven by a hostile relay: a DHKE chain derived from an encoding rather
+// than a key (closed separately by H-1), and a PQKEM exchange whose `reply=true`
+// answers were both dropped, leaving each side with a different single KEM
+// secret. Neither is detectable from inside one endpoint — the sides have to
+// compare something derived from the chains.
+//
+// So they do, before verification is offered: each peer sends HMAC(its own SEND
+// chain, domain-separated context) and requires exactly HMAC(its RECV chain,
+// same context) back. Deriving the same tag is proof of the same material. A
+// mismatch is a loud disconnect instead of a chat that silently goes nowhere.
+//
+// This gates only the UNLOCK step. It is not a substitute for the safety-number
+// comparison: confirmation proves you share a key with whoever is at the other
+// end, and the in-person check is what proves who that is.
+let confirmSent = false;
+let peerConfirm = null;
+let confirmDone = false;
+
+async function onChannelReady(room) {
+  const c = cipher.confirmation;
+  if (!c) return finishSession(room); // OTP: nothing was negotiated to confirm
+  if (!confirmSent) {
+    confirmSent = true;
+    ws.send(JSON.stringify({
+      type: "key", room, alg: sessionAlg, payload: packKey({ confirm: c.mine }),
+    }));
+    hint("Confirming that both sides derived the same key…");
+  }
+  await tryFinishConfirmation(room);
+}
+
+async function tryFinishConfirmation(room) {
+  if (confirmDone) return;
+  const c = cipher.confirmation;
+  if (!c || peerConfirm === null) return; // one half is still missing
+  if (peerConfirm !== c.theirs) {
+    addLine("sys", "", "[the other side derived a DIFFERENT key — refusing to continue]");
+    hint(
+      "Key confirmation failed: you and your contact do not hold the same session key. " +
+      "Messages would silently fail to arrive. Disconnecting.",
+      true,
+    );
+    if (ws) ws.close();
+    return;
+  }
+  confirmDone = true;
+  await finishSession(room);
+}
+
+// Everything that used to happen the moment the chains existed.
+async function finishSession(room) {
+  if (cipher.needsHandshake) {
+    await enterVerification(room, peerBundle);
+    return;
+  }
+  verified = true;
+  enableSend(true);
+  if (cipher.usesNonces) {
+    hint("Ready. Messages are end-to-end encrypted.");
+  } else {
+    updateOtpBudget();
+    hint("Ready. Messages are one-time-pad encrypted.");
+  }
+}
+
 async function handleMessage(room, raw) {
   let m;
   try {
@@ -1869,6 +2017,7 @@ async function handleMessage(room, raw) {
       // being asked to approve anyone).
       if (roomRole !== null) break;
       roomRole = "guest";
+      wasPending = true; // M-2: proof we went through the approval queue
       els.roomShort.textContent = room.slice(0, 8) + "…" + room.slice(-8);
       showScreen("chat");
       setStatus("waiting for approval");
@@ -1877,6 +2026,24 @@ async function handleMessage(room, raw) {
       ws.send(JSON.stringify({
         type: "knock", room, payload: packKey(await knockIntro(room)),
       }));
+      break;
+    }
+
+    // Pentest 2026-07-27 M-1: someone tried to join and was refused because the
+    // approval queue is full. Only the owner is told. This is a warning, not an
+    // action: the person being turned away may well be the peer you are waiting
+    // for, and a queue held by knocked squatters cannot be cleared from here —
+    // agreeing a fresh chat code out of band is the way out.
+    case "turned-away": {
+      const n = Number.isInteger(m.count) && m.count > 1 ? m.count : 1;
+      addLine("sys", "", n > 1
+        ? `[${n} people were turned away — the waiting queue is full]`
+        : "[someone was turned away — the waiting queue is full]");
+      hint(
+        "Someone could not even reach the approval queue because it is full. If the person you invited " +
+        "is stuck on \"room full\", agree a NEW chat code with them out of band.",
+        true,
+      );
       break;
     }
 
@@ -1916,6 +2083,18 @@ async function handleMessage(room, raw) {
       } else if (roomRole !== m.role) {
         addLine("sys", "", "[the relay changed our role mid-session — refusing]");
         hint("The relay tried to change your role in this room. Disconnecting.", true);
+        if (ws) ws.close();
+        return;
+      }
+      // Pentest 2026-07-27 M-2, guest half. The owner half (below, in the
+      // handshake) refuses a peer nobody approved; that alone still leaves the
+      // relay the option of telling BOTH parties they are guests, so neither
+      // one is ever asked to approve anybody. But the only legitimate way to
+      // become a guest is pending -> knock -> joined:guest, so a seat handed to
+      // us without ever passing through the queue means no owner approved it.
+      if (roomRole === "guest" && !wasPending) {
+        addLine("sys", "", "[we were seated in this room without ever asking to be let in — refusing]");
+        hint("This relay put you in the room without the owner approving you. Disconnecting.", true);
         if (ws) ws.close();
         return;
       }
@@ -1970,18 +2149,25 @@ async function handleMessage(room, raw) {
           // out-of-band verification, so receiving unlocks with sending.
           if (cipher.usesNonces && !cipher.ready) {
             await cipher.setNonces(myNonce, peerNonce);
-            verified = true;
-            enableSend(true);
-            hint("Ready. Messages are end-to-end encrypted.");
+            await onChannelReady(room);
           } else if (!cipher.needsHandshake && !cipher.usesNonces && !verified) {
             // OTP: no key material and no nonces — the pre-shared pad IS the
             // out-of-band secret (like AES256's passphrase), so seeing the peer
             // join is enough to unlock messaging.
-            verified = true;
-            enableSend(true);
-            updateOtpBudget();
-            hint("Ready. Messages are one-time-pad encrypted.");
+            await onChannelReady(room);
           }
+          break;
+        }
+
+        // Phase 3 — key confirmation (pentest 2026-07-27 M-5). Carried as a
+        // `key` frame like the rest of the exchange, and handled before the
+        // handshake branch because it is not one: it arrives after the chains
+        // exist and carries no key material.
+        if (typeof p.confirm === "string") {
+          // First write wins, exactly like the peer identity and the hello
+          // nonce: a relay must not get to try tag after tag until one sticks.
+          if (peerConfirm === null) peerConfirm = p.confirm;
+          await tryFinishConfirmation(room);
           break;
         }
 
@@ -2003,7 +2189,15 @@ async function handleMessage(room, raw) {
         if (!idb || !sig) {
           throw new Error("peer sent an unauthenticated handshake");
         }
-        const ok = await verifyHandshake(idb, room, [myNonce, peerNonce], pub, sig);
+        // Pentest 2026-07-27 H-1: pin the SPELLING before anything looks at the
+        // bundle. Every check downstream — the admitted-identity binding, the
+        // write-once peerBundle, the pin comparison, what sealed.js later signs
+        // over — has to agree about what "this key" is, and forgiving base64
+        // gave a relay four spellings per key to play them off each other. A
+        // non-canonical bundle is malformed input and dies here, not three
+        // checks later as a phantom "identity key CHANGED".
+        const idbCanon = canonicalBundle(idb);
+        const ok = await verifyHandshake(idbCanon, room, [myNonce, peerNonce], pub, sig);
         if (!ok) {
           addLine("sys", "", "[handshake signature INVALID — refusing to connect; a relay may be tampering with the key exchange]");
           hint("Authentication failed — disconnecting. This is what a MITM attempt looks like.", true);
@@ -2021,7 +2215,23 @@ async function handleMessage(room, raw) {
         // Keyed on admittedBundle ALONE, never on roomRole: the role comes from
         // the relay, so gating the check on it would let a relay switch the
         // check off by re-sending `joined` with role "guest".
-        if (admittedBundle && !sameBundle(admittedBundle, idb)) {
+        //
+        // Pentest 2026-07-27 M-2: keying on `admittedBundle` alone closes the
+        // role-flip door but leaves the check OFF BY DEFAULT — a relay that
+        // answers `join` with role "owner" to both parties and never delivers a
+        // `pending`/`knock` leaves admittedBundle null and admittedAnon false,
+        // so both gates below are skipped and P-08's approval control is fully
+        // negated. Refuse first, unconditionally: as the owner of a room, the
+        // only legitimate way a second member exists is that WE admitted it
+        // (relay.py `admit` is the sole seat-granting path), so a handshake
+        // with nobody admitted means the relay seated someone behind our back.
+        if (roomRole === "owner" && !admittedSomeone()) {
+          addLine("sys", "", "[a peer completed the key exchange without ever being approved — refusing]");
+          hint("Someone was connected to this room without your approval. The relay is not behaving. Disconnecting.", true);
+          if (ws) ws.close();
+          return;
+        }
+        if (admittedBundle && !sameBundle(admittedBundle, idbCanon)) {
           addLine("sys", "", "[the peer that connected is NOT the one you let in — refusing]");
           hint("The identity that completed the key exchange differs from the one you approved. Disconnecting.", true);
           if (ws) ws.close();
@@ -2045,8 +2255,8 @@ async function handleMessage(room, raw) {
         // pin the identity on first accept; hard-refuse any later frame whose
         // identity differs, and close the connection (that is a MITM attempt).
         if (peerBundle === null) {
-          peerBundle = idb; // write-once for this connection
-        } else if (!sameBundle(peerBundle, idb)) {
+          peerBundle = idbCanon; // write-once for this connection, canonical (H-1)
+        } else if (!sameBundle(peerBundle, idbCanon)) {
           addLine("sys", "", "[a SECOND identity tried to complete the key exchange — refusing; this is a relay MITM attempt]");
           hint("Two different identities attempted this handshake — disconnecting to protect you.", true);
           if (ws) ws.close();
@@ -2063,7 +2273,7 @@ async function handleMessage(room, raw) {
         }
 
         if (cipher.ready) {
-          await enterVerification(room, peerBundle);
+          await onChannelReady(room);
         }
       } catch (e) {
         hint("Key exchange failed: " + e.message, true);
@@ -2521,20 +2731,23 @@ async function otpExport() {
   const id = els.otpSelect.value;
   if (!id) { otpStatusMsg("Select a pad to export.", true); return; }
   if (!els.otpXferPass.value) { otpStatusMsg("Enter a transfer passphrase first (agree on it with your contact in person).", true); return; }
-  // Re-export guard (Finding 3): sharing one pad with more than one importer
-  // causes key reuse. Warn once and require a second click to confirm.
-  const meta = otp.padMeta(id);
-  if (meta && meta.exported && pendingReexportId !== id) {
-    pendingReexportId = id;
-    otpStatusMsg("⚠ This pad was already exported. A pad must be imported on only ONE device — re-exporting risks catastrophic key reuse. Click Export again to confirm you know what you are doing.", true);
-    return;
-  }
-  pendingReexportId = null;
   try {
-    const { record } = await ensureUnlocked(id); // decrypt at rest first
+    // Pentest 2026-07-27 L-3: the re-export guard now consults the AUTHENTICATED
+    // `exported` flag inside the pad blob, so it has to unlock first. Clearing
+    // the plaintext index entry no longer disarms the one warning that stands
+    // between a user and handing one pristine pad to two importers.
+    const { record, atRest } = await ensureUnlocked(id); // decrypt at rest first
+    // Re-export guard (Finding 3): sharing one pad with more than one importer
+    // causes key reuse. Warn once and require a second click to confirm.
+    if (record.exported && pendingReexportId !== id) {
+      pendingReexportId = id;
+      otpStatusMsg("⚠ This pad was already exported. A pad must be imported on only ONE device — re-exporting risks catastrophic key reuse. Click Export again to confirm you know what you are doing.", true);
+      return;
+    }
+    pendingReexportId = null;
     const text = await otp.exportPad(record, els.otpXferPass.value);
     downloadText(`secure-chat-pad-${record.label || record.padId}.json`, text);
-    otp.markExported(id);
+    await otp.markExported(record, atRest);
     otpStatusMsg("Exported. Give the file to your contact in person; they Import it with the same TRANSFER passphrase.");
   } catch (e) {
     otpStatusMsg("Export failed: " + e.message, true);

@@ -34,10 +34,40 @@ function b64(bytes) {
   for (let i = 0; i < u.length; i++) bin += String.fromCharCode(u[i]);
   return btoa(bin);
 }
+// Pentest 2026-07-27 H-1: `atob` implements WHATWG *forgiving* base64. It
+// strips ASCII whitespace, tolerates missing padding, and — the sharp edge —
+// DISCARDS the trailing slack bits instead of rejecting them. Every fixed-size
+// key here has a length ≡ 2 (mod 3), i.e. 2 slack bits, so FOUR distinct base64
+// strings decode to the identical bytes (256 spellings of a four-field bundle).
+//
+// That split a single value into two domains: byte checks (bundleDigest, the
+// handshake transcript, the safety number, Identity.verify) are encoding-blind
+// and PASS on a mutated spelling, while string checks (sameBundle, pin
+// persistence, the reflection guard) compare the raw received text and DIVERGE.
+// A relay flipping one character could therefore fire false "identity key
+// CHANGED" alarms at will, make a guest pin a non-canonical string, and
+// permanently break async chats (sealed.js signs the stored string but
+// recomputes from canonical bytes). It never yielded a false MATCH — string
+// equality is strictly finer than byte equality — but it eroded exactly the
+// trust signal the design calls the real boundary.
+//
+// The fix is to remove the second domain: decoding is CANONICAL, so every
+// string that survives it is the unique spelling of its bytes and the two kinds
+// of check can no longer disagree. Non-canonical input is a malformed value and
+// fails closed here, before any signature, digest or comparison sees it.
+const B64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
+
 function unb64(s) {
+  if (typeof s !== "string" || s.length % 4 !== 0 || !B64_RE.test(s)) {
+    throw new Error("malformed base64: not canonical");
+  }
   const bin = atob(s);
   const u = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+  // Re-encode and require an exact match. The alphabet/padding checks above
+  // cannot see slack bits; this does, and it is the check that collapses the
+  // four spellings of a key back to one.
+  if (b64(u) !== s) throw new Error("malformed base64: not canonical");
   return u;
 }
 // JWK coordinates are base64URL with the padding stripped (RFC 7515 §2).

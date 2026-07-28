@@ -40,9 +40,9 @@ console.log("OK  M-01: a wholesale old-blob restore (offset rollback) is refused
 // pad at offset 0 with a clean watermark, and every later message reused
 // keystream the peer had already seen.
 otp.forgetPad(rec.padId);
-assert.strictEqual(
-  localStorage.getItem("sc.otp.hw.v1." + rec.padId), "500",
-  "P-05: high-water survives forgetPad so a re-import can be refused",
+assert.ok(
+  localStorage.getItem("sc.otp.wm.v1." + rec.padId) !== null,
+  "P-05: the authenticated watermark survives forgetPad so a re-import can be refused",
 );
 assert.ok(otp.padWasUsed(rec.padId), "P-05: pad is still known to have been used here");
 console.log("OK  P-05: high-water tripwire SURVIVES forgetPad");
@@ -92,5 +92,94 @@ await assert.rejects(
   "P-01: a blob re-keyed under a fresh padId must be refused",
 );
 console.log("OK  P-01: padId re-key (M-01 watermark bypass) is refused");
+
+// --- Pentest 2026-07-27 H-3: the watermark is authenticated + fails closed ---
+// The tripwire used to be one PLAINTEXT decimal string, and its reader returned
+// 0 for a missing value. So the "restore just the pad blob" attack M-01 was
+// built to catch cost one extra removeItem: two messages then encrypted at the
+// same offset and C1 XOR C2 = P1 XOR P2 handed over a plaintext.
+{
+  const h = await otp.generatePad({ label: "h3", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const hAtRest = await otp.saveNewPad(h, PASS);
+  const hKey = "sc.otp.pad.v1." + h.padId;
+  const pristine = localStorage.getItem(hKey);
+  h.sendOffset = 85;
+  await otp.savePadProgress(h, hAtRest);
+
+  // The watermark is opaque at rest: no offset readable or editable in the clear.
+  const wmRaw = localStorage.getItem("sc.otp.wm.v1." + h.padId);
+  assert.ok(wmRaw && !wmRaw.includes("85"), "watermark is ciphertext, not a plaintext integer");
+
+  // Restore the pristine blob AND delete the watermark — the reported PoC.
+  localStorage.setItem(hKey, pristine);
+  localStorage.removeItem("sc.otp.wm.v1." + h.padId);
+  await assert.rejects(
+    otp.unlockPad(h.padId, PASS), /rollback record for this pad is missing/,
+    "H-3: deleting the watermark must FAIL CLOSED, not reset the tripwire to 0",
+  );
+
+  // Forging one is not an option either: it is AEAD under the pad's own key.
+  localStorage.setItem("sc.otp.wm.v1." + h.padId, JSON.stringify({
+    iv: "AAAAAAAAAAAAAAAA", ct: "AAAAAAAAAAAAAAAAAAAAAAA=",
+  }));
+  await assert.rejects(
+    otp.unlockPad(h.padId, PASS), /damaged or forged/,
+    "H-3: a forged watermark is refused",
+  );
+}
+console.log("OK  H-3: deleting or forging the OTP watermark fails closed");
+
+// --- Pentest 2026-07-27 M-7: the RECEIVE watermark rolls back too ------------
+// bumpHW only ever advanced on sendOffset, and the tripwire only checked
+// sendOffset. A restore taken after a stretch of RECEIVING ONLY therefore left
+// sendOffset untouched — nothing fired — while recvHighWater fell back to zero
+// and every already-delivered frame re-authenticated as fresh.
+{
+  const m = await otp.generatePad({ label: "m7", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const mAtRest = await otp.saveNewPad(m, PASS);
+  const mKey = "sc.otp.pad.v1." + m.padId;
+
+  m.sendOffset = 200;            // some sending, then…
+  await otp.savePadProgress(m, mAtRest);
+  const beforeReceiving = localStorage.getItem(mKey);
+
+  m.recvHighWater = 119;         // …a stretch of receiving only
+  await otp.savePadProgress(m, mAtRest);
+  assert.strictEqual((await otp.unlockPad(m.padId, PASS)).record.recvHighWater, 119);
+
+  // Restore the copy taken before the receiving: sendOffset is IDENTICAL, so
+  // the old send-only tripwire saw nothing wrong.
+  localStorage.setItem(mKey, beforeReceiving);
+  await assert.rejects(
+    otp.unlockPad(m.padId, PASS), /receive state was rolled back/,
+    "M-7: a receive-side rollback is refused even when sendOffset is unchanged",
+  );
+}
+console.log("OK  M-7: OTP recvHighWater rollback (replay across a reload) is refused");
+
+// --- Pentest 2026-07-27 L-3: `exported` is authenticated ---------------------
+// The double-export gate lived in the plaintext index, so clearing one field
+// removed the only warning that stops one pristine pad going to two importers.
+{
+  const e = await otp.generatePad({ label: "l3", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const eAtRest = await otp.saveNewPad(e, PASS);
+  const unlocked = await otp.unlockPad(e.padId, PASS);
+  assert.strictEqual(unlocked.record.exported, false, "a fresh pad is not exported");
+
+  await otp.markExported(unlocked.record, unlocked.atRest);
+  assert.strictEqual((await otp.unlockPad(e.padId, PASS)).record.exported, true,
+    "the flag round-trips through the AEAD");
+
+  // Clear the plaintext index copy — the render cache, not the trust source.
+  const idx = JSON.parse(localStorage.getItem("sc.otp.index.v1"));
+  for (const entry of idx) {
+    if (entry.padId === e.padId) entry.exported = false;
+  }
+  localStorage.setItem("sc.otp.index.v1", JSON.stringify(idx));
+  assert.strictEqual(otp.padMeta(e.padId).exported, false, "the index copy really was cleared");
+  assert.strictEqual((await otp.unlockPad(e.padId, PASS)).record.exported, true,
+    "L-3: clearing the plaintext index does NOT disarm the double-export warning");
+}
+console.log("OK  L-3: the double-export gate is authenticated, not a plaintext flag");
 
 console.log("\nAll OTP rollback checks passed.");

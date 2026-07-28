@@ -210,6 +210,31 @@ async def _safe_close(ws: WebSocket) -> None:
             pass
 
 
+class _NonTextFrame(Exception):
+    """The peer sent a non-text WebSocket frame (binary, or a close message)."""
+
+
+async def _receive_text(ws: WebSocket) -> str:
+    """Read one TEXT frame, or raise a typed error the loop can answer politely.
+
+    Pentest 2026-07-27 M-3. Starlette's `receive_text()` indexes
+    `message["text"]` unconditionally, so a binary frame raises a bare KeyError
+    that is neither WebSocketDisconnect nor a validation error — it reached the
+    catch-all `log.exception` and put a traceback on disk for any anonymous
+    socket that asked. We do the dispatch ourselves: a text frame returns its
+    text, a disconnect raises WebSocketDisconnect exactly as before, and
+    anything else raises _NonTextFrame, which the loop turns into the same kind
+    of polite error frame every other malformed input gets.
+    """
+    message = await ws.receive()
+    if message["type"] == "websocket.disconnect":
+        raise WebSocketDisconnect(message.get("code", 1000))
+    text = message.get("text")
+    if text is None:
+        raise _NonTextFrame()
+    return text
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket) -> None:
     # CSWSH protection: reject a present-but-disallowed browser Origin before
@@ -259,7 +284,17 @@ async def ws_endpoint(ws: WebSocket) -> None:
             else:
                 timeout = config.JOIN_TIMEOUT_SEC
             try:
-                raw = await asyncio.wait_for(ws.receive_text(), timeout=timeout)
+                raw = await asyncio.wait_for(_receive_text(ws), timeout=timeout)
+            except _NonTextFrame:
+                # Pentest 2026-07-27 M-3: a BINARY frame used to reach
+                # Starlette's receive_text(), which does message["text"]
+                # unconditionally and raises KeyError — not WebSocketDisconnect,
+                # so it fell through to the catch-all and wrote a full traceback
+                # to disk. Any unauthenticated socket could therefore mint
+                # precisely-timestamped log entries on demand (an I2 defeat and
+                # a ~640x log-amplification DoS). Answer politely instead.
+                await _safe_send(ws, '{"type":"error","reason":"binary frames not accepted"}')
+                break
             except asyncio.TimeoutError:
                 if joined_room:
                     reason = "idle timeout"
@@ -287,10 +322,13 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 continue
 
             # 4) Parse + strict-validate the envelope. Anything off -> reject.
+            # RecursionError (M-3): deeply nested JSON blows the C parser's
+            # stack, and that is a client-input error like any other — without
+            # it here the traceback landed in the catch-all logger.
             try:
                 data = json.loads(raw)
                 env = Envelope.model_validate(data)
-            except (json.JSONDecodeError, ValidationError):
+            except (json.JSONDecodeError, ValidationError, RecursionError):
                 await _safe_send(ws, '{"type":"error","reason":"bad envelope"}')
                 continue
 
@@ -317,6 +355,17 @@ async def ws_endpoint(ws: WebSocket) -> None:
                     await _safe_send(ws, '{"type":"pending"}')
                 else:
                     await _safe_send(ws, '{"type":"error","reason":"room full"}')
+                    # M-1: make the lockout VISIBLE to the owner. A knocked
+                    # waiter is not displaceable, so a filled queue turns every
+                    # honest join away before it can even knock — the owner used
+                    # to see nothing at all while the person they invited was
+                    # told "room full". Batched by the registry so this cannot
+                    # itself be flooded.
+                    owner, count = registry.note_turned_away(env.room)
+                    if owner is not None and owner is not conn:
+                        await _safe_send(owner.ws, json.dumps({
+                            "type": "turned-away", "count": count,
+                        }))
                 continue
 
             # A waiting socket may do exactly one thing: introduce itself to the
@@ -388,7 +437,14 @@ async def ws_endpoint(ws: WebSocket) -> None:
 
     except WebSocketDisconnect:
         pass
+    except (_NonTextFrame, RecursionError, ValueError, KeyError, TypeError):
+        # Pentest 2026-07-27 M-3: failures whose cause is peer-supplied bytes
+        # are not server faults, and a traceback per crafted frame is a
+        # log-amplification DoS plus the who-connected-when metadata trail I2
+        # promises not to keep. Swallow them silently; the socket just ends.
+        pass
     except Exception:  # noqa: BLE001 - never leak a stack trace to the client
+        # Genuine server faults still get a full (content-free) traceback.
         log.exception("unexpected error in ws loop")
     finally:
         connections.release()
@@ -415,6 +471,17 @@ if __name__ == "__main__":
     # is added below the ASGI layer and so cannot be removed by middleware.
     # access_log=False + log_level="warning": no request/connection metadata at
     # rest (I2); see _minimize_log_metadata above.
+    #
+    # Pentest 2026-07-27 H-4: proxy_headers=False + forwarded_allow_ips=[] are
+    # NOT optional. Uvicorn defaults to trusting X-Forwarded-For from a loopback
+    # peer and rewrites request.client BEFORE accounts.client_key ever runs, so
+    # rotating that header mints a fresh rate-limit bucket per request and every
+    # HTTP throttle (lookup anti-enumeration, challenge, register, mailbox) is
+    # bypassed. run.sh passes the equivalent --no-proxy-headers CLI flag; this
+    # programmatic launcher previously did not, which is how the live instance
+    # ran without the F-03 defense. Both launch paths must match.
+    # ws_max_size mirrors run.sh's --ws-max-size for the same reason: without it
+    # uvicorn buffers up to 16 MiB per frame before the app's 64 KiB cap runs.
     uvicorn.run(
         app,
         host=config.HOST,
@@ -422,4 +489,7 @@ if __name__ == "__main__":
         server_header=False,
         access_log=False,
         log_level="warning",
+        proxy_headers=False,
+        forwarded_allow_ips=[],
+        ws_max_size=config.MAX_FRAME_BYTES + 1024,
     )

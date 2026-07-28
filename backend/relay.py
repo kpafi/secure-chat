@@ -159,6 +159,23 @@ class Room:
     members: list[Conn] = field(default_factory=list)
     pending: dict[str, Conn] = field(default_factory=dict)
 
+    # Pentest 2026-07-27 M-1: how many joins this room has refused since the
+    # owner was last told, and when it was last told. A KNOCKED waiter holds its
+    # place for the full approval window and is not displaceable, so filling all
+    # MAX_ROOM_PENDING places with knocked sockets makes every honest join fail
+    # with "room full" BEFORE it is issued a jid — it cannot knock, and the owner
+    # never learns anyone was turned away. The lockout itself is inherent (a
+    # hostile relay can deny service regardless, and the real fix is the
+    # cryptographic room-entry proof the design already notes); what was missing
+    # is that it was SILENT, so both people sat waiting for each other with no
+    # sign that the room was under pressure. Now the owner is told.
+    turned_away: int = 0
+    # -inf, not 0.0: `time.monotonic()` is measured from an arbitrary point that
+    # on Linux is process/boot start, so a 0.0 sentinel would read as "notified
+    # just now" for the relay's first TURNAWAY_NOTICE_SEC seconds and swallow the
+    # very first notice — precisely when a room is most likely to be raced.
+    turnaway_notified_at: float = float("-inf")
+
     @property
     def owner(self) -> Conn | None:
         """The connection that created the room, or the oldest remaining one."""
@@ -260,6 +277,28 @@ class RoomRegistry:
         conn.jid = jid
         conn.queued_at = now
         return JoinResult.waiting, evicted
+
+    def note_turned_away(self, room: str) -> tuple[Conn | None, int]:
+        """Record a refused join and, at most once per notice window, report it.
+
+        Returns (owner, count-since-last-notice) when the owner should be told,
+        else (None, 0). The window is what stops the notice being a weapon of its
+        own: without it, an attacker holding the queue could also make the relay
+        send the owner one frame per join attempt — turning a signal meant to
+        reveal the flood into an amplifier for it. Batched, the owner learns the
+        room is under pressure at a bounded rate, and the count carries the scale.
+        """
+        entry = self._rooms.get(room)
+        if entry is None or not entry.members:
+            return None, 0
+        entry.turned_away += 1
+        now = time.monotonic()
+        if now - entry.turnaway_notified_at < config.TURNAWAY_NOTICE_SEC:
+            return None, 0
+        entry.turnaway_notified_at = now
+        count = entry.turned_away
+        entry.turned_away = 0
+        return entry.owner, count
 
     def has_free_slot(self, room: str) -> bool:
         entry = self._rooms.get(room)

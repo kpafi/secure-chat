@@ -17,6 +17,12 @@
 // is kept so the contact can be re-fetched / vouch-checked later.
 
 const LS_CONTACTS = "sc.contacts.v1";
+// Pentest 2026-07-27 L-1: an authenticated, monotonic generation counter kept
+// BESIDE the store. See assertNotRolledBack() for what it buys and what it does
+// not. Encrypted under the same data key, so only the passphrase holder can
+// write one — and its mere PRESENCE proves a store is supposed to exist.
+const LS_GEN = "sc.contacts.gen.v1";
+const GEN_DOMAIN = "secure-chat/contacts-generation/v1";
 const KDF_ITERS = 600000; // same OWASP-2023 work factor as identity.js
 
 const enc = new TextEncoder();
@@ -63,6 +69,7 @@ let dataKey = null;
 let salt = null;
 let contacts = null; // array of contact records while unlocked
 let pins = null;     // { "<key>": {ed, mldsa} } — TOFU identity pins (M-02)
+let generation = 0;  // monotonic store generation (L-1); bumped on every persist
 
 export function isUnlocked() {
   return dataKey !== null;
@@ -73,6 +80,7 @@ export function lock() {
   salt = null;
   contacts = null;
   pins = null;
+  generation = 0;
 }
 
 // Unlock (or create) the store with the identity passphrase. Throws if a blob
@@ -82,11 +90,17 @@ export async function unlock(passphrase) {
   if (!passphrase) throw new Error("passphrase required to unlock the contact store");
   const raw = localStorage.getItem(LS_CONTACTS);
   if (!raw) {
+    // No store. Before creating a fresh (empty, pin-less) one, make sure this
+    // really IS a first run and not a store somebody deleted — see L-1. The
+    // witness carries its OWN salt precisely so it stays readable when the
+    // store that would otherwise hold the salt has been removed.
+    await assertStoreNotDeleted(passphrase);
     salt = crypto.getRandomValues(new Uint8Array(16));
     dataKey = await deriveKey(passphrase, salt, KDF_ITERS);
     contacts = [];
     pins = {};
-    migrateLegacyPins();
+    generation = 0;
+    dropLegacyPins();
     await persist();
     return;
   }
@@ -109,25 +123,135 @@ export async function unlock(passphrase) {
     contacts = data.contacts || [];
     pins = data.pins || {};
   }
-  let dirty = migrateLegacyPins();
+  generation = Number.isInteger(data.gen) ? data.gen : 0;
+  await assertNotRolledBack(data.gen);
+  let dirty = dropLegacyPins();
   if ((blob.v || 1) < 3 && migrateH01Verification()) dirty = true;
+  // A pre-L-1 store carries no generation and no witness: adopt it at its
+  // current state (there is nothing to roll back TO yet) and start counting.
+  if (!Number.isInteger(data.gen)) dirty = true;
   if (dirty) await persist();
 }
 
-// One-time migration of the old PLAINTEXT localStorage pins (sc.pins.v1) into
-// this authenticated encrypted store (M-02). After migration the plaintext key
-// is removed so a forged pin can no longer be planted there to auto-unlock.
-function migrateLegacyPins() {
-  const legacy = localStorage.getItem("sc.pins.v1");
-  if (!legacy) return false;
-  try {
-    const old = JSON.parse(legacy);
-    for (const [k, v] of Object.entries(old)) {
-      if (!pins[k] && v && v.ed && v.mldsa) pins[k] = { ed: v.ed, mldsa: v.mldsa };
-    }
-  } catch { /* corrupt legacy pins: drop them */ }
+// Pentest 2026-07-27 H-2: this used to be migrateLegacyPins(), which COPIED any
+// entry from the plaintext `sc.pins.v1` into the authenticated pin map — and it
+// ran on EVERY unlock, not once. A device-local attacker with nothing but a
+// localStorage write could therefore plant a pin for a MITM bundle, have this
+// function launder it into the encrypted store, and watch the plaintext
+// evidence delete itself. The next session auto-accepted the attacker's keys
+// with no prompt while the REAL contact tripped "identity key CHANGED" — the
+// alarm inverted, and the M-02 fix ("a forged pin can no longer be planted
+// there to auto-unlock") undone.
+//
+// The migration shipped 2026-07-18 and every live store is v3, so there is
+// nothing left to migrate. What remains is the cleanup: delete the plaintext
+// key if it is still lying around, and NEVER read a pin out of it.
+function dropLegacyPins() {
+  if (localStorage.getItem("sc.pins.v1") === null) return false;
   localStorage.removeItem("sc.pins.v1");
-  return true;
+  return false; // nothing was imported, so nothing to persist on its account
+}
+
+// ---- rollback / deletion detection (pentest 2026-07-27 L-1) ----------------
+// The contact store holds the TOFU pins, so removing or rewinding it removes
+// key-change detection: app.js treats "no store" as a clean first contact and
+// shows the reassuring prompt instead of the loud one. Both moves are available
+// to a device-local attacker, who needs no passphrase to delete a file.
+//
+// The witness is a tiny AEAD record under the same data key carrying the store
+// generation. It cannot be forged (that needs the passphrase) and it cannot be
+// silently un-written: its presence alone says a store must exist.
+//
+//   store older than witness  -> rollback           -> fail closed
+//   witness present, no store -> store was deleted  -> fail closed
+//   store present, no witness -> witness was deleted -> fail closed (v4+ only)
+//   neither present           -> genuine first run   -> proceed
+//
+// HONEST LIMIT: an attacker who saves BOTH values and restores BOTH still
+// rewinds undetected. That is the whole-storage rollback README.md already
+// documents as residual; the point here is that it now takes a coordinated
+// snapshot rather than one `removeItem`.
+
+// `key` is optional: when the store blob is gone we have no salt to re-derive
+// from, so the caller passes the passphrase and we use the salt the witness
+// carries itself.
+async function readWitness(passphrase = null) {
+  const raw = localStorage.getItem(LS_GEN);
+  if (!raw) return null;
+  let rec;
+  try {
+    rec = JSON.parse(raw);
+  } catch {
+    return { corrupt: true };
+  }
+  try {
+    const key = passphrase === null
+      ? dataKey
+      : await deriveKey(passphrase, unb64(rec.salt), rec.iters || KDF_ITERS);
+    const plain = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: unb64(rec.iv) }, key, unb64(rec.ct),
+    );
+    const w = JSON.parse(dec.decode(plain));
+    if (w.d !== GEN_DOMAIN || !Number.isInteger(w.gen)) return { corrupt: true };
+    return w;
+  } catch {
+    // Written under a DIFFERENT passphrase, or edited. Either way it is not
+    // ours to interpret and it is not evidence we can act on safely.
+    return { corrupt: true };
+  }
+}
+
+async function writeWitness() {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plain = enc.encode(JSON.stringify({ d: GEN_DOMAIN, gen: generation }));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, dataKey, plain));
+  localStorage.setItem(LS_GEN, JSON.stringify({
+    salt: b64(salt), iters: KDF_ITERS, iv: b64(iv), ct: b64(ct),
+  }));
+}
+
+async function assertStoreNotDeleted(passphrase) {
+  const w = await readWitness(passphrase);
+  if (w === null) return; // no witness either: genuine first run
+  lock();
+  if (w.corrupt) {
+    throw new Error(
+      "a contact store was expected on this device but is missing, and its generation record does not " +
+      "decrypt — refusing to start over with an empty (unpinned) store",
+    );
+  }
+  throw new Error(
+    `your saved contacts (generation ${w.gen}) have been DELETED from this device — refusing to start ` +
+    "over with an empty store, because that would silently turn off key-change warnings",
+  );
+}
+
+async function assertNotRolledBack(storeGen) {
+  const w = await readWitness();
+  if (w === null) {
+    // No witness. Fine only for a pre-L-1 store, which has no generation
+    // either; a store that HAS one lost its witness, which is tampering.
+    if (Number.isInteger(storeGen)) {
+      lock();
+      throw new Error(
+        "the generation record for your saved contacts is missing — refusing to open the store, " +
+        "because a rollback could no longer be detected",
+      );
+    }
+    return;
+  }
+  if (w.corrupt) {
+    lock();
+    throw new Error("the generation record for your saved contacts is damaged or forged");
+  }
+  const gen = Number.isInteger(storeGen) ? storeGen : 0;
+  if (gen < w.gen) {
+    lock();
+    throw new Error(
+      `your saved contacts are OLDER than this device recorded (generation ${gen}, expected ${w.gen}) — ` +
+      "an earlier copy has been restored, which would silently undo recent verifications and pins",
+    );
+  }
 }
 
 // One-time v2→v3 migration (audit 2026-07-18 H-01): earlier builds displayed a
@@ -153,13 +277,18 @@ function migrateH01Verification() {
 
 async function persist() {
   if (!dataKey) throw new Error("contact store is locked");
+  generation += 1; // L-1: every write moves the store forward, monotonically
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const plain = enc.encode(JSON.stringify({ contacts, pins }));
+  const plain = enc.encode(JSON.stringify({ contacts, pins, gen: generation }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, dataKey, plain));
   localStorage.setItem(
     LS_CONTACTS,
-    JSON.stringify({ v: 3, iters: KDF_ITERS, salt: b64(salt), iv: b64(iv), ct: b64(ct) }),
+    JSON.stringify({ v: 4, iters: KDF_ITERS, salt: b64(salt), iv: b64(iv), ct: b64(ct) }),
   );
+  // Witness LAST. Interrupted between the two writes we end up with a store
+  // one generation ahead of its witness, which reads as "newer than recorded"
+  // — not a rollback, so an ordinary crash never locks the user out.
+  await writeWitness();
 }
 
 // ---- identity pins (TOFU, now inside the authenticated store) -------------
@@ -183,13 +312,21 @@ export async function savePin(key, bundle) {
 }
 
 // Remove the blob entirely (identity forgotten, or unrecoverable foreign blob).
+// The generation witness goes with it: this is the ONE deletion the user asked
+// for, so leaving the witness behind would make the next unlock refuse to open.
 export function wipe() {
   localStorage.removeItem(LS_CONTACTS);
+  localStorage.removeItem(LS_GEN);
   lock();
 }
 
+// True when a contact store is EXPECTED on this device — which includes the
+// case where the blob is gone but its generation witness is not (L-1). app.js
+// reads this through pinsReadable(), so a deleted store now takes the loud
+// "key changes cannot be detected" path instead of rendering every contact as a
+// benign first contact.
 export function hasStore() {
-  return localStorage.getItem(LS_CONTACTS) !== null;
+  return localStorage.getItem(LS_CONTACTS) !== null || localStorage.getItem(LS_GEN) !== null;
 }
 
 // ---- contact records ------------------------------------------------------
