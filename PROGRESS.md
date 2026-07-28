@@ -28,7 +28,9 @@ exists in the WebView leveldb alongside `sc.contacts.v1`. That is the migration
 running forward against a genuine pre-fix store on real hardware — the thing the
 unit tests could not prove.
 
-### 🔴 OTP pad migration v2→v3 is BROKEN — found on-device 2026-07-28, SHIPPED
+### 🔴 OTP pad migration v2→v3 was BROKEN — found on-device 2026-07-28
+**FIXED + regression-tested in `bf6bcd2` (pushed). NOT yet deployed and the APK
+is NOT rebuilt — the live client still has the bug.**
 
 **A pre-fix OTP pad that was ever USED is permanently refused after the upgrade.**
 Tested by generating a genuine v2 blob with the pre-fix `otp.js` (from `e86a60b`),
@@ -71,8 +73,25 @@ pristine case.
 **Impact:** fail-CLOSED, so no key material leaks — but anyone holding a pre-fix
 pad that has sent even one message is locked out of it and must exchange a fresh
 pad in person. **Zero impact on this user right now: the phone has no pads** (the
-test pad was removed afterwards; `sc.otp.*` is empty again, verified). Still
-shipped and live, so it bites the first real pre-fix pad it meets.
+test pad was removed afterwards; `sc.otp.*` is empty again, verified).
+
+**Fix applied `bf6bcd2`:** the legacy clause is gone from `knownUsedHere`; the
+two remaining sources are written only by post-fix code, so neither
+false-positives on a genuine pre-fix pad and H-3 still fails closed.
+`padWasUsed()` still consults the legacy marker, which is correct — that path is
+fail-closed by construction. The regression test reconstructs a real pre-fix pad
+and asserts it migrates, that the floor survives as `inner.hwSend`, and that H-3
+still bites once the pad is v3; **verified to FAIL before the fix**. Client
+suites now 85 checks / 8 suites, backend 129.
+
+**⬜ Still to do: deploy + rebuild the APK.** Client-only change, no wire-format
+or protocol impact, so this one is NOT the two-client break P-08 and key
+confirmation were — but the live client and the phone both still refuse used
+pre-fix pads until it ships. The on-device proof was run against the DEPLOYED
+(buggy) client; re-run it after deploying to confirm the fixed path on real
+hardware. Repro tooling is in the session scratchpad (`make-v2-pad.mjs`,
+`migrate-on-phone.mjs`, `cleanup-phone.mjs` — pre-fix `otp.js` from `e86a60b`,
+CDP over `adb forward` to `webview_devtools_remote_*`).
 
 **BREAKING protocol change again** (third one, after handshake v3 and P-08): a
 key-confirmation frame now gates the verification step, so relay and client are
