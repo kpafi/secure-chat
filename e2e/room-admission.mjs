@@ -129,7 +129,15 @@ await joinRoom(bob.page, code);
 await bob.page.waitForFunction(
   () => /waiting for approval/i.test(document.querySelector("#chatStatus").textContent),
   { timeout: 30000 });
-const queueNote = await text(alice.page, "#admitWarn");
+// Bob reaching "waiting for approval" only means the RELAY queued him — his
+// knock still has to reach alice and be rendered. Reading #admitWarn straight
+// after the status flip raced that and reported an empty string as a product
+// failure. Poll instead; the assertion itself is unchanged.
+let queueNote = "";
+for (let i = 0; i < 20 && !/more waiting/i.test(queueNote); i++) {
+  await sleep(250);
+  queueNote = await text(alice.page, "#admitWarn");
+}
 check("owner is told more than one peer is waiting", /more waiting/i.test(queueNote),
   JSON.stringify(queueNote));
 
