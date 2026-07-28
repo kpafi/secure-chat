@@ -1,0 +1,37 @@
+## secure-chat onion service (added 2026-07-28)
+##
+## This daemon exists to publish ONE onion service. It is not a client proxy
+## and not a relay, so everything that would make it either is switched off.
+## Overrides the package defaults in
+## /usr/share/tor/tor-service-defaults-torrc (torrc wins over that file).
+## ---------------------------------------------------------------------------
+
+# No SOCKS. The package default opens 127.0.0.1:9050 AND a WORLD-WRITABLE unix
+# socket at /run/tor/socks; neither is needed to publish a service, and both
+# would let any local process route traffic through Tor. 0 disables both.
+SOCKSPort 0
+
+# Never act as a relay, directory mirror, or exit.
+ORPort 0
+DirPort 0
+ExitRelay 0
+
+# Metadata minimization (I2). The relay itself writes no access log; Tor must
+# not reintroduce one. SafeLogging scrubs addresses, and warn drops the routine
+# notice-level chatter so a seized host yields no who-connected-when trail.
+SafeLogging 1
+Log warn syslog
+
+# The service. Tor terminates the onion protocol and forwards plaintext HTTP to
+# the loopback uvicorn — the same socket Caddy proxies to, so both front ends
+# share one process (no split-brain rooms). uvicorn itself stays bound to
+# 127.0.0.1 and is never exposed on a public interface.
+HiddenServiceDir /var/lib/tor/secure-chat/
+HiddenServiceVersion 3
+HiddenServicePort 80 127.0.0.1:8000
+
+# Proof-of-work defence against introduction floods (tor >= 0.4.8). This
+# matters more here than on a typical onion: SECURE_CHAT_TRUSTED_PROXIES is
+# deliberately unset, so every /api rate limiter collapses to ONE global
+# bucket, and the cheapest attack on the service is simply volume.
+HiddenServicePoWDefensesEnabled 1

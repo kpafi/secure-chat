@@ -3,7 +3,108 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (2026-07-28, every 2026-07-27 pentest finding fixed)
+## ⮕ RESUME HERE (2026-07-28, Tor onion service LIVE)
+
+**The last never-started checklist item is done.** The relay is reachable at
+`http://626vkwn6znrko2xhorirvv5ttrbzcr3xkdjmk65cks26qkvadplyk5id.onion`
+alongside the clearnet site, and a full relay round trip over Tor — including
+the P-08 owner-approval flow — is proved from the laptop.
+
+**Shape of it.** Tor 0.4.9.11 on the Debian 13 box publishes one v3 onion
+service forwarding to `127.0.0.1:8000` — the *same* uvicorn Caddy proxies to.
+Sharing the process is deliberate: rooms, session tokens and login challenges
+live in memory, so a second instance would split-brain them (same room id, two
+different rooms, one per front end). uvicorn still binds loopback only.
+
+**The decision that mattered: `SECURE_CHAT_TRUSTED_PROXIES` is now UNSET.**
+It was `127.0.0.1` so `/api` could rate-limit per client IP behind Caddy. Once
+Tor also forwards to that port, loopback stops meaning "came through Caddy" —
+the app cannot tell the two apart — so trusting it would let any onion visitor
+forge `X-Forwarded-For` and mint a fresh bucket per request. That is **F-03
+reopened**, against the anti-enumeration lookup limiter, the challenge limiter
+and the mailbox limiter at once. Unset, `client_key()` trusts nobody and
+everything keys on one shared bucket: fails closed. Measured on the live onion,
+16 parallel lookups, `LOOKUP_RATE_CAPACITY = 10`:
+
+| `X-Forwarded-For` | allowed | 429 |
+|---|---|---|
+| rotating, 16 distinct values | 10 | 6 |
+| fixed, 1 value | 10 | 6 |
+
+Identical, and exactly the bucket capacity — the forged header buys nothing.
+Had it been honoured, the rotating run would have scored 16/16, so the probe
+distinguishes the two hypotheses on the number alone. **Accepted cost:** the
+clearnet side loses per-IP limiting too and shares that global bucket, so one
+clearnet abuser can throttle onboarding for everyone. `config.py` already sizes
+`REGISTER_RATE_*` for this exact posture. Keeping per-IP limits would need a
+Caddy-injected secret header and a code change to `client_key()` — offered and
+**not** taken. Tor's `HiddenServicePoWDefensesEnabled 1` is on partly to blunt
+the volume attack the shared bucket invites.
+
+**Hardening applied to the tor daemon:** `SOCKSPort 0` (the Debian default
+otherwise opens `127.0.0.1:9050` **and a world-writable unix socket** at
+`/run/tor/socks` — neither is needed to publish a service, and both would let
+any local process route through Tor); `ORPort 0` / `DirPort 0` / `ExitRelay 0`;
+and `SafeLogging 1` + `Log warn syslog` so the onion daemon does not reintroduce
+the per-connection metadata trail I2 removes everywhere else. Verified after
+restart: no 9050, no unix socket, service keys `0600 debian-tor`.
+
+**Verified from the laptop over Tor** (local `tor` as an unprivileged process,
+SOCKS on 9050):
+- `/healthz` and `/` → 200 on the first attempt.
+- **No HSTS on the onion** (correct — `x-forwarded-proto` is absent there, and
+  HSTS is meaningless for `.onion`), no `server` header, CSP intact.
+- The served assets are the current ones (`CONFIRM_DOMAIN`,
+  `sc.contacts.gen.v1`, `sc.otp.wm.v1`, `adoptLegacy`).
+- Dev files 404 including the P-10 spellings (`//package.json`,
+  `/vendor/lean-qr/package.json`).
+- **9/9 relay checks** via `deploy/onion-ws.mjs`: WS upgrade through Tor, owner
+  seats first, second peer is *queued not seated* (P-08), knock relayed
+  verbatim, admit seats the guest, payloads relayed unchanged both ways,
+  **foreign Origin still refused (403)**, absent Origin still accepted.
+
+`deploy/onion-ws.mjs` exists because Node's built-in WebSocket cannot speak
+through a SOCKS proxy and `e2e/`'s `puppeteer-core` is gitignored, so it does
+SOCKS5 + raw RFC 6455 by hand with no npm dependency. Worth keeping for the same
+reason the CDP pad-injection harness was: it tests the deployed thing.
+
+**`deploy/` is new** and holds the unit, the torrc block, and the Caddyfile
+**pulled from the running box**, not written from memory, plus the recipe and
+the trade-offs.
+
+**Two honest limits.**
+1. **This onion is not location-anonymous.** It is colocated with a public
+   clearnet site on the same host, so anyone who knows both correlates them, and
+   the clearnet site stays an attack surface into the same box. That needs a
+   host with no clearnet service, not a config change.
+2. **The onion does not fix H-02.** It still serves the JavaScript, so a
+   compromised server can still ship backdoored code on the next load. The
+   Android app remains the only answer to that. What the onion *does* buy is a
+   self-authenticating address (no CA, no DNS) and no client IP at the relay.
+
+**Not done — the Android half.** The app still points at
+`https://138-199-144-35.sslip.io`. Pointing it at the onion needs **Orbot** on
+the phone (a WebView cannot resolve `.onion` by itself); `RelayUrls.kt` already
+accepts `.onion` hosts and `network_security_config.xml` already scopes
+cleartext to loopback + `.onion`, so it is an on-device task, not a code change.
+The phone was not connected this session.
+
+**Mistake worth recording:** the first unit rewrite used an unquoted heredoc
+with `\$ONION`, which wrote the literal string into
+`SECURE_CHAT_EXTRA_ORIGINS`. `config._valid_origins()` did exactly its job and
+raised at import — so the relay failed to start and the clearnet site was down
+for about a minute until the origin was corrected. That fail-closed validator
+turned a silent misconfiguration into an immediate, obvious outage, which is the
+behaviour its P-15 comment promises. 29 accounts before and after; backups at
+`/root/{secure-chat.service,Caddyfile,torrc,accounts.db}.bak-2026-07-28-tor` and
+`/root/secure-chat-predeploy-2026-07-28-tor.tar.gz`.
+
+**Not proved:** the counterfactual run (restore `TRUSTED_PROXIES`, watch the
+onion score 16/16, revert) was blocked by the sandbox as a live-box hole and was
+not worked around. The measured `10` above already separates the hypotheses, but
+nobody has *watched* the bypass happen on this deployment.
+
+## ⮕ (superseded) snapshot as of 2026-07-28, every 2026-07-27 pentest finding fixed
 
 **All 4 High, all 7 Medium, and L-1..L-6 from `secure-chat-pentest-2026-07-27.md`
 are fixed, with regression tests.** **Committed and pushed 2026-07-28**
@@ -3142,10 +3243,13 @@ chats, WhatsApp-style, no shared live room needed). Big change incl. backend
       in app.js/index.html. Verified end-to-end in a real browser (generate →
       export/import → two-way messaging → offsets persist → consumed bytes zeroed
       at rest).
-- [ ] **Tor deployment** — hardened reverse setup, `.onion` service config,
-      bind notes; never expose uvicorn directly to a public interface. Pairs
-      with the app: point the relay at the `.onion`, add its origin via
-      `SECURE_CHAT_EXTRA_ORIGINS`.
+- [x] **Tor deployment** — DONE 2026-07-28 (see the dated entry at the top):
+      v3 onion service live beside the clearnet site, both proxying to the one
+      loopback uvicorn; origin added via `SECURE_CHAT_EXTRA_ORIGINS`;
+      `SECURE_CHAT_TRUSTED_PROXIES` **unset** (F-03 would otherwise reopen on the
+      onion path); config committed under `deploy/`. **Android still points at
+      clearnet** — switching it needs Orbot on the phone, which is the remaining
+      piece of "pairs with the app".
 - [x] **Handshake replay across sessions in a reused room (Medium, found
       2026-07-02 pentest)** — DONE (2026-07-02 second session, see dated
       entry): transcript v2 folds a fresh per-connection nonce from both peers
