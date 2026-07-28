@@ -103,6 +103,16 @@ pad that had been refused:
 | re-unlock after migration | still 1234 / 777 |
 | delete the watermark post-migration (the H-3 PoC) | **still REFUSED** — the fix did not buy migration at H-3's expense |
 
+**CORRECTION — "H-3 still fails closed" was overstated.** `bf6bcd2`'s commit
+message and the row above claim it without qualification; the `pentest-new-code`
+review of that diff (2026-07-28) showed it holds **for v3 blobs only**. On a
+**v2-shaped** blob there is no `inner.hwSend`, so the whole evidence set is
+`sc.otp.used.v1` — one deletable plaintext key — and H-3 is bypassable. See F-1
+below. The review confirmed against `bf6bcd2^` that this is **pre-existing and
+not a regression**: the old `readLegacyHW` clause was defeated just as cheaply by
+deleting `sc.otp.hw.v1`. It also proved the fix **never lowers a floor** in any
+attacker-reachable state. So the fix is sound; the claim around it was too broad.
+
 Test residue removed afterwards; `sc.otp.*` is empty again and the phone is back
 to exactly its six real keys, verified. Repro tooling kept in the session
 scratchpad (`make-v2-pad.mjs`, `migrate-on-phone.mjs`, `h3-still-closed.mjs`,
@@ -2733,7 +2743,37 @@ after item 2 was dropped, none of it protects a running instance:
    refused.** Root cause, proposed one-line fix, and why the unit tests missed
    it are in the 🔴 section of the snapshot at the top. **This is the top open
    item — it is shipped and live.**
-5. **Residual, deliberate, unchanged:** whole-storage rollback (an attacker who
+5. **⬜ NEW from the `pentest-new-code` review of `bf6bcd2` (2026-07-28).** All
+   pre-existing, none introduced by that fix — the review verified the fix never
+   lowers a floor and that M-01/M-7/P-01/P-05 and the untrusted outer `v` byte
+   all still hold. Tooling: PoCs under the session scratchpad `lab/`.
+   - **F-1 (High) — H-3 is bypassable on any v2-shaped blob.** With no
+     `inner.hwSend` in the AEAD, `knownUsedHere` collapses to the plaintext
+     `sc.otp.used.v1`. Restore a v2 snapshot + 3 `removeItem`s → the pad unlocks
+     at offset 0 and two messages encrypt under the same keystream; the review
+     recovered a plaintext end-to-end. Two ways to get the snapshot: access while
+     the pad was genuinely v2 (used pre-fix pads were STUCK there until
+     `bf6bcd2`), or manufacture one — a single save from old client code rewrites
+     a v3 blob back to `v:2` and strips `hwSend`, permanently re-exempting it.
+     **No localStorage marker can fix this** (any marker is deletable); the
+     honest control is to make v2 adoption LOUD — prompt "this pad predates
+     rollback protection; its consumption cannot be verified" — and/or time-box
+     it behind a migration epoch after which v2 is refused outright. **Needs a
+     product decision.** Note `bf6bcd2` shrinks the exposure over time by getting
+     used pads onto v3, where the guard is AEAD-anchored.
+   - **F-2 (Medium) — the L-3 `exported` flag launders through the migrating
+     unlock.** `otp.js` falls back to the plaintext index exactly once, on the
+     upgrading unlock, then bakes that value into the AEAD permanently. Flip the
+     index first and the double-export warning is disarmed for good → one
+     pristine pad to two importers → a two-time pad by construction. **Fix: on
+     migration take `exported: true` if EITHER source says true; never downgrade
+     to `false` from an unauthenticated read.** Small and self-contained.
+   - **F-5 (Low)** — `sc.otp.hw.v1` is an un-clearable local DoS (a large value
+     bricks the pad, no UI to clear it). Verified it CANNOT be poisoned into the
+     AEAD: the rollback throw precedes the migration write, so deleting the key
+     restores the pad. Fail-closed and reversible; noted only because it is
+     silent to the user.
+6. **Residual, deliberate, unchanged:** whole-storage rollback (an attacker who
    snapshots BOTH the store and its witness, or both the pad and its watermark,
    still rewinds undetected — it needs OS-level trusted monotonic storage);
    whoever joins an empty room first owns it; a visible approval queue can still

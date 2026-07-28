@@ -107,8 +107,18 @@ console.log("OK  P-01: padId re-key (M-01 watermark bypass) is refused");
   await otp.savePadProgress(h, hAtRest);
 
   // The watermark is opaque at rest: no offset readable or editable in the clear.
+  //
+  // This was `!wmRaw.includes("85")` — a substring search over random base64
+  // ciphertext, so it failed ~1.4% of runs whenever "85" turned up by chance
+  // (caught 2026-07-28 while re-running the suite; pre-existing, not from the
+  // bf6bcd2 work). A flaky assertion on a security property is worse than none:
+  // it trains you to re-run until green. The property it was reaching for is
+  // structural and deterministic — the record carries ONLY iv+ct, so there is no
+  // plaintext field to read or edit, whatever the ciphertext happens to spell.
   const wmRaw = localStorage.getItem("sc.otp.wm.v1." + h.padId);
-  assert.ok(wmRaw && !wmRaw.includes("85"), "watermark is ciphertext, not a plaintext integer");
+  assert.ok(wmRaw, "the watermark exists after a save");
+  assert.deepStrictEqual(Object.keys(JSON.parse(wmRaw)).sort(), ["ct", "iv"],
+    "watermark stores only iv+ct — no plaintext offset field");
 
   // Restore the pristine blob AND delete the watermark — the reported PoC.
   localStorage.setItem(hKey, pristine);
@@ -195,11 +205,40 @@ console.log("OK  L-3: the double-export gate is authenticated, not a plaintext f
 // re-encrypt the inner record WITHOUT the v3-only fields under the same at-rest
 // key, stamp `v:2`, drop both post-fix artifacts, and leave the legacy
 // plaintext watermark the old code would have written.
+const _enc = new TextEncoder();
+const _dec = new TextDecoder();
+const _b64 = (u8) => Buffer.from(u8).toString("base64");
+const _unb64 = (s) => new Uint8Array(Buffer.from(s, "base64"));
+
+// Rewrite a pad's stored blob into the genuine pre-fix (v2) shape: the same
+// inner record minus the v3-only fields, re-encrypted under the same at-rest
+// key. `mutate` may adjust the inner record first (e.g. to stage a rollback).
+// Verified against `git show e86a60b:client/otp.js` — the pre-fix writePadBlob
+// emits exactly padId,label,regionSize,role,createdAt,bytes,sendOffset,
+// recvHighWater, in that order, which is what stripping the three v3 fields
+// from the current inner record produces.
+async function makeV2Blob(padId, key, mutate) {
+  const k = "sc.otp.pad.v1." + padId;
+  const cur = JSON.parse(localStorage.getItem(k));
+  const inner = JSON.parse(_dec.decode(await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: _unb64(cur.iv) }, key, _unb64(cur.ct),
+  )));
+  delete inner.hwSend;    // v3-only: the authenticated watermark mirror
+  delete inner.hwRecv;
+  delete inner.exported;  // v3-only: L-3 moved this inside the AEAD
+  if (mutate) mutate(inner);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv }, key, _enc.encode(JSON.stringify(inner)),
+  ));
+  localStorage.setItem(k, JSON.stringify({ v: 2, kdf: cur.kdf, iv: _b64(iv), ct: _b64(ct) }));
+}
+
 {
-  const enc = new TextEncoder();
-  const dec = new TextDecoder();
-  const b64 = (u8) => Buffer.from(u8).toString("base64");
-  const unb64 = (s) => new Uint8Array(Buffer.from(s, "base64"));
+  const enc = _enc;
+  const dec = _dec;
+  const b64 = _b64;
+  const unb64 = _unb64;
 
   const m = await otp.generatePad({ label: "v2-used", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
   const mAtRest = await otp.saveNewPad(m, PASS);
@@ -240,6 +279,10 @@ console.log("OK  L-3: the double-export gate is authenticated, not a plaintext f
   const innerNow = JSON.parse(dec.decode(await crypto.subtle.decrypt(
     { name: "AES-GCM", iv: unb64(rewound.iv) }, mAtRest.key, unb64(rewound.ct),
   )));
+  // NOTE: this assertion is necessary but NOT discriminating on its own — with
+  // USED === sendOffset, writePadBlob's max(prev, record.sendOffset) satisfies it
+  // even if readLegacyHW were dropped from the floor entirely. The case that
+  // actually pins readLegacyHW is the separate block below.
   assert.strictEqual(innerNow.hwSend, USED, "the legacy watermark became the authenticated floor");
 
   // And the H-3 guard still bites once the pad IS post-fix: same PoC as above.
@@ -254,5 +297,72 @@ console.log("OK  L-3: the double-export gate is authenticated, not a plaintext f
   );
 }
 console.log("OK  v2→v3: a USED pre-fix pad migrates (and keeps its floor), H-3 still closed");
+
+// --- the legacy watermark stays load-bearing AS A FLOOR ----------------------
+// Review of bf6bcd2 (F-3): every existing assertion about the floor was
+// satisfied by `record.sendOffset` alone, so deleting readLegacyHW() from the
+// max() at otp.js survived the whole suite — while being a real break. The
+// discriminating case is a pre-fix blob whose stored offset sits BELOW the
+// legacy watermark: a partial restore, or a restore-from-backup that reverted
+// the blob but not the plaintext tripwire. Only readLegacyHW() catches it.
+//
+// This is the one job bf6bcd2's rationale left for the legacy value after
+// removing it from `knownUsedHere`, so it is the one that must be pinned.
+{
+  const f = await otp.generatePad({ label: "v2-floor", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const fAtRest = await otp.saveNewPad(f, PASS);
+  const REACHED = 1234;
+  f.sendOffset = REACHED;
+  await otp.savePadProgress(f, fAtRest);
+
+  // Pre-fix shape, blob rewound to 0, legacy tripwire still recording 1234.
+  await makeV2Blob(f.padId, fAtRest.key, (inner) => { inner.sendOffset = 0; });
+  localStorage.removeItem("sc.otp.wm.v1." + f.padId);
+  localStorage.removeItem("sc.otp.used.v1." + f.padId);
+  localStorage.setItem("sc.otp.hw.v1." + f.padId, String(REACHED));
+
+  await assert.rejects(
+    otp.unlockPad(f.padId, PASS), /rolled back/,
+    "the legacy watermark must remain a FLOOR: a v2 blob below it is a rollback",
+  );
+}
+console.log("OK  F-3: the legacy watermark is still load-bearing as a rollback floor");
+
+// --- each knownUsedHere clause must be load-bearing ON ITS OWN ---------------
+// Review of bf6bcd2 (F-4): the H-3 checks above delete sc.otp.wm.v1 but leave
+// sc.otp.used.v1 on a v3 blob, so BOTH surviving clauses are true and neither is
+// isolated — dropping either one survived the suite, and dropping the
+// inner.hwSend clause is exploitable. bf6bcd2 deliberately narrowed this
+// predicate to two clauses, so both need pinning separately.
+{
+  // (a) the AUTHENTICATED clause alone: v3 blob, every plaintext marker deleted.
+  const a = await otp.generatePad({ label: "clause-inner", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const aAtRest = await otp.saveNewPad(a, PASS);
+  a.sendOffset = 400;
+  await otp.savePadProgress(a, aAtRest);
+  localStorage.removeItem("sc.otp.wm.v1." + a.padId);
+  localStorage.removeItem("sc.otp.used.v1." + a.padId);
+  localStorage.removeItem("sc.otp.hw.v1." + a.padId);
+  await assert.rejects(
+    otp.unlockPad(a.padId, PASS), /rollback record for this pad is missing/,
+    "inner.hwSend alone must trip H-3 once every plaintext marker is gone",
+  );
+
+  // (b) the usedKey clause alone: v2-shaped blob (no inner.hwSend), but this
+  // device stamped sc.otp.used.v1 — so a missing watermark is DELETION, not a
+  // pad that predates the scheme, and it must still fail closed.
+  const b = await otp.generatePad({ label: "clause-used", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const bAtRest = await otp.saveNewPad(b, PASS);
+  b.sendOffset = 300;
+  await otp.savePadProgress(b, bAtRest);
+  await makeV2Blob(b.padId, bAtRest.key);
+  localStorage.removeItem("sc.otp.wm.v1." + b.padId);
+  localStorage.removeItem("sc.otp.hw.v1." + b.padId);
+  await assert.rejects(
+    otp.unlockPad(b.padId, PASS), /rollback record for this pad is missing/,
+    "usedKey alone must trip H-3 on a v2-shaped blob",
+  );
+}
+console.log("OK  F-4: each knownUsedHere clause fails closed on its own");
 
 console.log("\nAll OTP rollback checks passed.");
