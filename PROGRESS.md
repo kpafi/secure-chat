@@ -29,8 +29,8 @@ running forward against a genuine pre-fix store on real hardware — the thing t
 unit tests could not prove.
 
 ### 🔴 OTP pad migration v2→v3 was BROKEN — found on-device 2026-07-28
-**FIXED + regression-tested in `bf6bcd2` (pushed). NOT yet deployed and the APK
-is NOT rebuilt — the live client still has the bug.**
+**FIXED (`bf6bcd2`), regression-tested, DEPLOYED + APK reinstalled 2026-07-28,
+and re-proved on the phone against the fixed client.**
 
 **A pre-fix OTP pad that was ever USED is permanently refused after the upgrade.**
 Tested by generating a genuine v2 blob with the pre-fix `otp.js` (from `e86a60b`),
@@ -84,14 +84,32 @@ and asserts it migrates, that the floor survives as `inner.hwSend`, and that H-3
 still bites once the pad is v3; **verified to FAIL before the fix**. Client
 suites now 85 checks / 8 suites, backend 129.
 
-**⬜ Still to do: deploy + rebuild the APK.** Client-only change, no wire-format
-or protocol impact, so this one is NOT the two-client break P-08 and key
-confirmation were — but the live client and the phone both still refuse used
-pre-fix pads until it ships. The on-device proof was run against the DEPLOYED
-(buggy) client; re-run it after deploying to confirm the fixed path on real
-hardware. Repro tooling is in the session scratchpad (`make-v2-pad.mjs`,
-`migrate-on-phone.mjs`, `cleanup-phone.mjs` — pre-fix `otp.js` from `e86a60b`,
-CDP over `adb forward` to `webview_devtools_remote_*`).
+**SHIPPED 2026-07-28.** Client-only change, no wire-format or protocol impact, so
+this was NOT the two-client break P-08 and key confirmation were. Deployed via
+the safe rsync recipe — **exactly one content transfer, `client/otp.js`** —
+`chown securechat` + restart; backups `/root/accounts.db.bak-2026-07-28-otpfix`
+and `/root/secure-chat-predeploy-2026-07-28-otpfix.tar.gz`; **28 accounts before
+and after**; `/` and `/healthz` 200. APK rebuilt (`syncWebClient` picked it up,
+`assets/web/otp.js` byte-identical to source and verified BEFORE installing),
+`adb install -r` → Success, clean launch.
+
+**Re-proved on real hardware against the FIXED client** by re-injecting the very
+pad that had been refused:
+
+| check | result |
+|---|---|
+| used pre-fix pad (`sendOffset` 1234, legacy hw 1234) | **migrates** → `v:3`, opaque `sc.otp.wm.v1` written |
+| offsets preserved through the migration | `sendOffset` 1234, `recvHighWater` 777 |
+| re-unlock after migration | still 1234 / 777 |
+| delete the watermark post-migration (the H-3 PoC) | **still REFUSED** — the fix did not buy migration at H-3's expense |
+
+Test residue removed afterwards; `sc.otp.*` is empty again and the phone is back
+to exactly its six real keys, verified. Repro tooling kept in the session
+scratchpad (`make-v2-pad.mjs`, `migrate-on-phone.mjs`, `h3-still-closed.mjs`,
+`cleanup-phone.mjs` — pre-fix `otp.js` from `e86a60b`, CDP over `adb forward` to
+`webview_devtools_remote_*`). **That injection harness is the thing worth
+keeping**: it is what caught a bug six suites of unit tests could not, because
+every unit test builds its pad with the CURRENT code.
 
 **BREAKING protocol change again** (third one, after handshake v3 and P-08): a
 key-confirmation frame now gates the verification step, so relay and client are
