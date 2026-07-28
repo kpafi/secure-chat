@@ -8,8 +8,27 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
 **All 4 High, all 7 Medium, and L-1..L-6 from `secure-chat-pentest-2026-07-27.md`
 are fixed, with regression tests.** **Committed and pushed 2026-07-28**
 (`dc182d7` on `pentest-2026-07-27-fixes`, merged `--no-ff` as `97c0754`; both on
-`origin`). **Nothing is deployed and the APK is built but NOT installed** — the
-whole remaining list is delivery.
+`origin`). **DEPLOYED to Hetzner + APK installed on the phone 2026-07-28** —
+backend and client rsynced, `chown securechat` + `systemctl restart`
+(relay PID 206611, `--no-proxy-headers` intact), then `adb install -r`
+immediately after so the two-client break was never live for more than the
+restart. Pre-deploy backups on the box: `/root/accounts.db.bak-2026-07-28-p27`
+and `/root/secure-chat-predeploy-2026-07-28-p27.tar.gz`; **28 accounts before
+and after**. Verified live over loopback: `/` and `/healthz` 200, and the served
+assets are the new ones (`CONFIRM_DOMAIN` in `crypto.js`, `sc.contacts.gen.v1`
+in `contacts.js`, `sc.otp.wm.v1` in `otp.js`). Verified on the phone: clean
+launch (no `AndroidRuntime`), `sc.identity.v1` / `sc.contacts.v1` /
+`sc.chats.v1` / `sc.username.v1` / `sc.lookuptoken.v1` all still present in the
+WebView leveldb, relay pref still `https://138-199-144-35.sslip.io`, and
+`healthz` 200 from the device.
+
+**STILL UNVERIFIED, and it is the top risk: the v3→v4 and v2→v3 migrations have
+not run on the device.** They fire on first UNLOCK, which needs the identity
+passphrase — the user's, not something a session can supply. `sc.contacts.gen.v1`
+and `sc.otp.wm.v1` are absent from the leveldb dump, which is exactly what
+"migration has not run yet" looks like. Both fail CLOSED by design, so if a
+migration is wrong the user is locked out of their own contact store. **Next
+session: unlock on the phone and confirm both witnesses appear.**
 
 **BREAKING protocol change again** (third one, after handshake v3 and P-08): a
 key-confirmation frame now gates the verification step, so relay and client are
@@ -2620,16 +2639,20 @@ after item 2 was dropped, none of it protects a running instance:
    instance — every remaining item below is next-release delivery.** The one
    genuinely undeployed piece (`accounts.client_key` rewrite detection) ships
    with item 3's normal deploy.
-3. **Deploy client + rebuild the APK TOGETHER.** Key confirmation is a breaking
-   protocol change between two CLIENTS: an old client never sends `confirm`, so a
-   new peer waits forever. Same coupling as P-08 — do not deploy `client/`
-   without reinstalling the app.
-4. **Re-verify on the phone** that the v3→v4 contact store and v2→v3 pad blob
-   migrations actually run on a real device with real data. Both are covered by
-   unit tests against an in-memory localStorage; neither has been run against the
-   WebView leveldb store with a genuine pre-fix blob in it. This is the highest
-   remaining risk in the change — a migration that fails on-device locks the user
-   out of their own contact store (it fails CLOSED by design).
+3. ~~**Deploy client + rebuild the APK TOGETHER.**~~ **DONE 2026-07-28** — see
+   the snapshot at the top for backups, verification, and the restart/install
+   ordering that kept the breaking two-client window to the restart itself.
+4. **⚠️ STILL OPEN — Re-verify on the phone** that the v3→v4 contact store and
+   v2→v3 pad blob migrations actually run on a real device with real data. Both
+   are covered by unit tests against an in-memory localStorage; neither has been
+   run against the WebView leveldb store with a genuine pre-fix blob in it. This
+   is the highest remaining risk in the change — a migration that fails
+   on-device locks the user out of their own contact store (it fails CLOSED by
+   design). **The 2026-07-28 deploy did NOT clear this**: migrations fire on
+   first unlock, which needs the identity passphrase, so no session can drive
+   them. Confirmed still pending — `sc.contacts.gen.v1` and `sc.otp.wm.v1` are
+   absent from the on-device leveldb. **Unlock on the phone and check both
+   witnesses appear.**
 5. **Residual, deliberate, unchanged:** whole-storage rollback (an attacker who
    snapshots BOTH the store and its witness, or both the pad and its watermark,
    still rewinds undetected — it needs OS-level trusted monotonic storage);
