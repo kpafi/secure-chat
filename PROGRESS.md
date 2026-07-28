@@ -22,13 +22,20 @@ launch (no `AndroidRuntime`), `sc.identity.v1` / `sc.contacts.v1` /
 WebView leveldb, relay pref still `https://138-199-144-35.sslip.io`, and
 `healthz` 200 from the device.
 
-**STILL UNVERIFIED, and it is the top risk: the v3→v4 and v2→v3 migrations have
-not run on the device.** They fire on first UNLOCK, which needs the identity
-passphrase — the user's, not something a session can supply. `sc.contacts.gen.v1`
-and `sc.otp.wm.v1` are absent from the leveldb dump, which is exactly what
-"migration has not run yet" looks like. Both fail CLOSED by design, so if a
-migration is wrong the user is locked out of their own contact store. **Next
-session: unlock on the phone and confirm both witnesses appear.**
+**Contact-store migration v3→v4 CONFIRMED ON-DEVICE 2026-07-28.** The user
+unlocked on the phone; the app opened normally and `sc.contacts.gen.v1` now
+exists in the WebView leveldb alongside `sc.contacts.v1`. That is the migration
+running forward against a genuine pre-fix store on real hardware — the thing the
+unit tests could not prove.
+
+**The OTP pad migration v2→v3 is still unexercised, and cannot be tested on this
+phone: it has no pads.** A `grep` for `sc.otp` across the whole leveldb returns
+0 — no `sc.otp.index.v1`, no `sc.otp.pad.v1.*`. So the v2→v3 path has still only
+ever run against in-memory localStorage. It fails CLOSED, so a bug there locks
+the user out of a pad rather than leaking one. **To actually close this: put a
+genuine pre-fix v2 pad blob on a device and unlock**, or accept it as tested by
+unit test only. Do not read the green contact-store result as covering it — they
+are separate code paths with separate blob formats.
 
 **BREAKING protocol change again** (third one, after handshake v3 and P-08): a
 key-confirmation frame now gates the verification step, so relay and client are
@@ -2642,17 +2649,14 @@ after item 2 was dropped, none of it protects a running instance:
 3. ~~**Deploy client + rebuild the APK TOGETHER.**~~ **DONE 2026-07-28** — see
    the snapshot at the top for backups, verification, and the restart/install
    ordering that kept the breaking two-client window to the restart itself.
-4. **⚠️ STILL OPEN — Re-verify on the phone** that the v3→v4 contact store and
-   v2→v3 pad blob migrations actually run on a real device with real data. Both
-   are covered by unit tests against an in-memory localStorage; neither has been
-   run against the WebView leveldb store with a genuine pre-fix blob in it. This
-   is the highest remaining risk in the change — a migration that fails
-   on-device locks the user out of their own contact store (it fails CLOSED by
-   design). **The 2026-07-28 deploy did NOT clear this**: migrations fire on
-   first unlock, which needs the identity passphrase, so no session can drive
-   them. Confirmed still pending — `sc.contacts.gen.v1` and `sc.otp.wm.v1` are
-   absent from the on-device leveldb. **Unlock on the phone and check both
-   witnesses appear.**
+4. **PARTLY DONE 2026-07-28.** ~~Contact store v3→v4~~ **CONFIRMED on-device**:
+   unlocked on the phone, app opened normally, `sc.contacts.gen.v1` written next
+   to a genuine pre-fix `sc.contacts.v1`. **⚠️ OTP pad v2→v3 STILL UNVERIFIED
+   and untestable on this phone** — it has no pads at all (`grep sc.otp` over
+   the leveldb returns 0), so that path has still only run against in-memory
+   localStorage. Closing it needs a real pre-fix v2 pad blob on a device, then
+   an unlock. Separate code path and separate blob format from the contact
+   store; the green result above does not cover it.
 5. **Residual, deliberate, unchanged:** whole-storage rollback (an attacker who
    snapshots BOTH the store and its witness, or both the pad and its watermark,
    still rewinds undetected — it needs OS-level trusted monotonic storage);
