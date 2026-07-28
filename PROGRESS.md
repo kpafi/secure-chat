@@ -33,7 +33,21 @@ everything keys on one shared bucket: fails closed. Measured on the live onion,
 
 Identical, and exactly the bucket capacity — the forged header buys nothing.
 Had it been honoured, the rotating run would have scored 16/16, so the probe
-distinguishes the two hypotheses on the number alone. **Accepted cost:** the
+distinguishes the two hypotheses on the number alone.
+
+> **🔴 CORRECTION 2026-07-29 — the paragraph above is WRONG and the measurement
+> that produced it was inadequate.** `client_key()` does not collapse to one
+> bucket; it collapses to **two**, and the client selects which one with a single
+> header (`X-Forwarded-For: 127.0.0.1` → `'!untrusted-forwarded'`, anything else
+> or absent → `'127.0.0.1'`). Both rows of the table above used `203.0.113.x`,
+> which land in the SAME branch, so the probe never separated the hypotheses at
+> all — it only ever measured one bucket twice. Every `/api` limiter is 2×, and
+> an attacker can starve the bucket honest traffic uses while working the
+> uncontended one. See M-1 in `secure-chat-pentest-2026-07-29.md` and item 1 of
+> the TODO. The claim is repeated verbatim in `deploy/README.md` and in commit
+> `d338e15`'s message; both need the same correction when it is fixed.
+
+**Accepted cost:** the
 clearnet side loses per-IP limiting too and shares that global bucket, so one
 clearnet abuser can throttle onboarding for everyone. `config.py` already sizes
 `REGISTER_RATE_*` for this exact posture. Keeping per-IP limits would need a
@@ -2808,6 +2822,163 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
   live integration suites, backend `pytest` 48 passed.
 
 ## TODO / NEXT (suggested order)
+
+### 🔴 OPEN from the 2026-07-29 pentest — NOTHING FIXED YET
+Full detail per item in `secure-chat-pentest-2026-07-29.md`. Four agents swept
+the Tor/deployment surface, the relay + admission protocol, the client crypto
+core, and at-rest storage + directory; every claim below was re-verified by hand
+against the shipped code before being written down. **The E2EE core held** — no
+Critical, and a hostile relay still cannot read or forge a conversation. What
+follows is everything that did not hold.
+
+Suggested order: **1 first** (one line, live right now, and it invalidates
+claims already published in the repo), then **2** (two lines), then the rest.
+
+1. **⬜ M-1 (Medium) — `client_key()` gives TWO attacker-selectable buckets, not
+   one. This corrects a claim I published on 2026-07-28.** `accounts.py:106-110`
+   branches on `peer in hops`, and in this deployment `peer` is always
+   `127.0.0.1`, so the client picks its own bucket with one header:
+   `X-Forwarded-For: 127.0.0.1` → `'!untrusted-forwarded'`, anything else or
+   absent → `'127.0.0.1'`. Measured 10+10 lookups against a nominal capacity of
+   10, and 61+61 against a nominal 60. An attacker can starve the bucket all
+   honest traffic sits in while working the uncontended one.
+   **Why it was missed:** the table in `deploy/README.md` used `203.0.113.x` for
+   BOTH rows, which land in the same branch; the one value that separates them
+   was never sent. **Fix:** return exactly one key per peer when no trusted proxy
+   is configured. **Also fix the docs it falsifies** — `deploy/README.md`,
+   the 2026-07-29 snapshot at the top of this file, and commit `d338e15`'s
+   message all state "one shared bucket". Fixing this also closes L-9.
+2. **⬜ H-1 (High) — `PadFloorBridge.clear()` hands the JS context a
+   delete-the-floor primitive.** `android/…/PadFloor.kt:150-151` exposes an
+   unauthenticated `clear` over `@JavascriptInterface`, five lines below the same
+   file's contract claiming the interface "has no lowering operation" and that
+   "deletion is not silent". Both are false. **This voids the F-1 Android
+   guarantee that was proved on real hardware 2026-07-28**: restore a snapshotted
+   pad blob AND its watermark, call `clear()` once, and the pad reopens at the
+   rolled-back offset silently — full keystream reuse. The floor is also
+   feature-detected from an attacker-writable global (`otp.js:108-110`), so
+   `delete window.SecureChatPadFloor` disables it with no error.
+   **Fix:** remove `clear` from the bridge (nothing in `client/` calls it), and
+   have the document-start injection set a `__SECURE_CHAT_NATIVE_FLOOR__` marker
+   — as it already does for `__SECURE_CHAT_RELAY__` — so `otp.js` fails closed
+   when the marker is present but the bridge is not.
+3. **⬜ H-2 (High) — contact pins silently zeroed by copying the witness over the
+   store.** `writeWitness()` (`contacts.js:204-210`) uses the SAME `dataKey` and
+   the SAME salt as the store blob; `readWitness()` checks a domain tag
+   (`:195`), `unlock()` does not (`:117-127`). One `setItem`, no passphrase, no
+   deletion → empty pin-less store at the same generation, `assertNotRolledBack`
+   passes, `pinsReadable()` stays true, and every peer renders as a benign first
+   contact instead of "⚠ identity key CHANGED". That is the alarm inversion L-1
+   and the 2026-07-27 H-2 were written to close. A sweep of all 30 blob-swap
+   combinations found this is the ONLY one that opens.
+   **Fix:** put `d: "secure-chat/contacts-store/v4"` inside the store plaintext
+   and require it in `unlock()`, adopting a pre-v4 blob that lacks it.
+4. **⬜ H-3 (High) — re-import after three `removeItem`s rebuilds a LEGITIMATE
+   pad at offset 0.** `padWasUsed()` (`otp.js:747-751`) reads three deletable
+   plaintext keys and never the native floor; `app.js:2805-2807` sets
+   `otpRecord` straight from `saveNewPad`, skipping `unlockPad` and every floor
+   check; `saveNewPad` (`otp.js:479`) seeds `wmCache` to zero so the
+   authenticated watermark is overwritten with zeros. No adoption prompt is
+   possible — the pad is re-created as a genuine v3 blob. Browser: permanent
+   two-time pad. Android: the floor refuses on the NEXT unlock, but the whole
+   current session sends from offset 0 over consumed keystream.
+   **Fix:** consult the native floor in `importPad`/`saveNewPad` and refuse when
+   a floor exists; make `saveNewPad` refuse to lower an existing watermark.
+5. **⬜ M-4 (Medium) — the Android-onion plan rests on a false premise, and the
+   obvious workaround is a Critical regression.** Chromium does NOT treat
+   `.onion` as potentially trustworthy, so the claim in
+   `network_security_config.xml`'s comment (and the plan built on it in the
+   2026-07-29 snapshot) is wrong. Measured: Chromium and default Firefox both
+   give `isSecureContext:false` / `crypto.subtle:undefined` on `http://…onion`;
+   only Firefox with `dom.securecontext.allowlist_onions` (which Tor Browser
+   ships) works. From an https page `new WebSocket("ws://…onion")` throws
+   outright, and `cleartextTrafficPermitted` sits BELOW Chromium's mixed-content
+   blocker so it cannot help. **Orbot alone will not make this work.**
+   **Write down next to the plan:** pointing the WebView at the onion as the
+   DOCUMENT origin would remove `crypto.subtle` entirely and make the JS
+   server-delivered again — destroying the exact H-02 property the app exists to
+   provide. Workable shapes: a local Orbot HTTP proxy on `127.0.0.1` (a
+   trustworthy origin) fronting the onion, or wrapping the onion in TLS.
+   Same gate is why the web client is unusable over the onion outside Tor
+   Browser; it fails closed, but the user sees a raw `TypeError`.
+6. **⬜ M-2 (Medium) — the accepted global-bucket DoS is cheaper than documented
+   and the reasoning is wrong on three counts.** ~2 req/s (~300 B/s) on
+   `/api/auth/challenge` denies **login to all existing accounts** (measured: 0
+   of 4 honest attempts succeeded); `GET /api/mailbox` burns its bucket
+   **unauthenticated** because the limiter is a route dependency that runs before
+   `current_user`. `deploy/README.md` is wrong that (a) the exposure is
+   onboarding — the tightest bucket is `CHALLENGE_RATE_*` at 0.5/s, which gates
+   login; (b) `config.py` sized for this — only `REGISTER_RATE_*` was, while
+   `CHALLENGE_RATE_*`/`LOOKUP_RATE_*` silently changed from per-IP to global;
+   (c) Tor PoW blunts it — PoW prices *introduction*, this attack needs one
+   circuit. The applicable knobs are `HiddenServiceMaxStreams` +
+   `HiddenServiceMaxStreamsCloseCircuit`, neither in `deploy/torrc.secure-chat`.
+7. **⬜ M-3 (Medium) — `deploy/onion-ws.mjs`'s only security assertion passes
+   vacuously.** `wsConnect` resolves `{code:0}` on any socket close before the
+   header terminator, so a Tor hiccup or a relay restart satisfies
+   `!foreign.upgraded` and the check reports OK — proved green at `HTTP 0` with
+   the CSWSH guard never exercised, while `deploy/README.md` and this file both
+   claim it verifies 403. Asserting `code===403` alone is still unsound:
+   `main.py:243` (bad origin) and `:249` (connection cap) both close before
+   `accept()` and collapse to the same status. **Fix:** add an adjacent positive
+   control — assert an allowed Origin upgrades AND the foreign one is refused in
+   the same run, failing if the allowed one did not.
+8. **⬜ M-5 (Medium) — a withheld handshake frame delivered after key
+   confirmation silently desyncs the session (PQKEM + RSA; DHKE immune).**
+   `_derive` replaces `this.chan` with a new `RatchetChannel` when the input
+   signature changes, resetting the confirmation tags, but `app.js`'s `case
+   "key"` has no `confirmDone` gate and `tryFinishConfirmation` never re-runs.
+   Both peers show "secure channel established", compare safety numbers, then
+   nothing works — exactly what M-5's own comment promises cannot happen. No
+   confidentiality loss. **Related, loud:** in a genuine simultaneous-connect
+   race both peers now disconnect, so the race tolerance at `crypto.js:645` is no
+   longer real.
+9. **⬜ M-6 (Medium) — the H-1 canonical-base64 boundary was never applied to the
+   directory → contacts path.** `account.js:100-104` copies server key strings
+   verbatim; `contacts.js:384-387` compares them as raw strings. A hostile
+   directory can, byte-for-byte truthfully, strip 🟢 + all vouches from a
+   verified contact at will, **permanently break sealed messaging to them**
+   (persisted non-canonical string, `seal()` throws before sending), and burn the
+   `MAX_AUTO_CONTACTS` budget. **Fix:** run directory answers through the same
+   `canonicalBundle()` gate `app.js` already uses at `:1797`/`:2199`.
+10. **⬜ M-7 (Medium) — `POST /api/vouch` is an un-throttled username-existence
+    oracle.** `accounts.py:587-590` answers 404 vs 400/422 **before** any
+    signature validation, with no dedicated limiter. Unlike registration it
+    consumes nothing, creates nothing and leaves no trace. **Fix:** check target
+    existence after signature verification, or put it on `lookup_rate_limit`.
+11. **⬜ Low / Info (see the report for each):** L-1 unbounded `knockQueue` growth
+    (~37 knocks/s, each forcing an ML-DSA verify on the owner's tab — dents
+    P-08's "waiting costs the room nothing"); L-2 deleting both contact keys
+    yields an empty store; L-3 two tabs silently lose a contact write; L-4 no
+    session revocation; L-5 `OtpPad` does not validate offsets (not reachable
+    today); L-6 `Pqkem`'s reflection guard is the unfixed M-4 string-compare bug
+    (latent); L-7 Tor's `/var/lib/tor/state` keeps a bandwidth/guard timeline, so
+    the I2 claim in `deploy/README.md` is overstated; L-8
+    `ReadWritePaths=/opt/secure-chat/backend` leaves the relay's own source
+    writable; L-9 the H-4 detector is remotely forgeable (closed by item 1);
+    L-10 the torrc install recipe is not idempotent.
+12. **⬜ Test-coverage gaps — every fix above must carry a test that FAILS against
+    today's code.** Highest value first: `crypto.test.mjs:448-462`
+    (`pqkemReplayDoesNotDesync`) **is vacuous** — it replays after `encrypt()`
+    sealed the cipher, so it would pass if `_derive` were entirely broken (same
+    failure mode `7d4e480` set out to fix); `test_proxy_headers.py` never tests
+    this topology and one line would have caught M-1
+    (`assert client_key(_Req("127.0.0.1","127.0.0.1")) == client_key(_Req("127.0.0.1"))`);
+    `deploy/secure-chat.service` is a third launch path with NO guard test, and
+    it is the one that starts production — nothing asserts it carries
+    `--no-proxy-headers` or lacks `SECURE_CHAT_TRUSTED_PROXIES`;
+    `otp-rollback.test.mjs:410` mocks the bridge without `clear`, and its final
+    `delete globalThis.SecureChatPadFloor` treats bridge-absence as a clean
+    browser — which IS the downgrade; nothing covers the witness→store swap, the
+    delete-then-reimport path, negative `OtpPad` offsets, the knock flood, or
+    that `crypto.subtle` is required at all.
+13. **⬜ `e2e/all-modes.mjs` is flaky — 2 failures in 5 local runs**, both at
+    bob's "waiting for approval" wait in the third mode. Not root-caused. Matters
+    because the harness is meant to be run over Tor, where this will read as a
+    Tor problem rather than a race. Its uncommitted `SECURE_CHAT_E2E_CHROME_ARGS`
+    knob should also **fail or tag the run** when
+    `--unsafely-treat-insecure-origin-as-secure` is present, rather than
+    reporting "all modes good" in a configuration no real user can reproduce.
 
 ### ⬜ OPEN from the 2026-07-27 pentest — SHIPPING, not fixing
 Every finding in `secure-chat-pentest-2026-07-27.md` is fixed and now merged to

@@ -41,6 +41,15 @@ function check(name, ok, detail = "") {
 
 const args = ["--no-sandbox", "--disable-dev-shm-usage"];
 if (PROXY) args.push(`--proxy-server=${PROXY}`);
+// Escape hatch for extra Chromium flags, e.g.
+// --unsafely-treat-insecure-origin-as-secure=http://<addr>.onion, which is
+// needed because Chromium does NOT treat .onion as a potentially-trustworthy
+// origin: without it window.isSecureContext is false, crypto.subtle is
+// undefined, and the client cannot start. Tor Browser (Firefox) does not need
+// this. Never use it to paper over a finding — it is a diagnostic.
+for (const a of (process.env.SECURE_CHAT_E2E_CHROME_ARGS || "").split(/\s+/).filter(Boolean)) {
+  args.push(a);
+}
 
 const browser = await puppeteer.launch({
   executablePath: process.env.CHROMIUM || "/usr/bin/chromium",
