@@ -80,7 +80,45 @@ const padKey = (id) => `sc.otp.pad.v1.${id}`;  // full record incl. bytes + offs
 const hwKey = (id) => `sc.otp.hw.v1.${id}`;        // legacy plaintext watermark
 const wmKey = (id) => `sc.otp.wm.v1.${id}`;        // authenticated {send,recv}
 const usedKey = (id) => `sc.otp.used.v1.${id}`;    // "this pad ran here" marker
+const EPOCH_KEY = "sc.otp.epoch.v1";               // "post-fix OTP ran on this device"
 const WM_DOMAIN = "secure-chat/otp-watermark/v1";
+
+// --- the native monotonic floor (pentest 2026-07-28 F-1) --------------------
+//
+// Everything above lives in localStorage, where each key is independently
+// deletable by whoever holds the JS context. For a v3 blob the floor is mirrored
+// inside the pad's own AEAD, so deleting `wmKey` is caught. For a v2-SHAPED blob
+// there is no mirror, and the whole defence collapsed to `usedKey` — one
+// plaintext string. Restore a v2 snapshot, delete three keys, and the pad
+// unlocks at offset 0: a full two-time pad.
+//
+// That is not fixable inside localStorage. Telling "genuinely old" from
+// "restored old" needs state the attacker cannot edit, and there is none here.
+// So on Android the floor also lives behind a native bridge, in app-private
+// storage under an AndroidKeyStore HMAC: monotone (no lowering call exists),
+// unforgeable without the non-exportable key, and its ABSENCE next to a pad that
+// exists is itself evidence. See android/.../PadFloor.kt.
+//
+// In a plain browser there is no such primitive, so `nativeFloor` is null and the
+// residual stands — documented in README. This is why OTP's guarantee is
+// strongest in the app, where pads actually live (they are exchanged in person,
+// device to device).
+const NATIVE_ABSENT = -1;
+const NATIVE_TAMPERED = -2;
+const nativeFloor = (() => {
+  const b = globalThis.SecureChatPadFloor;
+  if (!b || typeof b.read !== "function" || typeof b.bump !== "function") return null;
+  const num = (v) => {
+    const n = parseInt(v, 10);
+    // An unreadable answer from the bridge is treated as TAMPERED, never as
+    // "no floor" — a broken bridge must not read as a clean slate.
+    return Number.isFinite(n) ? n : NATIVE_TAMPERED;
+  };
+  return {
+    read: (id) => { try { return num(b.read(id)); } catch { return NATIVE_TAMPERED; } },
+    bump: (id, v) => { try { return num(b.bump(id, String(v | 0))); } catch { return NATIVE_TAMPERED; } },
+  };
+})();
 
 // In-memory high-water marks for pads unlocked this session, so every re-save
 // can take a max without re-deriving the at-rest key.
@@ -134,6 +172,15 @@ async function writeWatermark(id, key, wm) {
   // holds only the TRANSFER passphrase and so cannot open the record above, can
   // still refuse to resurrect a consumed pad from its (always pristine) file.
   localStorage.setItem(usedKey(id), "1");
+  // F-1: mirror the SEND floor into the native store, where it cannot be
+  // deleted from the JS context and cannot be lowered at all. Only the send
+  // side — that is what keystream reuse turns on, and it keeps the bridge to a
+  // single integer per pad. The recv side stays AEAD-mirrored inside the blob.
+  if (nativeFloor) nativeFloor.bump(id, wm.send);
+  // "Post-fix OTP has run on this device." Deletable like everything else here,
+  // so it may only ESCALATE a warning, never authorise anything — see the
+  // legacy-adoption gate in unlockPad.
+  localStorage.setItem(EPOCH_KEY, "1");
   wmCache.set(id, { send: wm.send, recv: wm.recv });
 }
 
@@ -441,7 +488,10 @@ export async function savePadProgress(record, atRest) {
 }
 
 // Decrypt a stored pad with its passphrase -> { record (bytes+offsets), atRest }.
-export async function unlockPad(padId, passphrase) {
+// `opts.adoptLegacy` — the caller has shown the user the F-1 warning and they
+// chose to adopt a pad whose consumption cannot be verified. Never default it to
+// true: silent adoption IS the vulnerability.
+export async function unlockPad(padId, passphrase, opts = {}) {
   const raw = localStorage.getItem(padKey(padId));
   if (!raw) throw new Error("no such pad on this device");
   const o = JSON.parse(raw);
@@ -494,6 +544,24 @@ export async function unlockPad(padId, passphrase) {
       "the rollback record for this pad is damaged or forged — refusing to use the pad; exchange a fresh one",
     );
   }
+
+  // F-1: the native floor, where available, is the one input to this decision an
+  // attacker holding the JS context cannot touch. Read it BEFORE the localStorage
+  // evidence so a forged bridge answer cannot be masked by a clean-looking store.
+  const native = nativeFloor ? nativeFloor.read(padId) : NATIVE_ABSENT;
+  if (native === NATIVE_TAMPERED) {
+    throw new Error(
+      "this pad's device-protected rollback record is damaged or forged — refusing to use the pad; exchange a fresh one",
+    );
+  }
+  // A floor recorded natively but no authenticated record beside it means the
+  // record was deleted: the H-3 PoC, and the v2-shaped variant it used to escape
+  // through. Unlike `usedKey`, this evidence is not deletable from JS.
+  if (native > NATIVE_ABSENT && outerWm === null) {
+    throw new Error(
+      "the rollback record for this pad is missing — refusing to use the pad, because pad reuse could no longer be detected; exchange a fresh pad",
+    );
+  }
   // Evidence that this pad has run here UNDER THE POST-FIX CODE, i.e. that a
   // watermark record must once have existed. Both sources are written only by
   // this version: `hwSend`/`hwRecv` live inside the AEAD and only a v3 blob
@@ -522,10 +590,15 @@ export async function unlockPad(padId, passphrase) {
       "the rollback record for this pad is missing — refusing to use the pad, because pad reuse could no longer be detected; exchange a fresh pad",
     );
   }
-  // max(outer, inner, legacy): each is a floor this device is known to have
-  // passed, so the highest of them is the truth.
+  // max(outer, inner, legacy, native): each is a floor this device is known to
+  // have passed, so the highest of them is the truth.
   const wm = {
-    send: Math.max(outerWm ? outerWm.send : 0, inner.hwSend | 0, readLegacyHW(padId)),
+    send: Math.max(
+      outerWm ? outerWm.send : 0,
+      inner.hwSend | 0,
+      readLegacyHW(padId),
+      native > NATIVE_ABSENT ? native : 0,
+    ),
     recv: Math.max(outerWm ? outerWm.recv : 0, inner.hwRecv | 0),
   };
   if (sendOffset < wm.send) {
@@ -535,6 +608,42 @@ export async function unlockPad(padId, passphrase) {
     // M-7: no keystream is reused, but every OTP frame the peer already sent
     // would authenticate again as fresh — the anti-replay guarantee, gone.
     throw new Error("pad receive state was rolled back (already-delivered messages could replay) — refusing to use it; exchange a fresh pad");
+  }
+
+  // F-1: adopting a v2/v1 blob means accepting consumption state NOTHING can
+  // verify — there is no authenticated floor for it, by definition. Doing that
+  // SILENTLY was the vulnerability: an attacker restores a v2 snapshot, deletes
+  // the deletable markers, and the pad quietly reopens at offset 0.
+  //
+  // So it is no longer automatic. The caller must ask for it explicitly, which
+  // means the user sees it and can recognise "this pad has no usage record" as
+  // wrong for a pad they have been using. The native floor above already refuses
+  // the attack outright on Android; this gate is what protects the browser,
+  // where no such floor exists, and it is the honest control there: user
+  // attention, because there is no cryptographic one to reach for.
+  //
+  // DELIBERATELY AFTER the two rollback checks. Adoption is consent to accept
+  // state that cannot be VERIFIED — never permission to override a rollback that
+  // has actually been DETECTED. A pad whose legacy watermark or native floor
+  // already proves it ran further than this blob claims is refused outright, and
+  // no `adoptLegacy` can reopen it.
+  //
+  // `EPOCH_KEY` and `usedKey` only ESCALATE the wording. They are deletable, so
+  // depending on them would rebuild the hole this closes; their absence must
+  // never turn the gate off.
+  const needsAdoption = (legacy || (o.v || 1) < PAD_BLOB_V) && outerWm === null;
+  if (needsAdoption && !opts.adoptLegacy) {
+    const err = new Error(
+      "this pad has no usage record on this device. If it has ever sent a message, that record has been deleted and the pad is NOT safe to use — exchange a fresh one.",
+    );
+    err.code = "LEGACY_PAD_ADOPTION";
+    err.padId = padId;
+    // True = this device has demonstrably run OTP under the current code, so a
+    // pad with no record is a much stronger signal of tampering than it would be
+    // on a device that just upgraded.
+    err.suspicious = localStorage.getItem(EPOCH_KEY) !== null ||
+      localStorage.getItem(usedKey(padId)) !== null;
+    throw err;
   }
   wmCache.set(padId, wm);
   const regionSize = src.regionSize;
@@ -558,9 +667,25 @@ export async function unlockPad(padId, passphrase) {
     recvHighWater,
     // L-3: authenticated in v3; a v1/v2 blob falls back to the plaintext index
     // ONCE, on the unlock that upgrades it, after which the flag is covered.
+    //
+    // F-2 (review of bf6bcd2): that fallback took the plaintext index value
+    // outright, so flipping the index to `false` BEFORE the migrating unlock
+    // baked `false` into the AEAD permanently and disarmed the double-export
+    // warning for good — one pristine pad to two importers, a two-time pad by
+    // construction.
+    //
+    // OR-ing the two sources does NOT fix it: a v1/v2 blob has no `exported`
+    // inside the AEAD at all, so the flipped index is the only source and the
+    // answer is still `false`. There is nothing to recover here — the flag was
+    // never authenticated on these blobs — so the only honest move is the same
+    // one the F-1 gate makes about consumption state: when it cannot be
+    // verified, assume the WORST. An adopted legacy pad is treated as possibly
+    // already exported, which costs a confirm on re-export and closes the
+    // laundering path. The user adopting it has just been told, in as many
+    // words, that this pad's history cannot be verified.
     exported: inner.exported !== undefined
       ? !!inner.exported
-      : !!(padMeta(padId) || {}).exported,
+      : true,
   };
   const atRest = { key, salt, iters };
   // Rewrite a genuine legacy blob in the v2 (fully authenticated) format

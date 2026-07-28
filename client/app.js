@@ -2598,7 +2598,31 @@ async function ensureUnlocked(padId) {
     return { record: otpRecord, atRest: otpAtRest };
   }
   if (!els.otpPass.value) throw new Error("Enter this pad's passphrase to unlock it.");
-  const unlocked = await otp.unlockPad(padId, els.otpPass.value);
+  let unlocked;
+  try {
+    unlocked = await otp.unlockPad(padId, els.otpPass.value);
+  } catch (e) {
+    // Pentest 2026-07-28 F-1. A pad predating the authenticated rollback record
+    // carries consumption state nothing can verify, so adopting it is now a
+    // decision the USER makes, not something that happens because they unlocked.
+    // The wording names the danger rather than asking to "continue": in the
+    // attack the victim is looking at a pad they have used for months, and
+    // "no usage record" is the sentence that should stop them.
+    if (e.code !== "LEGACY_PAD_ADOPTION") throw e;
+    const warn = e.suspicious
+      ? "WARNING: this device HAS used one-time pads under the current version, " +
+        "so this pad having no usage record is a strong sign its rollback " +
+        "protection was tampered with.\n\n"
+      : "";
+    if (!confirm(
+      warn + e.message +
+      "\n\nAdopt it anyway? Only do this if you are certain the pad has never " +
+      "been used to send a message from this device.",
+    )) {
+      throw new Error("Pad not adopted. Exchange a fresh pad in person.");
+    }
+    unlocked = await otp.unlockPad(padId, els.otpPass.value, { adoptLegacy: true });
+  }
   otpUnlockedId = padId;
   otpRecord = unlocked.record;
   otpAtRest = unlocked.atRest;

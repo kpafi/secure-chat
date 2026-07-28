@@ -265,7 +265,16 @@ async function makeV2Blob(padId, key, mutate) {
   localStorage.removeItem("sc.otp.used.v1." + m.padId);  // stamped only post-fix
   localStorage.setItem("sc.otp.hw.v1." + m.padId, String(USED)); // what old code wrote
 
-  const migrated = await otp.unlockPad(m.padId, PASS);
+  // F-1: adoption is no longer automatic. A pad with no authenticated floor is
+  // refused until the caller has shown the user the warning and they accept it.
+  // Silent adoption was the vulnerability, so this refusal is the fix.
+  await assert.rejects(
+    otp.unlockPad(m.padId, PASS),
+    (e) => e.code === "LEGACY_PAD_ADOPTION" && e.suspicious === true,
+    "F-1: a pre-fix pad must NOT be adopted silently, and this device has run OTP so it is flagged suspicious",
+  );
+
+  const migrated = await otp.unlockPad(m.padId, PASS, { adoptLegacy: true });
   assert.strictEqual(migrated.record.sendOffset, USED,
     "a USED pre-fix pad must migrate, not be refused");
   assert.strictEqual(JSON.parse(localStorage.getItem(mKey)).v, 3,
@@ -364,5 +373,113 @@ console.log("OK  F-3: the legacy watermark is still load-bearing as a rollback f
   );
 }
 console.log("OK  F-4: each knownUsedHere clause fails closed on its own");
+
+// --- F-1: the reported two-time pad, and the native floor that closes it -----
+// Review of bf6bcd2 found H-3 fully bypassable on a v2-shaped blob: with no
+// `hwSend` inside the AEAD the whole defence was the plaintext `sc.otp.used.v1`,
+// so restoring a v2 snapshot plus three removeItem()s reopened the pad at offset
+// 0 and two messages encrypted under the same keystream.
+//
+// Two layers now stand in the way, and they are tested separately because they
+// protect different platforms: the adoption gate (browser — user attention, the
+// only control available where all storage is attacker-writable), and the native
+// monotonic floor (Android — the pad ran, the floor says so, and no JS-side
+// deletion can say otherwise).
+{
+  // -- browser: no native bridge. The attack must at minimum become LOUD. ----
+  const v = await otp.generatePad({ label: "f1-browser", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const vAtRest = await otp.saveNewPad(v, PASS);
+  v.sendOffset = 900;
+  await otp.savePadProgress(v, vAtRest);
+
+  await makeV2Blob(v.padId, vAtRest.key, (inner) => { inner.sendOffset = 0; });
+  localStorage.removeItem("sc.otp.wm.v1." + v.padId);
+  localStorage.removeItem("sc.otp.used.v1." + v.padId);
+  localStorage.removeItem("sc.otp.hw.v1." + v.padId);   // the full 3-key PoC
+
+  await assert.rejects(
+    otp.unlockPad(v.padId, PASS),
+    (e) => e.code === "LEGACY_PAD_ADOPTION" && e.suspicious === true,
+    "F-1: the v2 two-time-pad PoC must not unlock silently",
+  );
+
+  // -- android: the native floor refuses it OUTRIGHT, adoption or not. -------
+  // Fresh module instance so the bridge is captured at load, exactly as on the
+  // device (otp.js reads globalThis.SecureChatPadFloor once, at import).
+  const floors = new Map();
+  globalThis.SecureChatPadFloor = {
+    read: (id) => String(floors.has(id) ? floors.get(id) : -1),
+    bump: (id, val) => {
+      const n = Math.max(floors.has(id) ? floors.get(id) : -1, parseInt(val, 10));
+      floors.set(id, n);
+      return String(n);
+    },
+  };
+  const otpN = await import("./otp.js?native=1");
+
+  const n = await otpN.generatePad({ label: "f1-native", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const nAtRest = await otpN.saveNewPad(n, PASS);
+  n.sendOffset = 900;
+  await otpN.savePadProgress(n, nAtRest);
+  assert.strictEqual(floors.get(n.padId), 900, "the native floor tracks the send offset");
+
+  // Same PoC, plus consent — the strongest form of the attack.
+  await makeV2Blob(n.padId, nAtRest.key, (inner) => { inner.sendOffset = 0; });
+  localStorage.removeItem("sc.otp.wm.v1." + n.padId);
+  localStorage.removeItem("sc.otp.used.v1." + n.padId);
+  localStorage.removeItem("sc.otp.hw.v1." + n.padId);
+
+  await assert.rejects(
+    otpN.unlockPad(n.padId, PASS, { adoptLegacy: true }),
+    /rollback record for this pad is missing/,
+    "F-1: the native floor refuses the PoC even when the user adopts",
+  );
+
+  // The floor is monotone: a bump downwards must not lower it.
+  globalThis.SecureChatPadFloor.bump(n.padId, "5");
+  assert.strictEqual(floors.get(n.padId), 900, "the native floor never goes down");
+
+  // A bridge that cannot be read fails CLOSED, never as "no floor".
+  const broken = await (async () => {
+    globalThis.SecureChatPadFloor = { read: () => "not-a-number", bump: () => "0" };
+    const mod = await import("./otp.js?native=broken");
+    const p = await mod.generatePad({ label: "f1-broken", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    await mod.saveNewPad(p, PASS);
+    return mod.unlockPad(p.padId, PASS).then(() => null, (e) => e.message);
+  })();
+  assert.match(broken, /damaged or forged/, "an unreadable native floor fails closed");
+
+  delete globalThis.SecureChatPadFloor;
+}
+console.log("OK  F-1: v2 two-time-pad PoC is loud in the browser, refused outright on device");
+
+// --- F-2: `exported` cannot be laundered through the migrating unlock --------
+// The plaintext index used to be taken at face value on the one unlock that
+// upgrades a pad, and then baked into the AEAD forever. Flipping it to false
+// beforehand disarmed the double-export warning permanently — the warning that
+// is all that stands between one pristine pad and two importers.
+{
+  const x = await otp.generatePad({ label: "f2", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const xAtRest = await otp.saveNewPad(x, PASS);
+  const unlocked = await otp.unlockPad(x.padId, PASS);
+  await otp.markExported(unlocked.record, unlocked.atRest);
+
+  // Pre-fix shape (no authenticated `exported`), and the attacker clears the
+  // only remaining source before the upgrading unlock.
+  await makeV2Blob(x.padId, xAtRest.key);
+  localStorage.removeItem("sc.otp.wm.v1." + x.padId);
+  localStorage.removeItem("sc.otp.used.v1." + x.padId);
+  localStorage.removeItem("sc.otp.hw.v1." + x.padId);
+  const idx = JSON.parse(localStorage.getItem("sc.otp.index.v1"));
+  for (const e of idx) if (e.padId === x.padId) e.exported = false;
+  localStorage.setItem("sc.otp.index.v1", JSON.stringify(idx));
+
+  const adopted = await otp.unlockPad(x.padId, PASS, { adoptLegacy: true });
+  assert.strictEqual(adopted.record.exported, true,
+    "F-2: an unverifiable `exported` must resolve to TRUE, not to the attacker's plaintext false");
+  assert.strictEqual((await otp.unlockPad(x.padId, PASS)).record.exported, true,
+    "and it is authenticated from then on");
+}
+console.log("OK  F-2: `exported` cannot be cleared through the legacy migration");
 
 console.log("\nAll OTP rollback checks passed.");

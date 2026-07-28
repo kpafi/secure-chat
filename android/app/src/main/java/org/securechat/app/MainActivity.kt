@@ -121,6 +121,15 @@ class MainActivity : AppCompatActivity() {
         // blob) over the devtools socket — only ever in debug builds.
         if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true)
 
+        // Pentest 2026-07-28 F-1: the OTP rollback floor cannot live in
+        // localStorage, because every key there is deletable by whoever holds the
+        // JS context. PadFloor keeps it in app-private storage under an
+        // AndroidKeyStore HMAC, monotone and forge-resistant. Only reachable from
+        // this WebView's asset origin; see PadFloor.kt for what it does and does
+        // not buy. The client feature-detects it, so the browser build is
+        // unaffected (and keeps the residual, documented in README).
+        wv.addJavascriptInterface(PadFloorBridge(this), "SecureChatPadFloor")
+
         wv.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(
                 view: WebView, request: WebResourceRequest,

@@ -2747,7 +2747,32 @@ after item 2 was dropped, none of it protects a running instance:
    pre-existing, none introduced by that fix — the review verified the fix never
    lowers a floor and that M-01/M-7/P-01/P-05 and the untrusted outer `v` byte
    all still hold. Tooling: PoCs under the session scratchpad `lab/`.
-   - **F-1 (High) — H-3 is bypassable on any v2-shaped blob.** With no
+   - ~~**F-1 (High)**~~ / ~~**F-2 (Medium)**~~ **FIXED 2026-07-28, deployed.**
+     Two layers, because they protect different platforms. **Browser:** adopting
+     a pad with no verifiable usage record is no longer automatic —
+     `unlockPad(..., {adoptLegacy:true})` is required, and `app.js` shows a
+     confirm that names the danger ("this pad has no usage record on this
+     device…"), escalated when `sc.otp.epoch.v1` or `usedKey` says this device
+     has run OTP before. Those markers only ESCALATE; being deletable, they can
+     never turn the gate off. The gate sits AFTER the rollback checks on purpose:
+     adoption is consent to accept state that cannot be VERIFIED, never
+     permission to override a rollback that has been DETECTED. **Android:** the
+     send floor also lives in `android/…/PadFloor.kt` — app-private
+     SharedPreferences under an AndroidKeyStore HMAC, monotone (no lowering call
+     exists), keyed per padId so a floor cannot be replayed under another id, and
+     bridged to JS as three integer methods. A floor present with no watermark
+     beside it is refused outright; an unreadable bridge fails closed rather than
+     reading as "no floor". F-2: an unverifiable `exported` now resolves to
+     **true** — OR-ing the sources does NOT fix it, since a v1/v2 blob has no
+     authenticated copy at all, so the flipped index would still win. Costs a
+     confirm on re-export of an adopted legacy pad; closes the laundering path.
+     Tests: `otp-rollback.test.mjs` gained the full v2 two-time-pad PoC (loud in
+     the browser, refused outright with a simulated bridge), native-floor
+     monotonicity, broken-bridge fail-closed, and the F-2 laundering attempt —
+     **89 checks / 8 suites**, 0 flakes in 30 runs. **APK built and verified but
+     NOT installed — the phone was disconnected; the on-device proof of the
+     native floor is still outstanding.**
+   - **F-1 original finding, for the record — H-3 is bypassable on any v2-shaped blob.** With no
      `inner.hwSend` in the AEAD, `knownUsedHere` collapses to the plaintext
      `sc.otp.used.v1`. Restore a v2 snapshot + 3 `removeItem`s → the pad unlocks
      at offset 0 and two messages encrypt under the same keystream; the review

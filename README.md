@@ -318,10 +318,34 @@ each has been addressed (see PROGRESS.md for the code):
   inside the pad blob, and a pad that has run on this device but cannot produce
   its watermark refuses to open. The `exported` flag that guards against handing
   one pad to two importers moved inside the AEAD too (**L-3**).
+  *Corrected again 2026-07-28* — "a pad that has run on this device but cannot
+  produce its watermark refuses to open" held only for **v3** blobs. On a
+  **v2-shaped** blob there is no watermark mirrored inside the AEAD, so the whole
+  check rested on one deletable plaintext key: restoring a v2 snapshot and
+  deleting three keys reopened the pad at offset 0, and the two-time pad was back
+  (**F-1**, demonstrated end-to-end). Two things changed:
+  * **Adopting a pad with no verifiable usage record is no longer silent.** It
+    now takes an explicit confirmation naming the danger, so the attack has to
+    get past the user instead of past nobody. In a plain browser that is the only
+    control available — every byte of storage is attacker-writable, so no marker
+    can be made undeletable, and user attention is the honest answer.
+  * **In the Android app the floor moved out of localStorage**, into app-private
+    storage behind an AndroidKeyStore HMAC (`android/…/PadFloor.kt`). It is
+    monotone — there is no lowering call — unforgeable without the non-exportable
+    key, and its absence beside a pad that exists is itself evidence. There the
+    attack is refused outright, with no prompt to click through.
+  * An unverifiable `exported` flag now resolves to **true**, not to whatever the
+    plaintext index says, so it cannot be cleared through the one migrating
+    unlock (**F-2**).
+
   *Residual, genuinely:* an attacker who snapshots **both** the pad blob and its
-  watermark and restores both still rewinds undetected. That is inherent to
-  untrusted browser storage (it needs OS-level trusted monotonic storage) — but
-  it now takes a coordinated snapshot rather than deleting one key.
+  watermark and restores both still rewinds undetected. In the browser that
+  remains a deletion away, which is why **OTP's guarantee is materially stronger
+  in the app** — and pads are exchanged in person, device to device, so the app is
+  where they actually live. On Android the bar is now app-data file access
+  (root): such an attacker can destroy a floor, which fails closed, but cannot
+  rewind one. Closing the browser case would need OS-level trusted monotonic
+  storage, which the web platform does not offer.
 - **M-03 / L-01 / L-02.** Dedicated stricter rate bucket on `/api/auth/challenge`;
   `Strict-Transport-Security` sent over HTTPS; dev files (`package.json`,
   `*.test.mjs`) are 404'd and removed from the deployed client.
