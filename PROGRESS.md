@@ -2769,9 +2769,18 @@ after item 2 was dropped, none of it protects a running instance:
      Tests: `otp-rollback.test.mjs` gained the full v2 two-time-pad PoC (loud in
      the browser, refused outright with a simulated bridge), native-floor
      monotonicity, broken-bridge fail-closed, and the F-2 laundering attempt —
-     **89 checks / 8 suites**, 0 flakes in 30 runs. **APK built and verified but
-     NOT installed — the phone was disconnected; the on-device proof of the
-     native floor is still outstanding.**
+     **89 checks / 8 suites**, 0 flakes in 30 runs. **APK installed and the
+     native floor PROVED on real hardware 2026-07-28** against the actual
+     AndroidKeyStore path (everything before that was a simulated bridge in
+     Node): bridge present; absent floor reads `-1`; `bump(500)` → `500`;
+     `bump(5)` → still **`500`** (monotone through the real HMAC); `clear` →
+     `-1`; using a pad set its floor to `900` unprompted; and **the full v2
+     two-time-pad PoC — rewound blob plus the three deletions — was REFUSED even
+     with `adoptLegacy:true`**, i.e. even when the user consents. That is the
+     exact attack that recovered a plaintext earlier the same day. Probe pad and
+     its native floor removed afterwards; the phone is back to its six real keys
+     with no `sc.otp.*` residue and no `AndroidRuntime` exception. Harness:
+     `native-floor-ondevice.mjs` in the session scratchpad.
    - **F-1 original finding, for the record — H-3 is bypassable on any v2-shaped blob.** With no
      `inner.hwSend` in the AEAD, `knownUsedHere` collapses to the plaintext
      `sc.otp.used.v1`. Restore a v2 snapshot + 3 `removeItem`s → the pad unlocks
