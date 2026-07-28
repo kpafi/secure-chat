@@ -6,8 +6,10 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
 ## ⮕ RESUME HERE (2026-07-28, every 2026-07-27 pentest finding fixed)
 
 **All 4 High, all 7 Medium, and L-1..L-6 from `secure-chat-pentest-2026-07-27.md`
-are fixed, with regression tests.** Nothing is committed, nothing is deployed,
-and the APK has NOT been rebuilt — the tree is left for review.
+are fixed, with regression tests.** **Committed and pushed 2026-07-28**
+(`dc182d7` on `pentest-2026-07-27-fixes`, merged `--no-ff` as `97c0754`; both on
+`origin`). **Nothing is deployed and the APK is built but NOT installed** — the
+whole remaining list is delivery.
 
 **BREAKING protocol change again** (third one, after handshake v3 and P-08): a
 key-confirmation frame now gates the verification step, so relay and client are
@@ -2597,11 +2599,16 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
 ## TODO / NEXT (suggested order)
 
 ### ⬜ OPEN from the 2026-07-27 pentest — SHIPPING, not fixing
-Every finding in `secure-chat-pentest-2026-07-27.md` is fixed in the working
-tree (see the snapshot at the top). What is left is entirely delivery:
+Every finding in `secure-chat-pentest-2026-07-27.md` is fixed and now merged to
+`master` (see the snapshot at the top). What is left is entirely delivery — and
+after item 2 was dropped, none of it protects a running instance:
 
-1. **Review + commit the tree.** Nothing is committed. `git diff` is ~1300 lines
-   across backend, client, Android manifest, and tests.
+1. ~~**Review + commit the tree.**~~ **DONE 2026-07-28.** Committed as
+   `dc182d7` on branch `pentest-2026-07-27-fixes` (23 files, +2547/−98) and
+   merged to `master` with `--no-ff` as `97c0754`; both pushed to `origin`. The
+   branch is kept on GitHub so the change stays reachable as one review unit.
+   Pre-commit: no DB files or secrets staged, backend 129 passed, client 84
+   checks across 8 suites.
 2. ~~**Restart the live relay** so H-4 actually applies to it.~~ **DROPPED
    2026-07-28 — this item was based on a wrong reading of H-4; do not re-add
    it.** Hetzner was never exposed: its `ExecStart` runs `-m uvicorn …
