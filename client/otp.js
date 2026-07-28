@@ -494,8 +494,25 @@ export async function unlockPad(padId, passphrase) {
       "the rollback record for this pad is damaged or forged — refusing to use the pad; exchange a fresh one",
     );
   }
+  // Evidence that this pad has run here UNDER THE POST-FIX CODE, i.e. that a
+  // watermark record must once have existed. Both sources are written only by
+  // this version: `hwSend`/`hwRecv` live inside the AEAD and only a v3 blob
+  // carries them, and `usedKey` is stamped by unlockPad below.
+  //
+  // The legacy plaintext watermark is deliberately NOT evidence here. It is
+  // written only by PRE-fix code, so it is present on exactly the pads that
+  // legitimately have no record yet — including it refused every used pre-fix
+  // pad outright (found on-device 2026-07-28: a v2 blob at sendOffset 1234 with
+  // `sc.otp.hw.v1` = 1234 was rejected as "rollback record missing", while a
+  // pristine one migrated fine). It stays load-bearing where it belongs: as a
+  // floor in the max() below. That is also all it can bear — it is
+  // attacker-writable plaintext, per readLegacyHW's own note.
+  //
+  // Do NOT be tempted to key this on the outer `v` byte instead: it is outside
+  // the AEAD, and deleting it is the downgrade trap documented at the top of
+  // unlockPad. `inner.hwSend` is the authenticated way to ask the same question.
   const knownUsedHere = Number.isInteger(inner.hwSend) || Number.isInteger(inner.hwRecv) ||
-    readLegacyHW(padId) > 0 || localStorage.getItem(usedKey(padId)) !== null;
+    localStorage.getItem(usedKey(padId)) !== null;
   if (outerWm === null && knownUsedHere) {
     // H-3: this is the reported PoC — restore an old blob, delete the watermark.
     // A pad that has demonstrably run on this device but can no longer produce

@@ -182,4 +182,77 @@ console.log("OK  M-7: OTP recvHighWater rollback (replay across a reload) is ref
 }
 console.log("OK  L-3: the double-export gate is authenticated, not a plaintext flag");
 
+// --- v2 -> v3 migration of a pad that was ALREADY USED before the fix -------
+// Found on-device 2026-07-28: every check above builds its pad with the CURRENT
+// generatePad(), so the blob is v3 with an authenticated watermark from birth.
+// Nothing here ever saw a genuine pre-fix pad, and the shipped code refused one:
+// `knownUsedHere` counted the legacy PLAINTEXT watermark as proof that a v3
+// record must exist — but that watermark is written only by pre-fix code, so it
+// is present on exactly the pads that legitimately have none yet. Result: a
+// pre-fix pad that had sent even one message was permanently unusable.
+//
+// Reconstructs a real pre-fix pad rather than asserting on the guard directly:
+// re-encrypt the inner record WITHOUT the v3-only fields under the same at-rest
+// key, stamp `v:2`, drop both post-fix artifacts, and leave the legacy
+// plaintext watermark the old code would have written.
+{
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  const b64 = (u8) => Buffer.from(u8).toString("base64");
+  const unb64 = (s) => new Uint8Array(Buffer.from(s, "base64"));
+
+  const m = await otp.generatePad({ label: "v2-used", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const mAtRest = await otp.saveNewPad(m, PASS);
+  const mKey = "sc.otp.pad.v1." + m.padId;
+
+  const USED = 1234;
+  m.sendOffset = USED;
+  await otp.savePadProgress(m, mAtRest);
+
+  // Roll the stored blob back to the pre-fix shape.
+  const cur = JSON.parse(localStorage.getItem(mKey));
+  const innerPlain = JSON.parse(dec.decode(await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: unb64(cur.iv) }, mAtRest.key, unb64(cur.ct),
+  )));
+  delete innerPlain.hwSend;      // v3-only: the authenticated watermark mirror
+  delete innerPlain.hwRecv;
+  delete innerPlain.exported;    // v3-only: L-3 moved this inside the AEAD
+  const iv2 = crypto.getRandomValues(new Uint8Array(12));
+  const ct2 = new Uint8Array(await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: iv2 }, mAtRest.key, enc.encode(JSON.stringify(innerPlain)),
+  ));
+  localStorage.setItem(mKey, JSON.stringify({ v: 2, kdf: cur.kdf, iv: b64(iv2), ct: b64(ct2) }));
+  localStorage.removeItem("sc.otp.wm.v1." + m.padId);    // never existed pre-fix
+  localStorage.removeItem("sc.otp.used.v1." + m.padId);  // stamped only post-fix
+  localStorage.setItem("sc.otp.hw.v1." + m.padId, String(USED)); // what old code wrote
+
+  const migrated = await otp.unlockPad(m.padId, PASS);
+  assert.strictEqual(migrated.record.sendOffset, USED,
+    "a USED pre-fix pad must migrate, not be refused");
+  assert.strictEqual(JSON.parse(localStorage.getItem(mKey)).v, 3,
+    "the migrated blob is rewritten as v3");
+  assert.ok(localStorage.getItem("sc.otp.wm.v1." + m.padId),
+    "migration writes the authenticated watermark");
+
+  // The floor must SURVIVE the migration — adopting a pre-fix pad must not
+  // reset its tripwire to zero, or the upgrade itself becomes the rollback.
+  const rewound = JSON.parse(localStorage.getItem(mKey));
+  const innerNow = JSON.parse(dec.decode(await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: unb64(rewound.iv) }, mAtRest.key, unb64(rewound.ct),
+  )));
+  assert.strictEqual(innerNow.hwSend, USED, "the legacy watermark became the authenticated floor");
+
+  // And the H-3 guard still bites once the pad IS post-fix: same PoC as above.
+  const post = localStorage.getItem(mKey);
+  m.sendOffset = USED + 500;
+  await otp.savePadProgress(m, mAtRest);
+  localStorage.setItem(mKey, post);
+  localStorage.removeItem("sc.otp.wm.v1." + m.padId);
+  await assert.rejects(
+    otp.unlockPad(m.padId, PASS), /rollback record for this pad is missing/,
+    "H-3 still fails closed for a v3 blob whose watermark was deleted",
+  );
+}
+console.log("OK  v2→v3: a USED pre-fix pad migrates (and keeps its floor), H-3 still closed");
+
 console.log("\nAll OTP rollback checks passed.");
