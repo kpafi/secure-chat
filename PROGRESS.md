@@ -28,14 +28,51 @@ exists in the WebView leveldb alongside `sc.contacts.v1`. That is the migration
 running forward against a genuine pre-fix store on real hardware — the thing the
 unit tests could not prove.
 
-**The OTP pad migration v2→v3 is still unexercised, and cannot be tested on this
-phone: it has no pads.** A `grep` for `sc.otp` across the whole leveldb returns
-0 — no `sc.otp.index.v1`, no `sc.otp.pad.v1.*`. So the v2→v3 path has still only
-ever run against in-memory localStorage. It fails CLOSED, so a bug there locks
-the user out of a pad rather than leaking one. **To actually close this: put a
-genuine pre-fix v2 pad blob on a device and unlock**, or accept it as tested by
-unit test only. Do not read the green contact-store result as covering it — they
-are separate code paths with separate blob formats.
+### 🔴 OTP pad migration v2→v3 is BROKEN — found on-device 2026-07-28, SHIPPED
+
+**A pre-fix OTP pad that was ever USED is permanently refused after the upgrade.**
+Tested by generating a genuine v2 blob with the pre-fix `otp.js` (from `e86a60b`),
+injecting it into the phone's real WebView localStorage over CDP, and calling the
+DEPLOYED `unlockPad()`. Result:
+
+| pre-fix v2 pad | legacy `sc.otp.hw.v1` | outcome |
+|---|---|---|
+| used (`sendOffset` 1234) | present, `1234` | **REFUSED** — *"the rollback record for this pad is missing … exchange a fresh pad"* |
+| pristine (`sendOffset` 0) | absent | migrates fine → `v:3`, opaque `sc.otp.wm.v1` written |
+
+**Root cause — `client/otp.js:497-499` contradicts `client/otp.js:511`.**
+```js
+const knownUsedHere = Number.isInteger(inner.hwSend) || Number.isInteger(inner.hwRecv) ||
+  readLegacyHW(padId) > 0 || localStorage.getItem(usedKey(padId)) !== null;
+if (outerWm === null && knownUsedHere) throw new Error("the rollback record … is missing");
+```
+Line 511 already treats `readLegacyHW(padId)` as a legitimate migration floor
+(`max(outer, inner, legacy)`), but line 498 treats the mere existence of that
+same legacy watermark as proof a v3 record *should* exist, and throws before
+reaching it. A pre-fix pad has no `sc.otp.wm.v1` by definition — it predates the
+scheme — so every used one hits `outerWm === null && knownUsedHere`.
+
+**Proposed fix: drop `readLegacyHW(padId) > 0` from `knownUsedHere`.** The other
+two clauses are the ones that actually catch H-3, and neither false-positives on
+a genuine pre-fix pad: `inner.hwSend/hwRecv` live inside the AEAD and exist only
+in v3 blobs, and `sc.otp.used.v1.*` is written only by post-fix code. Nothing is
+lost — the legacy value still applies as a floor at line 511, and `otp.js:93-95`
+already states it is "never load-bearing for a rollback decision on its own"
+because it is attacker-writable plaintext. **Do NOT gate on the outer `v` byte
+instead** — it is outside the AEAD and `otp.js:466-468` documents that exact
+downgrade trap.
+
+**Why the tests missed it:** every pad in `otp-rollback.test.mjs` is built by
+`otp.generatePad()` from the NEW module, so it is v3 with a `sc.otp.wm.v1` from
+birth. No test ever constructs a v2 blob carrying a legacy `sc.otp.hw.v1`. The
+2026-07-28 claim that the migration was "covered by tests" held only for the
+pristine case.
+
+**Impact:** fail-CLOSED, so no key material leaks — but anyone holding a pre-fix
+pad that has sent even one message is locked out of it and must exchange a fresh
+pad in person. **Zero impact on this user right now: the phone has no pads** (the
+test pad was removed afterwards; `sc.otp.*` is empty again, verified). Still
+shipped and live, so it bites the first real pre-fix pad it meets.
 
 **BREAKING protocol change again** (third one, after handshake v3 and P-08): a
 key-confirmation frame now gates the verification step, so relay and client are
@@ -2653,10 +2690,12 @@ after item 2 was dropped, none of it protects a running instance:
    unlocked on the phone, app opened normally, `sc.contacts.gen.v1` written next
    to a genuine pre-fix `sc.contacts.v1`. **⚠️ OTP pad v2→v3 STILL UNVERIFIED
    and untestable on this phone** — it has no pads at all (`grep sc.otp` over
-   the leveldb returns 0), so that path has still only run against in-memory
-   localStorage. Closing it needs a real pre-fix v2 pad blob on a device, then
-   an unlock. Separate code path and separate blob format from the contact
-   store; the green result above does not cover it.
+   the leveldb returns 0), so that path had only run against in-memory
+   localStorage. **Now tested on-device 2026-07-28 by injecting a genuine
+   pre-fix v2 blob — and it is BROKEN: a USED pre-fix pad is permanently
+   refused.** Root cause, proposed one-line fix, and why the unit tests missed
+   it are in the 🔴 section of the snapshot at the top. **This is the top open
+   item — it is shipped and live.**
 5. **Residual, deliberate, unchanged:** whole-storage rollback (an attacker who
    snapshots BOTH the store and its witness, or both the pad and its watermark,
    still rewinds undetected — it needs OS-level trusted monotonic storage);
