@@ -100,6 +100,13 @@ KNOCK_TIMEOUT_SEC = 10
 # 120 s a knocked waiter may hold.
 KNOCK_GRACE_SEC = 2.0
 
+# Pentest 2026-07-27 M-1: how often a room's owner may be told that joins are
+# being refused ("room full"). One notice per window, carrying the count since
+# the last one — so a queue-filling attacker cannot turn the warning into a
+# per-attempt frame flood at the owner, and the owner still learns promptly that
+# somebody is being locked out.
+TURNAWAY_NOTICE_SEC = 5.0
+
 # --- Trusted reverse proxies (rate-limit keying) --------------------------
 # Pentest 2026-07-25 F-03: every /api limiter keys on the client address. When
 # the app is reached DIRECTLY over loopback — which is exactly what a Tor

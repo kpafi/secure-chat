@@ -86,3 +86,39 @@ def test_run_sh_disables_uvicorn_proxy_headers():
     """client_key is only authoritative if uvicorn is not rewriting client.host."""
     run_sh = (Path(__file__).resolve().parents[1] / "run.sh").read_text()
     assert "--no-proxy-headers" in run_sh
+
+
+# --- Pentest 2026-07-27 H-4 --------------------------------------------------
+# The F-03 defense above was only ever a CLI flag in run.sh. The in-repo
+# programmatic launcher (`python main.py`) — which is how the live instance was
+# actually started — called uvicorn.run() without it, so uvicorn trusted a
+# loopback client's own X-Forwarded-For and rewrote request.client BEFORE
+# client_key ever ran. Every HTTP throttle was bypassable at full speed by
+# rotating one header: username enumeration via the register oracle, and
+# pending-challenge exhaustion as a login-availability DoS.
+
+def test_main_launcher_disables_uvicorn_proxy_headers():
+    """Both launch paths must agree; a flag in only one of them is not a control."""
+    main_py = (Path(__file__).resolve().parents[1] / "main.py").read_text()
+    assert "proxy_headers=False" in main_py
+    assert "forwarded_allow_ips=[]" in main_py
+
+
+def test_rewritten_client_address_falls_back_to_one_shared_bucket():
+    """Defense in depth: detect the rewrite instead of trusting the launcher.
+
+    If some ASGI server honours a forwarded header anyway, the address we are
+    handed is by construction one of the hops the CLIENT supplied. Keying on it
+    would hand out a bucket per forged header — so this case collapses to a
+    single shared bucket, which is the fail-CLOSED direction.
+    """
+    config.TRUSTED_PROXY_IPS = frozenset()
+    # Peer address equals a hop in the header => uvicorn rewrote it.
+    shared = accounts.client_key(_Req("1.2.3.4", "1.2.3.4"))
+    assert shared == accounts._UNTRUSTED_FORWARDED_KEY
+    # …and every forged value lands in that SAME bucket, so rotating buys nothing.
+    for forged in ("9.9.9.9", "8.8.8.8", "203.0.113.7"):
+        assert accounts.client_key(_Req(forged, forged)) == shared
+    # A normal request (peer not present in the header) is unaffected.
+    assert accounts.client_key(_Req("203.0.113.5", "1.2.3.4")) == "203.0.113.5"
+    assert accounts.client_key(_Req("203.0.113.5")) == "203.0.113.5"

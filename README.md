@@ -298,14 +298,30 @@ each has been addressed (see PROGRESS.md for the code):
   used to seal async messages.
 - **M-02 (medium) — trust pins in plaintext localStorage.** A forged pin could
   auto-unlock a session. **Fixed:** pins moved into the identity-encrypted,
-  GCM-authenticated contact store (with one-time migration that deletes the old
-  plaintext key).
+  GCM-authenticated contact store. The one-time migration that read the old
+  plaintext key was itself a hole (2026-07-27 **H-2**: it ran on every unlock and
+  laundered any planted pin into the authenticated store, inverting the MITM
+  alarm) and has been **removed** — the plaintext key is now only deleted, never
+  read. The contact store also carries an authenticated generation counter, so
+  deleting or rolling it back fails closed instead of quietly disabling
+  key-change detection (**L-1**).
 - **M-01 (medium) — OTP rollback.** A wholesale restore of an old encrypted pad
-  blob reused consumed keystream. **Fixed:** a separate monotonic send-offset
-  high-water tripwire refuses a pad whose offset regressed. *Residual:* a
-  full-storage rollback that also reverts the tripwire is inherent to untrusted
-  browser storage (needs OS-level trusted monotonic storage) — documented, out
-  of scope.
+  blob reused consumed keystream. **Fixed:** a monotonic high-water tripwire
+  refuses a pad whose consumption regressed.
+  *Corrected 2026-07-27* — the original wording understated what remained. That
+  tripwire was a single **plaintext** integer that read as 0 when absent, so one
+  extra `removeItem` restored the full two-time pad (**H-3**, demonstrated: a
+  message's plaintext was recovered from two ciphertexts); and it only tracked
+  the SEND offset, so a restore taken after a stretch of receiving rewound the
+  replay guard (**M-7**). Both are fixed: the watermark is now an AEAD record
+  under the pad's own at-rest key, it covers send AND receive, it is mirrored
+  inside the pad blob, and a pad that has run on this device but cannot produce
+  its watermark refuses to open. The `exported` flag that guards against handing
+  one pad to two importers moved inside the AEAD too (**L-3**).
+  *Residual, genuinely:* an attacker who snapshots **both** the pad blob and its
+  watermark and restores both still rewinds undetected. That is inherent to
+  untrusted browser storage (it needs OS-level trusted monotonic storage) — but
+  it now takes a coordinated snapshot rather than deleting one key.
 - **M-03 / L-01 / L-02.** Dedicated stricter rate bucket on `/api/auth/challenge`;
   `Strict-Transport-Security` sent over HTTPS; dev files (`package.json`,
   `*.test.mjs`) are 404'd and removed from the deployed client.

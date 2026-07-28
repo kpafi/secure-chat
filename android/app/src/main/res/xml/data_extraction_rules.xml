@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Pentest 2026-07-27 L-6 — device-to-device transfer copied everything.
+
+  `android:allowBackup="false"` covers cloud backup, and on API 31+ it also
+  covers the <cloud-backup> half of these rules. What it does NOT cover is the
+  OS device-to-device transfer flow: with no dataExtractionRules declared (and
+  targetSdk 34), that flow copies the whole app data directory to the new phone
+  — including the WebView profile, which is where every localStorage value
+  lives: the encrypted identity blob, the contact store, the OTP pad blobs, and
+  their rollback watermarks.
+
+  That is an OS-provided route to exactly the H-3 / M-7 attacks: pad bytes and
+  watermarks land on a second device, where an old copy can be restored to
+  reuse keystream or replay received frames. It also duplicates a pad onto two
+  devices at once, which the pad's whole security argument forbids (one pad,
+  two devices, one role each — never a third copy).
+
+  So: nothing leaves this app. Both halves are disabled outright rather than
+  excluding single paths — this app has no data a transfer could safely carry,
+  and a targeted exclusion list would silently stop covering anything added
+  later. Moving to a new phone is done the way the product already documents:
+  export the identity backup and exchange a FRESH pad in person.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </device-transfer>
+</data-extraction-rules>

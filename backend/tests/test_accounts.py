@@ -293,3 +293,56 @@ def test_challenge_endpoint_is_rate_limited():
     assert ok == config.CHALLENGE_RATE_CAPACITY
     # The next challenge within the same burst is throttled.
     assert client.post("/api/auth/challenge", json={"username": "rl-user"}).status_code == 429
+
+
+# --- Pentest 2026-07-27 H-1 (server half) ------------------------------------
+# `base64.b64decode(s, validate=True)` rejects out-of-alphabet characters but —
+# exactly like the browser's `atob` — silently DISCARDS the trailing slack bits.
+# Every key size here is ≡ 2 (mod 3), so every key has FOUR spellings that decode
+# to the same bytes. The signature checks operate on those bytes, but what the
+# directory STORES and serves is the STRING. A registrant could therefore park a
+# non-canonical spelling of their own key in the directory, and the client (which
+# canonicalizes what it receives) would report a permanent, unexplainable
+# "directory mismatch" against the same person's live handshake.
+
+def _respell(canonical: str) -> str:
+    """Another base64 string for the same bytes (vary the discarded slack bits)."""
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    pad = len(canonical) - len(canonical.rstrip("="))
+    assert pad, "expected a value with slack bits"
+    slack_bits = 2 if pad == 1 else 4
+    idx = len(canonical) - pad - 1
+    mask = (1 << slack_bits) - 1
+    cur = alphabet.index(canonical[idx])
+    return canonical[:idx] + alphabet[(cur & ~mask) | ((cur & mask) ^ 1)] + canonical[idx + 1:]
+
+
+def test_respelling_really_is_the_same_bytes():
+    """Ground truth for the finding — otherwise the test below proves nothing."""
+    ident = _new_identity()
+    alt = _respell(ident[1])
+    assert alt != ident[1]
+    assert base64.b64decode(alt, validate=True) == base64.b64decode(ident[1], validate=True)
+
+
+def test_register_rejects_non_canonical_base64():
+    ident = _new_identity()
+    body = _register_body("canon-user", ident)
+    # The SIGNATURE still covers the original message, and the bytes the
+    # signature check sees are identical — so this used to register fine and
+    # store a key spelling no honest client would ever produce.
+    body["ed"] = _respell(body["ed"])
+    resp = client.post("/api/register", json=body)
+    assert resp.status_code == 422, resp.text
+    assert "canonical" in resp.text
+
+    # Every field with slack bits goes through the same gate. (An ML-DSA-65
+    # signature is 3309 bytes — a multiple of 3 — so it has no slack to vary and
+    # only one spelling exists; nothing to test there.)
+    for field in ("mldsa", "sig"):
+        body = _register_body(f"canon-{field}", ident)
+        body[field] = _respell(body[field])
+        assert client.post("/api/register", json=body).status_code == 422, field
+
+    # …and the canonical original is still accepted, unchanged.
+    assert client.post("/api/register", json=_register_body("canon-ok", ident)).status_code == 200

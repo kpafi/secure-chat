@@ -3,7 +3,110 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (2026-07-27, P-08 fixed: room entry is now owner-approved)
+## ⮕ RESUME HERE (2026-07-28, every 2026-07-27 pentest finding fixed)
+
+**All 4 High, all 7 Medium, and L-1..L-6 from `secure-chat-pentest-2026-07-27.md`
+are fixed, with regression tests.** Nothing is committed, nothing is deployed,
+and the APK has NOT been rebuilt — the tree is left for review.
+
+**BREAKING protocol change again** (third one, after handshake v3 and P-08): a
+key-confirmation frame now gates the verification step, so relay and client are
+fine but two CLIENTS must both be new — an old client never sends `confirm`, so
+a new peer waits at "Confirming that both sides derived the same key…" forever.
+Deploy the client and rebuild the APK together, exactly as for P-08.
+
+Storage formats bumped: contact store **v3 → v4** (adds an authenticated
+generation counter + a `sc.contacts.gen.v1` witness), OTP pad blob **v2 → v3**
+(watermarks and `exported` move inside the AEAD, new `sc.otp.wm.v1.<id>` record).
+Both migrate forward on first unlock and both are covered by tests; a genuine
+pre-fix store is adopted, not rejected.
+
+What was done, by finding:
+- **H-4** `main.py`'s `uvicorn.run()` now passes `proxy_headers=False` +
+  `forwarded_allow_ips=[]` (it did not), and `accounts.client_key` additionally
+  DETECTS a rewrite (peer address appearing among the client-supplied hops) and
+  falls back to one shared bucket, so no launcher can reopen it.
+  **CORRECTION (2026-07-28): this never affected Hetzner, and the earlier note
+  here claiming "the live relay is still running the old launcher — restart it"
+  was wrong.** It was written from the finding's wording without checking the
+  box. Verified on `138.199.144.35`: the systemd `ExecStart` is
+  `/opt/secure-chat/venv/bin/python -m uvicorn main:app … --no-proxy-headers …`
+  with `Environment=SECURE_CHAT_TRUSTED_PROXIES=127.0.0.1`, and the running
+  process (PID 192873, started 2026-07-27 19:35) carries both. Production has
+  never used the `python main.py` launcher, so `main.py`'s `uvicorn.run()` args
+  are dead code there — a restart could not have applied this fix, and no
+  restart was performed. The F-03 defense has been live since 2026-07-25 (see
+  the systemd-unit edit at the 2026-07-25 entry, incl. the through-Caddy test
+  that a rotating spoofed `X-Forwarded-For` still gets 429 after 10).
+  The finding itself was real but scoped to the **local** dev relay: the pentest
+  report's own rules-of-engagement note identifies it as the pre-existing
+  `python3 main.py` (PID 15001) that held local :8000, and its executive summary
+  states production was never contacted. §H-4 called that instance "live", and
+  its remediation step hedged accordingly ("or is actually run via `run.sh`").
+  The `client_key` half IS genuinely undeployed and ships with the next normal
+  deploy — it is defense-in-depth against a future misconfigured launcher, not
+  protection against anything running today.
+- **H-1 + M-4** `unb64`/`b64ToBuf` are canonical-only (decode → re-encode →
+  require equality), so the byte-domain/string-domain split is gone. Bundles
+  compare on decoded bytes, received bundles are canonicalized at the handshake
+  and knock boundaries, the DHKE reflection guard compares the POINT, and
+  `_b64decode_fixed` closes the same hole server-side at registration.
+- **H-2 + L-1** `migrateLegacyPins()` is gone (it laundered plaintext pins into
+  the authenticated store on every unlock); the plaintext key is now only
+  deleted, never read. Contact store gained a monotonic generation + AEAD
+  witness: rollback, deletion, and witness removal all fail closed, and
+  `hasStore()` reports "expected" so app.js takes the loud P-02 path.
+- **H-3 + M-7 + L-3** OTP watermark is an AEAD record under the pad's at-rest
+  key, covers send AND recv, is mirrored inside the blob (max wins), and a pad
+  that has demonstrably run here but cannot produce a watermark fails closed.
+  `exported` moved inside the AEAD. One plaintext marker remains, deliberately:
+  `importPad` holds only the transfer passphrase and cannot open the record —
+  documented in `padWasUsed`.
+- **M-2** owner refuses a handshake when it admitted nobody; guest refuses a seat
+  it never queued for (`wasPending`), which closes the "tell both sides they are
+  guests" variant.
+- **M-3** binary frames and deeply-nested JSON are answered politely; client-input
+  errors never reach `log.exception`.
+- **M-5** explicit key confirmation (HMAC of the initial chain heads under a
+  domain-separated context) before verification unlocks. Note the finding's
+  route (a) fell out of the H-1 fix, and a local-invariant fix for route (b) is
+  IMPOSSIBLE — the honest staggered PQKEM order is indistinguishable from the
+  attack from inside one endpoint (see the comment in `_derive`).
+- **M-6** `RATCHET_MAX_SKIP` 1024 → 64. The suggested skipped-key cache was
+  deliberately NOT taken: it trades a real forward-secrecy property
+  (`crypto.test.mjs` asserts a skipped frame stays undecryptable) for speed
+  against an adversary the smaller window already handles.
+- **M-1** the relay now tells the owner when joins are turned away (batched by
+  `TURNAWAY_NOTICE_SEC` so the warning cannot itself be flooded). A per-source
+  sub-quota was rejected: behind Tor every peer is loopback, so it would cap the
+  whole queue.
+- **L-2** an AES256 chat that receives a message with no inner layer now says so.
+  **L-4** handle + lookup token are wiped by "Forget identity". **L-5** the OTP
+  receive path gained the send path's spent-keystream check. **L-6**
+  `dataExtractionRules` disables device-to-device transfer (it copied the pad
+  blobs and watermarks to a new phone).
+
+Green: backend **129 passed** (was 121; +8 new), `client` `npm test` 84 checks
+across 8 suites incl. the new `canonical-b64.test.mjs`, and all three e2e
+harnesses against a scratch relay — **13/13, 8/8, 12/12**. Note for whoever runs
+e2e next: point it at a scratch DB *and* set `SECURE_CHAT_EXTRA_ORIGINS` to the
+test origin, or the WS allow-list rejects every connection and it looks like a
+code bug.
+
+The APK was **built** (not installed) to prove the L-6 manifest change compiles:
+`aapt2 dump xmltree` confirms `dataExtractionRules` resolves to the new resource
+with the `<device-transfer>` exclusions, and `assets/web/` carries the fixed
+client (gradle `syncWebClient` picked it up). Installing is still to do.
+
+One bug was found and fixed in this session's OWN work while re-reading it:
+`Room.turnaway_notified_at` defaulted to `0.0`, and `time.monotonic()` counts
+from process/boot start — so the very first M-1 notice would have been swallowed
+during the relay's first `TURNAWAY_NOTICE_SEC`. Now `-inf`, with a test.
+
+A reusable `pentest-new-code` agent now lives in `.claude/agents/` (and
+`~/.claude/agents/`) — it audits the changed diff rather than the whole system.
+
+## (2026-07-27, P-08 fixed: room entry is now owner-approved)
 **User-designed fix for the last accepted-risk finding.** Their proposal: a peer
 who joins a chat code it did not create does not get in — the creator gets a
 prompt showing that peer's public key and web-of-trust rating and decides.
@@ -2492,6 +2595,40 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
   live integration suites, backend `pytest` 48 passed.
 
 ## TODO / NEXT (suggested order)
+
+### ⬜ OPEN from the 2026-07-27 pentest — SHIPPING, not fixing
+Every finding in `secure-chat-pentest-2026-07-27.md` is fixed in the working
+tree (see the snapshot at the top). What is left is entirely delivery:
+
+1. **Review + commit the tree.** Nothing is committed. `git diff` is ~1300 lines
+   across backend, client, Android manifest, and tests.
+2. ~~**Restart the live relay** so H-4 actually applies to it.~~ **DROPPED
+   2026-07-28 — this item was based on a wrong reading of H-4; do not re-add
+   it.** Hetzner was never exposed: its `ExecStart` runs `-m uvicorn …
+   --no-proxy-headers` with `SECURE_CHAT_TRUSTED_PROXIES=127.0.0.1` (live since
+   the 2026-07-25 F-03 unit edit), verified against the running process. The
+   `main.py` launcher this fix touches is not used in production, so a restart
+   would have applied nothing; none was performed. Full detail in the corrected
+   H-4 paragraph at the top of this file. **Nothing here protects a live
+   instance — every remaining item below is next-release delivery.** The one
+   genuinely undeployed piece (`accounts.client_key` rewrite detection) ships
+   with item 3's normal deploy.
+3. **Deploy client + rebuild the APK TOGETHER.** Key confirmation is a breaking
+   protocol change between two CLIENTS: an old client never sends `confirm`, so a
+   new peer waits forever. Same coupling as P-08 — do not deploy `client/`
+   without reinstalling the app.
+4. **Re-verify on the phone** that the v3→v4 contact store and v2→v3 pad blob
+   migrations actually run on a real device with real data. Both are covered by
+   unit tests against an in-memory localStorage; neither has been run against the
+   WebView leveldb store with a genuine pre-fix blob in it. This is the highest
+   remaining risk in the change — a migration that fails on-device locks the user
+   out of their own contact store (it fails CLOSED by design).
+5. **Residual, deliberate, unchanged:** whole-storage rollback (an attacker who
+   snapshots BOTH the store and its witness, or both the pad and its watermark,
+   still rewinds undetected — it needs OS-level trusted monotonic storage);
+   whoever joins an empty room first owns it; a visible approval queue can still
+   be filled (now at least the owner is told). These need protocol/platform
+   changes, not another localStorage key.
 
 ### ⬜ OPEN from the 2026-07-26 pentest (everything else in it is fixed + shipped)
 Full detail per item in `secure-chat-pentest-2026-07-26.md` (§4-6 findings,

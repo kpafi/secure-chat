@@ -51,14 +51,90 @@ const padKey = (id) => `sc.otp.pad.v1.${id}`;  // full record incl. bytes + offs
 // targeted restore of just the pad blob; a full-storage rollback that also
 // reverts the watermark is inherent to untrusted browser storage and out of
 // scope (documented) — it needs OS-level trusted monotonic storage.
-const hwKey = (id) => `sc.otp.hw.v1.${id}`;
-function readHW(id) {
-  const v = parseInt(localStorage.getItem(hwKey(id)) || "0", 10);
-  return Number.isFinite(v) ? v : 0;
+//
+// Pentest 2026-07-27 H-3 + M-7 — what that tripwire actually was, and is now.
+//
+// It used to be ONE plaintext decimal string, and `readHW` returned 0 for a
+// missing *or unparseable* value: fail-OPEN. So the "targeted restore of just
+// the pad blob" it was built to catch cost exactly one extra `removeItem`. The
+// pentest reproduced the full break — restore an old blob, delete the
+// watermark, and two messages encrypt at offset 0, giving
+// `C1 XOR C2 === P1 XOR P2` and a recovered plaintext. A two-time pad from one
+// deleted key.
+//
+// It also only ever tracked `sendOffset` (M-7), so a restore that left the send
+// side alone — the state after a stretch of receiving only — rewound
+// `recvHighWater` to zero and every previously-received frame re-authenticated
+// as fresh.
+//
+// Now: the watermark is an AEAD record under the pad's own at-rest key, it
+// covers BOTH offsets, it is mirrored inside the pad blob (max of the two
+// wins), and a pad blob that has one but cannot produce a valid watermark FAILS
+// CLOSED. Forging one needs the pad passphrase; deleting one is not a bypass
+// but a refusal to unlock.
+//
+// STILL RESIDUAL (documented, unchanged): an attacker who snapshots the pad
+// blob AND its watermark and restores BOTH rewinds undetected. That is the
+// whole-storage rollback README.md already calls out; it needs OS-level trusted
+// monotonic storage, not another localStorage key.
+const hwKey = (id) => `sc.otp.hw.v1.${id}`;        // legacy plaintext watermark
+const wmKey = (id) => `sc.otp.wm.v1.${id}`;        // authenticated {send,recv}
+const usedKey = (id) => `sc.otp.used.v1.${id}`;    // "this pad ran here" marker
+const WM_DOMAIN = "secure-chat/otp-watermark/v1";
+
+// In-memory high-water marks for pads unlocked this session, so every re-save
+// can take a max without re-deriving the at-rest key.
+const wmCache = new Map(); // padId -> {send, recv}
+
+function cachedWm(id) {
+  return wmCache.get(id) || { send: 0, recv: 0 };
 }
-function bumpHW(id, sendOffset) {
-  const cur = readHW(id);
-  if (sendOffset > cur) localStorage.setItem(hwKey(id), String(sendOffset));
+
+// The legacy (plaintext, send-only) watermark. Read ONLY to migrate a pad that
+// predates the authenticated record, and to answer padWasUsed for a pad whose
+// blob is gone. Never load-bearing for a rollback decision on its own.
+function readLegacyHW(id) {
+  const v = parseInt(localStorage.getItem(hwKey(id)) || "0", 10);
+  return Number.isFinite(v) && v > 0 ? v : 0;
+}
+
+// Decrypt the authenticated watermark for `id` under the pad's at-rest key.
+// Returns {send, recv} | null (absent) | "corrupt".
+async function readWatermark(id, key) {
+  const raw = localStorage.getItem(wmKey(id));
+  if (!raw) return null;
+  try {
+    const rec = JSON.parse(raw);
+    const plain = new Uint8Array(await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: unb64(rec.iv) }, key, unb64(rec.ct),
+    ));
+    const w = JSON.parse(decU.decode(plain));
+    plain.fill(0);
+    // The padId is INSIDE the AEAD, so an old pad's watermark cannot be
+    // re-keyed under a fresh id to read as a clean slate (the P-01 lesson).
+    if (w.d !== WM_DOMAIN || w.padId !== id ||
+        !Number.isInteger(w.send) || !Number.isInteger(w.recv)) {
+      return "corrupt";
+    }
+    return { send: w.send, recv: w.recv };
+  } catch {
+    return "corrupt";
+  }
+}
+
+async function writeWatermark(id, key, wm) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plain = encU.encode(JSON.stringify({
+    d: WM_DOMAIN, padId: id, send: wm.send, recv: wm.recv,
+  }));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain));
+  localStorage.setItem(wmKey(id), JSON.stringify({ iv: b64(iv), ct: b64(ct) }));
+  // Plaintext "this pad has run on this device" marker. It carries no offsets
+  // and is not trusted for a rollback decision — it exists so importPad, which
+  // holds only the TRANSFER passphrase and so cannot open the record above, can
+  // still refuse to resurrect a consumed pad from its (always pristine) file.
+  localStorage.setItem(usedKey(id), "1");
+  wmCache.set(id, { send: wm.send, recv: wm.recv });
 }
 
 // Pad size presets (total bytes; each direction gets half). XOR-OTP spends one
@@ -288,7 +364,9 @@ export function padMeta(padId) {
 
 // Stored-blob format version. v1 kept padId/label/regionSize/role OUTSIDE the
 // AES-GCM ciphertext; v2 puts every security-relevant field inside it (P-01).
-const PAD_BLOB_V = 2;
+// v3 (pentest 2026-07-27) additionally carries the send/recv high-water marks
+// and the `exported` flag inside the AEAD — see H-3/M-7 above and L-3 below.
+const PAD_BLOB_V = 3;
 
 // Encrypt the WHOLE record under `key` (a cached AES-GCM CryptoKey) with a fresh
 // IV and persist, keeping the stored salt/iters so the same key still unlocks it.
@@ -303,6 +381,15 @@ const PAD_BLOB_V = 2;
 // the AEAD; only the KDF parameters and the ciphertext are outside (they cannot
 // redirect key material, and the tag covers the rest).
 async function writePadBlob(record, key, salt, iters) {
+  // H-3/M-7: the watermarks only ever move forward, and they cover BOTH
+  // directions. Mirrored inside the blob so a restored blob carries its own
+  // floor, and written to the authenticated outer record so a restored blob is
+  // measured against the newest state this device ever reached.
+  const prev = cachedWm(record.padId);
+  const wm = {
+    send: Math.max(prev.send, record.sendOffset | 0),
+    recv: Math.max(prev.recv, record.recvHighWater | 0),
+  };
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const plain = encU.encode(JSON.stringify({
     padId: record.padId,
@@ -313,6 +400,15 @@ async function writePadBlob(record, key, salt, iters) {
     bytes: b64(record.bytes),
     sendOffset: record.sendOffset,
     recvHighWater: record.recvHighWater,
+    hwSend: wm.send,
+    hwRecv: wm.recv,
+    // L-3: `exported` decides whether the "you already gave this pad away"
+    // warning fires, and that warning is the only thing standing between a
+    // user and handing one pristine pad to two importers — a two-time pad by
+    // construction. It lived in the plaintext index, where clearing it was a
+    // one-line localStorage write. It is authenticated state now; the index
+    // keeps a copy purely so the pad list can render without the passphrase.
+    exported: !!record.exported,
   }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain));
   plain.fill(0);
@@ -322,8 +418,8 @@ async function writePadBlob(record, key, salt, iters) {
     iv: b64(iv),
     ct: b64(ct),
   }));
-  writeIndexEntry(record);
-  bumpHW(record.padId, record.sendOffset); // advance the rollback tripwire (M-01)
+  writeIndexEntry(record, { exported: !!record.exported });
+  await writeWatermark(record.padId, key, wm);
 }
 
 // First save of a freshly generated/imported pad: derive a NEW at-rest key from
@@ -333,6 +429,7 @@ export async function saveNewPad(record, passphrase) {
   if (!passphrase) throw new Error("choose a pad passphrase to protect it on this device");
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const key = await deriveKey(passphrase, salt, KDF_ITERS);
+  wmCache.set(record.padId, { send: 0, recv: 0 }); // a new pad starts at zero
   await writePadBlob(record, key, salt, KDF_ITERS);
   return { key, salt, iters: KDF_ITERS };
 }
@@ -360,15 +457,8 @@ export async function unlockPad(padId, passphrase) {
   const inner = JSON.parse(decU.decode(plain));
   plain.fill(0);
   const sendOffset = inner.sendOffset | 0;
-  // M-01: refuse a pad whose consumption has been rolled back below the highest
-  // offset we ever recorded — that would reuse already-spent keystream. P-01:
-  // the watermark is looked up by the REQUESTED id (the storage key the caller
-  // asked for), never by an id read out of the blob being validated — otherwise
-  // re-keying an old blob under a fresh id reads a watermark of 0 and the
-  // rollback sails through.
-  if (sendOffset < readHW(padId)) {
-    throw new Error("pad state was rolled back (consumed key material) — refusing to use it; exchange a fresh pad");
-  }
+  const recvHighWater = inner.recvHighWater | 0;
+
   // P-01: take every security-relevant field from INSIDE the AEAD. A v1 blob
   // kept them outside; it is migrated to v2 on first unlock (below), which binds
   // them from here on.
@@ -387,6 +477,49 @@ export async function unlockPad(padId, passphrase) {
   if (!legacy && inner.padId !== padId) {
     throw new Error("stored pad does not match its storage key — refusing to use it");
   }
+
+  // M-01 / H-3 / M-7: refuse a pad whose consumption has been rolled back below
+  // the highest offset we ever recorded — that reuses already-spent keystream
+  // (send side) or re-accepts already-delivered frames (receive side). Runs
+  // AFTER the identity check above, so the more specific "this blob is not the
+  // pad you asked for" verdict wins over "its rollback record is missing".
+  //
+  // P-01: everything here is keyed on the REQUESTED id (the storage key the
+  // caller asked for), never on an id read out of the blob being validated —
+  // and the record binds the padId inside its own AEAD for the same reason, so
+  // re-keying an old watermark under a fresh id cannot read as a clean slate.
+  const outerWm = await readWatermark(padId, key);
+  if (outerWm === "corrupt") {
+    throw new Error(
+      "the rollback record for this pad is damaged or forged — refusing to use the pad; exchange a fresh one",
+    );
+  }
+  const knownUsedHere = Number.isInteger(inner.hwSend) || Number.isInteger(inner.hwRecv) ||
+    readLegacyHW(padId) > 0 || localStorage.getItem(usedKey(padId)) !== null;
+  if (outerWm === null && knownUsedHere) {
+    // H-3: this is the reported PoC — restore an old blob, delete the watermark.
+    // A pad that has demonstrably run on this device but can no longer produce
+    // its watermark FAILS CLOSED. (No record AND no evidence = a pad written
+    // before this fix, adopted below.)
+    throw new Error(
+      "the rollback record for this pad is missing — refusing to use the pad, because pad reuse could no longer be detected; exchange a fresh pad",
+    );
+  }
+  // max(outer, inner, legacy): each is a floor this device is known to have
+  // passed, so the highest of them is the truth.
+  const wm = {
+    send: Math.max(outerWm ? outerWm.send : 0, inner.hwSend | 0, readLegacyHW(padId)),
+    recv: Math.max(outerWm ? outerWm.recv : 0, inner.hwRecv | 0),
+  };
+  if (sendOffset < wm.send) {
+    throw new Error("pad state was rolled back (consumed key material) — refusing to use it; exchange a fresh pad");
+  }
+  if (recvHighWater < wm.recv) {
+    // M-7: no keystream is reused, but every OTP frame the peer already sent
+    // would authenticate again as fresh — the anti-replay guarantee, gone.
+    throw new Error("pad receive state was rolled back (already-delivered messages could replay) — refusing to use it; exchange a fresh pad");
+  }
+  wmCache.set(padId, wm);
   const regionSize = src.regionSize;
   const role = src.role;
   if (role !== 0 && role !== 1) throw new Error("stored pad has an invalid role");
@@ -405,7 +538,12 @@ export async function unlockPad(padId, passphrase) {
     createdAt: src.createdAt,
     bytes,
     sendOffset,
-    recvHighWater: inner.recvHighWater | 0,
+    recvHighWater,
+    // L-3: authenticated in v3; a v1/v2 blob falls back to the plaintext index
+    // ONCE, on the unlock that upgrades it, after which the flag is covered.
+    exported: inner.exported !== undefined
+      ? !!inner.exported
+      : !!(padMeta(padId) || {}).exported,
   };
   const atRest = { key, salt, iters };
   // Rewrite a genuine legacy blob in the v2 (fully authenticated) format
@@ -418,15 +556,26 @@ export async function unlockPad(padId, passphrase) {
   // information that was never authenticated. What IS now guaranteed: a v2 blob
   // cannot be downgraded to obtain that weakness, and every blob becomes v2 on
   // its first unlock.
-  if (legacy) await writePadBlob(record, key, salt, iters);
+  //
+  // A v2 blob is rewritten for the same reason one version later: it carries no
+  // authenticated watermark and no authenticated `exported` flag, and the sooner
+  // it does the sooner H-3/M-7/L-3 apply to it.
+  if (legacy || (o.v || 1) < PAD_BLOB_V) await writePadBlob(record, key, salt, iters);
   return { record, atRest };
 }
 
 // Record that a pad has been exported (shared). Used to warn on re-export, which
 // risks distributing one pad to more than one importer (-> key reuse).
-export function markExported(padId) {
-  const meta = padMeta(padId);
-  if (meta) writeIndexEntry(meta, { exported: true });
+//
+// L-3: this used to write the plaintext index and nothing else, so clearing one
+// unauthenticated field removed the only warning standing between a user and
+// exporting one pristine pad to two importers — a two-time pad by construction.
+// The flag now lives inside the pad's AEAD, which is why this needs the
+// unlocked record and its at-rest key. The index copy is kept in step purely as
+// a render cache for the pad list (which has no passphrase to hand).
+export async function markExported(record, atRest) {
+  record.exported = true;
+  await writePadBlob(record, atRest.key, atRest.salt, atRest.iters);
 }
 
 // Forget a pad locally. Pentest 2026-07-26 P-05: the rollback watermark is
@@ -445,6 +594,16 @@ export function forgetPad(padId) {
 
 // True if this device has ever recorded consumption for `padId` — i.e. the pad
 // was used here before, so re-importing the pristine file would rewind it.
+//
+// This is the ONE watermark reader that cannot authenticate what it reads:
+// importPad holds the pad file's TRANSFER passphrase, not the at-rest passphrase
+// that opens the authenticated record, and after `forgetPad` there is no blob to
+// derive a key from anyway. It therefore answers from evidence-of-presence — any
+// of the three markers — which is the fail-CLOSED direction: extra markers can
+// only cause a refusal, never an acceptance. Rollback decisions that CAN be
+// authenticated are made in unlockPad, against the AEAD record.
 export function padWasUsed(padId) {
-  return readHW(padId) > 0;
+  return localStorage.getItem(usedKey(padId)) !== null ||
+    localStorage.getItem(wmKey(padId)) !== null ||
+    readLegacyHW(padId) > 0;
 }

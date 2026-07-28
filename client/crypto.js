@@ -39,10 +39,25 @@ export function bufToB64(buf) {
   return btoa(bin);
 }
 
+// Pentest 2026-07-27 H-1: canonical base64 only. `atob` is WHATWG *forgiving*
+// base64 — it strips whitespace, tolerates missing padding, and discards the
+// trailing slack bits, so several distinct strings decode to identical bytes.
+// Anywhere a value is compared as a STRING (the DHKE reflection guard, the
+// pinned bundle, a KEM tag) while it is also verified as BYTES, that slack is a
+// wedge a hostile relay can drive between the two checks. Decoding canonically
+// removes the wedge: a string that decodes here is the one spelling of its
+// bytes. Kept local rather than imported so this module still stands alone; it
+// mirrors identity.js `unb64` exactly, and crypto.test.mjs pins both.
+const B64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
+
 export function b64ToBuf(b64) {
+  if (typeof b64 !== "string" || b64.length % 4 !== 0 || !B64_RE.test(b64)) {
+    throw new Error("malformed base64: not canonical");
+  }
   const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  if (bufToB64(bytes) !== b64) throw new Error("malformed base64: not canonical");
   return bytes.buffer;
 }
 
@@ -97,8 +112,25 @@ class CallQueue {
 // ahead (earlier frames dropped or rejected in flight) fast-forwards the
 // chain, DISCARDING the skipped keys — bounded by RATCHET_MAX_SKIP so a
 // hostile relay cannot force unbounded chain work.
-
-const RATCHET_MAX_SKIP = 1024;
+//
+// Pentest 2026-07-27 M-6: that bound used to be 1024, and the scratch chain is
+// (correctly, for state safety) DISCARDED when the AEAD fails — so every forged
+// frame redid the full 2048 HMAC operations, ~60 ms each. At ~17 frames/s
+// (~2.4 KiB/s) a hostile relay saturated a core, and because handleMessage is
+// FIFO-serialized honest frames queued behind the flood. The window is now 64:
+// a gap that large already means the relay is dropping almost everything, and
+// the per-forged-frame cost falls ~16x, to a level an attacker could reach just
+// by sending ordinary traffic. There is no amplification left to speak of.
+//
+// The finding's other suggested half — caching the message keys we step OVER,
+// so a late frame costs one AEAD open instead of a second walk — is DELIBERATELY
+// NOT taken. This ratchet's forward secrecy rests on skipped keys being
+// destroyed as the chain steps (crypto.test.mjs asserts a skipped frame is
+// permanently undecryptable); a cache would keep up to a window of live message
+// keys in memory for frames that may never arrive, trading a real
+// confidentiality property against a captured-state adversary for a
+// performance win against an adversary the smaller window already handles.
+const RATCHET_MAX_SKIP = 64;
 
 const HMAC_CHAIN = { name: "HMAC", hash: "SHA-256", length: 256 };
 
@@ -122,7 +154,14 @@ async function chainAdvance(chain, steps, usage) {
   return { msgKey, chain };
 }
 
+// Key-confirmation domain (pentest 2026-07-27 M-5). Never a single byte, so it
+// can never collide with the chain's own 0x01 / 0x02 step inputs.
+const CONFIRM_DOMAIN = "secure-chat/key-confirmation/v1";
+
 class RatchetChannel {
+  // Use RatchetChannel.create() — the constructor cannot await, and the
+  // confirmation tags MUST be computed from the initial chain heads before
+  // anything advances them.
   constructor(roomId, domain, sendChain, recvChain) {
     this.roomId = roomId;
     this.domain = domain; // per-mode AD domain, so frames can never cross modes
@@ -130,7 +169,26 @@ class RatchetChannel {
     this.recvChain = recvChain;
     this.sendSeq = 0;
     this.recvSeq = 0;
+    // Key confirmation (M-5). `mine` is what we send the peer; `theirs` is what
+    // we require back. Computed once, from the chain heads as they are at
+    // creation, and only the 32-byte tags are retained — the heads themselves
+    // are never stored, so this costs nothing in forward secrecy.
+    this.confirmMine = null;
+    this.confirmTheirs = null;
     this._q = new CallQueue(); // serializes encrypt/decrypt (see CallQueue)
+  }
+  static async create(roomId, domain, sendChain, recvChain) {
+    const chan = new RatchetChannel(roomId, domain, sendChain, recvChain);
+    // Direction-separated exactly like the traffic: our tag comes from the
+    // chain we send on, which is the chain the peer receives on — so the peer
+    // computing it from THEIR recv chain is proving they derived the same
+    // material we did. Revealing one HMAC output under a long, domain-separated
+    // input tells an attacker nothing about the chain key, and the chain is
+    // stepped only with the one-byte inputs 0x01/0x02.
+    const ctx = enc.encode([CONFIRM_DOMAIN, domain, roomId].join("|"));
+    chan.confirmMine = bufToB64(await crypto.subtle.sign("HMAC", sendChain, ctx));
+    chan.confirmTheirs = bufToB64(await crypto.subtle.sign("HMAC", recvChain, ctx));
+    return chan;
   }
   // Canonical additional data: all parts are base64/int, so "|" is unambiguous.
   // Direction is bound by the chain itself (each is derived from its sender).
@@ -170,6 +228,9 @@ class RatchetChannel {
     );
     this.recvChain = step.chain; // commit: skipped/used keys are unrecoverable
     this.recvSeq = m.n;
+    return this._finish(pt);
+  }
+  _finish(pt) {
     const text = dec.decode(pt);
     // Pentest 2026-07-26 P-18: enforce the project's printable-ASCII invariant
     // here too. OtpPad._decrypt and both send paths already check it; this path
@@ -220,6 +281,13 @@ class AesPassphrase {
   get ready() {
     return this.chan !== null;
   }
+  // Key confirmation (pentest 2026-07-27 M-5): {mine, theirs} once the chains
+  // exist. `mine` goes to the peer; a peer that derived the same material sends
+  // back exactly `theirs`. See app.js for the exchange and why it gates the
+  // in-person verification step.
+  get confirmation() {
+    return this.chan ? { mine: this.chan.confirmMine, theirs: this.chan.confirmTheirs } : null;
+  }
   async init() {
     if (!this.passphrase) throw new Error("passphrase required for AES-256 mode");
     const pw = await crypto.subtle.importKey(
@@ -262,7 +330,7 @@ class AesPassphrase {
         false,
         ["sign"],
       );
-    this.chan = new RatchetChannel(this.roomId, AES_MSG_DOMAIN, await chain(myNonce), await chain(peerNonce));
+    this.chan = await RatchetChannel.create(this.roomId, AES_MSG_DOMAIN, await chain(myNonce), await chain(peerNonce));
     this.base = null; // only the forward-stepping chains remain
   }
   async encrypt(text) {
@@ -304,6 +372,13 @@ class Dhke {
   get ready() {
     return this.chan !== null;
   }
+  // Key confirmation (pentest 2026-07-27 M-5): {mine, theirs} once the chains
+  // exist. `mine` goes to the peer; a peer that derived the same material sends
+  // back exactly `theirs`. See app.js for the exchange and why it gates the
+  // in-person verification step.
+  get confirmation() {
+    return this.chan ? { mine: this.chan.confirmMine, theirs: this.chan.confirmTheirs } : null;
+  }
   async init() {
     this.kp = await crypto.subtle.generateKey(
       { name: "ECDH", namedCurve: "P-256" },
@@ -318,10 +393,21 @@ class Dhke {
   async onPeerKey(b64) {
     // Our own key echoed back can only be relay mischief: honest peers never
     // share a keypair, and identical pubs would collapse the direction chains.
-    if (b64 === this.myPub) throw new Error("reflected handshake rejected");
+    //
+    // Pentest 2026-07-27 M-4: this guard used to be a bare `b64 === this.myPub`
+    // string compare on a malleable encoding, so a re-SPELLED copy of our own
+    // signed offer walked straight past it (RSA and PQKEM survived only because
+    // they compare signature-covered inner JSON fields). The guest then derived
+    // a channel with herself and was prompted to verify her OWN fingerprint;
+    // clicking through pinned her own bundle as the room's contact. Decode
+    // FIRST — b64ToBuf is canonical now (H-1), so the decode rejects every
+    // non-canonical spelling — then compare the ECDH POINT, not its encoding.
+    const peerRaw = new Uint8Array(b64ToBuf(b64));
+    const myRaw = new Uint8Array(b64ToBuf(this.myPub));
+    if (bytesEqual(peerRaw, myRaw)) throw new Error("reflected handshake rejected");
     if (this.chan) return; // first key wins: ignore replays of the peer's key
     const peer = await crypto.subtle.importKey(
-      "raw", b64ToBuf(b64), { name: "ECDH", namedCurve: "P-256" }, false, [],
+      "raw", peerRaw, { name: "ECDH", namedCurve: "P-256" }, false, [],
     );
     // Run the raw ECDH secret (the shared point's X coordinate) through HKDF
     // rather than using it directly: proper key separation, with the room id
@@ -331,6 +417,10 @@ class Dhke {
     );
     const base = await crypto.subtle.importKey("raw", ecdhBits, "HKDF", false, ["deriveKey"]);
     ecdhBits.fill(0);
+    // The chain `info` is the sender's public key as a STRING. That is only
+    // unambiguous because both spellings that reach here are canonical (H-1) —
+    // otherwise two peers holding the same POINT could derive different chains
+    // and wedge one direction of a session they both believe is verified (M-5).
     const chain = (senderPubB64) =>
       crypto.subtle.deriveKey(
         { name: "HKDF", hash: "SHA-256", salt: enc.encode(this.roomId), info: enc.encode(DHKE_CHAIN_INFO + senderPubB64) },
@@ -339,7 +429,7 @@ class Dhke {
         false,
         ["sign"],
       );
-    this.chan = new RatchetChannel(this.roomId, DHKE_MSG_DOMAIN, await chain(this.myPub), await chain(b64));
+    this.chan = await RatchetChannel.create(this.roomId, DHKE_MSG_DOMAIN, await chain(this.myPub), await chain(b64));
     // Only one derivation ever happens (first key wins), so the private key is
     // done the moment the chains exist — drop it for in-session FS.
     this.kp = null;
@@ -355,6 +445,16 @@ class Dhke {
 }
 
 // ---- shared byte helpers (RSA + PQKEM) -------------------------------------
+
+// Byte equality. Not constant-time and does not need to be: every value
+// compared with it is PUBLIC key material already on the wire.
+function bytesEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
 
 function concatBytes(parts) {
   let n = 0;
@@ -418,6 +518,13 @@ class Rsa {
   }
   get ready() {
     return this.chan !== null;
+  }
+  // Key confirmation (pentest 2026-07-27 M-5): {mine, theirs} once the chains
+  // exist. `mine` goes to the peer; a peer that derived the same material sends
+  // back exactly `theirs`. See app.js for the exchange and why it gates the
+  // in-person verification step.
+  get confirmation() {
+    return this.chan ? { mine: this.chan.confirmMine, theirs: this.chan.confirmTheirs } : null;
   }
   async init() {
     this.kp = await crypto.subtle.generateKey(
@@ -498,7 +605,7 @@ class Rsa {
         false,
         ["sign"],
       );
-    this.chan = new RatchetChannel(this.roomId, RSA_MSG_DOMAIN, await chain(this.myPub), await chain(this.peerPubB64));
+    this.chan = await RatchetChannel.create(this.roomId, RSA_MSG_DOMAIN, await chain(this.myPub), await chain(this.peerPubB64));
   }
   // Erase everything that could reconstruct past (or all) message keys: the
   // root secrets and the RSA private key. From here only the forward-stepping
@@ -574,6 +681,13 @@ class Pqkem {
   get ready() {
     return this.chan !== null;
   }
+  // Key confirmation (pentest 2026-07-27 M-5): {mine, theirs} once the chains
+  // exist. `mine` goes to the peer; a peer that derived the same material sends
+  // back exactly `theirs`. See app.js for the exchange and why it gates the
+  // in-person verification step.
+  get confirmation() {
+    return this.chan ? { mine: this.chan.confirmMine, theirs: this.chan.confirmTheirs } : null;
+  }
   async init() {
     this.ecdh = await crypto.subtle.generateKey(
       { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"],
@@ -589,6 +703,15 @@ class Pqkem {
   // are kept intact.
   async _derive() {
     if (this.peerEcdh === null || this.secrets.size === 0) return;
+    // Pentest 2026-07-27 M-5: no LOCAL invariant can tell a healthy handshake
+    // from a wedged one here. The honest staggered order (offer -> answer)
+    // legitimately leaves each peer holding exactly ONE KEM secret, tagged with
+    // the same encapsulation key on both sides; a relay that drops both
+    // `reply=true` answers also leaves each peer holding exactly one, tagged
+    // with the key IT encapsulated to. The two cases are indistinguishable from
+    // inside this function — the difference is only visible when the peers
+    // compare something derived from the chains, which is what the explicit key
+    // confirmation in app.js does before the session is declared verified.
     const tags = [...this.secrets.keys()].sort();
     const signature = this.peerEcdh + "|" + tags.join(",");
     if (signature === this._derivedFrom) return;
@@ -611,7 +734,7 @@ class Pqkem {
         false,
         ["sign"],
       );
-    this.chan = new RatchetChannel(this.roomId, PQKEM_MSG_DOMAIN, await chain(this.myEcdhPub), await chain(this.peerEcdh));
+    this.chan = await RatchetChannel.create(this.roomId, PQKEM_MSG_DOMAIN, await chain(this.myEcdhPub), await chain(this.peerEcdh));
   }
   async handshakePayload() {
     if (this.answer) return this.answer;                        // reply to a peer offer
@@ -741,6 +864,11 @@ class OtpPad {
   get needsHandshake() { return false; } // the pad is the shared secret; nothing crosses the wire
   get usesNonces() { return false; }
   get ready() { return this.pad !== null; }
+  // No key confirmation to do (M-5): nothing was negotiated. Both sides either
+  // hold the same pad — carried between the devices in person — or they do not,
+  // in which case the very first frame fails its one-time HMAC. There is no
+  // state in which two peers "agree" on different key material.
+  get confirmation() { return null; }
   async init() {}
   handshakePayload() { return null; }
   async onPeerKey() {}
@@ -812,6 +940,17 @@ class OtpPad {
     if (p.o + need > this.regionSize) throw new Error("pad offset out of range");
     const base = peerRegion * this.regionSize;
     const abs = base + p.o;
+    // Pentest 2026-07-27 L-5 (defense in depth): the send path has carried this
+    // check since P-01; the receive path did not. Consumed pad is ZEROED, so an
+    // all-zero span here means we are about to verify and XOR against keystream
+    // that is already spent — the plaintext would fall straight out of the
+    // ciphertext. `recvHighWater` should make that unreachable, and no
+    // app-internal path to the required state was found; this is the guard for
+    // when it is wrong (a hand-edited or corrupted record), and it costs one
+    // scan of a span we are reading anyway.
+    if (isAllZero(this.pad, abs, abs + need)) {
+      throw new Error("pad region already consumed (zeroed) — refusing to decrypt against spent keystream");
+    }
     const macKeyBytes = this.pad.slice(abs, abs + OTP_MAC_BYTES);
     const { key, ad } = await this._mac(macKeyBytes, p.r, p.o, len, ct, "verify");
     const ok = await crypto.subtle.verify("HMAC", key, b64ToBuf(p.mac), ad);

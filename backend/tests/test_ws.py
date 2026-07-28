@@ -384,6 +384,9 @@ def test_a_waiter_inside_the_grace_is_never_displaced():
             # The last one in stands for the invited peer, still pre-knock.
             with client.websocket_connect("/ws") as attacker:
                 assert _join(attacker, room) == {"type": "error", "reason": "room full"}
+            # Pentest 2026-07-27 M-1: the refused join is now REPORTED to the
+            # owner, so the lockout is visible instead of silent.
+            assert _recv(owner) == {"type": "turned-away", "count": 1}
             # It is still queued, and can still introduce itself.
             _knock(opened[-1], room)
             knock = _recv(owner)
@@ -541,3 +544,81 @@ def test_join_timeout_drops_unjoined_connection(monkeypatch):
         assert _recv(ws) == {"type": "error", "reason": "join timeout"}
         with pytest.raises(WebSocketDisconnect):
             ws.receive_text()
+
+
+# --- Pentest 2026-07-27 M-3: client input must never write a traceback -------
+# `receive_text()` does message["text"] unconditionally, so a BINARY frame raised
+# a bare KeyError — neither WebSocketDisconnect nor a validation error — which
+# fell through to the catch-all `log.exception` and put a full traceback on disk.
+# One 3-byte frame produced 636 bytes of log; 200 connections × 1 byte produced
+# 127 KB in 0.31 s. That is an I2 defeat (precisely-timestamped who-connected-when
+# entries, mintable on demand by anyone) and a log-amplification DoS.
+
+def test_binary_frame_is_answered_politely_not_logged(caplog):
+    with caplog.at_level("ERROR"):
+        with client.websocket_connect("/ws") as ws:
+            ws.send_bytes(b"\x00\x01\x02")
+            assert _recv(ws) == {"type": "error", "reason": "binary frames not accepted"}
+    assert not [r for r in caplog.records if r.exc_info], "no traceback may be logged"
+
+
+def test_deeply_nested_json_is_a_bad_envelope_not_a_traceback(caplog):
+    # RecursionError from json.loads was not in the except clause either.
+    deep = "[" * 20000 + "]" * 20000
+    with caplog.at_level("ERROR"):
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(deep)
+            assert _recv(ws) == {"type": "error", "reason": "bad envelope"}
+    assert not [r for r in caplog.records if r.exc_info], "no traceback may be logged"
+
+
+# --- Pentest 2026-07-27 M-1: a filled queue is reported to the owner ---------
+
+def test_turnaway_notice_is_not_suppressed_on_a_fresh_room():
+    """The batching sentinel must not swallow the FIRST notice.
+
+    `time.monotonic()` counts from an arbitrary origin that on Linux is process
+    or boot start, so a 0.0 "last notified" sentinel reads as "notified just
+    now" for the relay's first TURNAWAY_NOTICE_SEC seconds — exactly the window
+    in which a freshly published room is most likely to be raced.
+    """
+    from relay import Room
+
+    assert Room().turnaway_notified_at == float("-inf")
+    assert time.monotonic() - Room().turnaway_notified_at >= config.TURNAWAY_NOTICE_SEC
+
+
+def test_owner_is_told_when_joins_are_turned_away():
+    """A knocked waiter is not displaceable, so a full queue locks everyone out.
+
+    The lockout itself is inherent (the real fix is a cryptographic room-entry
+    proof), but it used to be SILENT: the invited peer saw "room full" and the
+    owner saw nothing at all. Now the owner is told, with a count, and the
+    notices are batched so they cannot themselves be flooded.
+    """
+    room = _room()
+    with client.websocket_connect("/ws") as owner:
+        _join(owner, room)
+        waiters = [client.websocket_connect("/ws") for _ in range(config.MAX_ROOM_PENDING)]
+        opened = [w.__enter__() for w in waiters]
+        try:
+            for w in opened:
+                assert _join(w, room) == {"type": "pending"}
+                _knock(w, room)               # knocked waiters are not displaceable
+                assert _recv(owner)["type"] == "knock"
+            # Every honest join from here is refused before it can even knock.
+            with client.websocket_connect("/ws") as invited:
+                assert _join(invited, room) == {"type": "error", "reason": "room full"}
+            assert _recv(owner) == {"type": "turned-away", "count": 1}
+
+            # Batching: further refusals inside the window do not each mint a
+            # frame at the owner (that would make the warning an amplifier).
+            for _ in range(3):
+                with client.websocket_connect("/ws") as more:
+                    assert _join(more, room) == {"type": "error", "reason": "room full"}
+            # Nothing further arrives; prove it by round-tripping a real frame.
+            owner.send_text(json.dumps({"type": "knock", "room": room, "payload": "aGk="}))
+            assert _recv(owner) == {"type": "error", "reason": "not waiting"}
+        finally:
+            for w in waiters:
+                w.__exit__(None, None, None)
