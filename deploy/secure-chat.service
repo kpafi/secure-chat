@@ -1,0 +1,33 @@
+[Unit]
+Description=secure-chat relay (uvicorn, loopback only)
+After=network.target
+
+[Service]
+User=securechat
+Group=securechat
+WorkingDirectory=/opt/secure-chat/backend
+# Both front ends reach this ONE process over loopback: Caddy (TLS, clearnet)
+# and Tor (onion -> 127.0.0.1:8000). Sharing the process is deliberate — rooms,
+# session tokens and login challenges live in memory, so a second instance would
+# split-brain them.
+Environment=SECURE_CHAT_EXTRA_ORIGINS=https://138-199-144-35.sslip.io,http://626vkwn6znrko2xhorirvv5ttrbzcr3xkdjmk65cks26qkvadplyk5id.onion
+#
+# DELIBERATELY ABSENT: SECURE_CHAT_TRUSTED_PROXIES.
+# It used to be 127.0.0.1 so per-IP rate limiting worked behind Caddy. Since
+# 2026-07-28 Tor also forwards to 127.0.0.1:8000, and the app CANNOT tell a Tor
+# visitor from Caddy — both are loopback peers. Trusting loopback would let any
+# onion visitor forge X-Forwarded-For and mint a fresh rate-limit bucket per
+# request, which is pentest 2026-07-25 F-03 reopened. Unset => accounts.client_key
+# trusts nobody and every /api limiter keys on one shared bucket: fails CLOSED.
+# DO NOT re-add it while the onion service forwards to this port.
+ExecStart=/opt/secure-chat/venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000 --no-server-header --no-proxy-headers --no-access-log --log-level warning --ws-max-size 66560
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/secure-chat/backend
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target

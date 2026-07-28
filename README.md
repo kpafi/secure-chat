@@ -5,11 +5,13 @@ A deliberately tiny, security-first text chat. ASCII only. The server is a
 forwards opaque ciphertext between two parties in a room. The server never
 holds keys, never decrypts, and never stores or logs message content.
 
-> Status: **backend relay + web client working locally**, four encryption
-> modes verified end-to-end (DHKE, AES-256, RSA, PQKEM), all forward-secret
-> ratchets. The DHKE/RSA/PQKEM key exchange is **authenticated in the browser
-> client** with long-term identity keys (Ed25519 + ML-DSA-65) and an in-person
-> safety-number check, closing the relay-MITM gap. See `PROGRESS.md`.
+> Status: **backend relay + web client working locally and deployed**, four
+> encryption modes verified end-to-end (DHKE, AES-256, RSA, PQKEM), all
+> forward-secret ratchets. The DHKE/RSA/PQKEM key exchange is **authenticated in
+> the browser client** with long-term identity keys (Ed25519 + ML-DSA-65) and an
+> in-person safety-number check, closing the relay-MITM gap. The relay is
+> reachable over a **Tor v3 onion service** as well as clearnet — see
+> `deploy/README.md`. See `PROGRESS.md`.
 
 ## Why this design
 A breach of the server should leak nothing readable. By keeping the server
@@ -26,11 +28,19 @@ server can ship backdoored code on the next load and exfiltrate plaintext or
 private keys. CSP does not prevent this (the attacker controls the page that
 declares the policy), and neither does SRI (it controls the hashes too). This is
 the unavoidable trust assumption of *any* web-delivered E2EE app: **you trust the
-server to serve honest code every time you load it.** Mitigations on the roadmap:
-the dedicated **Android app** (code not server-delivered) and serving over a
-hardened **`.onion`**; for the web, reproducible builds + out-of-band code-hash
-verification. Treat the web client as "secure against a passive/compromised
-*relay*", not against a server actively serving malicious code.
+server to serve honest code every time you load it.** The mitigation is the
+dedicated **Android app** (audited client shipped in the APK, not
+server-delivered); for the web, reproducible builds + out-of-band code-hash
+verification remain on the roadmap. Treat the web client as "secure against a
+passive/compromised *relay*", not against a server actively serving malicious
+code.
+
+The relay is also served over a hardened **`.onion`** (live; see
+`deploy/README.md`). Be precise about what that buys: the address is
+self-authenticating — it *is* an Ed25519 public key — so reaching it trusts no
+certificate authority and no DNS, and the relay never learns a client IP. It
+does **not** close the gap above, because the onion still serves the
+JavaScript. Only the app does that.
 
 ## Architecture (current)
 ```
@@ -78,6 +88,20 @@ node ../client/accounts.integration.test.mjs
 # Legacy two-client smoke test (raw relay, no crypto):
 python tests/smoke_client.py
 ```
+
+## Deployment
+`deploy/` holds the live server config — the systemd unit, the Tor onion-service
+`torrc`, and the Caddy site — copied from the running box so a re-provision
+reproduces it. `deploy/README.md` is the recipe.
+
+Two rules that are easy to get wrong and expensive to get wrong:
+- **uvicorn binds `127.0.0.1` only.** Caddy (clearnet TLS) and Tor (onion) both
+  reach it over loopback; it is never on a public interface.
+- **`SECURE_CHAT_TRUSTED_PROXIES` stays unset** while the onion forwards to that
+  port. Loopback is no longer proof of "came through Caddy", so trusting it lets
+  an onion visitor forge `X-Forwarded-For` and mint a rate-limit bucket per
+  request (pentest F-03). Unset, every limiter shares one bucket and fails
+  closed. The reasoning and the measured numbers are in `deploy/README.md`.
 
 ## Encryption modes (client-side)
 | Mode    | Key agreement                       | Message cipher      | Notes                                       |
@@ -248,7 +272,9 @@ lifted to WARNING, so there is no who-connected-when / which-endpoint trail for
 a seized `.onion` host to yield. Only genuine error tracebacks are logged, and
 those never contain payloads or room ids. `run.sh` carries the matching flags;
 a guard test (`tests/test_logging.py`) fails if either is dropped. **Do not
-re-enable access logging in production.**
+re-enable access logging in production.** Tor is configured not to undo this:
+`SafeLogging 1` and `Log warn syslog`, so the onion daemon adds no
+per-connection trail of its own, and Caddy's site log is `output discard`.
 
 **Room ids are a bearer capability (L2).** A room is joined purely by knowing
 its 64-hex (256-bit) id — the relay is intentionally anonymous and performs no
