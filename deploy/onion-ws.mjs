@@ -79,13 +79,20 @@ async function wsConnect(host, { origin }) {
     };
     sock.on("data", onData);
     sock.on("error", reject);
-    sock.on("close", () => resolve({ code: 0, rest: Buffer.alloc(0) }));
+    // Pentest 2026-07-29 M-3: this used to resolve `{code: 0}` and say nothing
+    // more, so a socket that died before the header terminator — a Tor hiccup,
+    // a relay restart, the connection cap — was indistinguishable from "the
+    // server refused the upgrade". The one security assertion in this file
+    // (`!foreign.upgraded`) was satisfied by BOTH, so it passed vacuously; it
+    // was proved green at HTTP 0 with the CSWSH guard never exercised. Flag the
+    // difference so callers can refuse to draw a conclusion from a dead socket.
+    sock.on("close", () => resolve({ code: 0, rest: Buffer.alloc(0), transportFailed: true }));
     setTimeout(() => reject(new Error("upgrade timeout")), TIMEOUT);
   });
 
   if (status.code !== 101) {
     sock.destroy();
-    return { upgraded: false, code: status.code };
+    return { upgraded: false, code: status.code, transportFailed: !!status.transportFailed };
   }
 
   const inbox = [];
@@ -189,9 +196,40 @@ guest.close();
 
 // 5) The CSWSH guard must still be closed: adding the onion must not have
 //    turned the allow-list into "anything goes".
+//
+//    Pentest 2026-07-29 M-3. `!foreign.upgraded` on its own proves nothing —
+//    every transport failure satisfies it. Asserting `code === 403` instead is
+//    ALSO unsound: main.py closes on a bad origin and on the connection cap
+//    before `accept()`, and uvicorn collapses both to 403, so a capped relay
+//    would "pass" this check while the guard was never consulted.
+//
+//    What distinguishes "the guard rejected it" from "the transport is dead" is
+//    a POSITIVE CONTROL in the same pass: an allowed Origin must upgrade right
+//    now, over the same Tor circuit-building path, or the negative result is
+//    not evidence. Run the control immediately AFTER the foreign attempt, so a
+//    failure in between cannot make the pair look good.
 const foreign = await wsConnect(ONION, { origin: "http://evil.example.com" });
-check("foreign Origin still refused over the onion", !foreign.upgraded, `HTTP ${foreign.code}`);
 if (foreign.upgraded) foreign.close();
+const control = await wsConnect(ONION, { origin: onionOrigin });
+if (control.upgraded) control.close();
+
+check(
+  "positive control: an allowed Origin upgrades right now",
+  control.upgraded,
+  control.transportFailed
+    ? "transport died — the refusal below proves nothing"
+    : `HTTP ${control.code ?? 101}`,
+);
+check(
+  "foreign Origin still refused over the onion",
+  // All three, together: the foreign attempt was actually answered by the
+  // server (not a dead socket), it was refused, and an allowed Origin got
+  // through on the same run.
+  !foreign.upgraded && !foreign.transportFailed && foreign.code > 0 && control.upgraded,
+  foreign.transportFailed
+    ? "INCONCLUSIVE: socket closed before any HTTP status"
+    : `HTTP ${foreign.code}`,
+);
 
 // A native client sending no Origin at all is allowed by design (documented).
 const noOrigin = await wsConnect(ONION, { origin: null });

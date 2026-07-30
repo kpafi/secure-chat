@@ -242,7 +242,66 @@ class MainActivity : AppCompatActivity() {
         val config = JSONObject()
             .put("api", relay.httpOrigin)
             .put("ws", "${relay.wsOrigin}/ws")
-        val js = "window.__SECURE_CHAT_RELAY__ = $config;"
+        // Pentest 2026-07-29 H-1, second half: the client used to decide "is there
+        // a native pad floor?" by feature-detecting `window.SecureChatPadFloor`,
+        // an attacker-WRITABLE global. `delete window.SecureChatPadFloor` at
+        // document-start therefore read as "plain browser" and disabled the F-1
+        // floor with no error at all — a silent downgrade of the one control the
+        // JS context is not supposed to be able to reach.
+        //
+        // The marker below says "this build HAS a native floor". It is defined
+        // non-writable and non-configurable, so unlike the bridge global it
+        // cannot be deleted or overwritten from JS: an attacker can still remove
+        // the bridge, but they can no longer hide that it was supposed to be
+        // there, and otp.js then fails CLOSED instead of quietly continuing.
+        // Injected in the same document-start script as the relay config, so it
+        // lands before any page script runs and is covered by the same
+        // DOCUMENT_START_SCRIPT check and the same verify-after-load probe.
+        // Fix review 2026-07-30 (H-A): hardening the MARKER was not enough.
+        //
+        // The first cut of this made `__SECURE_CHAT_NATIVE_FLOOR__` non-configurable
+        // so `delete window.SecureChatPadFloor` could no longer masquerade as a
+        // plain browser. But `otp.js` still located the bridge by NAME and
+        // accepted anything with `read`/`bump` functions, so the attacker never
+        // needed to delete it: install an object that answers "no floor" (or
+        // overwrite just the two METHODS on the real one — two assignments, no
+        // `delete`, no `defineProperty`) and every check passed while the real
+        // Keystore-backed floor sat untouched and unconsulted. Full keystream
+        // reuse, exactly the state F-1 exists to prevent.
+        //
+        // So the bridge is captured HERE, at document-start, before any page
+        // script can run, and republished frozen under a non-configurable name.
+        // `otp.js` reads only that name. The bound methods mean overwriting
+        // `SecureChatPadFloor.read` afterwards changes nothing, and the property
+        // cannot be redefined or deleted.
+        //
+        // If the interface is somehow not present at this point, we deliberately
+        // do NOT fall back to the writable global: the marker is set to a value
+        // that makes otp.js fail closed, and verifyRelayConfig then refuses to
+        // run at all. An ordering surprise becomes a loud startup failure rather
+        // than a silent downgrade of the floor.
+        val js = """
+            window.__SECURE_CHAT_RELAY__ = $config;
+            (function () {
+              var b = window.SecureChatPadFloor;
+              var ok = !!b && typeof b.read === 'function' && typeof b.bump === 'function';
+              if (ok) {
+                // .bind() captures the FUNCTION VALUES now. A closure calling
+                // b.read(id) would re-look-up the property on every call and so
+                // would still obey a later `b.read = fake` — which is the whole
+                // attack. Function.prototype.bind is pristine at document-start,
+                // before any page script has run.
+                Object.defineProperty(window, '__SECURE_CHAT_PAD_FLOOR__', {
+                  value: Object.freeze({ read: b.read.bind(b), bump: b.bump.bind(b) }),
+                  writable: false, configurable: false, enumerable: false
+                });
+              }
+              Object.defineProperty(window, '__SECURE_CHAT_NATIVE_FLOOR__', {
+                value: ok ? true : 'unavailable',
+                writable: false, configurable: false, enumerable: false
+              });
+            })();
+        """.trimIndent()
         // Checked in onCreate too; re-checked here because promptForRelay() also
         // reaches this path, and loading the client without the config is the
         // silent failure L-10 is about.
@@ -265,8 +324,17 @@ class MainActivity : AppCompatActivity() {
      * block it.
      */
     private fun verifyRelayConfig() {
+        // Both halves of the document-start script must have landed, AND the pad
+        // floor bridge must be callable from the page (2026-07-29 H-1). A build
+        // that advertises a native floor it cannot actually reach is worse than
+        // the browser build, because otp.js will fail closed on every pad.
+        // The FROZEN copy is what otp.js uses, so that is what must exist —
+        // checking `SecureChatPadFloor` here would pass on a substituted bridge
+        // (H-A) and prove nothing.
         binding.webview.evaluateJavascript(
-            "!!window.__SECURE_CHAT_RELAY__",
+            "!!window.__SECURE_CHAT_RELAY__ && window.__SECURE_CHAT_NATIVE_FLOOR__ === true " +
+                "&& typeof (window.__SECURE_CHAT_PAD_FLOOR__||{}).read === 'function' " +
+                "&& typeof (window.__SECURE_CHAT_PAD_FLOOR__||{}).bump === 'function'",
         ) { result -> if (result != "true") refuseToRun() }
     }
 

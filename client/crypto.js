@@ -853,12 +853,27 @@ class OtpPad {
       throw new Error("OTP pad region too small");
     }
     if (pad.bytes.length !== 2 * pad.regionSize) throw new Error("OTP pad length mismatch");
+    // Pentest 2026-07-29 L-5: validate the offsets like every other field.
+    //
+    // Not reachable today — otp.js rejects negative offsets before it gets here
+    // and v3 keeps them inside the AEAD — but this class is written as though it
+    // defends itself against a bad record, and with a negative offset it does
+    // not. `sendOffset < 0` makes the P-01 spent-keystream guard return false on
+    // its first iteration and makes `slice()` draw the MAC key and keystream
+    // from the PEER's region (i.e. keystream the peer will also use to send);
+    // `recvHighWater < 0` turns the zeroing `fill()` into a no-op, so consumed
+    // keystream is never erased. Both are two-time-pad shaped, so the class
+    // should not be relying on a caller to have checked. `| 0` was silently
+    // coercing NaN/undefined to 0 as well, which hid a malformed record.
+    const inRange = (v) => Number.isInteger(v) && v >= 0 && v <= pad.regionSize;
+    if (!inRange(pad.sendOffset)) throw new Error("OTP pad has an invalid send offset");
+    if (!inRange(pad.recvHighWater)) throw new Error("OTP pad has an invalid receive high-water mark");
     this.roomId = roomId;
     this.pad = pad.bytes;          // shared reference: app.js persists it (zeroed as consumed)
     this.role = pad.role;
     this.regionSize = pad.regionSize;
-    this.sendOffset = pad.sendOffset | 0;       // our position in our send region
-    this.recvHighWater = pad.recvHighWater | 0; // highest consumed offset in the peer's region
+    this.sendOffset = pad.sendOffset;       // our position in our send region
+    this.recvHighWater = pad.recvHighWater; // highest consumed offset in the peer's region
     this._q = new CallQueue();
   }
   get needsHandshake() { return false; } // the pad is the shared secret; nothing crosses the wire

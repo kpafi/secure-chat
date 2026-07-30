@@ -336,8 +336,14 @@
           </div>
           <div class="row inline">
             <button id="profileExport" type="button">Copy backup</button>
+            <button id="profileLogout" type="button" hidden>Sign out of directory</button>
             <button id="profileForget" type="button" class="danger">Forget identity</button>
           </div>
+          <p class="hint" id="profileSessionHint" hidden>
+            Signing out revokes this device's directory session on the relay, so a
+            copied session token stops working. Your identity and contacts stay
+            on this device.
+          </p>
         </div>
       </section>
     </div><!-- /viewProfile -->

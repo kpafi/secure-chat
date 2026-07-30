@@ -46,6 +46,20 @@ distinguishes the two hypotheses on the number alone.
 > uncontended one. See M-1 in `secure-chat-pentest-2026-07-29.md` and item 1 of
 > the TODO. The claim is repeated verbatim in `deploy/README.md` and in commit
 > `d338e15`'s message; both need the same correction when it is fixed.
+>
+> **✅ FIXED 2026-07-30.** `client_key()` is now a pure function of the peer: it
+> ignores `X-Forwarded-For` entirely when no trusted proxy is configured, so
+> there is exactly ONE bucket per peer whatever the headers say. The forgeable
+> `peer in hops` detector is gone — with it went L-9, since that predicate was
+> also how a remote attacker burned the H-4 warning. Runtime detection of a real
+> rewrite now keys on the PORT (uvicorn synthesises `(host, 0)` from a bare-IP
+> hop, and no genuine TCP peer has source port 0), which the client cannot set:
+> no false positives, so it cannot be provoked. It is explicitly a diagnostic,
+> NOT the control — the control is `--no-proxy-headers`, and all three launch
+> paths are now held to it by tests, including `deploy/secure-chat.service`,
+> which had none. `deploy/README.md` is corrected in place with the third table
+> row that separates the hypotheses. Commit `d338e15`'s message cannot be
+> rewritten and stays wrong; this note is the correction of record.
 
 **Accepted cost:** the
 clearnet side loses per-IP limiting too and shares that global bucket, so one
@@ -2823,162 +2837,360 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
 
 ## TODO / NEXT (suggested order)
 
-### 🔴 OPEN from the 2026-07-29 pentest — NOTHING FIXED YET
-Full detail per item in `secure-chat-pentest-2026-07-29.md`. Four agents swept
-the Tor/deployment surface, the relay + admission protocol, the client crypto
-core, and at-rest storage + directory; every claim below was re-verified by hand
-against the shipped code before being written down. **The E2EE core held** — no
-Critical, and a hostile relay still cannot read or forge a conversation. What
-follows is everything that did not hold.
+### ✅ CLOSED — the 2026-07-29 pentest, all 13 items (fixed 2026-07-30)
+Every finding in `secure-chat-pentest-2026-07-29.md` is fixed on branch
+`pentest-2026-07-29-fixes`. Backend **143 passed**, client **109 checks / 11
+suites**, `e2e/all-modes.mjs` **32/32 on 5 consecutive runs** (it used to fail 2
+in 5 — root-caused, below). Nothing is deployed; see DELIVERY at the end.
 
-Suggested order: **1 first** (one line, live right now, and it invalidates
-claims already published in the repo), then **2** (two lines), then the rest.
+Each fix carries a test that FAILS against the pre-fix code — verified by
+stashing the fix and re-running, not by assertion. Where that was not possible,
+it says so.
 
-1. **⬜ M-1 (Medium) — `client_key()` gives TWO attacker-selectable buckets, not
-   one. This corrects a claim I published on 2026-07-28.** `accounts.py:106-110`
-   branches on `peer in hops`, and in this deployment `peer` is always
-   `127.0.0.1`, so the client picks its own bucket with one header:
-   `X-Forwarded-For: 127.0.0.1` → `'!untrusted-forwarded'`, anything else or
-   absent → `'127.0.0.1'`. Measured 10+10 lookups against a nominal capacity of
-   10, and 61+61 against a nominal 60. An attacker can starve the bucket all
-   honest traffic sits in while working the uncontended one.
-   **Why it was missed:** the table in `deploy/README.md` used `203.0.113.x` for
-   BOTH rows, which land in the same branch; the one value that separates them
-   was never sent. **Fix:** return exactly one key per peer when no trusted proxy
-   is configured. **Also fix the docs it falsifies** — `deploy/README.md`,
-   the 2026-07-29 snapshot at the top of this file, and commit `d338e15`'s
-   message all state "one shared bucket". Fixing this also closes L-9.
-2. **⬜ H-1 (High) — `PadFloorBridge.clear()` hands the JS context a
-   delete-the-floor primitive.** `android/…/PadFloor.kt:150-151` exposes an
-   unauthenticated `clear` over `@JavascriptInterface`, five lines below the same
-   file's contract claiming the interface "has no lowering operation" and that
-   "deletion is not silent". Both are false. **This voids the F-1 Android
-   guarantee that was proved on real hardware 2026-07-28**: restore a snapshotted
-   pad blob AND its watermark, call `clear()` once, and the pad reopens at the
-   rolled-back offset silently — full keystream reuse. The floor is also
-   feature-detected from an attacker-writable global (`otp.js:108-110`), so
-   `delete window.SecureChatPadFloor` disables it with no error.
-   **Fix:** remove `clear` from the bridge (nothing in `client/` calls it), and
-   have the document-start injection set a `__SECURE_CHAT_NATIVE_FLOOR__` marker
-   — as it already does for `__SECURE_CHAT_RELAY__` — so `otp.js` fails closed
-   when the marker is present but the bridge is not.
-3. **⬜ H-2 (High) — contact pins silently zeroed by copying the witness over the
-   store.** `writeWitness()` (`contacts.js:204-210`) uses the SAME `dataKey` and
-   the SAME salt as the store blob; `readWitness()` checks a domain tag
-   (`:195`), `unlock()` does not (`:117-127`). One `setItem`, no passphrase, no
-   deletion → empty pin-less store at the same generation, `assertNotRolledBack`
-   passes, `pinsReadable()` stays true, and every peer renders as a benign first
-   contact instead of "⚠ identity key CHANGED". That is the alarm inversion L-1
-   and the 2026-07-27 H-2 were written to close. A sweep of all 30 blob-swap
-   combinations found this is the ONLY one that opens.
-   **Fix:** put `d: "secure-chat/contacts-store/v4"` inside the store plaintext
-   and require it in `unlock()`, adopting a pre-v4 blob that lacks it.
-4. **⬜ H-3 (High) — re-import after three `removeItem`s rebuilds a LEGITIMATE
-   pad at offset 0.** `padWasUsed()` (`otp.js:747-751`) reads three deletable
-   plaintext keys and never the native floor; `app.js:2805-2807` sets
-   `otpRecord` straight from `saveNewPad`, skipping `unlockPad` and every floor
-   check; `saveNewPad` (`otp.js:479`) seeds `wmCache` to zero so the
-   authenticated watermark is overwritten with zeros. No adoption prompt is
-   possible — the pad is re-created as a genuine v3 blob. Browser: permanent
-   two-time pad. Android: the floor refuses on the NEXT unlock, but the whole
-   current session sends from offset 0 over consumed keystream.
-   **Fix:** consult the native floor in `importPad`/`saveNewPad` and refuse when
-   a floor exists; make `saveNewPad` refuse to lower an existing watermark.
-5. **⬜ M-4 (Medium) — the Android-onion plan rests on a false premise, and the
-   obvious workaround is a Critical regression.** Chromium does NOT treat
-   `.onion` as potentially trustworthy, so the claim in
-   `network_security_config.xml`'s comment (and the plan built on it in the
-   2026-07-29 snapshot) is wrong. Measured: Chromium and default Firefox both
-   give `isSecureContext:false` / `crypto.subtle:undefined` on `http://…onion`;
-   only Firefox with `dom.securecontext.allowlist_onions` (which Tor Browser
-   ships) works. From an https page `new WebSocket("ws://…onion")` throws
-   outright, and `cleartextTrafficPermitted` sits BELOW Chromium's mixed-content
-   blocker so it cannot help. **Orbot alone will not make this work.**
-   **Write down next to the plan:** pointing the WebView at the onion as the
-   DOCUMENT origin would remove `crypto.subtle` entirely and make the JS
-   server-delivered again — destroying the exact H-02 property the app exists to
-   provide. Workable shapes: a local Orbot HTTP proxy on `127.0.0.1` (a
-   trustworthy origin) fronting the onion, or wrapping the onion in TLS.
-   Same gate is why the web client is unusable over the onion outside Tor
-   Browser; it fails closed, but the user sees a raw `TypeError`.
-6. **⬜ M-2 (Medium) — the accepted global-bucket DoS is cheaper than documented
-   and the reasoning is wrong on three counts.** ~2 req/s (~300 B/s) on
-   `/api/auth/challenge` denies **login to all existing accounts** (measured: 0
-   of 4 honest attempts succeeded); `GET /api/mailbox` burns its bucket
-   **unauthenticated** because the limiter is a route dependency that runs before
-   `current_user`. `deploy/README.md` is wrong that (a) the exposure is
-   onboarding — the tightest bucket is `CHALLENGE_RATE_*` at 0.5/s, which gates
-   login; (b) `config.py` sized for this — only `REGISTER_RATE_*` was, while
-   `CHALLENGE_RATE_*`/`LOOKUP_RATE_*` silently changed from per-IP to global;
-   (c) Tor PoW blunts it — PoW prices *introduction*, this attack needs one
-   circuit. The applicable knobs are `HiddenServiceMaxStreams` +
-   `HiddenServiceMaxStreamsCloseCircuit`, neither in `deploy/torrc.secure-chat`.
-7. **⬜ M-3 (Medium) — `deploy/onion-ws.mjs`'s only security assertion passes
-   vacuously.** `wsConnect` resolves `{code:0}` on any socket close before the
-   header terminator, so a Tor hiccup or a relay restart satisfies
-   `!foreign.upgraded` and the check reports OK — proved green at `HTTP 0` with
-   the CSWSH guard never exercised, while `deploy/README.md` and this file both
-   claim it verifies 403. Asserting `code===403` alone is still unsound:
-   `main.py:243` (bad origin) and `:249` (connection cap) both close before
-   `accept()` and collapse to the same status. **Fix:** add an adjacent positive
-   control — assert an allowed Origin upgrades AND the foreign one is refused in
-   the same run, failing if the allowed one did not.
-8. **⬜ M-5 (Medium) — a withheld handshake frame delivered after key
-   confirmation silently desyncs the session (PQKEM + RSA; DHKE immune).**
-   `_derive` replaces `this.chan` with a new `RatchetChannel` when the input
-   signature changes, resetting the confirmation tags, but `app.js`'s `case
-   "key"` has no `confirmDone` gate and `tryFinishConfirmation` never re-runs.
-   Both peers show "secure channel established", compare safety numbers, then
-   nothing works — exactly what M-5's own comment promises cannot happen. No
-   confidentiality loss. **Related, loud:** in a genuine simultaneous-connect
-   race both peers now disconnect, so the race tolerance at `crypto.js:645` is no
-   longer real.
-9. **⬜ M-6 (Medium) — the H-1 canonical-base64 boundary was never applied to the
-   directory → contacts path.** `account.js:100-104` copies server key strings
-   verbatim; `contacts.js:384-387` compares them as raw strings. A hostile
-   directory can, byte-for-byte truthfully, strip 🟢 + all vouches from a
-   verified contact at will, **permanently break sealed messaging to them**
-   (persisted non-canonical string, `seal()` throws before sending), and burn the
-   `MAX_AUTO_CONTACTS` budget. **Fix:** run directory answers through the same
-   `canonicalBundle()` gate `app.js` already uses at `:1797`/`:2199`.
-10. **⬜ M-7 (Medium) — `POST /api/vouch` is an un-throttled username-existence
-    oracle.** `accounts.py:587-590` answers 404 vs 400/422 **before** any
-    signature validation, with no dedicated limiter. Unlike registration it
-    consumes nothing, creates nothing and leaves no trace. **Fix:** check target
-    existence after signature verification, or put it on `lookup_rate_limit`.
-11. **⬜ Low / Info (see the report for each):** L-1 unbounded `knockQueue` growth
-    (~37 knocks/s, each forcing an ML-DSA verify on the owner's tab — dents
-    P-08's "waiting costs the room nothing"); L-2 deleting both contact keys
-    yields an empty store; L-3 two tabs silently lose a contact write; L-4 no
-    session revocation; L-5 `OtpPad` does not validate offsets (not reachable
-    today); L-6 `Pqkem`'s reflection guard is the unfixed M-4 string-compare bug
-    (latent); L-7 Tor's `/var/lib/tor/state` keeps a bandwidth/guard timeline, so
-    the I2 claim in `deploy/README.md` is overstated; L-8
-    `ReadWritePaths=/opt/secure-chat/backend` leaves the relay's own source
-    writable; L-9 the H-4 detector is remotely forgeable (closed by item 1);
-    L-10 the torrc install recipe is not idempotent.
-12. **⬜ Test-coverage gaps — every fix above must carry a test that FAILS against
-    today's code.** Highest value first: `crypto.test.mjs:448-462`
-    (`pqkemReplayDoesNotDesync`) **is vacuous** — it replays after `encrypt()`
-    sealed the cipher, so it would pass if `_derive` were entirely broken (same
-    failure mode `7d4e480` set out to fix); `test_proxy_headers.py` never tests
-    this topology and one line would have caught M-1
-    (`assert client_key(_Req("127.0.0.1","127.0.0.1")) == client_key(_Req("127.0.0.1"))`);
-    `deploy/secure-chat.service` is a third launch path with NO guard test, and
-    it is the one that starts production — nothing asserts it carries
-    `--no-proxy-headers` or lacks `SECURE_CHAT_TRUSTED_PROXIES`;
-    `otp-rollback.test.mjs:410` mocks the bridge without `clear`, and its final
-    `delete globalThis.SecureChatPadFloor` treats bridge-absence as a clean
-    browser — which IS the downgrade; nothing covers the witness→store swap, the
-    delete-then-reimport path, negative `OtpPad` offsets, the knock flood, or
-    that `crypto.subtle` is required at all.
-13. **⬜ `e2e/all-modes.mjs` is flaky — 2 failures in 5 local runs**, both at
-    bob's "waiting for approval" wait in the third mode. Not root-caused. Matters
-    because the harness is meant to be run over Tor, where this will read as a
-    Tor problem rather than a race. Its uncommitted `SECURE_CHAT_E2E_CHROME_ARGS`
-    knob should also **fail or tag the run** when
-    `--unsafely-treat-insecure-origin-as-secure` is present, rather than
-    reporting "all modes good" in a configuration no real user can reproduce.
+1. **✅ M-1 — `client_key()` gives exactly one bucket per peer.** `X-Forwarded-For`
+   is ignored outright when no trusted proxy is configured. The forgeable
+   `peer in hops` detector is deleted; rewrite detection moved to the PORT
+   (uvicorn builds `(host, 0)` from a bare-IP hop; a real TCP peer never has
+   source port 0), which the client cannot set — no false positives, so **L-9
+   closes with it**. The detector is documented as a diagnostic, not the control.
+   Tests: the exact line the report said would have caught it
+   (`peer=127.0.0.1, XFF=127.0.0.1`), a one-key-per-peer sweep over 9 header
+   shapes, an end-to-end limiter test **through a TestClient bound to
+   127.0.0.1** — the module-level client reports `"testclient"`, which is in no
+   attacker's header, so the original topology could not reproduce M-1 at all —
+   and both directions of the L-9 forgeability property.
+2. **✅ H-1 — the native pad floor cannot be cleared or detected away.**
+   `PadFloorBridge.clear` is gone (nothing called it), and `PadFloor.kt`'s
+   contract no longer claims two things that were false. The app injects
+   `__SECURE_CHAT_NATIVE_FLOOR__` at document-start as a **non-configurable**
+   property — that is the load-bearing part: `delete window.SecureChatPadFloor`
+   still removes the bridge, but `delete` cannot remove the marker, so
+   "marker present, bridge missing" is now provable tampering and fails closed
+   instead of reading as a plain browser. `verifyRelayConfig` additionally
+   refuses to run if the page cannot call the bridge.
+   Also closed, and NOT in the report: floor **deletion** was still silent, since
+   an absent floor contributes 0 to the rollback comparison. A `nativeFloor`
+   flag now lives inside the pad's AEAD, so a blob written while a floor existed
+   is refused if the floor is later gone. Tests include the full
+   snapshot-restore-then-clear PoC (which silently reopened the pad before, and
+   is now refused), and a plain-browser case so the fix cannot become
+   "fail closed everywhere".
+3. **✅ H-2 — the witness can no longer be opened as the store.** The store
+   plaintext carries `d: "secure-chat/contacts-store/v4"` and `unlock()` requires
+   it. Pre-v4 blobs have no tag and are adopted, then re-persisted tagged.
+   The adoption decision keys on the **tag inside the AEAD, never the outer `v`
+   byte** — `v` is attacker-writable and the witness blob has none, so
+   `(blob.v || 1) < 4` would have read the witness as legacy and adopted it,
+   reopening the hole. That is the same trap the outer `v` byte set for OTP.
+4. **⚠️ H-3 — fixed on ANDROID ONLY; the browser residual stands.**
+   `padWasUsed()` consults the native floor first and treats TAMPERED as used;
+   `saveNewPad` refuses a padId that was ever used here and seeds the watermark
+   cache from the surviving floors rather than from zero, so it cannot erase the
+   record even if the refusal were bypassed. `app.js`'s `otpFileChosen` still
+   skips `unlockPad` **deliberately** — the guard now lives inside the two
+   functions it calls, i.e. on the path rather than beside it, for no extra
+   600k-iteration KDF.
+   **Corrected 2026-07-30 (fix review H-B).** This entry originally read
+   "✅ … Reproduced end to end: post-fix it is refused", with no platform
+   qualifier. That is false for the WEB CLIENT, which is the primary one: with
+   no floor, `nativeFloor` is null and `padWasUsed` still reads only the three
+   deletable plaintext keys, so the original PoC — three `removeItem`s, then
+   re-import — still rebuilds the pad at offset 0. Re-verified 2026-07-30.
+   Closing it in a browser is not possible with deletable storage; the honest
+   options are trusted monotonic storage (which is what `PadFloor` is) or
+   nothing. **This is exactly the failure mode M-1 was about** — a status line
+   claiming a property the measurement did not cover — so it is corrected here
+   rather than quietly rewritten, and the test's summary line is now scoped to
+   the platform it actually proves.
+5. **✅ M-4 — the false premise is corrected where it was written.**
+   `network_security_config.xml` no longer claims `.onion` is potentially
+   trustworthy; it carries the measured table, the reason
+   `cleartextTrafficPermitted` cannot help (it sits below Chromium's
+   mixed-content blocker), and an explicit **DO NOT** for the obvious workaround,
+   naming why a WebView document origin on the onion is a Critical regression
+   twice over. The two workable shapes (loopback Orbot proxy, TLS over the
+   onion) are recorded. The `onion` allow-list entry is kept and the comment
+   says why it is inert. **No code change is possible here — this finding is a
+   plan correction, and the Android-over-Tor work remains unbuilt.**
+6. **✅ M-2 — corrected, and the applicable knob is set.** `deploy/README.md`'s
+   three wrong claims are corrected in place (it is login for all accounts, not
+   onboarding; only `REGISTER_RATE_*` was ever resized; PoW prices introduction,
+   not requests). `torrc.secure-chat` gains `HiddenServiceMaxStreams 24` +
+   `HiddenServiceMaxStreamsCloseCircuit 1`, validated with `tor --verify-config`.
+   Stated plainly in both places: this raises the price, it does not remove the
+   DoS, and that remains **accepted**.
+7. **✅ M-3 — the harness now has a positive control.** `wsConnect` distinguishes
+   "closed before any HTTP status" (`transportFailed`) from a real refusal, and
+   the CSWSH check requires all of: the foreign attempt was actually answered,
+   it was refused, AND an allowed Origin upgraded in the same run. Verified
+   against all five scenarios: it now rejects the Tor-hiccup case that used to
+   pass green at `HTTP 0`, and the connection-cap case that a bare
+   `code === 403` would also have accepted. **Not re-run over real Tor** — that
+   needs the deploy box, so this is verified at the predicate, not end to end.
+8. **✅ M-5 — chains are frozen once confirmed, and the race works again.**
+   Both halves, which pull in opposite directions:
+   the **attack** (a withheld offer delivered after confirmation silently
+   rebuilds the chains) is now a loud refusal, gated both in `case "key"` before
+   the cipher is touched and in `onChannelReady` after; the **race** (each side
+   derives twice in a simultaneous connect, so the first tag is stale) works
+   because the peer's tags are kept in a **capped set** — matching any of them
+   proves the peer derived our current material, in any arrival order.
+   The cap (2, the maximum a legitimate peer can produce) preserves what
+   first-write-wins was protecting: the confirm frame is not signature-covered,
+   so an uncapped set would be a guessing oracle. A mismatch is no longer
+   instantly fatal, so loudness comes from a deadline — which also fixes a case
+   the ORIGINAL code hung on forever: a relay that never delivers the confirm
+   frame at all.
+   The state machine moved to `client/keyconfirm.js` so it can be tested without
+   a DOM. That is the point: the report could only model this "line for line" in
+   a scratch harness because it lived inline in `app.js`. Ten tests now run
+   against the shipped code, and the pre-fix semantics were transcribed and run
+   against them to prove they discriminate — the old code fails the attack test
+   AND disconnects both honest peers in the race.
+9. **✅ M-6 — directory answers go through the canonical gate.**
+   `account.fetchBundle` re-spells every key through `b64(unb64(...))`, which
+   throws on a non-canonical spelling, so a hostile directory can no longer
+   return the same bytes in a different spelling to strip 🟢 and vouches,
+   permanently break sealed messaging, or burn the auto-contact budget. Applied
+   at the fetch boundary rather than at each consumer.
+10. **✅ M-7 — `/api/vouch` is no longer an existence oracle.** The target-existence
+    answer is folded into the signature verdict (a random, correctly-sized decoy
+    bundle keeps the work and the timing identical), so an absent target and a
+    bad signature are byte-identical `400`s. The route also joins
+    `lookup_rate_limit`, the same anti-enumeration bucket as `GET /users/{u}`,
+    with a test that draining it via `/vouch` throttles `/users` — proving it is
+    the same bucket and not merely some limiter. `test_vouches.py:153`, which
+    **pinned the oracle in place** with `== 404`, is inverted.
+11. **✅ Low/Info.** L-1 knock queue capped at 8, dropping the EXCESS rather than
+    the oldest — evicting the oldest would let a flood push a genuine contact's
+    knock off the list, turning a nuisance into targeted denial of admission;
+    the cap sits before the two signature verifies, so a flood costs a regex.
+    L-3 lost updates are now a loud refusal via a compare-and-swap on the witness
+    (tested with two real module instances over one localStorage — that is what
+    two tabs are). L-4 gains `POST /api/auth/logout` **and** re-login retiring the
+    account's previous sessions; logout is deliberately not behind `current_user`,
+    or it would be a token-validity oracle needing no signature. L-5 `OtpPad`
+    validates its offsets (`| 0` was also turning NaN into 0). L-7 is written
+    down in `torrc.secure-chat` as accepted rather than claimed away, with
+    `AvoidDiskWrites 1`. L-8 the relay's source is no longer writable
+    (`StateDirectory` + `SECURE_CHAT_DB` under `/var/lib`, `ReadWritePaths`
+    dropped; **needs the one-off DB move in the unit's comment before restart**).
+    L-9 closed by item 1. L-10 the install recipe is idempotent.
+    **L-2 is unchanged and remains accepted** — deleting both contact keys still
+    yields an empty store; it is the documented whole-storage residual, and the
+    honest fix is trusted monotonic storage, not another key.
+12. **✅ Test-coverage gaps 1-8, plus the two vacuous tests.**
+    `pqkemReplayDoesNotDesync` was vacuous — it replayed AFTER `encrypt()` sealed
+    the cipher, so `onPeerKey` returned early and the assertion could never
+    observe `_derive`; it now replays pre-seal, where the live path is, and the
+    post-seal case is kept and labelled as the different mechanism it is.
+    `otp-rollback.test.mjs`'s bridge mock hid both halves of H-1 — no `clear`, so
+    the attack could not be expressed, and a final `delete globalThis.SecureChatPadFloor`
+    that treated bridge-absence as a clean browser, which IS the downgrade.
+    New: `test_service_unit.py` (the production launcher, previously untested),
+    `no-fallback.test.mjs` (gap 7 — nothing asserted `crypto.subtle` is required,
+    so the best result in the report was one compatibility commit from silently
+    inverting), `keyconfirm.test.mjs`, and regression tests for the
+    witness→store swap, delete-then-reimport, negative `OtpPad` offsets, and
+    the vouch oracle.
+    **Not covered, stated plainly:** the L-1 knock flood has no regression test —
+    it lives in `app.js`'s relay-message path, which still has no unit tests at
+    all (gap 8), and the queue cap is exercised by nothing but review. That is
+    the same structural gap that made M-5 untestable until `keyconfirm.js` was
+    split out; the admission paths deserve the same treatment.
+13. **✅ E2E — the flake is root-caused and fixed, and the harness cannot lie.**
+    The cause was a **substring bug in the test, not a race in the app**: the
+    harness waited for `/connected/i`, which also matches **"disconnected"** —
+    the status left over from the previous mode's teardown. From the second mode
+    onward that wait returned instantly, before alice had actually joined, so bob
+    could reach the empty room first and become its OWNER; he then never entered
+    the approval queue and his "waiting for approval" wait timed out 45 s later.
+    That is exactly the reported signature (2 in 5, always bob's approval wait,
+    always a later mode). Anchored to an exact match, and the same latent bug
+    fixed in `room-admission.mjs`. **5 consecutive runs, 32/32 each.**
+    Separately, `SECURE_CHAT_E2E_CHROME_ARGS` now TAINTS the run when it disables
+    a security gate: the flags are named up front, the summary never prints a
+    bare "all modes good", and the exit code is non-zero unless
+    `SECURE_CHAT_E2E_ACK_UNSAFE=1`. A green run in a configuration no user can
+    reproduce is worse than a red one, because it gets quoted.
+
+### 🔧 FIX REVIEW of the above (2026-07-30) — 6 findings, all fixed
+The `pentest-new-code` agent was run against the fix commit `23bc905`, on the
+principle that a fix is new code and the most dangerous kind. It found six
+things, **three of them regressions the fixes themselves introduced**. All are
+fixed; the review's other verdicts (M-5, H-2, M-6, M-7, L-3, L-5 and the launch
+paths) held under independent attack.
+
+- **H-A (High) — the H-1 floor was defeated by SUBSTITUTING the bridge, not
+  deleting it.** I hardened the marker and left the lookup alone: `otp.js` found
+  the bridge by its ordinary global name and accepted anything with `read`/`bump`
+  functions, so an attacker could install a lookalike answering "no floor", or
+  just overwrite the two METHODS on the real object — two assignments, no
+  `delete`, and it survives making the global itself non-writable. Every new
+  check passed, `verifyRelayConfig`'s probe answered true, and the real Keystore
+  floor was never consulted: full keystream reuse, F-1 void again. Reproduced.
+  **Fixed:** the app captures the interface at document-start, before any page
+  script, and republishes it **frozen** under a non-configurable
+  `__SECURE_CHAT_PAD_FLOOR__` with `.bind()`-captured methods; `otp.js` reads
+  only that name and a test asserts it never touches the writable global. The
+  lesson: I keyed the check on SHAPE where it needed to be PROVENANCE.
+- **H-B (High, reporting) — my own H-3 claim was false for the web client.**
+  Corrected in item 4 above, in the commit trail, and in the test's summary line.
+- **M-A (Medium) — my L-1 knock cap made things WORSE than no cap.** Nothing
+  pruned the owner's queue when a waiter left (the relay pops `pending` and tells
+  nobody), and a knocker whose entry is dropped can never retry, because the
+  client knocks exactly once and the relay refuses a second knock per socket. So
+  eight cheap connect/knock/disconnect cycles filled the queue with immortal
+  ghosts and the invited peer waited forever, unseen — a permanent silent denial
+  of admission, and a direct hit on the P-08 property the cap was protecting. My
+  own comment claimed a dropped knocker "simply has to knock again"; it cannot.
+  **Fixed:** the relay now sends `withdrawn` (join id only — no identity, nothing
+  new at rest) and the owner's client prunes; the cap is raised above
+  `MAX_ROOM_PENDING` and demoted to a backstop for relays that do not send it.
+  Four relay tests, including the flood shape.
+- **M-B (Medium) — my M-1 fix deleted H-4's fail-closed collapse.** Removing the
+  forgeable detector was right; removing the SAFE COLLAPSE it drove was not,
+  because in the H-4 condition `peer` is attacker-chosen, so returning it hands
+  out a private bucket per forged header with one log line as the only trace.
+  **Fixed:** warn *and* collapse. Port 0 has no remote false positives, which is
+  what makes it safe to act on and not merely log — and the suite now asserts
+  the BUCKET under a misconfiguration, which it never did.
+- **M-C (Medium) — my L-4 fix was a self-inflicted DoS.** One-session-per-account
+  plus `pollMailbox`'s 6 s "401 → re-login" made two tabs of the same account
+  revoke each other forever: ~0.33 challenges/s against a 0.5/s bucket that,
+  since M-1, is GLOBAL to the relay. Two of a user's own tabs ate most of the
+  relay's login capacity; three denied login to everyone. Both tabs then sat
+  permanently offline for sealed mail with no visible sign — the exact failure
+  the 401 handler exists to prevent. **Fixed:** `MAX_SESSIONS_PER_ACCOUNT = 5`
+  with oldest-evicted, re-login no longer revokes, failed re-login backs off and
+  says so, and revocation is `POST /api/auth/logout` — which is now **wired into
+  the profile view** (L-B: it had no caller at all, so the only revocation a user
+  could trigger was the one that caused this).
+- **L-A (Low) — the fail-closed messages blamed the pad.** "Damaged or forged",
+  "already been used", and each recommending a fresh pad exchange, when the real
+  cause is the app cannot reach its own floor — so a user burns real pads chasing
+  it. Now a distinct message that says so and says *not* to exchange.
+
+(The taint gate and `fetchBundle` length-checking were done in the same commit;
+`HiddenServiceMaxStreams 24` remains the value most likely to need revisiting on
+the box, and is untestable here without a Tor daemon.)
+
+### 🔧 FIX REVIEW, ROUND 2 (2026-07-30) — 1 High + 5 Low, all fixed
+The agent was run again against the fix-review commit `b471cbf`, because those
+fixes were themselves written under the assumption that they closed something.
+Five of six claims held. One did not, and it is the more instructive failure:
+
+- **H-1 (High) — I hardened the bridge and left every VALUE it produces flowing
+  through mutable globals.** `otp.js` parsed the floor with `parseInt` guarded by
+  `Number.isFinite`, and the rollback verdict was a single `Math.max` over the
+  four floors. So `globalThis.parseInt = () => 0` — one assignment, never naming
+  the bridge, no `delete`, no `defineProperty` — made every floor read as zero
+  while the frozen bridge, the non-configurable marker and `verifyRelayConfig`'s
+  probe all stayed intact. `Math.max = ...` was worse: it overruled the native
+  floor, the authenticated watermark, `inner.hwSend` and the legacy watermark in
+  one go, **in a plain browser too**. Reproduced: pad reopened at offset 0 with
+  the hardware floor still reading 3000.
+  **Fixed:** the bridge returns a **number** now (`PadFloorBridge` returns
+  `Long`), so there is no parse step to poison; validation uses only `typeof` and
+  bitwise ops, which have no global behind them; and every rollback `Math.max` is
+  a local `maxOf` built from comparisons. Note capturing primordials at module
+  top would NOT have worked — a document-start attacker runs first.
+  **The lesson, and it is the same one twice:** in round 1 I keyed the check on
+  shape where it needed provenance; here I secured the source of a value and left
+  the path it travels. Both times the fix was correct about the PoC and wrong
+  about the boundary.
+- **M-1 (Medium) — the M-C backoff was dead code.** `pollMailbox` returned at its
+  first line when `apiToken` was null, and the 401 branch was the only thing that
+  ever called `autoLogin`. So one failed re-login was terminal: no retry, the
+  12/24/48/96/120 s ladder unreachable, and the tab permanently offline for
+  sealed mail — precisely the state M-C was written to remove, reached by a
+  different road. **Fixed:** `pollMailbox` re-authenticates from the top, which
+  is what makes the backoff load-bearing rather than decorative.
+- **L-1 — `withdrawn` was sent for waiters that never knocked**, which prunes
+  nothing (the owner's queue only holds knocked waiters) and is exactly the
+  unbatched per-join-attempt frame `note_turned_away` avoids on purpose. Gated on
+  `conn.knocked`; the test that asserted the old behaviour is inverted.
+- **L-2 — `showNextKnock` is not re-entrant**, and `withdrawn` gave it a second
+  concurrent trigger that `msgChain` does not serialise against clicks. Fixed
+  with a render generation counter plus a queue-head re-read after the await.
+- **L-3 — `forgetIdentity` never revoked the directory session**, leaving a live
+  bearer for up to an hour after the control a user reaches for when handing the
+  device on. It now calls the `logout` this work introduced.
+- **L-4 — the "you are offline" messages went to the chat transcript**, a screen
+  the user is usually not on — the same "only if you happen to look" complaint
+  M-C was about. Routed to the active screen's hint, and the sign-out message now
+  says where to sign back in.
+
+Verified sound across both rounds and not re-broken: M-5/`keyconfirm.js` (byte
+identical, re-attacked), H-2/`contacts.js` (byte identical, confirmed the
+re-applied version locks before throwing), M-B's port-0 branch (unreachable from
+any header), M-C's eviction arithmetic (cannot over-evict; an attacker cannot
+force-evict, since the signature is checked before the eviction block), and the
+M-A relay path (every way a knocked waiter can leave emits exactly one notice).
+
+**One residual the review could not close and neither could I:** M-B's claim rests
+on "a connected TCP socket cannot have source port 0". Neither of us had
+`CAP_NET_RAW` to test whether a crafted SYN can surface `sin_port == 0` from
+`accept()`. If it can, that branch becomes reachable and is an M-1-shaped second
+bucket. The docstring says so rather than claiming "no false positives" flatly.
+
+### 🔧 MERGE REVIEW (2026-07-30) — 1 finding fixed, 1 flagged
+Delivery item 1 ("review the diff and merge") read as a real review, not a
+formality. The full local gate was re-run first and everything the previous
+sessions claimed reproduced: backend **152 passed** (151 before the fix below),
+client **112 checks / 10 suites**, the three integration suites green against a
+live local relay, and e2e `all-modes` **32/32**, `room-admission` 13/13,
+`no-dead-ends` 12/12, `two-user-flow` 8/8.
+
+- **✅ The L-8 fix made the account database world-readable.** Moving the DB out
+  of the code tree was right; the mode was never checked. `StateDirectory=` alone
+  leaves systemd's **0755 default**, which it re-applies on every start, so
+  `/var/lib/secure-chat` would be world-traversable with a 0644 `accounts.db`
+  inside it — publishing the directory's lookup TOKENS (the secret half of
+  `username#token`, and the entire anti-enumeration control that makes a bare
+  username reveal nothing) and the sealed mailbox ciphertext to any local user on
+  the box. The unit's own comment asserted "systemd creates it 0700"; it does
+  not, and `man systemd.exec` says 0755 in as many words. The migration recipe
+  three lines above said 0750, which systemd would have silently overridden — the
+  two disagreed and neither was right.
+  **Fixed:** `StateDirectoryMode=0700`, the recipe corrected to match, and the
+  false claim replaced with why the line is not optional. `test_service_unit.py`
+  gains a case that **fails against the pre-fix unit** (verified by reverting the
+  file and re-running, not by assertion) and that also holds the comment's recipe
+  to the enforced mode, since a divergence there is how this happened.
+  Worth noting what class of bug this is: L-8 was verified as "the code tree is
+  no longer writable", which was true, and the property that broke was one nobody
+  had written down. Same shape as M-1 — a status line the measurement did not
+  cover — one layer down.
+- **⬜ FLAGGED, not fixed: `PadFloor.kt` is invisible to `git diff`.** It contains
+  raw NUL bytes in the HMAC domain separator at line 98
+  (`"secure-chat/otp-pad-floor/v1\0$padId\0$value"`, written as literal U+0000 in
+  the source rather than `\u0000`), so git classifies it as binary and every diff
+  of it renders as `Bin 7111 -> 9149 bytes`. `file` calls it `data`. This is
+  **pre-existing on master, not introduced by this branch** — but it means the
+  H-1 changes to the one file whose whole job is to be the control the JS context
+  cannot reach went to review as an opaque blob. `git diff --text` was used here
+  instead and the content is correct. The fix is to spell the separator
+  `\u0000`, which is byte-identical after compilation (so the HMAC and every
+  stored floor are unaffected) and makes the file text again. Not done in this
+  commit because it wants a compile to confirm, and the APK rebuild is delivery
+  item 3 — do it there.
+
+**⬜ DELIVERY — nothing here is deployed.** All of the above is committed on a
+branch and verified locally only. Still to do, in order:
+  1. Review the diff (it touches crypto, at-rest storage, the relay and the
+     admission path) and merge.
+  2. Deploy the relay + client. **The systemd unit changed**: do the one-off DB
+     move in its comment BEFORE the restart, or the relay starts with an empty
+     database.
+  3. Rebuild + install the APK. **H-1's marker is injected by the app**, so a
+     client update WITHOUT an APK update leaves Android on the old feature
+     detection — deploy them together, as with the 2026-07-28 release.
+  4. Re-run the on-device native-floor proof: H-1 changed `PadFloor.kt` and the
+     document-start injection, and the 2026-07-28 hardware proof no longer
+     covers the shipped code.
+  5. `deploy/onion-ws.mjs`'s new positive control has never run over real Tor.
+
 
 ### ⬜ OPEN from the 2026-07-27 pentest — SHIPPING, not fixing
 Every finding in `secure-chat-pentest-2026-07-27.md` is fixed and now merged to

@@ -452,9 +452,23 @@ async def ws_endpoint(ws: WebSocket) -> None:
         if room is not None:
             # Waiters left with nobody to approve them are closed rather than
             # left to time out (the owner's departure ends the room).
-            for orphan in registry.leave(room, conn):
+            orphans, withdrawn = registry.leave(room, conn)
+            for orphan in orphans:
                 await _safe_send(orphan.ws, '{"type":"error","reason":"room closed"}')
                 await _safe_close(orphan.ws)
+            # Fix review 2026-07-30 (M-A): a waiter that gave up (or was cut off)
+            # must be removed from the OWNER's approval queue. Nothing else tells
+            # the owner, so without this the entry sits there forever and — with
+            # the queue now capped — cheap connect/knock/disconnect cycles fill
+            # it with ghosts and a genuine knock is dropped with no way to retry.
+            # Carries only the server-issued join id, which the owner already
+            # has: no identity, nothing new about who was connected when (I2).
+            if withdrawn is not None:
+                owner_conn, gone_jid = withdrawn
+                await _safe_send(
+                    owner_conn.ws,
+                    json.dumps({"type": "withdrawn", "room": room, "jid": gone_jid}),
+                )
 
 
 # Serve the static web client same-origin. Mounted last so the explicit /ws and

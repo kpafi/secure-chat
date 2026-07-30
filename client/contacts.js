@@ -23,6 +23,18 @@ const LS_CONTACTS = "sc.contacts.v1";
 // write one — and its mere PRESENCE proves a store is supposed to exist.
 const LS_GEN = "sc.contacts.gen.v1";
 const GEN_DOMAIN = "secure-chat/contacts-generation/v1";
+// Pentest 2026-07-29 H-2. The witness above and the store below were encrypted
+// under the SAME dataKey and recorded the SAME salt, and only the witness
+// carried a domain tag. So the witness blob decrypted perfectly as a store:
+// `sc.contacts.v1 := sc.contacts.gen.v1` — one setItem, no passphrase, no
+// deletion — yielded an empty, PIN-LESS store at the witness's own generation.
+// assertNotRolledBack passed (same gen), hasStore() and pinsReadable() stayed
+// true so the loud P-02 path never ran, and every peer then rendered as a
+// benign first contact instead of "identity key CHANGED". The alarm inverted,
+// which is exactly what L-1 and the 2026-07-27 H-2 were written to prevent. A
+// sweep of all 30 blob-swap combinations found this was the ONLY one that
+// opened; the store plaintext was simply missing the tag its witness had.
+const STORE_DOMAIN = "secure-chat/contacts-store/v4";
 const KDF_ITERS = 600000; // same OWASP-2023 work factor as identity.js
 
 const enc = new TextEncoder();
@@ -115,6 +127,37 @@ export async function unlock(passphrase) {
     throw new Error("contact store does not decrypt with this passphrase (different identity, or tampered)");
   }
   const data = JSON.parse(dec.decode(plain));
+
+  // H-2: this plaintext must be a contact STORE and not some other record that
+  // happens to decrypt under the same key. Only two shapes are acceptable:
+  //
+  //   d === STORE_DOMAIN  -> a v4+ store, tagged. Normal path.
+  //   d absent            -> a pre-v4 store, written before the tag existed.
+  //                          Adopted, then re-persisted WITH the tag below.
+  //
+  // Anything else — in practice the generation witness, whose own `d` is
+  // GEN_DOMAIN — is refused. Note the discriminator is the tag INSIDE the
+  // AEAD, deliberately not the outer `v` byte: `v` is attacker-writable, and
+  // the witness blob has no `v` at all, so `(blob.v || 1) < 4` would read the
+  // witness as a legacy store and adopt it — reopening the exact hole. This is
+  // the same downgrade trap the outer `v` byte set for OTP (P-01).
+  const tagged = Object.prototype.hasOwnProperty.call(data, "d");
+  const notAStore = () => {
+    lock();
+    return new Error(
+      "the contact store on this device is not a contact store — refusing to open it, because " +
+      "continuing would silently discard your saved identity pins",
+    );
+  };
+  if (tagged && data.d !== STORE_DOMAIN) throw notAStore();
+  // Defence in depth for the untagged path: a genuine pre-v4 store is either
+  // the bare v1 array or an object carrying contacts/pins. A record with
+  // neither is not a store, whatever it claims.
+  const looksLikeStore = Array.isArray(data) ||
+    Object.prototype.hasOwnProperty.call(data, "contacts") ||
+    Object.prototype.hasOwnProperty.call(data, "pins");
+  if (!tagged && !looksLikeStore) throw notAStore();
+
   // v1 blobs stored the bare contacts array; v2 wraps {contacts, pins}.
   if (Array.isArray(data)) {
     contacts = data;
@@ -127,6 +170,8 @@ export async function unlock(passphrase) {
   await assertNotRolledBack(data.gen);
   let dirty = dropLegacyPins();
   if ((blob.v || 1) < 3 && migrateH01Verification()) dirty = true;
+  // An adopted pre-v4 store is rewritten tagged, so it only ever happens once.
+  if (!tagged) dirty = true;
   // A pre-L-1 store carries no generation and no witness: adopt it at its
   // current state (there is nothing to roll back TO yet) and start counting.
   if (!Number.isInteger(data.gen)) dirty = true;
@@ -277,9 +322,36 @@ function migrateH01Verification() {
 
 async function persist() {
   if (!dataKey) throw new Error("contact store is locked");
+  // Pentest 2026-07-29 L-3: refuse a LOST UPDATE instead of causing one.
+  //
+  // Two tabs both unlock at generation N and both write N+1; the second
+  // overwrites the first, and because it also rewrites the witness to N+1 the
+  // rollback check agrees and nothing ever notices. Whatever the first tab
+  // saved — including a pin — is simply gone, silently. OTP has a cross-tab
+  // lock for the same class of problem; contacts had nothing.
+  //
+  // A compare-and-swap is enough here and needs no lock: the witness already
+  // records the newest generation any tab has committed, so a witness ahead of
+  // our in-memory copy means somebody else wrote while we were holding stale
+  // state. That is not something to merge behind the user's back — the two
+  // versions may disagree about a PIN — so it is a loud refusal and a reload.
+  //
+  // Not a security boundary against a device-local attacker (they can write the
+  // witness too); it is protection against the user's own second tab, which is
+  // what actually happens.
+  const witness = await readWitness();
+  if (witness && !witness.corrupt && witness.gen > generation) {
+    lock();
+    throw new Error(
+      "your contacts were changed in another tab (or another window) — this page is out of date. " +
+      "Reload before making further changes, so the other tab's changes are not lost.",
+    );
+  }
   generation += 1; // L-1: every write moves the store forward, monotonically
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const plain = enc.encode(JSON.stringify({ contacts, pins, gen: generation }));
+  // `d` is the H-2 domain tag: it makes this plaintext unmistakably a STORE, so
+  // no other record encrypted under the same key can be substituted for it.
+  const plain = enc.encode(JSON.stringify({ d: STORE_DOMAIN, contacts, pins, gen: generation }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, dataKey, plain));
   localStorage.setItem(
     LS_CONTACTS,

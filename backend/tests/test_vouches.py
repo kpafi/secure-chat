@@ -147,14 +147,66 @@ def test_vouch_rejects_bad_signatures_and_auth():
     swapped = dict(_vouch_body(alice, eve), target=bob["username"])
     assert client.post("/api/vouch", json=swapped, headers=_auth(tok)).status_code == 400
 
-    # Self-vouch and unknown target are refused.
+    # Self-vouch is refused (this one is about the CALLER, so it leaks nothing).
     assert client.post("/api/vouch", json=_vouch_body(alice, alice), headers=_auth(tok)).status_code == 422
+
+    # Pentest 2026-07-29 M-7: an unknown target must be INDISTINGUISHABLE from a
+    # bad signature. This assertion used to read `== 404` — it pinned the oracle
+    # in place rather than testing against it. /vouch answered 404 for an absent
+    # name and 400/422 for a real one, before any signature or base64 validation
+    # and with no dedicated limiter, so it was a free, traceless username
+    # enumerator for any authenticated user.
     ghost = dict(_vouch_body(alice, bob), target="wot-ghost")
-    assert client.post("/api/vouch", json=ghost, headers=_auth(tok)).status_code == 404
+    r_ghost = client.post("/api/vouch", json=ghost, headers=_auth(tok))
+    r_real = client.post("/api/vouch", json=body, headers=_auth(tok))  # real name, bad sig
+    assert r_ghost.status_code == 400, "M-7: an absent target must not answer 404"
+    assert r_ghost.status_code == r_real.status_code, "M-7: status code distinguishes existence"
+    assert r_ghost.json() == r_real.json(), (
+        f"M-7: response body distinguishes existence: {r_ghost.json()} vs {r_real.json()}"
+    )
+
+    # …and the same must hold for any well-formed name that was never seen.
+    # The limiter is cleared between probes because /vouch is now ON the
+    # anti-enumeration bucket (below) and would otherwise start answering 429,
+    # which would mask the property under test rather than demonstrate it.
+    for absent in ("wot-nobody", "wot-zzz", "wot-ghost2"):
+        accounts._lookup_limiter._buckets.clear()
+        probe = dict(_vouch_body(alice, bob), target=absent)
+        rp = client.post("/api/vouch", json=probe, headers=_auth(tok))
+        assert (rp.status_code, rp.json()) == (r_real.status_code, r_real.json()), (
+            f"M-7: {absent} is distinguishable from a registered name"
+        )
 
     # Nothing slipped into storage.
+    accounts._lookup_limiter._buckets.clear()
     r = client.get(f"/api/users/{bob['username']}/vouches", params={"t": bob["token"]})
     assert r.json()["vouches"] == []
+
+
+def test_vouch_is_throttled_on_the_anti_enumeration_bucket():
+    """M-7, second half: probing /vouch must cost the same as probing /users.
+
+    Identical answers are not enough on their own — an oracle you can hit at
+    router speed is still an oracle if any OTHER signal (timing, or simply a
+    later behavioural difference) ever leaks. /vouch shares `lookup_rate_limit`
+    with `GET /users/{username}`, so enumeration is bounded either way.
+    """
+    accounts._lookup_limiter._buckets.clear()
+    alice = _register("wot-lim-alice")
+    bob = _register("wot-lim-bob")
+    tok = _login(alice)
+    body = _vouch_body(alice, bob)
+
+    codes = [
+        client.post("/api/vouch", json=body, headers=_auth(tok)).status_code
+        for _ in range(config.LOOKUP_RATE_CAPACITY + 4)
+    ]
+    assert 429 in codes, f"/vouch is not on the anti-enumeration bucket: {codes}"
+
+    # Cross-check that it is the SAME bucket, not merely some limiter: draining
+    # it via /vouch must throttle a /users lookup too.
+    r = client.get(f"/api/users/{bob['username']}", params={"t": bob["token"]})
+    assert r.status_code == 429, "/vouch must share lookup_rate_limit, not have its own"
 
 
 def _register_v2(username):

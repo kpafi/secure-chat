@@ -162,6 +162,15 @@ MAX_ACCOUNTS = 100_000           # total rows in the directory
 MAX_PENDING_CHALLENGES = 10_000  # outstanding login challenges
 MAX_ACTIVE_TOKENS = 50_000       # outstanding session tokens
 
+# Sessions ONE account may hold at once (pentest 2026-07-29 L-4, corrected by
+# the M-C fix review). Not 1: pollMailbox re-authenticates on a 401 every 6 s, so
+# one-session-per-account made two tabs of the same account revoke each other in
+# a loop and drain the global challenge bucket. Not unbounded either, or a leaked
+# token lives out its full TTL beside the real one. Room for a laptop, a phone
+# and a couple of tabs; the oldest is evicted past that, and /auth/logout is the
+# on-demand remedy.
+MAX_SESSIONS_PER_ACCOUNT = 5
+
 # --- Static web client -----------------------------------------------------
 # Served same-origin so the page, the WebSocket, and the (future) .onion all
 # share one origin. Set to None to run as a pure relay with no static files.

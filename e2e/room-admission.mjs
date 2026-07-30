@@ -93,8 +93,12 @@ console.log("1. alice creates the chat");
 const code = await alice.page.evaluate(() => document.querySelector("#room").value.trim());
 check("a chat code is generated for the owner", /^[0-9a-f]{64}$/.test(code), code.slice(0, 12) + "…");
 await alice.page.click("#connect");
+// Anchored, not /connected/i — that also matches "disconnected". This agent is
+// fresh so the substring could not bite here, but it is the same latent bug
+// that made all-modes.mjs flaky (pentest 2026-07-29 item 13).
 await alice.page.waitForFunction(
-  () => /connected/i.test(document.querySelector("#chatStatus").textContent), { timeout: 30000 });
+  () => document.querySelector("#chatStatus").textContent.trim().toLowerCase() === "connected",
+  { timeout: 30000 });
 const ownerLog = await text(alice.page, "#log");
 check("owner is told the room is hers to control", /you decide who is let in/i.test(ownerLog),
   JSON.stringify(ownerLog.slice(-90)));

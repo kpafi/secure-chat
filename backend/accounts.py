@@ -81,38 +81,102 @@ def client_key(request: Request) -> str:
     RIGHTMOST entry, which is the one that proxy appended (anything further
     left was supplied by the client and can say whatever it likes).
 
-    With no trusted proxy configured this returns the real peer address, so a
-    direct/.onion deployment collapses to one shared bucket — throttled, which
-    is the safe direction — instead of handing out a bucket per forged header.
+    With no trusted proxy configured this IGNORES the header completely and
+    returns the real peer address. In a direct/.onion deployment every request
+    arrives from the same loopback peer, so that is one shared bucket —
+    throttled, which is the safe direction — instead of handing out a bucket
+    per forged header.
 
     Requires uvicorn to run with --no-proxy-headers; otherwise its middleware
-    rewrites request.client before we ever see it.
+    rewrites request.client before we ever see it. All three launch paths pass
+    it, and `test_service_unit.py` / `test_proxy_headers.py` hold them to it.
 
-    Pentest 2026-07-27 H-4: that requirement used to be a comment plus a CLI
-    flag in run.sh, and the in-repo `python main.py` launcher — how the live
-    instance was actually started — did not pass it, silently reintroducing the
-    bypass F-03 closed. main.py now passes proxy_headers=False, but a launcher
-    is a configuration knob and this function is the control, so it also
-    DETECTS the rewrite and fails closed: if uvicorn honoured a forwarded
-    header, the address we are handed is by construction one of the hops in
-    that header. When the peer is not a trusted proxy and yet matches a hop the
-    client itself supplied, the address is attacker-chosen — key everything on
-    one shared bucket instead (throttled, the safe direction) rather than
-    handing out a fresh bucket per forged header.
+    Pentest 2026-07-29 M-1: this function used to ALSO try to detect that
+    rewrite per-request, by treating `peer in hops` as proof that uvicorn had
+    honoured the header, and collapsing to a constant bucket when it did. That
+    was unsound in both directions and was the bug:
+
+      * The predicate is client-controlled. In this deployment `peer` is always
+        127.0.0.1, so `X-Forwarded-For: 127.0.0.1` satisfied it on a CORRECTLY
+        configured server. The result was TWO buckets the client chose between
+        with one header — honest traffic in `'127.0.0.1'`, the attacker alone
+        in the constant — so every limiter was 2x and bucket A could be starved
+        while bucket B ran uncontended. Exactly the private bucket the design
+        says a forged header cannot buy.
+      * The same forged header wrote the "proxy headers appear to be TRUSTED"
+        warning on a healthy server, burning the only runtime signal for the
+        real H-4 condition (L-9).
+
+    So the key is now a pure function of the peer: for any given peer there is
+    exactly ONE bucket, whatever the headers say. Detecting the misconfiguration
+    is a separate concern, handled below on a signal the client cannot set.
     """
     peer = request.client.host if request.client else "unknown"
-    forwarded = request.headers.get("x-forwarded-for", "")
-    hops = [h.strip() for h in forwarded.split(",") if h.strip()]
     if peer not in config.TRUSTED_PROXY_IPS:
-        if peer in hops:
+        # Fix review 2026-07-30 (M-B). The M-1 fix removed the forgeable
+        # detector, correctly — but it also removed the fail-CLOSED collapse that
+        # detector was driving, leaving nothing but a log line. In the one
+        # condition H-4 is about (an ASGI server honouring the header while we
+        # trust no proxy) `peer` IS attacker-chosen, so returning it hands out a
+        # fresh uncontended bucket per forged value: F-03 reopened, with a single
+        # once-per-process warning as the only trace.
+        #
+        # The two are not exclusive. Port 0 has no REMOTE false positives (a
+        # connected TCP socket cannot have source port 0, so no header can
+        # provoke this), which is exactly why it was safe to base the warning on
+        # — and equally safe to base the collapse on. So: warn AND collapse.
+        # Rate limiting is then throttled-but-shared in the misconfigured case,
+        # which is the safe direction, while a correctly configured server is
+        # untouched and L-9 stays closed.
+        if _client_addr_was_rewritten(request):
             _warn_proxy_headers_trusted()
             return _UNTRUSTED_FORWARDED_KEY
         return peer
+    forwarded = request.headers.get("x-forwarded-for", "")
+    hops = [h.strip() for h in forwarded.split(",") if h.strip()]
     return hops[-1] if hops else peer
 
 
-# One shared bucket for every request whose source address we cannot trust. A
-# constant, so a forged X-Forwarded-For cannot buy an attacker a private bucket.
+def _client_addr_was_rewritten(request: Request) -> bool:
+    """True if the ASGI server looks like it synthesised `request.client`.
+
+    Replaces the L-9 detector, which inferred the rewrite from `peer in hops` —
+    a predicate the client sets itself, so it produced false positives on demand
+    and burned the signal (see `client_key`).
+
+    The signal used instead is the PORT, which the client cannot choose:
+    uvicorn's ProxyHeadersMiddleware builds the replacement address with
+    `_parse_host_port()`, which yields port 0 for the bare-IP forms every real
+    proxy emits (`X-Forwarded-For: 1.2.3.4`). A genuine TCP peer never has
+    source port 0 — the kernel cannot assign it to a connected socket — so
+    port 0 together with a forwarded header means something synthesised that
+    address.
+
+    Deliberately one-directional, and that asymmetry is what makes it safe to
+    act on rather than merely log:
+
+      * NO false positives. Nothing a remote client can send produces port 0, so
+        this cannot be provoked — that is L-9 closed, and it is why `client_key`
+        may collapse to the shared bucket here without handing an attacker a way
+        to move themselves out of the honest bucket.
+      * There ARE false negatives: a forged `X-Forwarded-For: 1.2.3.4:5678`
+        keeps its port and stays quiet. So this is defence in depth, NOT the
+        control. The control is `--no-proxy-headers` on every launch path, which
+        `test_proxy_headers.py` and `test_service_unit.py` hold all three to.
+
+    A unix-socket deployment has `request.client is None` (uvicorn's
+    `get_remote_addr` returns None for AF_UNIX), which reads as not-rewritten —
+    correct, since there is no header-derived address to be fooled by.
+    """
+    if not request.headers.get("x-forwarded-for"):
+        return False
+    client = request.client
+    return client is not None and getattr(client, "port", None) == 0
+
+# One shared bucket for every request whose source address we cannot trust — the
+# H-4 fail-closed fallback (restored by the M-B fix review). A constant, so the
+# misconfigured case is throttled-but-shared rather than a fresh private bucket
+# per forged header. Unreachable on a correctly configured server.
 _UNTRUSTED_FORWARDED_KEY = "!untrusted-forwarded"
 
 _proxy_warning_lock = threading.Lock()
@@ -274,6 +338,20 @@ def _register_message_v2(username: str, ed: str, mldsa: str, ecdh: str, mlkem: s
 # stays v1. The domain differs so a v1 signature can never be read as a v2 one.
 _VOUCH_DOMAIN = b"secure-chat/vouch/v1"
 _VOUCH_V2_DOMAIN = b"secure-chat/vouch/v2"
+
+
+# A well-formed but meaningless bundle, used when /vouch's target does not
+# exist (M-7). Built once at import so the oracle cannot be re-opened as a
+# TIMING one: it is the same size as a real v2 bundle, so `_vouch_message`
+# builds the same length of message and both verifications do the same work as
+# they would for a real target. Random rather than fixed so it can never
+# collide with a genuine registered bundle.
+_DECOY_BUNDLE = {
+    "ed_pub": base64.b64encode(secrets.token_bytes(config.ED25519_PUB_BYTES)).decode("ascii"),
+    "mldsa_pub": base64.b64encode(secrets.token_bytes(config.MLDSA65_PUB_BYTES)).decode("ascii"),
+    "ecdh_pub": base64.b64encode(secrets.token_bytes(config.ECDH_PUB_BYTES)).decode("ascii"),
+    "mlkem_pub": base64.b64encode(secrets.token_bytes(config.MLKEM768_PUB_BYTES)).decode("ascii"),
+}
 
 
 def _vouch_message(target: str, ed: str, mldsa: str, ecdh: str = "", mlkem: str = "") -> bytes:
@@ -530,10 +608,47 @@ def auth_verify(req: VerifyReq) -> dict:
     token = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
     with _store_lock:
         _prune(_tokens)
+        # Pentest 2026-07-29 L-4: bound how many sessions one account can hold,
+        # so a leaked token cannot be retained indefinitely and a reconnect loop
+        # cannot fill MAX_ACTIVE_TOKENS with one user's dead sessions.
+        #
+        # The first cut of this retired ALL the account's other tokens on login,
+        # which the fix review (M-C) showed was a self-inflicted DoS: pollMailbox
+        # runs every 6 s and treats a 401 by calling autoLogin, so two tabs of
+        # the SAME account revoke each other forever. That sustains ~0.33
+        # challenges/s against CHALLENGE_RATE_REFILL_PER_SEC = 0.5 — which, since
+        # the M-1 fix, is one bucket for the whole relay — so two of a user's own
+        # tabs ate most of the relay's login capacity and three saturated it,
+        # denying login to every account. The tabs then sat permanently offline
+        # for sealed mail with no visible sign, which is the exact failure the
+        # 401 handler was written to prevent.
+        #
+        # LRU eviction instead: several tabs and a phone coexist happily, and the
+        # oldest session is what goes when the cap is reached. Revocation on
+        # demand is what /auth/logout is for — that is the honest remedy for a
+        # leaked token, and unlike "log in again" it does not fight the poller.
+        mine = [t for t, (owner, _exp) in _tokens.items() if owner == req.username]
+        for old in mine[: max(0, len(mine) + 1 - config.MAX_SESSIONS_PER_ACCOUNT)]:
+            del _tokens[old]  # dict order is insertion order, so this is oldest-first
         if len(_tokens) >= config.MAX_ACTIVE_TOKENS:
             raise HTTPException(status_code=503, detail="too many active sessions")
         _tokens[token] = (req.username, time.monotonic() + config.TOKEN_TTL_SEC)
     return {"token": token, "ttl": config.TOKEN_TTL_SEC}
+
+
+@router.post("/auth/logout")
+def auth_logout(authorization: str | None = Header(default=None)) -> dict:
+    """Drop the presented session token (pentest 2026-07-29 L-4).
+
+    Deliberately NOT behind `current_user`: an already-invalid token must get
+    the same answer as a valid one, or this becomes a token-validity oracle
+    that needs no signature. Always 200, always idempotent, and it reveals
+    nothing about whether anything was actually removed.
+    """
+    if authorization and authorization.startswith("Bearer "):
+        with _store_lock:
+            _tokens.pop(authorization[len("Bearer "):], None)
+    return {"status": "logged out"}
 
 
 def current_user(authorization: str | None = Header(default=None)) -> str:
@@ -563,7 +678,7 @@ class VouchReq(BaseModel):
     mldsa_sig: str  # voucher's ML-DSA-65 signature over the same message
 
 
-@router.post("/vouch")
+@router.post("/vouch", dependencies=[Depends(lookup_rate_limit)])
 def vouch(req: VouchReq, username: str = Depends(current_user)) -> dict:
     """Publish (or refresh) a dual-signed vouch for `target`.
 
@@ -582,12 +697,26 @@ def vouch(req: VouchReq, username: str = Depends(current_user)) -> dict:
         voucher_row = conn.execute(
             "SELECT ed_pub, mldsa_pub FROM accounts WHERE username = ?", (username,)
         ).fetchone()
-    # The voucher is authenticated (session token), so telling them the target
-    # is unknown leaks nothing beyond what registering that name would.
-    if target_row is None:
-        raise HTTPException(status_code=404, detail="no such target user")
     if voucher_row is None:
         raise HTTPException(status_code=401, detail="voucher not registered")
+
+    # Anti-enumeration (pentest 2026-07-29 M-7). This used to answer
+    # `404 "no such target user"` HERE, before any signature or base64
+    # validation, while a real name fell through to a 400/422 — a username
+    # oracle that, unlike the registration oracle the module docstring
+    # acknowledges, consumes nothing, creates nothing, leaves no directory
+    # trace and had no dedicated limiter.
+    #
+    # Two changes: the route now shares `lookup_rate_limit`, the same
+    # anti-enumeration bucket `GET /users/{username}` uses; and the existence
+    # answer is folded into the signature check below so that a missing target
+    # and a bad signature are indistinguishable. A decoy bundle keeps the work
+    # (and so the timing) the same either way — the same shape as `get_user`'s
+    # length-matched token decoy. Verification against the decoy always fails,
+    # which is exactly the outcome we want to be indistinguishable from.
+    missing_target = target_row is None
+    if missing_target:
+        target_row = _DECOY_BUNDLE
 
     sig_raw = _b64decode_fixed(req.sig, config.ED25519_SIG_BYTES)
     mldsa_sig_raw = _b64decode_fixed(req.mldsa_sig, config.MLDSA65_SIG_BYTES)
@@ -599,9 +728,14 @@ def vouch(req: VouchReq, username: str = Depends(current_user)) -> dict:
     )
     ed_raw = base64.b64decode(voucher_row["ed_pub"], validate=True)
     mldsa_raw = base64.b64decode(voucher_row["mldsa_pub"], validate=True)
-    if not _ed25519_verify(ed_raw, sig_raw, msg):
+    ed_ok = _ed25519_verify(ed_raw, sig_raw, msg)
+    mldsa_ok = _mldsa65_verify(mldsa_raw, mldsa_sig_raw, msg)
+    # Both verifications always run, and the verdict is combined afterwards, so
+    # neither the status code nor the number of expensive operations depends on
+    # whether the target exists.
+    if missing_target or not ed_ok:
         raise HTTPException(status_code=400, detail="vouch signature invalid")
-    if not _mldsa65_verify(mldsa_raw, mldsa_sig_raw, msg):
+    if not mldsa_ok:
         raise HTTPException(status_code=400, detail="post-quantum vouch signature invalid")
 
     with _db() as conn:

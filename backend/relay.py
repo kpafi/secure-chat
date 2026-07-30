@@ -345,20 +345,45 @@ class RoomRegistry:
             conn.jid = None
         return conn
 
-    def leave(self, room: str, conn: Conn) -> list[Conn]:
+    def leave(self, room: str, conn: Conn) -> tuple[list[Conn], tuple[Conn, str] | None]:
         """Remove `conn` from `room`, member or waiting.
 
-        Returns the connections left orphaned by this departure: when the last
-        MEMBER goes, nobody can approve the queue any more, so those waiters are
-        handed back to be closed instead of waiting out the approval timeout.
+        Returns `(orphans, withdrawn)`:
+          * `orphans` — connections left with nobody to approve them, because the
+            last MEMBER just went. Handed back to be closed rather than left to
+            wait out the approval timeout.
+          * `withdrawn` — `(owner, jid)` when a WAITER departed and there is
+            still an owner to tell, so the owner's queue can be pruned (M-A).
         """
         entry = self._rooms.get(room)
         if entry is None:
-            return []
+            return [], None
         if conn in entry.members:
             entry.members.remove(conn)
-        if conn.jid is not None:
-            entry.pending.pop(conn.jid, None)
+        # Fix review 2026-07-30 (M-A): tell the owner when a WAITER leaves.
+        #
+        # This used to pop the waiter and say nothing, so the owner's client kept
+        # the knock in its queue forever — there is no other signal that a
+        # pending socket is gone. Harmless while that queue was unbounded; once
+        # the L-1 cap landed it became a permanent denial of admission, because
+        # cheap connect/knock/disconnect cycles fill the queue with entries that
+        # will never be answered, and a dropped knocker CANNOT re-knock (the
+        # client sends its knock once, on `pending`, and `conn.knocked` refuses a
+        # second one on the same socket). Pruning is the real fix; the cap is
+        # then only a backstop.
+        #
+        # Returned rather than stashed on self: two sockets can be closing at
+        # once, and instance state would let one overwrite the other's notice.
+        #
+        # Gated on `knocked` (fix review round 2, L-1). The owner's queue only
+        # ever contains waiters that INTRODUCED themselves, so a notice for one
+        # that never knocked prunes nothing — it is pure noise, and it is exactly
+        # the per-join-attempt frame that `note_turned_away`'s batching exists to
+        # avoid handing an attacker. A silent join/disconnect cycle stays silent.
+        withdrawn: tuple[Conn, str] | None = None
+        if conn.jid is not None and entry.pending.pop(conn.jid, None) is not None:
+            if conn.knocked and entry.owner is not None:
+                withdrawn = (entry.owner, conn.jid)
         conn.admitted = False
         conn.waiting_room = None
         conn.jid = None
@@ -371,7 +396,7 @@ class RoomRegistry:
             entry.pending.clear()
         if entry.is_empty():
             del self._rooms[room]  # empty rooms leave no trace
-        return orphans
+        return orphans, withdrawn
 
     def peers(self, room: str, exclude: Conn) -> list[Conn]:
         """Every ADMITTED member of `room` except `exclude` (the sender).

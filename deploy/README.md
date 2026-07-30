@@ -44,24 +44,60 @@ request. That is pentest 2026-07-25 **F-03** reopened, and it defeats the
 anti-enumeration lookup limiter, the challenge limiter, and the mailbox limiter
 at once.
 
-Unset, `client_key()` trusts nobody and every limiter keys on one shared
-bucket. It **fails closed**. Measured on the live onion (16 parallel lookups,
+Unset, `client_key()` trusts nobody: it ignores `X-Forwarded-For` completely and
+keys on the real peer, so the onion topology collapses to one shared bucket. It
+**fails closed**. Measured on the live onion (16 parallel lookups,
 `LOOKUP_RATE_CAPACITY = 10`):
 
 | `X-Forwarded-For` | allowed | rate-limited |
 |---|---|---|
 | rotating (16 distinct values) | 10 | 6 |
 | fixed (1 value) | 10 | 6 |
+| **`127.0.0.1` (the peer's own address)** | **10** | **6** |
 
 Identical, and exactly the bucket capacity — forging the header buys nothing.
 Were it honoured, the rotating run would have scored 16/16.
 
+> **Corrected 2026-07-29 (pentest M-1).** The third row is new, and until this
+> fix it read **10 allowed / 0 limited**: a *second* bucket. The original table
+> used `203.0.113.x` for both rows, and both land in the same branch of the old
+> `client_key()`, so it measured one bucket twice and never tested the claim.
+> The old code treated `peer in hops` as proof that uvicorn had rewritten the
+> address; in this deployment the peer is always `127.0.0.1`, so one header
+> picked the branch. Honest traffic sat in bucket A while the attacker worked
+> bucket B uncontended — and the same header wrote the "proxy headers appear to
+> be TRUSTED" warning on a healthy server, burning that signal (L-9).
+> `client_key()` is now a pure function of the peer, and
+> `test_proxy_headers.py` pins that with the topology the original measurement
+> missed.
+
 **Accepted trade-off:** the clearnet side loses per-IP rate limiting too, and
-shares that one global bucket with the onion. A single clearnet abuser can
-therefore throttle onboarding for everyone. `config.py` already sizes
-`REGISTER_RATE_*` for exactly this ("behind Tor the keying collapses to ONE
-GLOBAL bucket"). Tor's proof-of-work defence (`HiddenServicePoWDefensesEnabled`)
-is on partly to blunt the volume attack this invites.
+shares that one global bucket with the onion.
+
+> **Corrected 2026-07-29 (pentest M-2).** This paragraph used to say a clearnet
+> abuser can "throttle onboarding", that `config.py` "already sizes
+> `REGISTER_RATE_*` for exactly this", and that Tor's PoW defence blunts it.
+> All three were wrong:
+>
+> 1. **It is worse than onboarding.** The tightest global bucket is
+>    `CHALLENGE_RATE_REFILL_PER_SEC = 0.5`, which gates **login for every
+>    existing account**, not registration. Measured: an attacker at ~2 req/s
+>    (~300 B/s) on `POST /api/auth/challenge` denied login to all accounts —
+>    0 of 4 honest attempts succeeded. `GET /api/mailbox` burns its bucket
+>    **unauthenticated**, because the limiter is a route dependency that runs
+>    before `current_user`.
+> 2. **`config.py` sized the wrong knob.** Only `REGISTER_RATE_*` was
+>    re-derived for a global bucket. `CHALLENGE_RATE_*` and `LOOKUP_RATE_*`
+>    were sized as *per-IP* limits and silently became global ones.
+> 3. **PoW does not apply.** `HiddenServicePoWDefensesEnabled` prices
+>    *introduction*; this attack builds one circuit and then sends cheap HTTP
+>    on it. The options that do apply are `HiddenServiceMaxStreams` and
+>    `HiddenServiceMaxStreamsCloseCircuit`, now set in
+>    `torrc.secure-chat`. They cap concurrent streams per circuit, which raises
+>    the cost of the attack but does not remove it — an attacker willing to
+>    build circuits still gets through, and that remains **accepted**.
+>
+> Live chat (`/ws`) is unaffected: its token bucket is per-connection.
 
 If per-IP limiting on clearnet is ever needed back, the honest fix is a secret
 header that Caddy injects and a Tor visitor cannot know — a code change to
@@ -82,7 +118,10 @@ and the service will not start, check that line first.
 
 ```bash
 apt-get install -y tor
-cat deploy/torrc.secure-chat >> /etc/tor/torrc
+# Idempotent (L-10): appending twice gives a duplicate HiddenServiceDir and Tor
+# then refuses to start. Guard the append instead of repeating it.
+grep -q 'HiddenServiceDir /var/lib/tor/secure-chat' /etc/tor/torrc \
+  || cat deploy/torrc.secure-chat >> /etc/tor/torrc
 tor --verify-config -f /etc/tor/torrc
 systemctl restart tor@default
 cat /var/lib/tor/secure-chat/hostname          # the .onion address
@@ -112,7 +151,20 @@ node onion-ws.mjs <address>.onion
 `onion-ws.mjs` speaks SOCKS5 + raw RFC 6455 because Node's built-in WebSocket
 cannot use a proxy and the `e2e/` suite's `puppeteer-core` is gitignored. It
 asserts the upgrade succeeds, the onion Origin is allow-listed, a **foreign
-Origin is still refused (403)**, and payloads relay both ways.
+Origin is refused with a definite HTTP status while an allowed Origin upgrades
+in the same run**, and payloads relay both ways.
+
+> **Corrected 2026-07-29 (pentest M-3).** This used to claim the harness
+> verifies a **403**. It did not verify anything: `wsConnect` resolved
+> `{code: 0}` on *any* close before the header terminator, so a Tor hiccup or a
+> relay restart satisfied the check and it reported OK — proved green at
+> `HTTP 0` with the CSWSH guard never exercised. Asserting `code === 403` alone
+> is still unsound, because `main.py`'s bad-origin close and its connection-cap
+> close both happen before `accept()` and uvicorn collapses them to the same
+> status. The harness now runs a **positive control in the same pass**: the
+> allowed Origin must upgrade *and* the foreign one must be refused, and the
+> run fails if the allowed Origin did not upgrade — which is what distinguishes
+> "the guard rejected it" from "the transport died".
 
 ## What the onion does and does not buy
 

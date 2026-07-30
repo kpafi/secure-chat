@@ -29,6 +29,7 @@ import * as otp from "./otp.js";
 import * as contacts from "./contacts.js";
 import * as chats from "./chats.js";
 import * as sealed from "./sealed.js";
+import { makeKeyConfirmation } from "./keyconfirm.js";
 import { generate as qrGenerate } from "lean-qr";
 
 const $ = (id) => document.getElementById(id);
@@ -88,6 +89,7 @@ const els = {
   profileFingerprint: $("profileFingerprint"), profileKeys: $("profileKeys"),
   profileStatus: $("profileStatus"),
   profileExport: $("profileExport"), profileForget: $("profileForget"),
+  profileLogout: $("profileLogout"), profileSessionHint: $("profileSessionHint"),
   // users view
   usersLocked: $("usersLocked"), usersUnlocked: $("usersUnlocked"),
   addHandle: $("addHandle"), addContact: $("addContact"),
@@ -175,6 +177,22 @@ let admittedBundle = null; // the identity WE let in (owner side), or null
 let admittedAnon = false;  // we let in someone with no identity at all
 let wasPending = false;    // we sat in the approval queue (M-2, guest side)
 let knockQueue = [];       // [{jid, bundle, anon}] waiting for our verdict
+let currentRoom = null;    // the room this connection is in (keyconfirm effects)
+// L-1: a backstop on the approval queue, NOT the control.
+//
+// The relay holds at most MAX_ROOM_PENDING (4) waiters at a time, so with the
+// `withdrawn` pruning below this queue cannot legitimately exceed that. The cap
+// exists for the case where pruning does not happen — an older relay that does
+// not send `withdrawn`, or a hostile one that withholds it — and it is set well
+// above the relay's own limit so it never drops a knock the relay considers
+// live. The first cut of this fix set it to 8 with no pruning at all, which the
+// fix review (M-A) showed made things WORSE than no cap: cheap
+// connect/knock/disconnect cycles filled the queue with ghosts that nothing
+// removed, and because the client sends its knock exactly once and the relay
+// refuses a second one on the same socket, a dropped knocker could never try
+// again. That is a permanent, silent denial of admission — a direct hit on the
+// P-08 property this was supposed to protect.
+const MAX_KNOCK_QUEUE = 16;
 
 let identity = null;       // unlocked Identity, or null
 let myBundle = null;       // identity.publicBundle(), or null
@@ -599,10 +617,24 @@ async function exportIdentity() {
   }
 }
 
-function forgetIdentity() {
+async function forgetIdentity() {
   if (!confirm("Remove this identity from the device? Without a backup you cannot recover it, and contacts will need to re-verify you.")) {
     return;
   }
+  // Fix review round 2 (L-3): revoke the directory session too.
+  //
+  // This dropped `apiToken` locally and left the bearer valid on the relay for
+  // the rest of TOKEN_TTL_SEC — a live capability surviving the exact control a
+  // user reaches for when handing the device on, which is the same reasoning
+  // that made the L-4 fix below remove the handle and lookup token. Once M-C
+  // stopped re-login from being a revocation, this was the last silent gap.
+  // Best-effort and non-blocking on failure: the local wipe must happen either
+  // way, and the token expires on its own.
+  stopMailboxPolling();
+  const staleToken = apiToken;
+  apiToken = null;
+  if (staleToken) await account.logout(API_BASE, staleToken);
+
   localStorage.removeItem(LS_IDENTITY);
   contacts.wipe(); // bound to the identity passphrase; unusable without it
   chats.wipe();
@@ -654,18 +686,49 @@ async function registerAccount() {
 // failure (offline, or the name belongs to another identity) — the explicit
 // "Log in" button is still there and reports properly.
 let autoLoginRunning = false;
+// Pentest fix review 2026-07-30 (M-C). This used to retry on every 6 s mailbox
+// tick and swallow every failure silently, so a re-login that kept failing —
+// most easily because the relay's global challenge bucket was rate-limiting it —
+// left the tab permanently offline for sealed mail with NO visible sign: the
+// "not logged in" chip is only redrawn when the user happens to open the profile
+// view. That is the failure the 401 handler exists to prevent, reached by a
+// different road. So: back off, and say something.
+let autoLoginBackoffUntil = 0;
+let autoLoginFailures = 0;
+
 async function autoLogin(username) {
   if (!identity || apiToken || autoLoginRunning) return false;
   if (!account.isValidUsername(username)) return false;
+  if (Date.now() < autoLoginBackoffUntil) return false;
   autoLoginRunning = true;
   try {
     const { token } = await account.login(API_BASE, identity, username);
     apiToken = token;
+    autoLoginFailures = 0;
+    autoLoginBackoffUntil = 0;
     startMailboxPolling();
     renderProfile();
     if (!els.viewChats.hidden) refreshChats();
     return true;
-  } catch {
+  } catch (e) {
+    // Exponential-ish backoff, capped: 12s, 24s, 48s, 96s, then 2 minutes. Keeps
+    // a retry loop from being indistinguishable from an attack on the shared
+    // challenge bucket, which is what two tabs doing this became.
+    autoLoginFailures += 1;
+    const wait = Math.min(120000, 6000 * 2 ** Math.min(autoLoginFailures, 5));
+    autoLoginBackoffUntil = Date.now() + wait;
+    renderProfile();
+    // Visible, once per failure streak, so the user is not silently offline.
+    // Routed through hint(), which writes to whichever screen is actually in
+    // front of the user — addLine() alone put this in the CHAT TRANSCRIPT, a
+    // screen you are usually not on when a background re-login fails, which is
+    // the same "only redrawn if you happen to look" complaint that made M-C
+    // silent in the first place.
+    if (autoLoginFailures === 1 || autoLoginFailures === 4) {
+      const why = e && e.message ? e.message : "login failed";
+      hint(`Not signed in to the directory — sealed messages will not arrive (${why}). Retrying.`, true);
+      addLine("sys", "", `[not signed in to the directory — sealed messages will not arrive (${why})]`);
+    }
     return false;
   } finally {
     autoLoginRunning = false;
@@ -837,6 +900,12 @@ function renderProfile() {
     chip.textContent = label;
     els.profileStatus.appendChild(chip);
   }
+
+  // L-4: sign-out is only meaningful while a session exists. This is the ONLY
+  // revocation a user can trigger — "log in again" is deliberately no longer a
+  // revocation, because making it one made two tabs fight (M-C).
+  els.profileLogout.hidden = !apiToken;
+  els.profileSessionHint.hidden = !apiToken;
 }
 
 // Render the invite link as a QR into the profile canvas (lean-qr, vendored —
@@ -1377,19 +1446,32 @@ async function sendChatMessage(e) {
 // handle inside is used only to (a) name a brand-new contact and (b) store the
 // reply token; an existing contact keyed by the same bundle always wins.
 async function pollMailbox() {
-  if (!apiToken || !identity || !chats.isUnlocked() || !contacts.isUnlocked()) return;
+  if (!identity || !chats.isUnlocked() || !contacts.isUnlocked()) return;
+  // Fix review round 2 (M-1): re-authenticate from HERE, not only from the 401
+  // branch below.
+  //
+  // The 401 branch cleared `apiToken` and called `autoLogin` once. If that call
+  // failed — a 429 from the global challenge bucket, a blip, or the new
+  // deliberate sign-out — `apiToken` stayed null and every later tick returned
+  // at this very line, before ever reaching the 401 branch again. So there was
+  // no second attempt, the backoff ladder added for M-C was unreachable from
+  // the only periodic caller, and the tab sat permanently offline for sealed
+  // mail: exactly the state M-C was supposed to remove, arrived at by a
+  // different road. autoLogin's own backoff is what keeps this from becoming a
+  // 6 s retry loop against a shared bucket.
+  if (!apiToken) {
+    const savedName = localStorage.getItem(LS_USERNAME);
+    if (savedName) await autoLogin(savedName);
+    return; // let the next tick collect, with a token or with a longer backoff
+  }
   let batch;
   try {
     batch = await account.fetchMail(API_BASE, apiToken);
   } catch (e) {
     // A directory session lasts TOKEN_TTL_SEC. When it expires the fetch 401s
-    // forever and mail stops arriving with no visible sign, so re-authenticate
-    // and let the next tick collect. Anything else: offline, just retry later.
-    if (e && e.status === 401) {
-      apiToken = null;
-      const savedName = localStorage.getItem(LS_USERNAME);
-      if (savedName) await autoLogin(savedName);
-    }
+    // forever and mail stops arriving with no visible sign, so drop the token
+    // and let the block above re-authenticate on the next tick.
+    if (e && e.status === 401) apiToken = null;
     return;
   }
   let changed = false;
@@ -1576,6 +1658,16 @@ function startMailboxPolling() {
   pollMailbox();
 }
 
+// Stop polling on a deliberate sign-out (L-4). Without this the interval keeps
+// firing, 401s on the revoked token, and re-authenticates — turning sign-out
+// into a 6 s round trip that undoes itself.
+function stopMailboxPolling() {
+  if (mailboxTimer) {
+    clearInterval(mailboxTimer);
+    mailboxTimer = null;
+  }
+}
+
 // ---- connection lifecycle -------------------------------------------------
 
 // Pentest 2026-07-26 P-19: connect() awaits a directory fetch, a pad unlock
@@ -1693,9 +1785,7 @@ async function connectInner() {
   admittedBundle = null;
   admittedAnon = false;
   wasPending = false;
-  confirmSent = false;
-  peerConfirm = null;
-  confirmDone = false;
+  keyConfirm.reset();
   knockQueue = [];
   hideAdmitPrompt();
   // P-19: freeze the session's room/alg now; the send path uses these, never the
@@ -1745,9 +1835,7 @@ async function connectInner() {
     admittedBundle = null;
     admittedAnon = false;
     wasPending = false;
-    confirmSent = false;
-    peerConfirm = null;
-    confirmDone = false;
+    keyConfirm.reset();
     knockQueue = [];
     hideAdmitPrompt();
     enableSend(false);
@@ -1777,6 +1865,26 @@ async function queueKnock(m) {
   if (roomRole !== "owner") return; // only the owner is asked; ignore the rest
   if (typeof m.jid !== "string" || !/^[0-9a-f]{16}$/.test(m.jid)) return;
   if (knockQueue.some((k) => k.jid === m.jid)) return;
+  // Pentest 2026-07-29 L-1: cap the queue.
+  //
+  // It used to grow without bound. Dedup is per-`jid` and every fresh socket
+  // brings a new one, the relay never tells the owner that a waiter left, and
+  // main.py creates the WS token bucket PER CONNECTION — so
+  // connect->join->knock->disconnect gets a fresh budget each cycle. Measured
+  // at 60 knocks in 1.6s (~37/s), each one forcing an Ed25519 AND an ML-DSA-65
+  // verify on the owner's tab. Availability only, and the owner can see it
+  // happening, but it dents P-08's "waiting costs the room nothing".
+  //
+  // Dropping the EXCESS rather than the oldest is deliberate: the queue is
+  // handled oldest-first, so the entries already in it are the ones the owner
+  // is being asked about right now, and letting a flood evict them would let an
+  // attacker push a genuine contact's knock off the list — turning a nuisance
+  // into a targeted denial of admission. A dropped knocker simply has to knock
+  // again once the queue drains, which is what an honest one does anyway.
+  //
+  // Note the cap sits BEFORE the two signature verifies below, so a flood costs
+  // the owner a regex and an array scan, not the expensive part.
+  if (knockQueue.length >= MAX_KNOCK_QUEUE) return;
   let p;
   try {
     p = unpackKey(m.payload);
@@ -1805,7 +1913,24 @@ async function queueKnock(m) {
   await showNextKnock();
 }
 
+// Fix review round 2 (L-2). `showNextKnock` awaits a digest before it writes
+// any DOM, and it now has two concurrent triggers that are NOT serialised
+// against each other: the click path (decideKnock) and the message path (the
+// new `withdrawn` case, plus `queueKnock`). `handleMessage` serialises
+// message-vs-message via msgChain, but nothing serialises click-vs-message. Two
+// interleavings matter: a synchronous render for an ANON entry finishing while a
+// bundled render is still inside fingerprintOf, leaving the DOM describing a
+// verified contact while knockQueue[0] is the anon one; and `withdrawn`
+// emptying the queue and hiding the prompt while an in-flight render then
+// un-hides it for an entry that no longer exists — an undismissable prompt,
+// which is what no-dead-ends.mjs exists to catch.
+//
+// A generation counter fixes both: only the most recently STARTED render may
+// write, and it re-reads the queue head after every await.
+let knockRenderGen = 0;
+
 async function showNextKnock() {
+  const gen = ++knockRenderGen;
   if (!knockQueue.length) {
     hideAdmitPrompt();
     return;
@@ -1814,7 +1939,11 @@ async function showNextKnock() {
   els.admitWarn.textContent = "";
   els.admitWarn.className = "hint";
   if (k.bundle) {
-    els.admitFingerprint.textContent = await Identity.fingerprintOf(k.bundle);
+    const fp = await Identity.fingerprintOf(k.bundle);
+    // Someone else started a render, or this entry left the queue, while we were
+    // hashing. Whatever they decided is newer than this; do not write over it.
+    if (gen !== knockRenderGen || knockQueue[0] !== k) return;
+    els.admitFingerprint.textContent = fp;
     // Who is this, in OUR terms? Matched on the keys themselves — never on a
     // name the other side chose (F-01).
     const known = contacts.isUnlocked()
@@ -1882,7 +2011,7 @@ function hideAdmitPrompt() {
 // but the pin had already moved to the second knocker, and the peer already in
 // the room then failed the identity check and was disconnected by its own
 // owner. One admit per session; the button is disabled once someone is in.
-function decideKnock(allow) {
+async function decideKnock(allow) {
   if (!knockQueue.length || !ws) return;
   if (allow && admittedSomeone()) return; // guarded in the UI too; belt and braces
   const k = knockQueue.shift();
@@ -1897,7 +2026,7 @@ function decideKnock(allow) {
     type: allow ? "admit" : "deny", room: sessionRoom, jid: k.jid,
   }));
   if (!allow) addLine("sys", "", "you denied someone who asked to join");
-  showNextKnock();
+  return showNextKnock();   // awaited by callers; unawaited it races the message path
 }
 
 // True once this session has let someone in. The chat holds two people, so from
@@ -1948,39 +2077,58 @@ function sendSignedKey(room, reply) {
 // This gates only the UNLOCK step. It is not a substitute for the safety-number
 // comparison: confirmation proves you share a key with whoever is at the other
 // end, and the in-person check is what proves who that is.
-let confirmSent = false;
-let peerConfirm = null;
-let confirmDone = false;
-
-async function onChannelReady(room) {
-  const c = cipher.confirmation;
-  if (!c) return finishSession(room); // OTP: nothing was negotiated to confirm
-  if (!confirmSent) {
-    confirmSent = true;
-    ws.send(JSON.stringify({
-      type: "key", room, alg: sessionAlg, payload: packKey({ confirm: c.mine }),
-    }));
-    hint("Confirming that both sides derived the same key…");
-  }
-  await tryFinishConfirmation(room);
-}
-
-async function tryFinishConfirmation(room) {
-  if (confirmDone) return;
-  const c = cipher.confirmation;
-  if (!c || peerConfirm === null) return; // one half is still missing
-  if (peerConfirm !== c.theirs) {
-    addLine("sys", "", "[the other side derived a DIFFERENT key — refusing to continue]");
+// Pentest 2026-07-29 M-5. The exchange above was right, but it assumed the
+// chains it confirms never change afterwards. They can: `_derive` REPLACES
+// `this.chan` (and so both confirmation tags) whenever its input signature
+// changes, in PQKEM and RSA alike. Two consequences, both of which this block
+// now handles explicitly:
+//
+//  1. THE ATTACK. A relay replays one genuine hello and delays one genuine
+//     signed offer until after confirmation has completed. `case "key"` had no
+//     `confirmDone` gate and `tryFinishConfirmation` returned early once done,
+//     so the late frame re-derived new chains that nobody re-confirmed: both
+//     peers displayed "secure channel established", compared safety numbers
+//     successfully, and then nothing worked — precisely the silent dead chat
+//     the comment above promises cannot happen. Chains are now FROZEN once
+//     confirmed; a frame that would change them is a loud refusal.
+//
+//  2. THE RACE, which the fix must not break. In a genuine simultaneous
+//     connect each side derives twice (its own offer secret, then the answer),
+//     so a tag sent after the first derivation is stale by the time the peer
+//     sees it. Comparing only the latest tag made confirmation ALWAYS mismatch
+//     in that case and disconnected BOTH honest peers — the race tolerance
+//     documented at crypto.js:645 stopped being real the moment confirmation
+//     was put in front of it. So we keep every tag the peer has sent and match
+//     our current `theirs` against the set: each tag is a signed, identity-
+//     pinned claim "I derived this material", and one of them matching is the
+//     proof we want, whichever order the frames arrived in.
+//
+// A mismatch therefore no longer disconnects on the spot — a stale tag is
+// expected in the race — so the loudness comes from a deadline instead. This
+// also covers a case the old code hung on: a relay that never delivers the
+// peer's confirm frame at all.
+// The state machine itself lives in keyconfirm.js so it can be unit-tested
+// without a DOM — see that file's header for why. app.js supplies the effects.
+const keyConfirm = makeKeyConfirmation({
+  send: (tag) => ws.send(JSON.stringify({
+    type: "key", room: currentRoom, alg: sessionAlg, payload: packKey({ confirm: tag }),
+  })),
+  hint: (msg) => hint(msg),
+  fail: (why) => {
+    addLine("sys", "", `[${why} — refusing to continue]`);
     hint(
       "Key confirmation failed: you and your contact do not hold the same session key. " +
       "Messages would silently fail to arrive. Disconnecting.",
       true,
     );
     if (ws) ws.close();
-    return;
-  }
-  confirmDone = true;
-  await finishSession(room);
+  },
+  finish: () => finishSession(currentRoom),
+});
+
+async function onChannelReady(room) {
+  currentRoom = room;
+  await keyConfirm.onChains(cipher.confirmation);
 }
 
 // Everything that used to happen the moment the chains existed.
@@ -2058,6 +2206,25 @@ async function handleMessage(room, raw) {
     // point is that a human looks at the key.
     case "knock": {
       await queueKnock(m);
+      break;
+    }
+
+    // A waiter gave up or was cut off (fix review 2026-07-30, M-A). Prune it, so
+    // the queue reflects who is actually still waiting. Without this the entry
+    // is immortal — nothing else reports a departed waiter — and the L-1 cap
+    // then turns a flood of cheap connect/knock/disconnect cycles into a
+    // permanent denial of admission for the peer you are actually expecting.
+    //
+    // Untrusted, like every relay frame, but it can only ever REMOVE an entry
+    // from our own queue. The worst a hostile relay does with it is drop a
+    // knock it could have declined to deliver in the first place.
+    case "withdrawn": {
+      if (roomRole !== "owner") break;
+      if (typeof m.jid !== "string") break;
+      const before = knockQueue.length;
+      knockQueue = knockQueue.filter((k) => k.jid !== m.jid);
+      // Re-render only if the prompt could be showing the entry we just removed.
+      if (knockQueue.length !== before) await showNextKnock();
       break;
     }
 
@@ -2164,10 +2331,12 @@ async function handleMessage(room, raw) {
         // handshake branch because it is not one: it arrives after the chains
         // exist and carries no key material.
         if (typeof p.confirm === "string") {
-          // First write wins, exactly like the peer identity and the hello
-          // nonce: a relay must not get to try tag after tag until one sticks.
-          if (peerConfirm === null) peerConfirm = p.confirm;
-          await tryFinishConfirmation(room);
+          // M-5: a bounded set rather than first-write-wins, because the race
+          // legitimately produces two tags per side and the second is the one
+          // that counts. The cap is what keeps this from becoming an oracle a
+          // relay can hammer — see MAX_PEER_CONFIRMS.
+          currentRoom = room;
+          await keyConfirm.onPeerTag(p.confirm, cipher.confirmation);
           break;
         }
 
@@ -2260,6 +2429,17 @@ async function handleMessage(room, raw) {
           addLine("sys", "", "[a SECOND identity tried to complete the key exchange — refusing; this is a relay MITM attempt]");
           hint("Two different identities attempted this handshake — disconnecting to protect you.", true);
           if (ws) ws.close();
+          return;
+        }
+        // M-5: refuse handshake material once confirmation has completed.
+        // `_derive` rebuilds the chains whenever its input signature changes,
+        // so folding in a withheld-then-delivered offer here would silently
+        // replace the very material both sides just proved they shared — the
+        // safety numbers stay green and the chat goes quietly dead. onChannelReady
+        // catches the same condition afterwards; this refuses it up front so
+        // the cipher state is never disturbed in the first place.
+        if (keyConfirm.done) {
+          keyConfirm.failNow("a handshake frame arrived AFTER both sides had confirmed the key");
           return;
         }
         // Feed the key material (same identity guaranteed above). The cipher
@@ -2802,6 +2982,18 @@ async function otpFileChosen() {
       otpStatusMsg("You already have this pad on this device — not importing again (a pad must live on exactly one device per side).", true);
       return;
     }
+    // Pentest 2026-07-29 H-3: this path takes the record straight from
+    // saveNewPad and never calls unlockPad, so none of unlockPad's rollback or
+    // native-floor checks run on an import. That was half the finding — the
+    // other half being that importPad's own guard read only deletable
+    // localStorage keys.
+    //
+    // Both guards now live INSIDE the two functions this line calls
+    // (importPad above and saveNewPad here), and both consult the native floor,
+    // which the JS context cannot delete. Deliberately not "fixed" by adding an
+    // unlockPad round trip: that would put the check beside the path instead of
+    // on it, and cost a third 600k-iteration KDF for no property this does not
+    // already have.
     otpAtRest = await otp.saveNewPad(rec, els.otpPass.value); // encrypt at rest with the pad passphrase
     otpRecord = rec;
     otpUnlockedId = rec.padId;
@@ -2825,7 +3017,7 @@ function otpForgetSelected() {
 els.idCreate.addEventListener("click", createIdentity);
 els.idUnlock.addEventListener("click", unlockIdentity);
 els.idExport.addEventListener("click", exportIdentity);
-els.idForget.addEventListener("click", forgetIdentity);
+els.idForget.addEventListener("click", () => { forgetIdentity(); });
 els.register.addEventListener("click", registerAccount);
 els.login.addEventListener("click", loginAccount);
 
@@ -2929,6 +3121,25 @@ els.profileCopyInvite.addEventListener("click", () => {
   if (h) copyToClipboard(els.profileCopyInvite, inviteLink(h));
 });
 els.profileExport.addEventListener("click", exportIdentity);
+// L-4: the user-facing half of session revocation. Drop the token locally
+// FIRST, so the session is gone from this device even if the relay is
+// unreachable, and stop the poller before it can re-authenticate — otherwise
+// the next 6 s tick would 401 and sign straight back in, which is exactly the
+// loop the M-C fix removed from re-login.
+els.profileLogout.addEventListener("click", async () => {
+  const token = apiToken;
+  apiToken = null;
+  stopMailboxPolling();
+  // Suppress the automatic re-login for a moment, so this is a deliberate
+  // sign-out rather than a blip the poller undoes.
+  autoLoginBackoffUntil = Date.now() + 60000;
+  renderProfile();
+  await account.logout(API_BASE, token);
+  // Say WHERE to sign back in: this button is in Profile, the login field is on
+  // the identity screen, and "sign in again" on its own sends people looking.
+  accountStatus("Signed out of the directory. Sealed messages will not arrive until you log in again on the identity screen.", "ok");
+  addLine("sys", "", "[signed out of the directory — sealed messages will not arrive until you log in again]");
+});
 els.profileForget.addEventListener("click", async () => {
   await forgetIdentity();
   renderProfile(); // reflect the now-locked state without leaving the view

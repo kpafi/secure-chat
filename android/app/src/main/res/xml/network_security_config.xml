@@ -1,23 +1,58 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   Cleartext is permitted so the relay can be reached over plain HTTP/WS in the
-  two cases the browser still allows it from the app's secure (https) page:
-    * a LOOPBACK relay (http://127.0.0.1:8000, e.g. `adb reverse` in dev, or a
-      local Orbot SOCKS/relay), which Chromium treats as potentially trustworthy;
-    * a Tor .onion (also potentially trustworthy; the Tor circuit encrypts it).
-  A plain http:// LAN host (192.168.x.x) is NOT one of these — the browser's
-  Mixed-Content rule blocks an insecure ws:// from an https page regardless of
-  this setting, so such a relay simply will not connect (the app shows a clear
-  error). For a clearnet production relay, front it with TLS: the page then uses
-  wss:// and no cleartext is involved.
+  one case the browser still allows it from the app's secure (https) page:
+  a LOOPBACK relay (http://127.0.0.1:8000, e.g. `adb reverse` in dev, or a local
+  Orbot SOCKS/HTTP proxy), which Chromium treats as potentially trustworthy.
+
+  CORRECTED 2026-07-29 (pentest M-4). This file used to claim a `.onion` was
+  "also potentially trustworthy". THAT IS FALSE FOR CHROMIUM, which is what the
+  WebView is. Measured:
+
+    | context                                      | isSecureContext | crypto.subtle |
+    | Chromium, http://<addr>.onion                | false           | ABSENT        |
+    | Firefox, default prefs                       | false           | ABSENT        |
+    | Firefox + dom.securecontext.allowlist_onions | true            | present       |
+    | Chromium, http://127.0.0.1                   | true            | present       |
+
+  Only Firefox has that pref, and only Tor Browser ships it enabled. From the
+  app's https page `new WebSocket("ws://<addr>.onion")` throws outright ("An
+  insecure WebSocket connection may not be initiated from a page loaded over
+  HTTPS"), and cleartextTrafficPermitted cannot help: it is an Android-platform
+  control that sits BELOW Chromium's mixed-content blocker. So pointing the app
+  at the onion is NOT "an on-device task, not a code change" as PROGRESS.md
+  claimed — it cannot work, with or without Orbot.
+
+  DO NOT "fix" this by loading http://<addr>.onion as the WebView's DOCUMENT
+  origin. That is a Critical regression twice over: it removes crypto.subtle
+  entirely (no secure context => no Web Crypto => the client cannot run at all),
+  and it makes the JavaScript server-delivered again, destroying the exact H-02
+  property the Android app exists to provide — code you verified once and
+  bundled in the APK, rather than re-fetched from a relay you do not trust.
+
+  The workable shapes, both still to be built:
+    * a local Orbot HTTP/SOCKS proxy on 127.0.0.1 (a trustworthy origin)
+      fronting the onion — which is why loopback stays allow-listed below; or
+    * wrapping the onion in TLS so the page can use wss:// directly.
+
+  The `onion` entry is kept on purpose: it is inert (the mixed-content blocker
+  refuses those connections before this file is consulted) and it is what a
+  loopback Orbot proxy would eventually forward TO. Removing it would change
+  nothing about what the app can reach today.
+
+  A plain http:// LAN host (192.168.x.x) is likewise blocked by the
+  mixed-content rule regardless of this setting, so such a relay simply will not
+  connect (the app shows a clear error). For a clearnet production relay, front
+  it with TLS: the page then uses wss:// and no cleartext is involved.
+
   This does NOT affect chat security either way: all confidentiality/authenticity
   is end-to-end inside the bundled client; the relay only sees opaque ciphertext.
 -->
 <network-security-config>
     <!-- Default: no cleartext anywhere. A clearnet relay must be https/wss. -->
     <base-config cleartextTrafficPermitted="false" />
-    <!-- Cleartext is scoped to exactly the two hosts the browser still treats as
-         potentially-trustworthy from the app's secure page: loopback and .onion. -->
+    <!-- Loopback is the only host cleartext actually reaches today; see above
+         for why the .onion entry is retained but cannot currently be used. -->
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="true">127.0.0.1</domain>
         <domain includeSubdomains="true">localhost</domain>
