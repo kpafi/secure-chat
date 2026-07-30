@@ -617,10 +617,24 @@ async function exportIdentity() {
   }
 }
 
-function forgetIdentity() {
+async function forgetIdentity() {
   if (!confirm("Remove this identity from the device? Without a backup you cannot recover it, and contacts will need to re-verify you.")) {
     return;
   }
+  // Fix review round 2 (L-3): revoke the directory session too.
+  //
+  // This dropped `apiToken` locally and left the bearer valid on the relay for
+  // the rest of TOKEN_TTL_SEC — a live capability surviving the exact control a
+  // user reaches for when handing the device on, which is the same reasoning
+  // that made the L-4 fix below remove the handle and lookup token. Once M-C
+  // stopped re-login from being a revocation, this was the last silent gap.
+  // Best-effort and non-blocking on failure: the local wipe must happen either
+  // way, and the token expires on its own.
+  stopMailboxPolling();
+  const staleToken = apiToken;
+  apiToken = null;
+  if (staleToken) await account.logout(API_BASE, staleToken);
+
   localStorage.removeItem(LS_IDENTITY);
   contacts.wipe(); // bound to the identity passphrase; unusable without it
   chats.wipe();
@@ -705,8 +719,15 @@ async function autoLogin(username) {
     autoLoginBackoffUntil = Date.now() + wait;
     renderProfile();
     // Visible, once per failure streak, so the user is not silently offline.
+    // Routed through hint(), which writes to whichever screen is actually in
+    // front of the user — addLine() alone put this in the CHAT TRANSCRIPT, a
+    // screen you are usually not on when a background re-login fails, which is
+    // the same "only redrawn if you happen to look" complaint that made M-C
+    // silent in the first place.
     if (autoLoginFailures === 1 || autoLoginFailures === 4) {
-      addLine("sys", "", `[not signed in to the directory — sealed messages will not arrive (${e && e.message ? e.message : "login failed"})]`);
+      const why = e && e.message ? e.message : "login failed";
+      hint(`Not signed in to the directory — sealed messages will not arrive (${why}). Retrying.`, true);
+      addLine("sys", "", `[not signed in to the directory — sealed messages will not arrive (${why})]`);
     }
     return false;
   } finally {
@@ -1425,19 +1446,32 @@ async function sendChatMessage(e) {
 // handle inside is used only to (a) name a brand-new contact and (b) store the
 // reply token; an existing contact keyed by the same bundle always wins.
 async function pollMailbox() {
-  if (!apiToken || !identity || !chats.isUnlocked() || !contacts.isUnlocked()) return;
+  if (!identity || !chats.isUnlocked() || !contacts.isUnlocked()) return;
+  // Fix review round 2 (M-1): re-authenticate from HERE, not only from the 401
+  // branch below.
+  //
+  // The 401 branch cleared `apiToken` and called `autoLogin` once. If that call
+  // failed — a 429 from the global challenge bucket, a blip, or the new
+  // deliberate sign-out — `apiToken` stayed null and every later tick returned
+  // at this very line, before ever reaching the 401 branch again. So there was
+  // no second attempt, the backoff ladder added for M-C was unreachable from
+  // the only periodic caller, and the tab sat permanently offline for sealed
+  // mail: exactly the state M-C was supposed to remove, arrived at by a
+  // different road. autoLogin's own backoff is what keeps this from becoming a
+  // 6 s retry loop against a shared bucket.
+  if (!apiToken) {
+    const savedName = localStorage.getItem(LS_USERNAME);
+    if (savedName) await autoLogin(savedName);
+    return; // let the next tick collect, with a token or with a longer backoff
+  }
   let batch;
   try {
     batch = await account.fetchMail(API_BASE, apiToken);
   } catch (e) {
     // A directory session lasts TOKEN_TTL_SEC. When it expires the fetch 401s
-    // forever and mail stops arriving with no visible sign, so re-authenticate
-    // and let the next tick collect. Anything else: offline, just retry later.
-    if (e && e.status === 401) {
-      apiToken = null;
-      const savedName = localStorage.getItem(LS_USERNAME);
-      if (savedName) await autoLogin(savedName);
-    }
+    // forever and mail stops arriving with no visible sign, so drop the token
+    // and let the block above re-authenticate on the next tick.
+    if (e && e.status === 401) apiToken = null;
     return;
   }
   let changed = false;
@@ -1879,7 +1913,24 @@ async function queueKnock(m) {
   await showNextKnock();
 }
 
+// Fix review round 2 (L-2). `showNextKnock` awaits a digest before it writes
+// any DOM, and it now has two concurrent triggers that are NOT serialised
+// against each other: the click path (decideKnock) and the message path (the
+// new `withdrawn` case, plus `queueKnock`). `handleMessage` serialises
+// message-vs-message via msgChain, but nothing serialises click-vs-message. Two
+// interleavings matter: a synchronous render for an ANON entry finishing while a
+// bundled render is still inside fingerprintOf, leaving the DOM describing a
+// verified contact while knockQueue[0] is the anon one; and `withdrawn`
+// emptying the queue and hiding the prompt while an in-flight render then
+// un-hides it for an entry that no longer exists — an undismissable prompt,
+// which is what no-dead-ends.mjs exists to catch.
+//
+// A generation counter fixes both: only the most recently STARTED render may
+// write, and it re-reads the queue head after every await.
+let knockRenderGen = 0;
+
 async function showNextKnock() {
+  const gen = ++knockRenderGen;
   if (!knockQueue.length) {
     hideAdmitPrompt();
     return;
@@ -1888,7 +1939,11 @@ async function showNextKnock() {
   els.admitWarn.textContent = "";
   els.admitWarn.className = "hint";
   if (k.bundle) {
-    els.admitFingerprint.textContent = await Identity.fingerprintOf(k.bundle);
+    const fp = await Identity.fingerprintOf(k.bundle);
+    // Someone else started a render, or this entry left the queue, while we were
+    // hashing. Whatever they decided is newer than this; do not write over it.
+    if (gen !== knockRenderGen || knockQueue[0] !== k) return;
+    els.admitFingerprint.textContent = fp;
     // Who is this, in OUR terms? Matched on the keys themselves — never on a
     // name the other side chose (F-01).
     const known = contacts.isUnlocked()
@@ -1956,7 +2011,7 @@ function hideAdmitPrompt() {
 // but the pin had already moved to the second knocker, and the peer already in
 // the room then failed the identity check and was disconnected by its own
 // owner. One admit per session; the button is disabled once someone is in.
-function decideKnock(allow) {
+async function decideKnock(allow) {
   if (!knockQueue.length || !ws) return;
   if (allow && admittedSomeone()) return; // guarded in the UI too; belt and braces
   const k = knockQueue.shift();
@@ -1971,7 +2026,7 @@ function decideKnock(allow) {
     type: allow ? "admit" : "deny", room: sessionRoom, jid: k.jid,
   }));
   if (!allow) addLine("sys", "", "you denied someone who asked to join");
-  showNextKnock();
+  return showNextKnock();   // awaited by callers; unawaited it races the message path
 }
 
 // True once this session has let someone in. The chat holds two people, so from
@@ -2962,7 +3017,7 @@ function otpForgetSelected() {
 els.idCreate.addEventListener("click", createIdentity);
 els.idUnlock.addEventListener("click", unlockIdentity);
 els.idExport.addEventListener("click", exportIdentity);
-els.idForget.addEventListener("click", forgetIdentity);
+els.idForget.addEventListener("click", () => { forgetIdentity(); });
 els.register.addEventListener("click", registerAccount);
 els.login.addEventListener("click", loginAccount);
 
@@ -3080,7 +3135,10 @@ els.profileLogout.addEventListener("click", async () => {
   autoLoginBackoffUntil = Date.now() + 60000;
   renderProfile();
   await account.logout(API_BASE, token);
-  addLine("sys", "", "[signed out of the directory — sealed messages will not arrive until you sign in again]");
+  // Say WHERE to sign back in: this button is in Profile, the login field is on
+  // the identity screen, and "sign in again" on its own sends people looking.
+  accountStatus("Signed out of the directory. Sealed messages will not arrive until you log in again on the identity screen.", "ok");
+  addLine("sys", "", "[signed out of the directory — sealed messages will not arrive until you log in again]");
 });
 els.profileForget.addEventListener("click", async () => {
   await forgetIdentity();

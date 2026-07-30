@@ -409,11 +409,12 @@ console.log("OK  F-4: each knownUsedHere clause fails closed on its own");
   // device (otp.js reads globalThis.__SECURE_CHAT_PAD_FLOOR__ once, at import).
   const floors = new Map();
   globalThis.__SECURE_CHAT_PAD_FLOOR__ = {
-    read: (id) => String(floors.has(id) ? floors.get(id) : -1),
+    read: (id) => (floors.has(id) ? floors.get(id) : -1),
     bump: (id, val) => {
-      const n = Math.max(floors.has(id) ? floors.get(id) : -1, parseInt(val, 10));
+      const cur = floors.has(id) ? floors.get(id) : -1;
+      const n = val > cur ? val : cur;
       floors.set(id, n);
-      return String(n);
+      return n;
     },
   };
   const otpN = await import("./otp.js?native=1");
@@ -446,7 +447,7 @@ console.log("OK  F-4: each knownUsedHere clause fails closed on its own");
   // "used", because an import/save must never be the way out of a damaged one.
   // Both refusals are the same property; assert the earliest, and that the pad
   // never reaches a usable state.
-  globalThis.__SECURE_CHAT_PAD_FLOOR__ = { read: () => "not-a-number", bump: () => "0" };
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = { read: () => "not-a-number", bump: () => "0" };  // strings are now invalid
   const modBroken = await import("./otp.js?native=broken");
   const pBroken = await modBroken.generatePad({ label: "f1-broken", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
   await assert.rejects(
@@ -477,11 +478,12 @@ console.log("OK  F-1: v2 two-time-pad PoC is loud in the browser, refused outrig
 {
   const floors = new Map();
   const bridge = (extra = {}) => ({
-    read: (id) => String(floors.has(id) ? floors.get(id) : -1),
+    read: (id) => (floors.has(id) ? floors.get(id) : -1),
     bump: (id, val) => {
-      const n = Math.max(floors.has(id) ? floors.get(id) : -1, parseInt(val, 10));
+      const cur = floors.has(id) ? floors.get(id) : -1;
+      const n = val > cur ? val : cur;
       floors.set(id, n);
-      return String(n);
+      return n;
     },
     ...extra,
   });
@@ -600,11 +602,12 @@ console.log("OK  H-1: the native floor cannot be cleared or feature-detected awa
 {
   const realFloors = new Map();
   const realBridge = {
-    read: (id) => String(realFloors.has(id) ? realFloors.get(id) : -1),
+    read: (id) => (realFloors.has(id) ? realFloors.get(id) : -1),
     bump: (id, val) => {
-      const n = Math.max(realFloors.has(id) ? realFloors.get(id) : -1, parseInt(val, 10));
+      const cur = realFloors.has(id) ? realFloors.get(id) : -1;
+      const n = val > cur ? val : cur;
       realFloors.set(id, n);
-      return String(n);
+      return n;
     },
   };
 
@@ -631,13 +634,13 @@ console.log("OK  H-1: the native floor cannot be cleared or feature-detected awa
   assert.strictEqual(realFloors.get(p.padId), 3000, "precondition: the real floor is 3000");
 
   // ATTACK 1 — overwrite the methods on the raw interface. Two assignments.
-  globalThis.SecureChatPadFloor.read = () => "-1";
-  globalThis.SecureChatPadFloor.bump = () => "-1";
+  globalThis.SecureChatPadFloor.read = () => -1;
+  globalThis.SecureChatPadFloor.bump = () => -1;
   assert.ok(otpA.padWasUsed(p.padId),
     "H-A: overwriting the raw bridge's methods must not make the pad look unused");
 
   // ATTACK 2 — replace the raw global outright with a lookalike.
-  globalThis.SecureChatPadFloor = { read: () => "-1", bump: () => "0" };
+  globalThis.SecureChatPadFloor = { read: () => -1, bump: () => 0 };
   assert.ok(otpA.padWasUsed(p.padId),
     "H-A: a substituted raw bridge must not make the pad look unused");
 
@@ -654,10 +657,10 @@ console.log("OK  H-1: the native floor cannot be cleared or feature-detected awa
   // The protected copy really is immune: freezing means the attacker cannot
   // reach through it, and non-configurability is what the app relies on.
   assert.throws(
-    () => { "use strict"; globalThis.__SECURE_CHAT_PAD_FLOOR__.read = () => "-1"; },
+    () => { "use strict"; globalThis.__SECURE_CHAT_PAD_FLOOR__.read = () => -1; },
     "H-A: the protected bridge must be frozen",
   );
-  assert.strictEqual(globalThis.__SECURE_CHAT_PAD_FLOOR__.read(p.padId), "3000",
+  assert.strictEqual(globalThis.__SECURE_CHAT_PAD_FLOOR__.read(p.padId), 3000,
     "H-A: the protected bridge still reports the real floor");
 
   // And the app must actually publish it that way — the fix depends on `.bind`
@@ -682,6 +685,96 @@ console.log("OK  H-1: the native floor cannot be cleared or feature-detected awa
 }
 console.log("OK  H-A: a bridge that LIES is refused, not just one that is deleted");
 
+// --- H-1 round 2: poisoning the VALUE path, not the bridge -------------------
+// The H-A fix froze which function produces the floor. It did not freeze what
+// the caller did with the answer: `parseInt`, `Number.isFinite` and `Math.max`
+// are all writable globals, and the rollback verdict was a single `Math.max`
+// over the four floors. So one assignment — never naming the bridge, needing no
+// `delete` — made every floor read as 0 while the frozen bridge, the
+// non-configurable marker and verifyRelayConfig's probe all stayed intact.
+//
+// Note these cannot be defended by capturing primordials at module top: a
+// document-start attacker runs first. The bridge returns a NUMBER now, and the
+// remaining checks use only `typeof` and bitwise ops, which have no global
+// behind them to redefine.
+{
+  const REAL = { parseInt: globalThis.parseInt, max: Math.max, isFinite: Number.isFinite };
+  const floors = new Map();
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = Object.freeze({
+    read: (id) => (floors.has(id) ? floors.get(id) : -1),
+    bump: (id, v) => {
+      const cur = floors.has(id) ? floors.get(id) : -1;
+      const n = v > cur ? v : cur;
+      floors.set(id, n);
+      return n;
+    },
+  });
+  globalThis.__SECURE_CHAT_NATIVE_FLOOR__ = true;
+  const otpP = await import("./otp.js?poison=1");
+
+  const p = await otpP.generatePad({ label: "poison", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const atRest = await otpP.saveNewPad(p, PASS);
+  const pristine = localStorage.getItem("sc.otp.pad.v1." + p.padId);
+  const XFER = "xfer-pass";
+  const file = await otpP.exportPad(p, XFER);
+  p.sendOffset = 3000;
+  await otpP.savePadProgress(p, atRest);
+  assert.strictEqual(floors.get(p.padId), 3000, "precondition: the real floor is 3000");
+
+  try {
+    // ATTACK 1 — parseInt. One assignment, and the bridge is never named.
+    globalThis.parseInt = () => 0;
+    assert.ok(otpP.padWasUsed(p.padId), "H-1: a poisoned parseInt must not zero the floor");
+
+    // ATTACK 2 — Number.isFinite, the guard that was supposed to catch garbage.
+    globalThis.parseInt = REAL.parseInt;
+    Number.isFinite = () => false;
+    assert.ok(otpP.padWasUsed(p.padId), "H-1: a poisoned Number.isFinite must not zero the floor");
+
+    // ATTACK 3 — Math.max, which WAS the whole rollback verdict: one call over
+    // the native floor, the authenticated watermark, inner.hwSend and the
+    // legacy watermark. Poisoning it overruled all four at once. This one works
+    // in a plain browser too, with no bridge involved.
+    Number.isFinite = REAL.isFinite;
+    Math.max = (...a) => (a.length === 4 ? 0 : REAL.max(...a));
+    localStorage.setItem("sc.otp.pad.v1." + p.padId, pristine);   // rewind the blob
+    await assert.rejects(
+      otpP.unlockPad(p.padId, PASS, { adoptLegacy: true }),
+      /rolled back|rollback record|deleted/,
+      "H-1: a poisoned Math.max must not overrule the rollback floors",
+    );
+
+    // …and the full PoC: poisoned parseInt plus the three deletions plus a
+    // re-import, which is what recovered a plaintext in the review.
+    Math.max = REAL.max;
+    globalThis.parseInt = () => 0;
+    otpP.forgetPad(p.padId);
+    for (const k of ["used", "wm", "hw"]) localStorage.removeItem(`sc.otp.${k}.v1.${p.padId}`);
+    await assert.rejects(
+      otpP.importPad(file, XFER),
+      /already been used on this device/,
+      "H-1: the full poisoned-parse PoC must be refused",
+    );
+    assert.strictEqual(floors.get(p.padId), 3000, "H-1: the real floor is untouched");
+  } finally {
+    globalThis.parseInt = REAL.parseInt;
+    Math.max = REAL.max;
+    Number.isFinite = REAL.isFinite;
+  }
+
+  // The source must not reintroduce a poisonable step on the rollback path.
+  const src = await readFile(new URL("./otp.js", import.meta.url), "utf8");
+  const code = src.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  const rollback = code.slice(code.indexOf("export async function unlockPad"));
+  for (const bad of [/\bMath\.max\(/, /\bparseInt\(/, /\bNumber\.isFinite\(/]) {
+    assert.ok(!bad.test(rollback), `H-1: ${bad} is poisonable and must not decide a rollback`);
+  }
+
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+  delete globalThis.__SECURE_CHAT_NATIVE_FLOOR__;
+}
+console.log("OK  H-1: poisoning parseInt/isFinite/Math.max cannot lower a floor");
+
 // --- H-3 (2026-07-29): delete the three markers, then re-import --------------
 // importPad's only rollback guard was padWasUsed(), which read three DELETABLE
 // plaintext keys and never the native floor. So: use a pad, remove the three
@@ -693,11 +786,12 @@ console.log("OK  H-A: a bridge that LIES is refused, not just one that is delete
 {
   const floors = new Map();
   globalThis.__SECURE_CHAT_PAD_FLOOR__ = {
-    read: (id) => String(floors.has(id) ? floors.get(id) : -1),
+    read: (id) => (floors.has(id) ? floors.get(id) : -1),
     bump: (id, val) => {
-      const n = Math.max(floors.has(id) ? floors.get(id) : -1, parseInt(val, 10));
+      const cur = floors.has(id) ? floors.get(id) : -1;
+      const n = val > cur ? val : cur;
       floors.set(id, n);
-      return String(n);
+      return n;
     },
   };
   const otpI = await import("./otp.js?h3=import");

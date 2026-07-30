@@ -3071,12 +3071,68 @@ paths) held under independent attack.
   cause is the app cannot reach its own floor — so a user burns real pads chasing
   it. Now a distinct message that says so and says *not* to exchange.
 
-Still open from the review, deliberately: the taint gate in `all-modes.mjs` is a
-deny-list rather than an allow-list; `fetchBundle` canonicalises without
-length-checking; and `HiddenServiceMaxStreams 24` may be tight for the web client
-over Tor (~7 streams per cold load, so ~3 tabs reach the cap) — untestable here
-without a Tor daemon, and it is the value most likely to need revisiting on the
-box.
+(The taint gate and `fetchBundle` length-checking were done in the same commit;
+`HiddenServiceMaxStreams 24` remains the value most likely to need revisiting on
+the box, and is untestable here without a Tor daemon.)
+
+### 🔧 FIX REVIEW, ROUND 2 (2026-07-30) — 1 High + 5 Low, all fixed
+The agent was run again against the fix-review commit `b471cbf`, because those
+fixes were themselves written under the assumption that they closed something.
+Five of six claims held. One did not, and it is the more instructive failure:
+
+- **H-1 (High) — I hardened the bridge and left every VALUE it produces flowing
+  through mutable globals.** `otp.js` parsed the floor with `parseInt` guarded by
+  `Number.isFinite`, and the rollback verdict was a single `Math.max` over the
+  four floors. So `globalThis.parseInt = () => 0` — one assignment, never naming
+  the bridge, no `delete`, no `defineProperty` — made every floor read as zero
+  while the frozen bridge, the non-configurable marker and `verifyRelayConfig`'s
+  probe all stayed intact. `Math.max = ...` was worse: it overruled the native
+  floor, the authenticated watermark, `inner.hwSend` and the legacy watermark in
+  one go, **in a plain browser too**. Reproduced: pad reopened at offset 0 with
+  the hardware floor still reading 3000.
+  **Fixed:** the bridge returns a **number** now (`PadFloorBridge` returns
+  `Long`), so there is no parse step to poison; validation uses only `typeof` and
+  bitwise ops, which have no global behind them; and every rollback `Math.max` is
+  a local `maxOf` built from comparisons. Note capturing primordials at module
+  top would NOT have worked — a document-start attacker runs first.
+  **The lesson, and it is the same one twice:** in round 1 I keyed the check on
+  shape where it needed provenance; here I secured the source of a value and left
+  the path it travels. Both times the fix was correct about the PoC and wrong
+  about the boundary.
+- **M-1 (Medium) — the M-C backoff was dead code.** `pollMailbox` returned at its
+  first line when `apiToken` was null, and the 401 branch was the only thing that
+  ever called `autoLogin`. So one failed re-login was terminal: no retry, the
+  12/24/48/96/120 s ladder unreachable, and the tab permanently offline for
+  sealed mail — precisely the state M-C was written to remove, reached by a
+  different road. **Fixed:** `pollMailbox` re-authenticates from the top, which
+  is what makes the backoff load-bearing rather than decorative.
+- **L-1 — `withdrawn` was sent for waiters that never knocked**, which prunes
+  nothing (the owner's queue only holds knocked waiters) and is exactly the
+  unbatched per-join-attempt frame `note_turned_away` avoids on purpose. Gated on
+  `conn.knocked`; the test that asserted the old behaviour is inverted.
+- **L-2 — `showNextKnock` is not re-entrant**, and `withdrawn` gave it a second
+  concurrent trigger that `msgChain` does not serialise against clicks. Fixed
+  with a render generation counter plus a queue-head re-read after the await.
+- **L-3 — `forgetIdentity` never revoked the directory session**, leaving a live
+  bearer for up to an hour after the control a user reaches for when handing the
+  device on. It now calls the `logout` this work introduced.
+- **L-4 — the "you are offline" messages went to the chat transcript**, a screen
+  the user is usually not on — the same "only if you happen to look" complaint
+  M-C was about. Routed to the active screen's hint, and the sign-out message now
+  says where to sign back in.
+
+Verified sound across both rounds and not re-broken: M-5/`keyconfirm.js` (byte
+identical, re-attacked), H-2/`contacts.js` (byte identical, confirmed the
+re-applied version locks before throwing), M-B's port-0 branch (unreachable from
+any header), M-C's eviction arithmetic (cannot over-evict; an attacker cannot
+force-evict, since the signature is checked before the eviction block), and the
+M-A relay path (every way a knocked waiter can leave emits exactly one notice).
+
+**One residual the review could not close and neither could I:** M-B's claim rests
+on "a connected TCP socket cannot have source port 0". Neither of us had
+`CAP_NET_RAW` to test whether a crafted SYN can surface `sin_port == 0` from
+`accept()`. If it can, that branch becomes reachable and is an M-1-shaped second
+bucket. The docstring says so rather than claiming "no false positives" flatly.
 
 **⬜ DELIVERY — nothing here is deployed.** All of the above is committed on a
 branch and verified locally only. Still to do, in order:

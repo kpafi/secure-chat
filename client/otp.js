@@ -149,17 +149,46 @@ const nativeFloor = (() => {
     // someone having set the marker to brick OTP (loud, and fail-closed).
     return { read: () => NATIVE_TAMPERED, bump: () => NATIVE_TAMPERED, broken: true };
   }
+  // Fix review round 2 (H-1): validate WITHOUT poisonable globals.
+  //
+  // This used to be `parseInt(v, 10)` guarded by `Number.isFinite`. Freezing the
+  // bridge stopped an attacker replacing the function that produces the answer,
+  // but both of those are ordinary writable globals, so one assignment —
+  // `globalThis.parseInt = () => 0` — made every floor read as 0 while the
+  // frozen bridge, the non-configurable marker and verifyRelayConfig's probe
+  // all stayed intact. The hardened part was bypassed by poisoning the step
+  // AFTER it. Note that capturing primordials at module top would not help
+  // either: a document-start attacker runs first.
+  //
+  // So: the bridge now returns a NUMBER (see PadFloorBridge), and the checks
+  // below use only `typeof` and bitwise ops, which are language constructs with
+  // no interceptable global behind them. `(n | 0) === n` is an integer test
+  // that cannot be redefined, and pad offsets are far below 2^31.
   const num = (v) => {
-    const n = parseInt(v, 10);
-    // An unreadable answer from the bridge is treated as TAMPERED, never as
-    // "no floor" — a broken bridge must not read as a clean slate.
-    return Number.isFinite(n) ? n : NATIVE_TAMPERED;
+    // An unreadable answer from the bridge is TAMPERED, never "no floor" — a
+    // broken bridge must not read as a clean slate.
+    if (typeof v !== "number") return NATIVE_TAMPERED;
+    if ((v | 0) !== v) return NATIVE_TAMPERED;      // NaN, Infinity, fractions
+    return v;
   };
   return {
     read: (id) => { try { return num(b.read(id)); } catch { return NATIVE_TAMPERED; } },
-    bump: (id, v) => { try { return num(b.bump(id, String(v | 0))); } catch { return NATIVE_TAMPERED; } },
+    bump: (id, v) => { try { return num(b.bump(id, v | 0)); } catch { return NATIVE_TAMPERED; } },
   };
 })();
+
+// Max without `Math.max` (H-1). `Math.max` is writable, and the rollback verdict
+// is a single call to it over the four floors — so one assignment overruled the
+// native floor, the authenticated watermark, the in-AEAD `hwSend` and the legacy
+// watermark simultaneously, silently. Comparison operators cannot be redefined.
+function maxOf(...values) {
+  let best = 0;
+  for (const v of values) {
+    const n = typeof v === "number" && (v | 0) === v ? v : 0;
+    if (n > best) best = n;
+  }
+  return best;
+}
 
 // In-memory high-water marks for pads unlocked this session, so every re-save
 // can take a max without re-deriving the at-rest key.
@@ -186,8 +215,13 @@ function cachedWm(id) {
 // predates the authenticated record, and to answer padWasUsed for a pad whose
 // blob is gone. Never load-bearing for a rollback decision on its own.
 function readLegacyHW(id) {
-  const v = parseInt(localStorage.getItem(hwKey(id)) || "0", 10);
-  return Number.isFinite(v) && v > 0 ? v : 0;
+  // H-1: no parseInt/Number.isFinite — both writable. The VALUE here is
+  // attacker-writable anyway (plain localStorage), but poisoning the parse
+  // could zero a floor that would otherwise have fired, so it is read the
+  // same poison-proof way as the native one.
+  const raw = localStorage.getItem(hwKey(id));
+  const v = +raw;                       // unary plus: no global to redefine
+  return typeof v === "number" && (v | 0) === v && v > 0 ? v : 0;
 }
 
 // Decrypt the authenticated watermark for `id` under the pad's at-rest key.
@@ -489,8 +523,8 @@ async function writePadBlob(record, key, salt, iters) {
   // measured against the newest state this device ever reached.
   const prev = cachedWm(record.padId);
   const wm = {
-    send: Math.max(prev.send, record.sendOffset | 0),
-    recv: Math.max(prev.recv, record.recvHighWater | 0),
+    send: maxOf(prev.send, record.sendOffset | 0),
+    recv: maxOf(prev.recv, record.recvHighWater | 0),
   };
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const plain = encU.encode(JSON.stringify({
@@ -566,7 +600,7 @@ export async function saveNewPad(record, passphrase) {
   // For a genuinely new pad every source is absent and this is {0,0}.
   const survivingNative = nativeFloor ? nativeFloor.read(record.padId) : NATIVE_ABSENT;
   wmCache.set(record.padId, {
-    send: Math.max(readLegacyHW(record.padId), survivingNative > NATIVE_ABSENT ? survivingNative : 0),
+    send: maxOf(readLegacyHW(record.padId), survivingNative > NATIVE_ABSENT ? survivingNative : 0),
     recv: 0,
   });
   await writePadBlob(record, key, salt, KDF_ITERS);
@@ -697,13 +731,13 @@ export async function unlockPad(padId, passphrase, opts = {}) {
   // max(outer, inner, legacy, native): each is a floor this device is known to
   // have passed, so the highest of them is the truth.
   const wm = {
-    send: Math.max(
+    send: maxOf(
       outerWm ? outerWm.send : 0,
       inner.hwSend | 0,
       readLegacyHW(padId),
       native > NATIVE_ABSENT ? native : 0,
     ),
-    recv: Math.max(outerWm ? outerWm.recv : 0, inner.hwRecv | 0),
+    recv: maxOf(outerWm ? outerWm.recv : 0, inner.hwRecv | 0),
   };
   if (sendOffset < wm.send) {
     throw new Error("pad state was rolled back (consumed key material) — refusing to use it; exchange a fresh pad");

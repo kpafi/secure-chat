@@ -315,15 +315,29 @@ def test_withdrawal_carries_no_identity():
         assert set(gone) == {"type", "room", "jid"}, gone
 
 
-def test_a_waiter_that_never_knocked_is_also_reported():
-    """Otherwise the ghost is simply invisible instead of immortal."""
+def test_a_waiter_that_never_knocked_is_NOT_reported():
+    """Silence is correct here — and the first cut of this got it backwards.
+
+    The owner's queue only ever holds waiters that introduced themselves, so a
+    notice for one that never knocked prunes nothing. Worse, it is precisely the
+    unbatched per-join-attempt frame that `note_turned_away` deliberately avoids
+    emitting, on the grounds that it would turn a signal meant to reveal a flood
+    into an amplifier for it (relay.py, Room.turned_away). The fix review (L-1)
+    caught this asserting the opposite.
+    """
     room = _room()
     with client.websocket_connect("/ws") as owner:
         _join(owner, room)
-        with client.websocket_connect("/ws") as guest:
-            assert _join(guest, room) == {"type": "pending"}
-        gone = _recv(owner)
-        assert gone["type"] == "withdrawn" and gone["room"] == room
+        for _ in range(4):
+            with client.websocket_connect("/ws") as guest:
+                assert _join(guest, room) == {"type": "pending"}
+        # Nothing should have been sent. Prove it by making the NEXT frame a
+        # knock from a real waiter: if any withdrawn slipped through, this reads
+        # it instead.
+        with client.websocket_connect("/ws") as real:
+            _join(real, room)
+            _knock(real, room)
+            assert _recv(owner)["type"] == "knock"
 
 
 def test_repeated_join_and_drop_cycles_do_not_accumulate_pending():
@@ -339,7 +353,7 @@ def test_repeated_join_and_drop_cycles_do_not_accumulate_pending():
         for _ in range(config.MAX_ROOM_PENDING * 3):
             with client.websocket_connect("/ws") as ghost:
                 assert _join(ghost, room) == {"type": "pending"}
-                _knock(ghost, room)
+                _knock(ghost, room)   # knocked, so its departure IS reported
                 assert _recv(owner)["type"] == "knock"
             assert _recv(owner)["type"] == "withdrawn"
         # A genuine peer still gets in afterwards — the point of the whole fix.

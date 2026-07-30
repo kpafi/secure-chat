@@ -374,9 +374,15 @@ class RoomRegistry:
         #
         # Returned rather than stashed on self: two sockets can be closing at
         # once, and instance state would let one overwrite the other's notice.
+        #
+        # Gated on `knocked` (fix review round 2, L-1). The owner's queue only
+        # ever contains waiters that INTRODUCED themselves, so a notice for one
+        # that never knocked prunes nothing — it is pure noise, and it is exactly
+        # the per-join-attempt frame that `note_turned_away`'s batching exists to
+        # avoid handing an attacker. A silent join/disconnect cycle stays silent.
         withdrawn: tuple[Conn, str] | None = None
         if conn.jid is not None and entry.pending.pop(conn.jid, None) is not None:
-            if entry.owner is not None:
+            if conn.knocked and entry.owner is not None:
                 withdrawn = (entry.owner, conn.jid)
         conn.admitted = False
         conn.waiting_room = None
