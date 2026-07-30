@@ -88,6 +88,30 @@ def test_state_is_not_written_into_the_code_tree(unit):
     assert re.search(r"SECURE_CHAT_DB=/var/lib/secure-chat/", db[0]), db
 
 
+def test_state_directory_is_not_world_readable(unit):
+    """Moving the DB out of the code tree must not make it readable to everyone.
+
+    systemd defaults StateDirectoryMode= to 0755 and enforces that mode on every
+    start, so relying on the default (or on a 0750 the migration recipe created)
+    leaves /var/lib/secure-chat world-traversable with a 0644 accounts.db inside.
+    That publishes the directory's lookup TOKENS — the secret half of
+    `username#token`, and the whole anti-enumeration control — plus the sealed
+    mailbox ciphertext, to any local user. The unit must say 0700 explicitly.
+    """
+    modes = _directives(unit, "StateDirectoryMode")
+    assert modes, (
+        "StateDirectoryMode is unset, so systemd applies its 0755 default and "
+        "the account database is world-readable"
+    )
+    assert modes[-1] == "0700", f"state directory must be 0700, got {modes[-1]!r}"
+    # The migration recipe in the comments creates the directory by hand; if it
+    # disagrees with the enforced mode the two silently diverge.
+    install_lines = [ln for ln in unit.splitlines() if "install -d" in ln]
+    assert install_lines, "the one-off migration recipe went missing from the unit"
+    for ln in install_lines:
+        assert "-m 0700" in ln, f"migration recipe creates the wrong mode: {ln.strip()!r}"
+
+
 def test_sandboxing_directives_are_present(unit):
     for directive in (
         "NoNewPrivileges=yes",

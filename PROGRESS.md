@@ -3134,6 +3134,48 @@ on "a connected TCP socket cannot have source port 0". Neither of us had
 `accept()`. If it can, that branch becomes reachable and is an M-1-shaped second
 bucket. The docstring says so rather than claiming "no false positives" flatly.
 
+### 🔧 MERGE REVIEW (2026-07-30) — 1 finding fixed, 1 flagged
+Delivery item 1 ("review the diff and merge") read as a real review, not a
+formality. The full local gate was re-run first and everything the previous
+sessions claimed reproduced: backend **152 passed** (151 before the fix below),
+client **112 checks / 10 suites**, the three integration suites green against a
+live local relay, and e2e `all-modes` **32/32**, `room-admission` 13/13,
+`no-dead-ends` 12/12, `two-user-flow` 8/8.
+
+- **✅ The L-8 fix made the account database world-readable.** Moving the DB out
+  of the code tree was right; the mode was never checked. `StateDirectory=` alone
+  leaves systemd's **0755 default**, which it re-applies on every start, so
+  `/var/lib/secure-chat` would be world-traversable with a 0644 `accounts.db`
+  inside it — publishing the directory's lookup TOKENS (the secret half of
+  `username#token`, and the entire anti-enumeration control that makes a bare
+  username reveal nothing) and the sealed mailbox ciphertext to any local user on
+  the box. The unit's own comment asserted "systemd creates it 0700"; it does
+  not, and `man systemd.exec` says 0755 in as many words. The migration recipe
+  three lines above said 0750, which systemd would have silently overridden — the
+  two disagreed and neither was right.
+  **Fixed:** `StateDirectoryMode=0700`, the recipe corrected to match, and the
+  false claim replaced with why the line is not optional. `test_service_unit.py`
+  gains a case that **fails against the pre-fix unit** (verified by reverting the
+  file and re-running, not by assertion) and that also holds the comment's recipe
+  to the enforced mode, since a divergence there is how this happened.
+  Worth noting what class of bug this is: L-8 was verified as "the code tree is
+  no longer writable", which was true, and the property that broke was one nobody
+  had written down. Same shape as M-1 — a status line the measurement did not
+  cover — one layer down.
+- **⬜ FLAGGED, not fixed: `PadFloor.kt` is invisible to `git diff`.** It contains
+  raw NUL bytes in the HMAC domain separator at line 98
+  (`"secure-chat/otp-pad-floor/v1\0$padId\0$value"`, written as literal U+0000 in
+  the source rather than `\u0000`), so git classifies it as binary and every diff
+  of it renders as `Bin 7111 -> 9149 bytes`. `file` calls it `data`. This is
+  **pre-existing on master, not introduced by this branch** — but it means the
+  H-1 changes to the one file whose whole job is to be the control the JS context
+  cannot reach went to review as an opaque blob. `git diff --text` was used here
+  instead and the content is correct. The fix is to spell the separator
+  `\u0000`, which is byte-identical after compilation (so the HMAC and every
+  stored floor are unaffected) and makes the file text again. Not done in this
+  commit because it wants a compile to confirm, and the APK rebuild is delivery
+  item 3 — do it there.
+
 **⬜ DELIVERY — nothing here is deployed.** All of the above is committed on a
 branch and verified locally only. Still to do, in order:
   1. Review the diff (it touches crypto, at-rest storage, the relay and the

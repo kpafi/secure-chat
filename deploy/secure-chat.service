@@ -16,7 +16,7 @@ Environment=SECURE_CHAT_EXTRA_ORIGINS=https://138-199-144-35.sslip.io,http://626
 # writable to itself. State now lives in its own StateDirectory, so the code
 # tree is covered by ProtectSystem=strict with no write exception at all.
 # MIGRATION (one-off, before the first restart on this unit):
-#   install -d -o securechat -g securechat -m 0750 /var/lib/secure-chat
+#   install -d -o securechat -g securechat -m 0700 /var/lib/secure-chat
 #   mv /opt/secure-chat/backend/accounts.db* /var/lib/secure-chat/
 Environment=SECURE_CHAT_DB=/var/lib/secure-chat/accounts.db
 #
@@ -32,9 +32,20 @@ ExecStart=/opt/secure-chat/venv/bin/python -m uvicorn main:app --host 127.0.0.1 
 Restart=on-failure
 NoNewPrivileges=yes
 ProtectSystem=strict
-# The only writable path. systemd creates it 0700 owned by User=, and there is
-# deliberately no ReadWritePaths for the code tree (L-8).
+# The only writable path, and there is deliberately no ReadWritePaths for the
+# code tree (L-8).
+#
+# StateDirectoryMode is NOT optional here. systemd defaults it to 0755, so
+# without this line /var/lib/secure-chat is world-readable and so is the
+# accounts.db inside it (sqlite creates the file 0644): every local user could
+# read the directory's lookup TOKENS — the secret half of `username#token`, the
+# whole anti-enumeration control — and the sealed mailbox ciphertext. An earlier
+# revision of this comment claimed systemd creates it 0700; it does not, and the
+# claim was never measured. 0700 is also why the migration below uses 0700:
+# systemd enforces this mode on every start, so a directory installed 0750 would
+# be silently tightened and the two would disagree.
 StateDirectory=secure-chat
+StateDirectoryMode=0700
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
