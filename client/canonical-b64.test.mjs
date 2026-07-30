@@ -222,7 +222,24 @@ async function testDirectoryAnswersAreCanonicalised() {
         `M-6: a re-spelled ${field} from the directory must be refused`,
       );
     }
+    // Wrong-sized but canonical keys are malformed input at the same boundary
+    // (fix review 2026-07-30). Before this they were accepted here and failed
+    // much later inside Identity.verify/seal(), where it reads as a crypto bug
+    // rather than a bad directory answer.
+    for (const [field, bytes] of [["ed", 32], ["mldsa", 1952]]) {
+      for (const wrong of [bytes - 1, bytes + 1, 0, 16]) {
+        const evil = { ed: bundle.ed, mldsa: bundle.mldsa };
+        evil[field] = b64(crypto.getRandomValues(new Uint8Array(wrong)));
+        serve(evil);
+        await assert.rejects(
+          () => account.fetchBundle("http://relay.invalid", HANDLE),
+          /wrong-sized|malformed/,
+          `a ${wrong}-byte ${field} key must be refused (expected ${bytes})`,
+        );
+      }
+    }
     console.log("OK  M-6: directory answers go through the canonical-base64 gate");
+    console.log("OK  directory keys are length-checked at the same boundary");
   } finally {
     globalThis.fetch = realFetch;
   }

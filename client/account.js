@@ -115,25 +115,58 @@ export async function fetchBundle(base, handle) {
   // refused outright instead of being stored as a different-looking key. This
   // is the same gate `app.js`'s canonicalBundle applies to bundles arriving
   // over the wire; the directory path was simply never put behind it.
-  const canon = (v, field) => {
+  // Sizes are fixed by the algorithms, so a wrong length is malformed input and
+  // belongs here too (fix review 2026-07-30): canonicalising alone let a
+  // correctly-spelled 16-byte "Ed25519 key" through, to fail much later inside
+  // Identity.verify or seal() where it reads as a crypto error rather than a bad
+  // directory answer. Same boundary, one more check.
+  const SIZES = { ed: 32, mldsa: 1952, ecdh: 65, mlkem: 1184 };
+  const canon = (v, key, field) => {
+    let raw;
     try {
-      return b64(unb64(v));
+      raw = unb64(v);
     } catch {
       throw new Error(
         `the directory returned a malformed ${field} key for ${parsed.username} — refusing it`,
       );
     }
+    if (raw.length !== SIZES[key]) {
+      throw new Error(
+        `the directory returned a wrong-sized ${field} key for ${parsed.username} ` +
+        `(${raw.length} bytes, expected ${SIZES[key]}) — refusing it`,
+      );
+    }
+    return b64(raw);
   };
   const out = {
     username: parsed.username,
-    ed: canon(d.ed, "identity"),
-    mldsa: canon(d.mldsa, "post-quantum identity"),
+    ed: canon(d.ed, "ed", "identity"),
+    mldsa: canon(d.mldsa, "mldsa", "post-quantum identity"),
   };
   if (d.ecdh && d.mlkem) {
-    out.ecdh = canon(d.ecdh, "encryption");   // bundle v2: sealed-message keys
-    out.mlkem = canon(d.mlkem, "post-quantum encryption");
+    // bundle v2: sealed-message encryption keys
+    out.ecdh = canon(d.ecdh, "ecdh", "encryption");
+    out.mlkem = canon(d.mlkem, "mlkem", "post-quantum encryption");
   }
   return out;
+}
+
+// Revoke a session token server-side (pentest 2026-07-29 L-4).
+//
+// The endpoint answers 200 whether or not the token was real — deliberately, so
+// it is not a token-validity oracle — which means there is nothing to check
+// here. Best-effort by design: if the request never lands, the token still
+// expires at TOKEN_TTL_SEC, and the caller has already dropped it locally.
+export async function logout(base, token) {
+  if (!token) return;
+  try {
+    await fetch(base + "/api/auth/logout", {
+      method: "POST",
+      headers: { authorization: "Bearer " + token },
+    });
+  } catch {
+    /* offline: the token expires on its own, and it is gone from this device */
+  }
 }
 
 // Prove account control: sign a fresh server challenge, receive a bearer token.

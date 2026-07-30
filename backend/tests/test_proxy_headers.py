@@ -195,3 +195,56 @@ def test_rewrite_detector_still_fires_on_the_real_condition():
     accounts.client_key(_Req("1.2.3.4", "1.2.3.4", port=0))
     assert accounts._proxy_warning_emitted
     accounts._proxy_warning_emitted = False
+
+
+# --- Fix review 2026-07-30 (M-B) ---------------------------------------------
+# The M-1 fix removed the forgeable detector, and with it the fail-CLOSED
+# collapse that detector drove — leaving one log line as the entire response to
+# the H-4 condition. In that condition `peer` IS attacker-chosen, so returning
+# it hands out a fresh uncontended bucket per forged header: F-03 reopened.
+# Nothing in the suite asserted the BUCKET under a misconfiguration, only the
+# warning, so the loss was invisible. It is asserted now.
+
+def test_rewritten_addresses_collapse_to_one_shared_bucket():
+    """The H-4 misconfiguration must be throttled-but-shared, not per-header."""
+    config.TRUSTED_PROXY_IPS = frozenset()
+    accounts._proxy_warning_emitted = False
+    keys = {
+        accounts.client_key(_Req(forged, forged, port=0))
+        for forged in ("1.2.3.4", "5.6.7.8", "9.9.9.9", "203.0.113.7", "10.0.0.1")
+    }
+    assert keys == {accounts._UNTRUSTED_FORWARDED_KEY}, (
+        f"M-B: a rewritten client address must not buy a private bucket: {keys}"
+    )
+    accounts._proxy_warning_emitted = False
+
+
+def test_the_collapse_is_not_reachable_from_a_forged_header():
+    """…and the collapse must not become a way to LEAVE the honest bucket.
+
+    That is the trap M-1 fell into: if a client could move itself into the
+    shared bucket on demand, honest traffic and attacker traffic would sit in
+    different buckets again. Port 0 is unreachable for a real socket, so no
+    header can select this branch — which is what makes acting on it safe.
+    """
+    config.TRUSTED_PROXY_IPS = frozenset()
+    for xff in ("127.0.0.1", "1.2.3.4", "127.0.0.1, 9.9.9.9", "0.0.0.0:0", "1.2.3.4:0"):
+        assert accounts.client_key(_Req("127.0.0.1", xff)) == "127.0.0.1", (
+            f"M-B: header {xff!r} escaped the peer's own bucket"
+        )
+
+
+def test_unix_socket_deployment_is_one_bucket_and_silent():
+    """`request.client is None` (AF_UNIX) must not read as a rewrite."""
+    config.TRUSTED_PROXY_IPS = frozenset()
+    accounts._proxy_warning_emitted = False
+
+    class _UdsReq:
+        client = None
+
+        def __init__(self, xff=None):
+            self.headers = {"x-forwarded-for": xff} if xff else {}
+
+    assert accounts.client_key(_UdsReq()) == "unknown"
+    assert accounts.client_key(_UdsReq("1.2.3.4")) == "unknown"
+    assert not accounts._proxy_warning_emitted, "a UDS deployment must stay silent"

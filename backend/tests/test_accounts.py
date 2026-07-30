@@ -218,7 +218,17 @@ def _me(token):
 # token still answered 200 on /api/me. So a leaked token could not be revoked
 # by any action available to the user, including the one everybody tries first.
 
-def test_relogin_invalidates_the_previous_session():
+def test_relogin_does_not_revoke_the_previous_session():
+    """Two tabs of the same account must COEXIST.
+
+    The first cut of L-4 retired every other token on login. The fix review
+    (M-C) showed that was a self-inflicted DoS: pollMailbox re-authenticates on
+    a 401 every 6 s, so two tabs revoked each other in a loop, sustaining ~0.33
+    challenges/s against a 0.5/s bucket that — since the M-1 fix — is GLOBAL to
+    the relay. Two of one user's tabs ate most of the relay's login capacity;
+    three denied login to everybody. Both tabs then sat silently offline for
+    sealed mail. Revocation on demand is /auth/logout's job, not login's.
+    """
     ident, _ = _register("revoke-relogin")
     first = _login("revoke-relogin", ident[0])
     assert _me(first) == 200, "precondition: the first token works"
@@ -226,7 +236,19 @@ def test_relogin_invalidates_the_previous_session():
     second = _login("revoke-relogin", ident[0])
     assert second != first, "a fresh login must mint a new token"
     assert _me(second) == 200, "the new session works"
-    assert _me(first) == 401, "L-4: logging in again must retire the old session"
+    assert _me(first) == 200, "M-C: a second tab must not revoke the first"
+
+
+def test_sessions_per_account_are_capped_with_oldest_evicted():
+    """…but not unbounded, or a leaked token outlives every remedy but the TTL."""
+    ident, _ = _register("revoke-cap")
+    tokens = [_login("revoke-cap", ident[0]) for _ in range(config.MAX_SESSIONS_PER_ACCOUNT)]
+    assert all(_me(t) == 200 for t in tokens), "every session up to the cap is live"
+
+    extra = _login("revoke-cap", ident[0])
+    assert _me(extra) == 200, "the newest session works"
+    assert _me(tokens[0]) == 401, "the OLDEST session is the one evicted"
+    assert all(_me(t) == 200 for t in tokens[1:]), "the rest are untouched"
 
 
 def test_logout_revokes_the_presented_token():
@@ -258,15 +280,22 @@ def test_logout_is_idempotent_and_not_a_validity_oracle():
         )
 
 
-def test_other_accounts_sessions_survive_a_login():
-    """Revocation is per-account; one user logging in must not log everyone out."""
+def test_eviction_and_logout_are_scoped_to_one_account():
+    """Neither the cap nor logout may reach another user's sessions."""
     a_ident, _ = _register("revoke-a")
     b_ident, _ = _register("revoke-b")
-    a_tok = _login("revoke-a", a_ident[0])
     b_tok = _login("revoke-b", b_ident[0])
-    _login("revoke-a", a_ident[0])  # a logs in again
-    assert _me(a_tok) == 401, "a's old session is gone"
-    assert _me(b_tok) == 200, "b's session is untouched"
+
+    # Drive account A past its cap; B must be untouched throughout.
+    for _ in range(config.MAX_SESSIONS_PER_ACCOUNT + 2):
+        _login("revoke-a", a_ident[0])
+    assert _me(b_tok) == 200, "another account's session survives A's evictions"
+
+    # And A signing out does not touch B either.
+    a_tok = _login("revoke-a", a_ident[0])
+    client.post("/api/auth/logout", headers={"Authorization": f"Bearer {a_tok}"})
+    assert _me(a_tok) == 401
+    assert _me(b_tok) == 200, "another account's session survives A's logout"
 
 
 def test_login_rejects_wrong_signature():

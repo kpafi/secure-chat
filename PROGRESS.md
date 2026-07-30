@@ -2882,15 +2882,26 @@ it says so.
    byte** — `v` is attacker-writable and the witness blob has none, so
    `(blob.v || 1) < 4` would have read the witness as legacy and adopted it,
    reopening the hole. That is the same trap the outer `v` byte set for OTP.
-4. **✅ H-3 — delete-the-markers-then-reimport is refused.** `padWasUsed()`
-   consults the native floor first and treats TAMPERED as used; `saveNewPad`
-   refuses a padId that was ever used here and seeds the watermark cache from
-   the surviving floors rather than from zero, so it cannot erase the record
-   even if the refusal were bypassed. `app.js`'s `otpFileChosen` still skips
-   `unlockPad` **deliberately** — the guard now lives inside the two functions
-   it calls, i.e. on the path rather than beside it, for no extra 600k-iteration
-   KDF. Reproduced end to end: pre-fix the import rebuilt the pad at offset 0
-   (a two-time pad); post-fix it is refused.
+4. **⚠️ H-3 — fixed on ANDROID ONLY; the browser residual stands.**
+   `padWasUsed()` consults the native floor first and treats TAMPERED as used;
+   `saveNewPad` refuses a padId that was ever used here and seeds the watermark
+   cache from the surviving floors rather than from zero, so it cannot erase the
+   record even if the refusal were bypassed. `app.js`'s `otpFileChosen` still
+   skips `unlockPad` **deliberately** — the guard now lives inside the two
+   functions it calls, i.e. on the path rather than beside it, for no extra
+   600k-iteration KDF.
+   **Corrected 2026-07-30 (fix review H-B).** This entry originally read
+   "✅ … Reproduced end to end: post-fix it is refused", with no platform
+   qualifier. That is false for the WEB CLIENT, which is the primary one: with
+   no floor, `nativeFloor` is null and `padWasUsed` still reads only the three
+   deletable plaintext keys, so the original PoC — three `removeItem`s, then
+   re-import — still rebuilds the pad at offset 0. Re-verified 2026-07-30.
+   Closing it in a browser is not possible with deletable storage; the honest
+   options are trusted monotonic storage (which is what `PadFloor` is) or
+   nothing. **This is exactly the failure mode M-1 was about** — a status line
+   claiming a property the measurement did not cover — so it is corrected here
+   rather than quietly rewritten, and the test's summary line is now scoped to
+   the platform it actually proves.
 5. **✅ M-4 — the false premise is corrected where it was written.**
    `network_security_config.xml` no longer claims `.onion` is potentially
    trustworthy; it carries the measured table, the reason
@@ -3002,6 +3013,70 @@ it says so.
     bare "all modes good", and the exit code is non-zero unless
     `SECURE_CHAT_E2E_ACK_UNSAFE=1`. A green run in a configuration no user can
     reproduce is worse than a red one, because it gets quoted.
+
+### 🔧 FIX REVIEW of the above (2026-07-30) — 6 findings, all fixed
+The `pentest-new-code` agent was run against the fix commit `23bc905`, on the
+principle that a fix is new code and the most dangerous kind. It found six
+things, **three of them regressions the fixes themselves introduced**. All are
+fixed; the review's other verdicts (M-5, H-2, M-6, M-7, L-3, L-5 and the launch
+paths) held under independent attack.
+
+- **H-A (High) — the H-1 floor was defeated by SUBSTITUTING the bridge, not
+  deleting it.** I hardened the marker and left the lookup alone: `otp.js` found
+  the bridge by its ordinary global name and accepted anything with `read`/`bump`
+  functions, so an attacker could install a lookalike answering "no floor", or
+  just overwrite the two METHODS on the real object — two assignments, no
+  `delete`, and it survives making the global itself non-writable. Every new
+  check passed, `verifyRelayConfig`'s probe answered true, and the real Keystore
+  floor was never consulted: full keystream reuse, F-1 void again. Reproduced.
+  **Fixed:** the app captures the interface at document-start, before any page
+  script, and republishes it **frozen** under a non-configurable
+  `__SECURE_CHAT_PAD_FLOOR__` with `.bind()`-captured methods; `otp.js` reads
+  only that name and a test asserts it never touches the writable global. The
+  lesson: I keyed the check on SHAPE where it needed to be PROVENANCE.
+- **H-B (High, reporting) — my own H-3 claim was false for the web client.**
+  Corrected in item 4 above, in the commit trail, and in the test's summary line.
+- **M-A (Medium) — my L-1 knock cap made things WORSE than no cap.** Nothing
+  pruned the owner's queue when a waiter left (the relay pops `pending` and tells
+  nobody), and a knocker whose entry is dropped can never retry, because the
+  client knocks exactly once and the relay refuses a second knock per socket. So
+  eight cheap connect/knock/disconnect cycles filled the queue with immortal
+  ghosts and the invited peer waited forever, unseen — a permanent silent denial
+  of admission, and a direct hit on the P-08 property the cap was protecting. My
+  own comment claimed a dropped knocker "simply has to knock again"; it cannot.
+  **Fixed:** the relay now sends `withdrawn` (join id only — no identity, nothing
+  new at rest) and the owner's client prunes; the cap is raised above
+  `MAX_ROOM_PENDING` and demoted to a backstop for relays that do not send it.
+  Four relay tests, including the flood shape.
+- **M-B (Medium) — my M-1 fix deleted H-4's fail-closed collapse.** Removing the
+  forgeable detector was right; removing the SAFE COLLAPSE it drove was not,
+  because in the H-4 condition `peer` is attacker-chosen, so returning it hands
+  out a private bucket per forged header with one log line as the only trace.
+  **Fixed:** warn *and* collapse. Port 0 has no remote false positives, which is
+  what makes it safe to act on and not merely log — and the suite now asserts
+  the BUCKET under a misconfiguration, which it never did.
+- **M-C (Medium) — my L-4 fix was a self-inflicted DoS.** One-session-per-account
+  plus `pollMailbox`'s 6 s "401 → re-login" made two tabs of the same account
+  revoke each other forever: ~0.33 challenges/s against a 0.5/s bucket that,
+  since M-1, is GLOBAL to the relay. Two of a user's own tabs ate most of the
+  relay's login capacity; three denied login to everyone. Both tabs then sat
+  permanently offline for sealed mail with no visible sign — the exact failure
+  the 401 handler exists to prevent. **Fixed:** `MAX_SESSIONS_PER_ACCOUNT = 5`
+  with oldest-evicted, re-login no longer revokes, failed re-login backs off and
+  says so, and revocation is `POST /api/auth/logout` — which is now **wired into
+  the profile view** (L-B: it had no caller at all, so the only revocation a user
+  could trigger was the one that caused this).
+- **L-A (Low) — the fail-closed messages blamed the pad.** "Damaged or forged",
+  "already been used", and each recommending a fresh pad exchange, when the real
+  cause is the app cannot reach its own floor — so a user burns real pads chasing
+  it. Now a distinct message that says so and says *not* to exchange.
+
+Still open from the review, deliberately: the taint gate in `all-modes.mjs` is a
+deny-list rather than an allow-list; `fetchBundle` canonicalises without
+length-checking; and `HiddenServiceMaxStreams 24` may be tight for the web client
+over Tor (~7 streams per cold load, so ~3 tabs reach the cap) — untestable here
+without a Tor daemon, and it is the value most likely to need revisiting on the
+box.
 
 **⬜ DELIVERY — nothing here is deployed.** All of the above is committed on a
 branch and verified locally only. Still to do, in order:

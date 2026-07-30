@@ -113,15 +113,32 @@ def client_key(request: Request) -> str:
     """
     peer = request.client.host if request.client else "unknown"
     if peer not in config.TRUSTED_PROXY_IPS:
-        _detect_client_rewrite(request)
+        # Fix review 2026-07-30 (M-B). The M-1 fix removed the forgeable
+        # detector, correctly — but it also removed the fail-CLOSED collapse that
+        # detector was driving, leaving nothing but a log line. In the one
+        # condition H-4 is about (an ASGI server honouring the header while we
+        # trust no proxy) `peer` IS attacker-chosen, so returning it hands out a
+        # fresh uncontended bucket per forged value: F-03 reopened, with a single
+        # once-per-process warning as the only trace.
+        #
+        # The two are not exclusive. Port 0 has no REMOTE false positives (a
+        # connected TCP socket cannot have source port 0, so no header can
+        # provoke this), which is exactly why it was safe to base the warning on
+        # — and equally safe to base the collapse on. So: warn AND collapse.
+        # Rate limiting is then throttled-but-shared in the misconfigured case,
+        # which is the safe direction, while a correctly configured server is
+        # untouched and L-9 stays closed.
+        if _client_addr_was_rewritten(request):
+            _warn_proxy_headers_trusted()
+            return _UNTRUSTED_FORWARDED_KEY
         return peer
     forwarded = request.headers.get("x-forwarded-for", "")
     hops = [h.strip() for h in forwarded.split(",") if h.strip()]
     return hops[-1] if hops else peer
 
 
-def _detect_client_rewrite(request: Request) -> None:
-    """Warn once if the ASGI server looks like it rewrote `request.client`.
+def _client_addr_was_rewritten(request: Request) -> bool:
+    """True if the ASGI server looks like it synthesised `request.client`.
 
     Replaces the L-9 detector, which inferred the rewrite from `peer in hops` —
     a predicate the client sets itself, so it produced false positives on demand
@@ -132,20 +149,35 @@ def _detect_client_rewrite(request: Request) -> None:
     `_parse_host_port()`, which yields port 0 for the bare-IP forms every real
     proxy emits (`X-Forwarded-For: 1.2.3.4`). A genuine TCP peer never has
     source port 0 — the kernel cannot assign it to a connected socket — so
-    port 0 on an http/websocket scope means something synthesised that address.
+    port 0 together with a forwarded header means something synthesised that
+    address.
 
-    Deliberately one-directional. There are no false positives, so this cannot
-    be provoked remotely; there ARE false negatives (an attacker who forges
-    `X-Forwarded-For: 1.2.3.4:5678` keeps the port and stays quiet), so this is
-    a diagnostic and NOT the control. The control is `--no-proxy-headers` on
-    every launch path, which `test_proxy_headers.py` and `test_service_unit.py`
-    now hold all three to.
+    Deliberately one-directional, and that asymmetry is what makes it safe to
+    act on rather than merely log:
+
+      * NO false positives. Nothing a remote client can send produces port 0, so
+        this cannot be provoked — that is L-9 closed, and it is why `client_key`
+        may collapse to the shared bucket here without handing an attacker a way
+        to move themselves out of the honest bucket.
+      * There ARE false negatives: a forged `X-Forwarded-For: 1.2.3.4:5678`
+        keeps its port and stays quiet. So this is defence in depth, NOT the
+        control. The control is `--no-proxy-headers` on every launch path, which
+        `test_proxy_headers.py` and `test_service_unit.py` hold all three to.
+
+    A unix-socket deployment has `request.client is None` (uvicorn's
+    `get_remote_addr` returns None for AF_UNIX), which reads as not-rewritten —
+    correct, since there is no header-derived address to be fooled by.
     """
     if not request.headers.get("x-forwarded-for"):
-        return
+        return False
     client = request.client
-    if client is not None and getattr(client, "port", None) == 0:
-        _warn_proxy_headers_trusted()
+    return client is not None and getattr(client, "port", None) == 0
+
+# One shared bucket for every request whose source address we cannot trust — the
+# H-4 fail-closed fallback (restored by the M-B fix review). A constant, so the
+# misconfigured case is throttled-but-shared rather than a fresh private bucket
+# per forged header. Unreachable on a correctly configured server.
+_UNTRUSTED_FORWARDED_KEY = "!untrusted-forwarded"
 
 _proxy_warning_lock = threading.Lock()
 _proxy_warning_emitted = False
@@ -576,21 +608,28 @@ def auth_verify(req: VerifyReq) -> dict:
     token = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
     with _store_lock:
         _prune(_tokens)
-        # Pentest 2026-07-29 L-4: a fresh login retires this account's previous
-        # sessions. There was no revocation of any kind — no logout, and
-        # re-login left the old bearer valid (measured: the previous token still
-        # answered 200 on /api/me) — so a leaked token was good for the full
-        # TOKEN_TTL_SEC no matter what the user did. "Log in again" is the one
-        # remedy a user reaches for by instinct, and it did nothing.
+        # Pentest 2026-07-29 L-4: bound how many sessions one account can hold,
+        # so a leaked token cannot be retained indefinitely and a reconnect loop
+        # cannot fill MAX_ACTIVE_TOKENS with one user's dead sessions.
         #
-        # One session per account is the right default here: the directory is a
-        # lookup convenience, not a multi-device workspace, and a second device
-        # simply logs in again. Doing it BEFORE the cap check also means a user
-        # who reconnects repeatedly cannot fill MAX_ACTIVE_TOKENS with their own
-        # dead sessions.
-        for old, (owner, _exp) in list(_tokens.items()):
-            if owner == req.username:
-                del _tokens[old]
+        # The first cut of this retired ALL the account's other tokens on login,
+        # which the fix review (M-C) showed was a self-inflicted DoS: pollMailbox
+        # runs every 6 s and treats a 401 by calling autoLogin, so two tabs of
+        # the SAME account revoke each other forever. That sustains ~0.33
+        # challenges/s against CHALLENGE_RATE_REFILL_PER_SEC = 0.5 — which, since
+        # the M-1 fix, is one bucket for the whole relay — so two of a user's own
+        # tabs ate most of the relay's login capacity and three saturated it,
+        # denying login to every account. The tabs then sat permanently offline
+        # for sealed mail with no visible sign, which is the exact failure the
+        # 401 handler was written to prevent.
+        #
+        # LRU eviction instead: several tabs and a phone coexist happily, and the
+        # oldest session is what goes when the cap is reached. Revocation on
+        # demand is what /auth/logout is for — that is the honest remedy for a
+        # leaked token, and unlike "log in again" it does not fight the poller.
+        mine = [t for t, (owner, _exp) in _tokens.items() if owner == req.username]
+        for old in mine[: max(0, len(mine) + 1 - config.MAX_SESSIONS_PER_ACCOUNT)]:
+            del _tokens[old]  # dict order is insertion order, so this is oldest-first
         if len(_tokens) >= config.MAX_ACTIVE_TOKENS:
             raise HTTPException(status_code=503, detail="too many active sessions")
         _tokens[token] = (req.username, time.monotonic() + config.TOKEN_TTL_SEC)

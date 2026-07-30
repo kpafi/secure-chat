@@ -278,6 +278,77 @@ def test_one_knock_per_socket():
         assert _recv(guest) == {"type": "error", "reason": "already knocked"}
 
 
+# --- Fix review 2026-07-30 (M-A) ---------------------------------------------
+# The owner's approval queue had NO liveness signal: the relay popped a departing
+# waiter from `pending` and told nobody, so the owner's client kept the knock
+# forever. That was survivable while the client queue was unbounded. Once the
+# L-1 cap landed it became a permanent, silent denial of admission — cheap
+# connect/knock/disconnect cycles fill the queue with ghosts, and a knocker whose
+# entry is dropped can never retry, because the client knocks exactly once and
+# `already knocked` refuses a second attempt on the same socket.
+
+def test_owner_is_told_when_a_waiter_departs():
+    room = _room()
+    with client.websocket_connect("/ws") as owner:
+        _join(owner, room)
+        with client.websocket_connect("/ws") as guest:
+            assert _join(guest, room) == {"type": "pending"}
+            _knock(guest, room)
+            knock = _recv(owner)
+            assert knock["type"] == "knock"
+            jid = knock["jid"]
+        # The guest is gone; the owner must learn, and by the SAME jid it queued.
+        gone = _recv(owner)
+        assert gone == {"type": "withdrawn", "room": room, "jid": jid}
+
+
+def test_withdrawal_carries_no_identity():
+    """I2: the notice must add nothing about who was connected when."""
+    room = _room()
+    with client.websocket_connect("/ws") as owner:
+        _join(owner, room)
+        with client.websocket_connect("/ws") as guest:
+            _join(guest, room)
+            _knock(guest, room, "QUJD")
+            _recv(owner)
+        gone = _recv(owner)
+        assert set(gone) == {"type", "room", "jid"}, gone
+
+
+def test_a_waiter_that_never_knocked_is_also_reported():
+    """Otherwise the ghost is simply invisible instead of immortal."""
+    room = _room()
+    with client.websocket_connect("/ws") as owner:
+        _join(owner, room)
+        with client.websocket_connect("/ws") as guest:
+            assert _join(guest, room) == {"type": "pending"}
+        gone = _recv(owner)
+        assert gone["type"] == "withdrawn" and gone["room"] == room
+
+
+def test_repeated_join_and_drop_cycles_do_not_accumulate_pending():
+    """The flood shape from the PoC: the queue must return to empty every time.
+
+    MAX_ROOM_PENDING is 4, so without pruning the fifth cycle would find the
+    relay-side queue full; with the owner also never told, the owner's client
+    queue would keep every one of them.
+    """
+    room = _room()
+    with client.websocket_connect("/ws") as owner:
+        _join(owner, room)
+        for _ in range(config.MAX_ROOM_PENDING * 3):
+            with client.websocket_connect("/ws") as ghost:
+                assert _join(ghost, room) == {"type": "pending"}
+                _knock(ghost, room)
+                assert _recv(owner)["type"] == "knock"
+            assert _recv(owner)["type"] == "withdrawn"
+        # A genuine peer still gets in afterwards — the point of the whole fix.
+        with client.websocket_connect("/ws") as real:
+            assert _join(real, room) == {"type": "pending"}
+            _knock(real, room)
+            assert _recv(owner)["type"] == "knock"
+
+
 def test_knock_before_join_rejected():
     with client.websocket_connect("/ws") as ws:
         _knock(ws, _room())

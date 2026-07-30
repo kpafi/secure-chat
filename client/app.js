@@ -89,6 +89,7 @@ const els = {
   profileFingerprint: $("profileFingerprint"), profileKeys: $("profileKeys"),
   profileStatus: $("profileStatus"),
   profileExport: $("profileExport"), profileForget: $("profileForget"),
+  profileLogout: $("profileLogout"), profileSessionHint: $("profileSessionHint"),
   // users view
   usersLocked: $("usersLocked"), usersUnlocked: $("usersUnlocked"),
   addHandle: $("addHandle"), addContact: $("addContact"),
@@ -177,10 +178,21 @@ let admittedAnon = false;  // we let in someone with no identity at all
 let wasPending = false;    // we sat in the approval queue (M-2, guest side)
 let knockQueue = [];       // [{jid, bundle, anon}] waiting for our verdict
 let currentRoom = null;    // the room this connection is in (keyconfirm effects)
-// L-1: an owner decides one knock at a time, so a queue longer than this is not
-// a busy room — it is a flood. Small enough that the cost of a flood is bounded
-// and large enough that a handful of genuine simultaneous knocks all survive.
-const MAX_KNOCK_QUEUE = 8;
+// L-1: a backstop on the approval queue, NOT the control.
+//
+// The relay holds at most MAX_ROOM_PENDING (4) waiters at a time, so with the
+// `withdrawn` pruning below this queue cannot legitimately exceed that. The cap
+// exists for the case where pruning does not happen — an older relay that does
+// not send `withdrawn`, or a hostile one that withholds it — and it is set well
+// above the relay's own limit so it never drops a knock the relay considers
+// live. The first cut of this fix set it to 8 with no pruning at all, which the
+// fix review (M-A) showed made things WORSE than no cap: cheap
+// connect/knock/disconnect cycles filled the queue with ghosts that nothing
+// removed, and because the client sends its knock exactly once and the relay
+// refuses a second one on the same socket, a dropped knocker could never try
+// again. That is a permanent, silent denial of admission — a direct hit on the
+// P-08 property this was supposed to protect.
+const MAX_KNOCK_QUEUE = 16;
 
 let identity = null;       // unlocked Identity, or null
 let myBundle = null;       // identity.publicBundle(), or null
@@ -660,18 +672,42 @@ async function registerAccount() {
 // failure (offline, or the name belongs to another identity) — the explicit
 // "Log in" button is still there and reports properly.
 let autoLoginRunning = false;
+// Pentest fix review 2026-07-30 (M-C). This used to retry on every 6 s mailbox
+// tick and swallow every failure silently, so a re-login that kept failing —
+// most easily because the relay's global challenge bucket was rate-limiting it —
+// left the tab permanently offline for sealed mail with NO visible sign: the
+// "not logged in" chip is only redrawn when the user happens to open the profile
+// view. That is the failure the 401 handler exists to prevent, reached by a
+// different road. So: back off, and say something.
+let autoLoginBackoffUntil = 0;
+let autoLoginFailures = 0;
+
 async function autoLogin(username) {
   if (!identity || apiToken || autoLoginRunning) return false;
   if (!account.isValidUsername(username)) return false;
+  if (Date.now() < autoLoginBackoffUntil) return false;
   autoLoginRunning = true;
   try {
     const { token } = await account.login(API_BASE, identity, username);
     apiToken = token;
+    autoLoginFailures = 0;
+    autoLoginBackoffUntil = 0;
     startMailboxPolling();
     renderProfile();
     if (!els.viewChats.hidden) refreshChats();
     return true;
-  } catch {
+  } catch (e) {
+    // Exponential-ish backoff, capped: 12s, 24s, 48s, 96s, then 2 minutes. Keeps
+    // a retry loop from being indistinguishable from an attack on the shared
+    // challenge bucket, which is what two tabs doing this became.
+    autoLoginFailures += 1;
+    const wait = Math.min(120000, 6000 * 2 ** Math.min(autoLoginFailures, 5));
+    autoLoginBackoffUntil = Date.now() + wait;
+    renderProfile();
+    // Visible, once per failure streak, so the user is not silently offline.
+    if (autoLoginFailures === 1 || autoLoginFailures === 4) {
+      addLine("sys", "", `[not signed in to the directory — sealed messages will not arrive (${e && e.message ? e.message : "login failed"})]`);
+    }
     return false;
   } finally {
     autoLoginRunning = false;
@@ -843,6 +879,12 @@ function renderProfile() {
     chip.textContent = label;
     els.profileStatus.appendChild(chip);
   }
+
+  // L-4: sign-out is only meaningful while a session exists. This is the ONLY
+  // revocation a user can trigger — "log in again" is deliberately no longer a
+  // revocation, because making it one made two tabs fight (M-C).
+  els.profileLogout.hidden = !apiToken;
+  els.profileSessionHint.hidden = !apiToken;
 }
 
 // Render the invite link as a QR into the profile canvas (lean-qr, vendored —
@@ -1582,6 +1624,16 @@ function startMailboxPolling() {
   pollMailbox();
 }
 
+// Stop polling on a deliberate sign-out (L-4). Without this the interval keeps
+// firing, 401s on the revoked token, and re-authenticates — turning sign-out
+// into a 6 s round trip that undoes itself.
+function stopMailboxPolling() {
+  if (mailboxTimer) {
+    clearInterval(mailboxTimer);
+    mailboxTimer = null;
+  }
+}
+
 // ---- connection lifecycle -------------------------------------------------
 
 // Pentest 2026-07-26 P-19: connect() awaits a directory fetch, a pad unlock
@@ -2099,6 +2151,25 @@ async function handleMessage(room, raw) {
     // point is that a human looks at the key.
     case "knock": {
       await queueKnock(m);
+      break;
+    }
+
+    // A waiter gave up or was cut off (fix review 2026-07-30, M-A). Prune it, so
+    // the queue reflects who is actually still waiting. Without this the entry
+    // is immortal — nothing else reports a departed waiter — and the L-1 cap
+    // then turns a flood of cheap connect/knock/disconnect cycles into a
+    // permanent denial of admission for the peer you are actually expecting.
+    //
+    // Untrusted, like every relay frame, but it can only ever REMOVE an entry
+    // from our own queue. The worst a hostile relay does with it is drop a
+    // knock it could have declined to deliver in the first place.
+    case "withdrawn": {
+      if (roomRole !== "owner") break;
+      if (typeof m.jid !== "string") break;
+      const before = knockQueue.length;
+      knockQueue = knockQueue.filter((k) => k.jid !== m.jid);
+      // Re-render only if the prompt could be showing the entry we just removed.
+      if (knockQueue.length !== before) await showNextKnock();
       break;
     }
 
@@ -2995,6 +3066,22 @@ els.profileCopyInvite.addEventListener("click", () => {
   if (h) copyToClipboard(els.profileCopyInvite, inviteLink(h));
 });
 els.profileExport.addEventListener("click", exportIdentity);
+// L-4: the user-facing half of session revocation. Drop the token locally
+// FIRST, so the session is gone from this device even if the relay is
+// unreachable, and stop the poller before it can re-authenticate — otherwise
+// the next 6 s tick would 401 and sign straight back in, which is exactly the
+// loop the M-C fix removed from re-login.
+els.profileLogout.addEventListener("click", async () => {
+  const token = apiToken;
+  apiToken = null;
+  stopMailboxPolling();
+  // Suppress the automatic re-login for a moment, so this is a deliberate
+  // sign-out rather than a blip the poller undoes.
+  autoLoginBackoffUntil = Date.now() + 60000;
+  renderProfile();
+  await account.logout(API_BASE, token);
+  addLine("sys", "", "[signed out of the directory — sealed messages will not arrive until you sign in again]");
+});
 els.profileForget.addEventListener("click", async () => {
   await forgetIdentity();
   renderProfile(); // reflect the now-locked state without leaving the view

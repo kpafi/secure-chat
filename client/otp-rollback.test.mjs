@@ -406,9 +406,9 @@ console.log("OK  F-4: each knownUsedHere clause fails closed on its own");
 
   // -- android: the native floor refuses it OUTRIGHT, adoption or not. -------
   // Fresh module instance so the bridge is captured at load, exactly as on the
-  // device (otp.js reads globalThis.SecureChatPadFloor once, at import).
+  // device (otp.js reads globalThis.__SECURE_CHAT_PAD_FLOOR__ once, at import).
   const floors = new Map();
-  globalThis.SecureChatPadFloor = {
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = {
     read: (id) => String(floors.has(id) ? floors.get(id) : -1),
     bump: (id, val) => {
       const n = Math.max(floors.has(id) ? floors.get(id) : -1, parseInt(val, 10));
@@ -437,7 +437,7 @@ console.log("OK  F-4: each knownUsedHere clause fails closed on its own");
   );
 
   // The floor is monotone: a bump downwards must not lower it.
-  globalThis.SecureChatPadFloor.bump(n.padId, "5");
+  globalThis.__SECURE_CHAT_PAD_FLOOR__.bump(n.padId, "5");
   assert.strictEqual(floors.get(n.padId), 900, "the native floor never goes down");
 
   // A bridge that cannot be read fails CLOSED, never as "no floor". Since the
@@ -446,7 +446,7 @@ console.log("OK  F-4: each knownUsedHere clause fails closed on its own");
   // "used", because an import/save must never be the way out of a damaged one.
   // Both refusals are the same property; assert the earliest, and that the pad
   // never reaches a usable state.
-  globalThis.SecureChatPadFloor = { read: () => "not-a-number", bump: () => "0" };
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = { read: () => "not-a-number", bump: () => "0" };
   const modBroken = await import("./otp.js?native=broken");
   const pBroken = await modBroken.generatePad({ label: "f1-broken", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
   await assert.rejects(
@@ -457,7 +457,7 @@ console.log("OK  F-4: each knownUsedHere clause fails closed on its own");
   assert.strictEqual(modBroken.padMeta(pBroken.padId), null,
     "a pad refused at save must not be left half-created");
 
-  delete globalThis.SecureChatPadFloor;
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
 }
 console.log("OK  F-1: v2 two-time-pad PoC is loud in the browser, refused outright on device");
 
@@ -504,7 +504,7 @@ console.log("OK  F-1: v2 two-time-pad PoC is loud in the browser, refused outrig
   // and its watermark, advance the pad, restore BOTH, then clear the floor.
   // Without a floor to contradict it the restore is undetectable, so this is
   // the case that must stay unreachable.
-  globalThis.SecureChatPadFloor = bridge();
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = bridge();
   const otpC = await import("./otp.js?native=clear");
   const c = await otpC.generatePad({ label: "h1-clear", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
   const cAtRest = await otpC.saveNewPad(c, PASS);
@@ -530,7 +530,7 @@ console.log("OK  F-1: v2 two-time-pad PoC is loud in the browser, refused outrig
   // advanced under a working bridge, whose owner then loads a page with the
   // bridge deleted. Creating the pad under the broken bridge instead would test
   // nothing, because there would be no floor to lose.
-  globalThis.SecureChatPadFloor = bridge();
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = bridge();
   const otpW = await import("./otp.js?native=marker-pre");
   const w = await otpW.generatePad({ label: "h1-marker", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
   const wAtRest = await otpW.saveNewPad(w, PASS);
@@ -539,16 +539,19 @@ console.log("OK  F-1: v2 two-time-pad PoC is loud in the browser, refused outrig
   assert.strictEqual(floors.get(w.padId), 700, "precondition: the pad has a real floor");
 
   globalThis.__SECURE_CHAT_NATIVE_FLOOR__ = true;
-  delete globalThis.SecureChatPadFloor;                 // the whole attack
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;                 // the whole attack
   const otpM = await import("./otp.js?native=marker-only");
   await assert.rejects(
     otpM.unlockPad(w.padId, PASS, { adoptLegacy: true }),
-    /damaged or forged/,
+    // Since the L-A fix this says what is actually wrong instead of blaming
+    // the pad — the old wording told the user to exchange a fresh pad, which
+    // does not help and burns real pads.
+    /cannot reach it/,
     "H-1(b): marker present + bridge deleted must fail closed, not degrade",
   );
   // The floor itself is untouched — this is a JS-side downgrade, not deletion —
   // so restoring the bridge restores normal service. Fail-closed, not bricked.
-  globalThis.SecureChatPadFloor = bridge();
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = bridge();
   const otpR = await import("./otp.js?native=marker-restored");
   const reopened = await otpR.unlockPad(w.padId, PASS);
   assert.strictEqual(reopened.record.sendOffset, 700, "the pad reopens once the bridge is back");
@@ -580,6 +583,105 @@ console.log("OK  F-1: v2 two-time-pad PoC is loud in the browser, refused outrig
 }
 console.log("OK  H-1: the native floor cannot be cleared or feature-detected away");
 
+// --- H-A (fix review 2026-07-30): a LYING bridge, not a deleted one ----------
+// The H-1 fix hardened the marker, on the assumption that the only move
+// available was `delete window.SecureChatPadFloor`. It was not. otp.js located
+// the bridge by its ordinary global name and accepted anything shaped like it,
+// so an attacker could install a lookalike that reports "no floor" — or simply
+// overwrite the two METHODS on the real object, which needs no `delete` and no
+// `defineProperty` and survives making the global itself non-writable. Every
+// new check passed, `verifyRelayConfig`'s probe answered true, and the real
+// Keystore floor sat untouched and unconsulted: full keystream reuse.
+//
+// The bridge is now captured at document-start and republished FROZEN under
+// `__SECURE_CHAT_PAD_FLOOR__`, with bound methods, and that is the only name
+// otp.js reads. These tests are what the old bridge mock could not express: a
+// bridge that lies.
+{
+  const realFloors = new Map();
+  const realBridge = {
+    read: (id) => String(realFloors.has(id) ? realFloors.get(id) : -1),
+    bump: (id, val) => {
+      const n = Math.max(realFloors.has(id) ? realFloors.get(id) : -1, parseInt(val, 10));
+      realFloors.set(id, n);
+      return String(n);
+    },
+  };
+
+  // What the app's document-start script does, transcribed. `.bind` captures
+  // the function VALUES, which is the load-bearing detail.
+  const publishProtected = () => {
+    delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+    globalThis.__SECURE_CHAT_PAD_FLOOR__ = Object.freeze({
+      read: realBridge.read.bind(realBridge),
+      bump: realBridge.bump.bind(realBridge),
+    });
+  };
+
+  globalThis.SecureChatPadFloor = realBridge;   // the raw, writable interface
+  publishProtected();
+  const otpA = await import("./otp.js?ha=1");
+
+  const p = await otpA.generatePad({ label: "ha", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const atRest = await otpA.saveNewPad(p, PASS);
+  const XFER = "xfer-pass";
+  const file = await otpA.exportPad(p, XFER);
+  p.sendOffset = 3000;
+  await otpA.savePadProgress(p, atRest);
+  assert.strictEqual(realFloors.get(p.padId), 3000, "precondition: the real floor is 3000");
+
+  // ATTACK 1 — overwrite the methods on the raw interface. Two assignments.
+  globalThis.SecureChatPadFloor.read = () => "-1";
+  globalThis.SecureChatPadFloor.bump = () => "-1";
+  assert.ok(otpA.padWasUsed(p.padId),
+    "H-A: overwriting the raw bridge's methods must not make the pad look unused");
+
+  // ATTACK 2 — replace the raw global outright with a lookalike.
+  globalThis.SecureChatPadFloor = { read: () => "-1", bump: () => "0" };
+  assert.ok(otpA.padWasUsed(p.padId),
+    "H-A: a substituted raw bridge must not make the pad look unused");
+
+  // …and the consequences that mattered: re-import and unlock both still refuse.
+  otpA.forgetPad(p.padId);
+  for (const k of ["used", "wm", "hw"]) localStorage.removeItem(`sc.otp.${k}.v1.${p.padId}`);
+  await assert.rejects(
+    otpA.importPad(file, XFER),
+    /already been used on this device/,
+    "H-A: the full PoC — lying bridge plus the three deletions — must be refused",
+  );
+  assert.strictEqual(realFloors.get(p.padId), 3000, "H-A: the real floor is untouched");
+
+  // The protected copy really is immune: freezing means the attacker cannot
+  // reach through it, and non-configurability is what the app relies on.
+  assert.throws(
+    () => { "use strict"; globalThis.__SECURE_CHAT_PAD_FLOOR__.read = () => "-1"; },
+    "H-A: the protected bridge must be frozen",
+  );
+  assert.strictEqual(globalThis.__SECURE_CHAT_PAD_FLOOR__.read(p.padId), "3000",
+    "H-A: the protected bridge still reports the real floor");
+
+  // And the app must actually publish it that way — the fix depends on `.bind`
+  // and on configurable:false, both of which are one word from being lost.
+  const activity = await readFile(
+    new URL("../android/app/src/main/java/org/securechat/app/MainActivity.kt", import.meta.url),
+    "utf8",
+  );
+  const inject = activity.slice(activity.indexOf("__SECURE_CHAT_PAD_FLOOR__"));
+  assert.match(inject, /Object\.freeze/, "H-A: the published bridge must be frozen");
+  assert.match(inject, /\.bind\(b\)/,
+    "H-A: methods must be BOUND, or a later `b.read = fake` is still obeyed");
+  assert.match(inject, /configurable:\s*false/, "H-A: the published name must be non-configurable");
+  // otp.js must not read the writable global at all any more.
+  const otpSrc = await readFile(new URL("./otp.js", import.meta.url), "utf8");
+  const code = otpSrc.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  assert.ok(!/globalThis\.SecureChatPadFloor/.test(code),
+    "H-A: otp.js must read only the protected name, never the writable global");
+
+  delete globalThis.SecureChatPadFloor;
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+}
+console.log("OK  H-A: a bridge that LIES is refused, not just one that is deleted");
+
 // --- H-3 (2026-07-29): delete the three markers, then re-import --------------
 // importPad's only rollback guard was padWasUsed(), which read three DELETABLE
 // plaintext keys and never the native floor. So: use a pad, remove the three
@@ -590,7 +692,7 @@ console.log("OK  H-1: the native floor cannot be cleared or feature-detected awa
 // unlock, but the whole current session sent from offset 0 over spent keystream.
 {
   const floors = new Map();
-  globalThis.SecureChatPadFloor = {
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = {
     read: (id) => String(floors.has(id) ? floors.get(id) : -1),
     bump: (id, val) => {
       const n = Math.max(floors.has(id) ? floors.get(id) : -1, parseInt(val, 10));
@@ -639,10 +741,16 @@ console.log("OK  H-1: the native floor cannot be cleared or feature-detected awa
   assert.strictEqual(floors.get(p.padId), 640, "H-3: the floor survived the attempt");
 
   // In a plain browser there is no floor, so the three deletions DO erase the
-  // localStorage evidence — that residual is real and documented. What must
-  // still hold is that the pad file itself cannot be re-imported while any
-  // evidence survives; check the guard is not simply dead in the browser.
-  delete globalThis.SecureChatPadFloor;
+  // localStorage evidence and the re-import SUCCEEDS. H-3 is therefore fixed on
+  // Android only, and the fix review (H-B) was right that the summary line and
+  // PROGRESS.md read as though it were fixed everywhere. Closing it in the
+  // browser is not possible with deletable storage — the honest options are
+  // trusted monotonic storage (what PadFloor is) or nothing.
+  //
+  // What is still asserted below is the weaker property that DOES hold in a
+  // browser: while any evidence survives, the guard fires. That is P-05, and it
+  // is what keeps the guard from being dead code on the platform.
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
   const otpBr = await import("./otp.js?h3=browser");
   const q = await otpBr.generatePad({ label: "h3-browser", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
   const atRestQ = await otpBr.saveNewPad(q, PASS);
@@ -656,7 +764,9 @@ console.log("OK  H-1: the native floor cannot be cleared or feature-detected awa
     "H-3: forget-then-reimport is still refused in the browser (P-05)",
   );
 }
-console.log("OK  H-3: delete-the-markers-then-reimport cannot rebuild a pad at offset 0");
+console.log("OK  H-3 (Android): delete-the-markers-then-reimport is refused where a floor exists");
+console.log("    NOTE: in a plain browser the three markers are still deletable and the");
+console.log("    re-import still succeeds — documented residual, not covered by the above.");
 
 // --- F-2: `exported` cannot be laundered through the migrating unlock --------
 // The plaintext index used to be taken at face value on the one unlock that

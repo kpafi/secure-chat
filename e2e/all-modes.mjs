@@ -61,13 +61,27 @@ for (const a of extraArgs) args.push(a);
 // non-zero unless the operator explicitly acknowledges it. The flag stays
 // available — it is genuinely the only way to exercise the stack over Tor
 // today (see M-4) — it just cannot masquerade as a passing run.
-const UNSAFE_RE = /--unsafely-treat-insecure-origin-as-secure|--disable-web-security|--allow-running-insecure-content|--ignore-certificate-errors/;
-const tainted = extraArgs.filter((a) => UNSAFE_RE.test(a));
+// An ALLOW-list, not a deny-list (fix review 2026-07-30). The first cut named
+// four dangerous flags, which meant --allow-insecure-localhost,
+// --disable-features=…, --disable-site-isolation-trials and --proxy-server all
+// sailed through untainted. "A comment is not a control" applies to the taint
+// gate itself: anything not known-harmless taints the run, so a new flag has to
+// be considered rather than merely spelled differently.
+const KNOWN_HARMLESS = [
+  /^--window-size=/,
+  /^--lang=/,
+  /^--force-device-scale-factor=/,
+  /^--disable-gpu$/,
+  /^--no-sandbox$/,            // CI containers; affects Chromium's own sandbox,
+  /^--disable-dev-shm-usage$/, // not any gate this harness is asserting
+];
+const tainted = extraArgs.filter((a) => !KNOWN_HARMLESS.some((re) => re.test(a)));
 const taintAck = process.env.SECURE_CHAT_E2E_ACK_UNSAFE === "1";
 if (tainted.length) {
-  console.log("\n  !! TAINTED RUN — security gates are disabled by these flags:");
+  console.log("\n  !! TAINTED RUN — these extra Chromium flags are not on the known-harmless list,");
+  console.log("     so this run may not reflect a configuration a real user can reproduce:");
   for (const a of tainted) console.log(`     ${a}`);
-  console.log("     Results below do NOT describe a configuration a real user can run.");
+
   console.log(
     taintAck
       ? "     SECURE_CHAT_E2E_ACK_UNSAFE=1 set: exiting 0 anyway, on your head be it.\n"

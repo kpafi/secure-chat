@@ -122,14 +122,32 @@ const NATIVE_TAMPERED = -2;
 //
 // A plain browser sets neither, so it still gets `null` and the documented
 // residual (see README) — unchanged.
-const nativeFloorExpected = globalThis.__SECURE_CHAT_NATIVE_FLOOR__ === true;
+// Fix review 2026-07-30 (H-A). Hardening the marker alone was not enough: this
+// code used to look the bridge up by the ordinary global `SecureChatPadFloor`
+// and accept anything with `read`/`bump` functions. An attacker never needed to
+// DELETE it — installing a lookalike that answers "no floor", or overwriting
+// just the two methods on the real object, satisfied every check while the real
+// Keystore-backed floor was never consulted. Two assignments, and F-1 was void.
+//
+// The app now captures the bridge at document-start, before any page script can
+// run, and republishes it FROZEN under `__SECURE_CHAT_PAD_FLOOR__` as a
+// non-configurable property, with the methods bound so a later
+// `SecureChatPadFloor.read = fake` cannot reach them. That name is the only one
+// read here. `__SECURE_CHAT_NATIVE_FLOOR__` is the separate, also
+// non-configurable statement that a floor is SUPPOSED to exist, so
+// "expected but not securable" is a distinguishable, fail-closed state rather
+// than something that reads as a plain browser.
+const nativeFloorMarker = globalThis.__SECURE_CHAT_NATIVE_FLOOR__;
+const nativeFloorExpected = nativeFloorMarker === true || nativeFloorMarker === "unavailable";
 
 const nativeFloor = (() => {
-  const b = globalThis.SecureChatPadFloor;
+  const b = globalThis.__SECURE_CHAT_PAD_FLOOR__;
   if (!b || typeof b.read !== "function" || typeof b.bump !== "function") {
     if (!nativeFloorExpected) return null;   // genuine browser: no floor exists
-    // Marker without a working bridge. Refuse everything rather than degrade.
-    return { read: () => NATIVE_TAMPERED, bump: () => NATIVE_TAMPERED };
+    // Marker without a usable protected bridge. Refuse everything rather than
+    // degrade — this is either the app failing to secure the interface, or
+    // someone having set the marker to brick OTP (loud, and fail-closed).
+    return { read: () => NATIVE_TAMPERED, bump: () => NATIVE_TAMPERED, broken: true };
   }
   const num = (v) => {
     const n = parseInt(v, 10);
@@ -145,6 +163,19 @@ const nativeFloor = (() => {
 
 // In-memory high-water marks for pads unlocked this session, so every re-save
 // can take a max without re-deriving the at-rest key.
+// Fix review 2026-07-30 (L-A). When the floor is EXPECTED but not usable, the
+// pad is fine and the platform is not: every message that came out of this state
+// blamed the pad ("damaged or forged", "already been used") and told the user to
+// exchange a fresh one, which does not help and burns real pads. Say what is
+// actually wrong instead. Still fail-closed — only the wording changes.
+function floorUnavailableError() {
+  return new Error(
+    "this device says it has hardware rollback protection for one-time pads, but the app cannot reach it. " +
+    "Your pad is probably fine — do NOT exchange a new one. On Android, reinstall or update the app; " +
+    "in a browser, an extension or script has set this flag and OTP is disabled until it is removed.",
+  );
+}
+
 const wmCache = new Map(); // padId -> {send, recv}
 
 function cachedWm(id) {
@@ -351,6 +382,7 @@ export async function importPad(fileText, passphrase) {
   // one this device has already consumed would rewind sendOffset to 0 and reuse
   // keystream the peer has already seen. The watermark survives `forgetPad`
   // precisely so this check can fire.
+  if (nativeFloor && nativeFloor.broken) throw floorUnavailableError();
   if (padWasUsed(o.padId)) {
     throw new Error(
       "this pad has already been used on this device — importing it again would reuse key material. Generate and exchange a fresh pad in person.",
@@ -521,6 +553,7 @@ export async function saveNewPad(record, passphrase) {
   // importPad because this is the function that destroys the record: any future
   // caller that reaches it with a used padId would rebuild the same hole, and
   // an argument about why the callers are safe is not a control.
+  if (nativeFloor && nativeFloor.broken) throw floorUnavailableError();
   if (padWasUsed(record.padId)) {
     throw new Error(
       "this pad has already been used on this device — saving it as new would erase its usage record and reuse key material. Generate and exchange a fresh pad in person.",
@@ -607,6 +640,7 @@ export async function unlockPad(padId, passphrase, opts = {}) {
   // F-1: the native floor, where available, is the one input to this decision an
   // attacker holding the JS context cannot touch. Read it BEFORE the localStorage
   // evidence so a forged bridge answer cannot be masked by a clean-looking store.
+  if (nativeFloor && nativeFloor.broken) throw floorUnavailableError();
   const native = nativeFloor ? nativeFloor.read(padId) : NATIVE_ABSENT;
   if (native === NATIVE_TAMPERED) {
     throw new Error(
@@ -826,6 +860,7 @@ export function forgetPad(padId) {
 // cannot delete, so it is consulted FIRST and it is decisive. It is also the
 // only one that survives the deletions, which is precisely why the PoC worked.
 export function padWasUsed(padId) {
+  if (nativeFloor && nativeFloor.broken) return true;   // fail closed
   if (nativeFloor) {
     const native = nativeFloor.read(padId);
     // TAMPERED (a forged record, or a marker with no working bridge) counts as
