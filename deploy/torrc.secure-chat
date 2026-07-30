@@ -22,6 +22,17 @@ ExitRelay 0
 SafeLogging 1
 Log warn syslog
 
+# Pentest 2026-07-29 L-7 — the two lines above do NOT make this host log-free,
+# and the I2 claim was overstated. Tor keeps /var/lib/tor/secure-chat/../state,
+# which records BWHistory*Values (bandwidth in fixed time buckets — i.e. a
+# service-activity timeline) and EntryGuard entries with first-seen timestamps.
+# Neither SafeLogging nor the log level touches that file; it is how Tor works.
+# AvoidDiskWrites only makes the flushes less frequent, it does not stop them.
+# Accepted, and written down rather than claimed away: a seized host yields a
+# coarse "the service was busy at these times" trail, but no per-client data.
+# Reasoned from Tor's documented state format, not reproduced here.
+AvoidDiskWrites 1
+
 # The service. Tor terminates the onion protocol and forwards plaintext HTTP to
 # the loopback uvicorn — the same socket Caddy proxies to, so both front ends
 # share one process (no split-brain rooms). uvicorn itself stays bound to
@@ -30,8 +41,22 @@ HiddenServiceDir /var/lib/tor/secure-chat/
 HiddenServiceVersion 3
 HiddenServicePort 80 127.0.0.1:8000
 
-# Proof-of-work defence against introduction floods (tor >= 0.4.8). This
-# matters more here than on a typical onion: SECURE_CHAT_TRUSTED_PROXIES is
-# deliberately unset, so every /api rate limiter collapses to ONE global
-# bucket, and the cheapest attack on the service is simply volume.
+# Proof-of-work defence against INTRODUCTION floods (tor >= 0.4.8). Keep it on,
+# but be precise about what it buys: it prices the introduction handshake, i.e.
+# building circuits. It does nothing about the attack that actually matters
+# here (pentest 2026-07-29 M-2), which builds ONE circuit and then sends cheap
+# HTTP on it — ~2 req/s against /api/auth/challenge denies login to every
+# existing account, because SECURE_CHAT_TRUSTED_PROXIES is deliberately unset
+# and that limiter is one global bucket. deploy/README.md used to credit PoW
+# with blunting exactly that; it does not.
 HiddenServicePoWDefensesEnabled 1
+
+# What DOES apply to the M-2 attack: bound how much one circuit can do. A
+# request flood down a single circuit now hits a stream cap and the circuit is
+# torn down, so the attacker has to keep paying the PoW-priced introduction
+# cost above to continue. 24 concurrent streams is comfortably above what the
+# client opens (one WebSocket plus a handful of /api fetches) while being far
+# below what a flood needs.
+# This raises the price of the DoS; it does not remove it. Still accepted.
+HiddenServiceMaxStreams 24
+HiddenServiceMaxStreamsCloseCircuit 1

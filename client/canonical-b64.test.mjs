@@ -159,8 +159,78 @@ async function testWireFramesAreCanonical() {
   console.log("OK  H-1: wire frames decode canonically too (channel intact)");
 }
 
+// --- M-6 (2026-07-29): the DIRECTORY path was never put behind this gate -----
+// account.fetchBundle copied the server's key strings verbatim, and
+// contacts.upsert decides `keyChanged` by RAW STRING comparison. So a hostile
+// directory could re-spell a key — byte-for-byte the same key — and truthfully
+// fire "the fetched keys DIFFER from what you verified", stripping the verified
+// mark and every vouch; permanently break sealed messaging to that contact,
+// because the non-canonical string is persisted and seal() throws on it before
+// sending; and push their inbound mail into a fresh `unknown-…` auto-contact.
+async function testDirectoryAnswersAreCanonicalised() {
+  const account = await import("./account.js");
+  const id = await Identity.generate();
+  const bundle = id.publicBundle();
+  const TOKEN = "tok";
+  const HANDLE = `dir-victim#${TOKEN}`;
+
+  const realFetch = globalThis.fetch;
+  const serve = (body) => {
+    globalThis.fetch = async () => ({
+      ok: true, status: 200, json: async () => body,
+    });
+  };
+  try {
+    // Honest answer: passes through unchanged.
+    serve({ ed: bundle.ed, mldsa: bundle.mldsa });
+    const good = await account.fetchBundle("http://relay.invalid", HANDLE);
+    assert.strictEqual(good.ed, bundle.ed, "a canonical bundle is returned as-is");
+    assert.strictEqual(good.mldsa, bundle.mldsa);
+
+    // Hostile answer: same BYTES, different spelling. Must be refused at the
+    // boundary rather than returned as a different-looking key.
+    for (const field of ["ed", "mldsa"]) {
+      const evil = { ed: bundle.ed, mldsa: bundle.mldsa };
+      evil[field] = respellings(bundle[field])[0];
+      assert.notStrictEqual(evil[field], bundle[field], "precondition: re-spelt");
+      assert.deepStrictEqual(
+        Buffer.from(unb64(bundle[field])), Buffer.from(atob(evil[field]), "binary"),
+        "precondition: the re-spelling decodes to the SAME bytes",
+      );
+      serve(evil);
+      await assert.rejects(
+        () => account.fetchBundle("http://relay.invalid", HANDLE),
+        /malformed/,
+        `M-6: a re-spelled ${field} from the directory must be refused`,
+      );
+    }
+
+    // The v2 encryption keys go through the same gate — they are what seal()
+    // consumes, so a re-spelling there is the "permanently unmailable" half.
+    const ecdh = b64(crypto.getRandomValues(new Uint8Array(65)));
+    const mlkem = b64(crypto.getRandomValues(new Uint8Array(1184)));
+    serve({ ed: bundle.ed, mldsa: bundle.mldsa, ecdh, mlkem });
+    const v2 = await account.fetchBundle("http://relay.invalid", HANDLE);
+    assert.strictEqual(v2.ecdh, ecdh, "canonical v2 keys pass through");
+    for (const field of ["ecdh", "mlkem"]) {
+      const evil = { ed: bundle.ed, mldsa: bundle.mldsa, ecdh, mlkem };
+      evil[field] = respellings(evil[field])[0];
+      serve(evil);
+      await assert.rejects(
+        () => account.fetchBundle("http://relay.invalid", HANDLE),
+        /malformed/,
+        `M-6: a re-spelled ${field} from the directory must be refused`,
+      );
+    }
+    console.log("OK  M-6: directory answers go through the canonical-base64 gate");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
 await testForgivingDecodeIsGone();
 await testMutatedBundleNoLongerVerifies();
 await testDhkeReflectionGuardOnBytes();
 await testWireFramesAreCanonical();
+await testDirectoryAnswersAreCanonicalised();
 console.log("\nAll canonical-base64 checks passed.");

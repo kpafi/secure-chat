@@ -29,6 +29,7 @@ import * as otp from "./otp.js";
 import * as contacts from "./contacts.js";
 import * as chats from "./chats.js";
 import * as sealed from "./sealed.js";
+import { makeKeyConfirmation } from "./keyconfirm.js";
 import { generate as qrGenerate } from "lean-qr";
 
 const $ = (id) => document.getElementById(id);
@@ -175,6 +176,11 @@ let admittedBundle = null; // the identity WE let in (owner side), or null
 let admittedAnon = false;  // we let in someone with no identity at all
 let wasPending = false;    // we sat in the approval queue (M-2, guest side)
 let knockQueue = [];       // [{jid, bundle, anon}] waiting for our verdict
+let currentRoom = null;    // the room this connection is in (keyconfirm effects)
+// L-1: an owner decides one knock at a time, so a queue longer than this is not
+// a busy room — it is a flood. Small enough that the cost of a flood is bounded
+// and large enough that a handful of genuine simultaneous knocks all survive.
+const MAX_KNOCK_QUEUE = 8;
 
 let identity = null;       // unlocked Identity, or null
 let myBundle = null;       // identity.publicBundle(), or null
@@ -1693,9 +1699,7 @@ async function connectInner() {
   admittedBundle = null;
   admittedAnon = false;
   wasPending = false;
-  confirmSent = false;
-  peerConfirm = null;
-  confirmDone = false;
+  keyConfirm.reset();
   knockQueue = [];
   hideAdmitPrompt();
   // P-19: freeze the session's room/alg now; the send path uses these, never the
@@ -1745,9 +1749,7 @@ async function connectInner() {
     admittedBundle = null;
     admittedAnon = false;
     wasPending = false;
-    confirmSent = false;
-    peerConfirm = null;
-    confirmDone = false;
+    keyConfirm.reset();
     knockQueue = [];
     hideAdmitPrompt();
     enableSend(false);
@@ -1777,6 +1779,26 @@ async function queueKnock(m) {
   if (roomRole !== "owner") return; // only the owner is asked; ignore the rest
   if (typeof m.jid !== "string" || !/^[0-9a-f]{16}$/.test(m.jid)) return;
   if (knockQueue.some((k) => k.jid === m.jid)) return;
+  // Pentest 2026-07-29 L-1: cap the queue.
+  //
+  // It used to grow without bound. Dedup is per-`jid` and every fresh socket
+  // brings a new one, the relay never tells the owner that a waiter left, and
+  // main.py creates the WS token bucket PER CONNECTION — so
+  // connect->join->knock->disconnect gets a fresh budget each cycle. Measured
+  // at 60 knocks in 1.6s (~37/s), each one forcing an Ed25519 AND an ML-DSA-65
+  // verify on the owner's tab. Availability only, and the owner can see it
+  // happening, but it dents P-08's "waiting costs the room nothing".
+  //
+  // Dropping the EXCESS rather than the oldest is deliberate: the queue is
+  // handled oldest-first, so the entries already in it are the ones the owner
+  // is being asked about right now, and letting a flood evict them would let an
+  // attacker push a genuine contact's knock off the list — turning a nuisance
+  // into a targeted denial of admission. A dropped knocker simply has to knock
+  // again once the queue drains, which is what an honest one does anyway.
+  //
+  // Note the cap sits BEFORE the two signature verifies below, so a flood costs
+  // the owner a regex and an array scan, not the expensive part.
+  if (knockQueue.length >= MAX_KNOCK_QUEUE) return;
   let p;
   try {
     p = unpackKey(m.payload);
@@ -1948,39 +1970,58 @@ function sendSignedKey(room, reply) {
 // This gates only the UNLOCK step. It is not a substitute for the safety-number
 // comparison: confirmation proves you share a key with whoever is at the other
 // end, and the in-person check is what proves who that is.
-let confirmSent = false;
-let peerConfirm = null;
-let confirmDone = false;
-
-async function onChannelReady(room) {
-  const c = cipher.confirmation;
-  if (!c) return finishSession(room); // OTP: nothing was negotiated to confirm
-  if (!confirmSent) {
-    confirmSent = true;
-    ws.send(JSON.stringify({
-      type: "key", room, alg: sessionAlg, payload: packKey({ confirm: c.mine }),
-    }));
-    hint("Confirming that both sides derived the same key…");
-  }
-  await tryFinishConfirmation(room);
-}
-
-async function tryFinishConfirmation(room) {
-  if (confirmDone) return;
-  const c = cipher.confirmation;
-  if (!c || peerConfirm === null) return; // one half is still missing
-  if (peerConfirm !== c.theirs) {
-    addLine("sys", "", "[the other side derived a DIFFERENT key — refusing to continue]");
+// Pentest 2026-07-29 M-5. The exchange above was right, but it assumed the
+// chains it confirms never change afterwards. They can: `_derive` REPLACES
+// `this.chan` (and so both confirmation tags) whenever its input signature
+// changes, in PQKEM and RSA alike. Two consequences, both of which this block
+// now handles explicitly:
+//
+//  1. THE ATTACK. A relay replays one genuine hello and delays one genuine
+//     signed offer until after confirmation has completed. `case "key"` had no
+//     `confirmDone` gate and `tryFinishConfirmation` returned early once done,
+//     so the late frame re-derived new chains that nobody re-confirmed: both
+//     peers displayed "secure channel established", compared safety numbers
+//     successfully, and then nothing worked — precisely the silent dead chat
+//     the comment above promises cannot happen. Chains are now FROZEN once
+//     confirmed; a frame that would change them is a loud refusal.
+//
+//  2. THE RACE, which the fix must not break. In a genuine simultaneous
+//     connect each side derives twice (its own offer secret, then the answer),
+//     so a tag sent after the first derivation is stale by the time the peer
+//     sees it. Comparing only the latest tag made confirmation ALWAYS mismatch
+//     in that case and disconnected BOTH honest peers — the race tolerance
+//     documented at crypto.js:645 stopped being real the moment confirmation
+//     was put in front of it. So we keep every tag the peer has sent and match
+//     our current `theirs` against the set: each tag is a signed, identity-
+//     pinned claim "I derived this material", and one of them matching is the
+//     proof we want, whichever order the frames arrived in.
+//
+// A mismatch therefore no longer disconnects on the spot — a stale tag is
+// expected in the race — so the loudness comes from a deadline instead. This
+// also covers a case the old code hung on: a relay that never delivers the
+// peer's confirm frame at all.
+// The state machine itself lives in keyconfirm.js so it can be unit-tested
+// without a DOM — see that file's header for why. app.js supplies the effects.
+const keyConfirm = makeKeyConfirmation({
+  send: (tag) => ws.send(JSON.stringify({
+    type: "key", room: currentRoom, alg: sessionAlg, payload: packKey({ confirm: tag }),
+  })),
+  hint: (msg) => hint(msg),
+  fail: (why) => {
+    addLine("sys", "", `[${why} — refusing to continue]`);
     hint(
       "Key confirmation failed: you and your contact do not hold the same session key. " +
       "Messages would silently fail to arrive. Disconnecting.",
       true,
     );
     if (ws) ws.close();
-    return;
-  }
-  confirmDone = true;
-  await finishSession(room);
+  },
+  finish: () => finishSession(currentRoom),
+});
+
+async function onChannelReady(room) {
+  currentRoom = room;
+  await keyConfirm.onChains(cipher.confirmation);
 }
 
 // Everything that used to happen the moment the chains existed.
@@ -2164,10 +2205,12 @@ async function handleMessage(room, raw) {
         // handshake branch because it is not one: it arrives after the chains
         // exist and carries no key material.
         if (typeof p.confirm === "string") {
-          // First write wins, exactly like the peer identity and the hello
-          // nonce: a relay must not get to try tag after tag until one sticks.
-          if (peerConfirm === null) peerConfirm = p.confirm;
-          await tryFinishConfirmation(room);
+          // M-5: a bounded set rather than first-write-wins, because the race
+          // legitimately produces two tags per side and the second is the one
+          // that counts. The cap is what keeps this from becoming an oracle a
+          // relay can hammer — see MAX_PEER_CONFIRMS.
+          currentRoom = room;
+          await keyConfirm.onPeerTag(p.confirm, cipher.confirmation);
           break;
         }
 
@@ -2260,6 +2303,17 @@ async function handleMessage(room, raw) {
           addLine("sys", "", "[a SECOND identity tried to complete the key exchange — refusing; this is a relay MITM attempt]");
           hint("Two different identities attempted this handshake — disconnecting to protect you.", true);
           if (ws) ws.close();
+          return;
+        }
+        // M-5: refuse handshake material once confirmation has completed.
+        // `_derive` rebuilds the chains whenever its input signature changes,
+        // so folding in a withheld-then-delivered offer here would silently
+        // replace the very material both sides just proved they shared — the
+        // safety numbers stay green and the chat goes quietly dead. onChannelReady
+        // catches the same condition afterwards; this refuses it up front so
+        // the cipher state is never disturbed in the first place.
+        if (keyConfirm.done) {
+          keyConfirm.failNow("a handshake frame arrived AFTER both sides had confirmed the key");
           return;
         }
         // Feed the key material (same identity guaranteed above). The cipher
@@ -2802,6 +2856,18 @@ async function otpFileChosen() {
       otpStatusMsg("You already have this pad on this device — not importing again (a pad must live on exactly one device per side).", true);
       return;
     }
+    // Pentest 2026-07-29 H-3: this path takes the record straight from
+    // saveNewPad and never calls unlockPad, so none of unlockPad's rollback or
+    // native-floor checks run on an import. That was half the finding — the
+    // other half being that importPad's own guard read only deletable
+    // localStorage keys.
+    //
+    // Both guards now live INSIDE the two functions this line calls
+    // (importPad above and saveNewPad here), and both consult the native floor,
+    // which the JS context cannot delete. Deliberately not "fixed" by adding an
+    // unlockPad round trip: that would put the check beside the path instead of
+    // on it, and cost a third 600k-iteration KDF for no property this does not
+    // already have.
     otpAtRest = await otp.saveNewPad(rec, els.otpPass.value); // encrypt at rest with the pad passphrase
     otpRecord = rec;
     otpUnlockedId = rec.padId;

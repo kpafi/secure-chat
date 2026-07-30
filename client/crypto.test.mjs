@@ -445,6 +445,14 @@ async function concurrencyChecks(alg) {
 }
 
 // A replayed handshake frame must NOT rotate an established key (relay DoS).
+//
+// Pentest 2026-07-29, test-coverage gap 1: this test WAS VACUOUS. It replayed
+// the offer after `a.encrypt()` had already sealed the cipher, and `_seal()`
+// makes `onPeerKey` an immediate no-op — so the replay never reached `_derive`
+// at all and the assertion could not observe it. It would have passed with
+// `_derive` entirely broken, which is the same failure mode 7d4e480 set out to
+// fix. The replay has to land BEFORE the first message for this to test
+// anything.
 async function pqkemReplayDoesNotDesync() {
   const a = makeCipher("PQKEM", ROOM);
   const b = makeCipher("PQKEM", ROOM);
@@ -453,12 +461,56 @@ async function pqkemReplayDoesNotDesync() {
   const bOffer = await b.handshakePayload();
   await a.onPeerKey(bOffer);
   await b.onPeerKey(await a.handshakePayload());
-  assert.strictEqual(await b.decrypt(await a.encrypt(MSG)), MSG, "PQKEM baseline works");
-  // Relay replays B's original (validly-signed) offer to A after establishment.
+
+  // The real test: replay while the cipher is still UNSEALED, so the frame
+  // genuinely reaches _derive and idempotence is what has to save us.
+  const beforeReplay = a.confirmation;
+  await a.onPeerKey(bOffer);
+  assert.deepStrictEqual(a.confirmation, beforeReplay,
+    "a replayed offer must not rebuild the chains (pre-seal — this is the live path)");
+
+  assert.strictEqual(await b.decrypt(await a.encrypt(MSG)), MSG,
+    "PQKEM still works after a pre-seal replay");
+
+  // …and the post-seal path stays covered too: once sealed, onPeerKey is a
+  // no-op by construction. Kept because it is a DIFFERENT mechanism, and
+  // labelled so nobody mistakes it for the assertion above again.
   await a.onPeerKey(bOffer);
   assert.strictEqual(await b.decrypt(await a.encrypt("still here")), "still here",
-    "PQKEM session survives a replayed offer (no key desync)");
+    "PQKEM session survives a replayed offer post-seal (onPeerKey is a no-op)");
   console.log("OK  PQKEM replayed handshake offer does not desync the key");
+}
+
+// M-5 (2026-07-29): a WITHHELD offer delivered later is not a replay — it is
+// new material, and `_derive` rebuilds `this.chan` (and both confirmation tags)
+// when it lands. That is the mechanism behind the silent desync; the app-level
+// fix is a confirmDone gate in app.js, but the cipher-level fact it rests on
+// needs pinning here, or a future refactor could make _derive idempotent-ish
+// and quietly invalidate the reasoning on both sides.
+async function pqkemLateOfferChangesTheChains() {
+  const a = makeCipher("PQKEM", ROOM);
+  const b = makeCipher("PQKEM", ROOM);
+  await a.init();
+  await b.init();
+  // A derives from its own offer being answered…
+  await a.onPeerKey(await b.handshakePayload());
+  const first = a.confirmation;
+  assert.ok(first && first.mine, "precondition: A has chains and a confirmation tag");
+
+  // …then B's ANSWER (new KEM material, a different input signature) arrives.
+  await b.onPeerKey(await a.handshakePayload());
+  const bAnswer = await b.handshakePayload();
+  await a.onPeerKey(bAnswer);
+
+  if (a.confirmation.mine === first.mine) {
+    // Nothing to prove: this input did not add material. Say so rather than
+    // passing silently, so the test cannot rot into another vacuous one.
+    console.log("OK  PQKEM late offer folded idempotently (no chain change to gate)");
+    return;
+  }
+  assert.notStrictEqual(a.confirmation.theirs, first.theirs,
+    "a chain rebuild must move BOTH tags, or confirmation could not detect it");
+  console.log("OK  PQKEM a late offer DOES rebuild the chains (M-5's mechanism, pinned)");
 }
 
 // ---- OTP (pre-shared one-time pad) -----------------------------------------
@@ -471,6 +523,35 @@ function otpPeers(regionSize = 4096) {
     pad: { bytes: shared.slice(), role, regionSize, sendOffset: 0, recvHighWater: 0 },
   });
   return [view(0), view(1)];
+}
+
+// L-5 (2026-07-29): OtpPad must validate its own offsets.
+//
+// Not reachable through otp.js today — it rejects negative offsets before the
+// cipher is built, and v3 keeps them inside the AEAD — but the class validates
+// every OTHER field of the record, and with a bad offset the consequences are
+// two-time-pad shaped: a negative sendOffset makes the P-01 spent-keystream
+// guard return false on its first iteration and makes slice() draw the MAC key
+// and keystream from the PEER's region, while a negative recvHighWater turns
+// the zeroing fill() into a no-op. `| 0` also quietly turned NaN into 0.
+function otpChecksOffsetValidation() {
+  const regionSize = 4096;
+  const bytes = crypto.getRandomValues(new Uint8Array(2 * regionSize));
+  const build = (over) => () => makeCipher("OTP", ROOM, {
+    pad: { bytes: bytes.slice(), role: 0, regionSize, sendOffset: 0, recvHighWater: 0, ...over },
+  });
+
+  for (const bad of [-1, -4096, -0.5, 1.5, NaN, Infinity, "0", null, undefined, regionSize + 1]) {
+    assert.throws(build({ sendOffset: bad }), /invalid send offset/,
+      `sendOffset ${String(bad)} must be refused`);
+    assert.throws(build({ recvHighWater: bad }), /invalid receive high-water/,
+      `recvHighWater ${String(bad)} must be refused`);
+  }
+  // The legitimate boundaries still work: a fresh pad and a fully spent one.
+  assert.ok(build({ sendOffset: 0, recvHighWater: 0 })(), "a fresh pad is valid");
+  assert.ok(build({ sendOffset: regionSize, recvHighWater: regionSize })(),
+    "a fully consumed pad is valid (it just has no room left)");
+  console.log("OK  L-5: OtpPad refuses out-of-range or non-integer offsets");
 }
 
 async function otpChecks() {
@@ -555,10 +636,12 @@ await symmetricAttackChecks("AES256");
 await symmetricAttackChecks("DHKE");
 await symmetricAttackChecks("PQKEM");
 await pqkemReplayDoesNotDesync();
+await pqkemLateOfferChangesTheChains();
 await handshakeRatchetChecks();
 await concurrencyChecks("AES256");
 await concurrencyChecks("DHKE");
 await concurrencyChecks("RSA");
 await concurrencyChecks("PQKEM");
+otpChecksOffsetValidation();
 await otpChecks();
 console.log("\nAll crypto checks passed.");

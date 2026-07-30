@@ -15,7 +15,7 @@
 // a random lookup token; a contact fetches your bundle with the HANDLE
 // `username#token`, so a bare username reveals nothing.
 
-import { unb64, concat } from "./identity.js";
+import { b64, unb64, concat } from "./identity.js";
 
 const REGISTER_DOMAIN = "secure-chat/register/v1";
 const LOGIN_DOMAIN = "secure-chat/login/v1";
@@ -97,10 +97,41 @@ export async function fetchBundle(base, handle) {
   if (res.status === 404) return null;
   if (!res.ok) throw new Error("lookup failed: " + (await asError(res)));
   const d = await res.json();
-  const out = { username: parsed.username, ed: d.ed, mldsa: d.mldsa };
+  // Pentest 2026-07-29 M-6: canonicalise here, at the boundary where a
+  // server-controlled string first enters the client.
+  //
+  // Every key in a bundle is a byte length ≡2 (mod 3), so four base64 spellings
+  // decode to identical bytes. This function used to copy the server's spelling
+  // VERBATIM, and `contacts.upsert` decides `keyChanged` by comparing those raw
+  // STRINGS while everything downstream compares BYTES. A hostile directory
+  // could therefore re-spell a key and, byte-for-byte truthfully, (a) fire
+  // "the fetched keys DIFFER from what you verified" at will, stripping the
+  // verified mark and every vouch from a contact, (b) PERMANENTLY break sealed
+  // messaging to them, because the non-canonical string gets persisted and
+  // `seal()` throws on it before sending, and (c) push inbound mail into a new
+  // `unknown-…` auto-contact, burning the MAX_AUTO_CONTACTS budget.
+  //
+  // `unb64` throws on a non-canonical spelling, so a re-spelled bundle is now
+  // refused outright instead of being stored as a different-looking key. This
+  // is the same gate `app.js`'s canonicalBundle applies to bundles arriving
+  // over the wire; the directory path was simply never put behind it.
+  const canon = (v, field) => {
+    try {
+      return b64(unb64(v));
+    } catch {
+      throw new Error(
+        `the directory returned a malformed ${field} key for ${parsed.username} — refusing it`,
+      );
+    }
+  };
+  const out = {
+    username: parsed.username,
+    ed: canon(d.ed, "identity"),
+    mldsa: canon(d.mldsa, "post-quantum identity"),
+  };
   if (d.ecdh && d.mlkem) {
-    out.ecdh = d.ecdh;   // bundle v2: encryption keys for sealed messages
-    out.mlkem = d.mlkem;
+    out.ecdh = canon(d.ecdh, "encryption");   // bundle v2: sealed-message keys
+    out.mlkem = canon(d.mlkem, "post-quantum encryption");
   }
   return out;
 }

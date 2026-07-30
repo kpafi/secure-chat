@@ -11,6 +11,14 @@ WorkingDirectory=/opt/secure-chat/backend
 # session tokens and login challenges live in memory, so a second instance would
 # split-brain them.
 Environment=SECURE_CHAT_EXTRA_ORIGINS=https://138-199-144-35.sslip.io,http://626vkwn6znrko2xhorirvv5ttrbzcr3xkdjmk65cks26qkvadplyk5id.onion
+# Pentest 2026-07-29 L-8: the DB used to default next to the code, which forced
+# ReadWritePaths=/opt/secure-chat/backend and left the relay's own source
+# writable to itself. State now lives in its own StateDirectory, so the code
+# tree is covered by ProtectSystem=strict with no write exception at all.
+# MIGRATION (one-off, before the first restart on this unit):
+#   install -d -o securechat -g securechat -m 0750 /var/lib/secure-chat
+#   mv /opt/secure-chat/backend/accounts.db* /var/lib/secure-chat/
+Environment=SECURE_CHAT_DB=/var/lib/secure-chat/accounts.db
 #
 # DELIBERATELY ABSENT: SECURE_CHAT_TRUSTED_PROXIES.
 # It used to be 127.0.0.1 so per-IP rate limiting worked behind Caddy. Since
@@ -24,7 +32,9 @@ ExecStart=/opt/secure-chat/venv/bin/python -m uvicorn main:app --host 127.0.0.1 
 Restart=on-failure
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/opt/secure-chat/backend
+# The only writable path. systemd creates it 0700 owned by User=, and there is
+# deliberately no ReadWritePaths for the code tree (L-8).
+StateDirectory=secure-chat
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

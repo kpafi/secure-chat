@@ -105,9 +105,32 @@ const WM_DOMAIN = "secure-chat/otp-watermark/v1";
 // device to device).
 const NATIVE_ABSENT = -1;
 const NATIVE_TAMPERED = -2;
+
+// Pentest 2026-07-29 H-1. Feature-detecting the bridge alone was a silent
+// downgrade: `SecureChatPadFloor` is an ordinary writable global, so
+// `delete window.SecureChatPadFloor` at document-start made the code below
+// return null, the floor went away, and NOTHING said so — on the platform whose
+// whole point is that the floor is unreachable from JS.
+//
+// The app's document-start script now also defines `__SECURE_CHAT_NATIVE_FLOOR__`
+// as a non-writable, NON-CONFIGURABLE property. That is the load-bearing part:
+// a JS attacker can still delete the bridge, but `delete` on a non-configurable
+// property does not remove it, so they cannot also erase the statement that a
+// floor was supposed to be here. Marker present + bridge missing or unusable is
+// therefore not "plain browser" — it is evidence of tampering, and it fails
+// CLOSED on every pad rather than quietly dropping the control.
+//
+// A plain browser sets neither, so it still gets `null` and the documented
+// residual (see README) — unchanged.
+const nativeFloorExpected = globalThis.__SECURE_CHAT_NATIVE_FLOOR__ === true;
+
 const nativeFloor = (() => {
   const b = globalThis.SecureChatPadFloor;
-  if (!b || typeof b.read !== "function" || typeof b.bump !== "function") return null;
+  if (!b || typeof b.read !== "function" || typeof b.bump !== "function") {
+    if (!nativeFloorExpected) return null;   // genuine browser: no floor exists
+    // Marker without a working bridge. Refuse everything rather than degrade.
+    return { read: () => NATIVE_TAMPERED, bump: () => NATIVE_TAMPERED };
+  }
   const num = (v) => {
     const n = parseInt(v, 10);
     // An unreadable answer from the bridge is treated as TAMPERED, never as
@@ -456,6 +479,20 @@ async function writePadBlob(record, key, salt, iters) {
     // one-line localStorage write. It is authenticated state now; the index
     // keeps a copy purely so the pad list can render without the passphrase.
     exported: !!record.exported,
+    // Pentest 2026-07-29 H-1: "a floor was in force when this blob was written."
+    //
+    // Deleting the native floor record used to be SILENT even though the file
+    // header claimed otherwise: with the floor gone, `native` reads ABSENT, so
+    // the "floor but no watermark" branch cannot fire and the floor contributes
+    // 0 to the max() below — the pad just reopens wherever the blob says.
+    //
+    // This flag is the missing half. It says a floor EXISTED, it lives inside
+    // the AEAD so it cannot be cleared or forged from JS, and its presence next
+    // to an ABSENT floor is proof of deletion rather than of a fresh pad. Pads
+    // written before the floor shipped simply lack it, so no legitimate pad is
+    // caught by it — which is why this is authenticated state and not another
+    // localStorage marker.
+    nativeFloor: !!nativeFloor,
   }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain));
   plain.fill(0);
@@ -474,9 +511,31 @@ async function writePadBlob(record, key, salt, iters) {
 // session's cheap re-saves.
 export async function saveNewPad(record, passphrase) {
   if (!passphrase) throw new Error("choose a pad passphrase to protect it on this device");
+  // Pentest 2026-07-29 H-3, second half. This used to seed the cache at zero
+  // unconditionally, so the very next writePadBlob overwrote the authenticated
+  // watermark WITH ZEROS — the step that turned "delete three markers and
+  // re-import" into a legitimate-looking v3 pad at offset 0 rather than
+  // something unlockPad could refuse.
+  //
+  // A "new" pad must genuinely be new. The check is here as well as in
+  // importPad because this is the function that destroys the record: any future
+  // caller that reaches it with a used padId would rebuild the same hole, and
+  // an argument about why the callers are safe is not a control.
+  if (padWasUsed(record.padId)) {
+    throw new Error(
+      "this pad has already been used on this device — saving it as new would erase its usage record and reuse key material. Generate and exchange a fresh pad in person.",
+    );
+  }
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const key = await deriveKey(passphrase, salt, KDF_ITERS);
-  wmCache.set(record.padId, { send: 0, recv: 0 }); // a new pad starts at zero
+  // Belt and braces: seed from whatever floors DID survive rather than from
+  // zero, so even a bypass of the refusal above cannot lower the watermark.
+  // For a genuinely new pad every source is absent and this is {0,0}.
+  const survivingNative = nativeFloor ? nativeFloor.read(record.padId) : NATIVE_ABSENT;
+  wmCache.set(record.padId, {
+    send: Math.max(readLegacyHW(record.padId), survivingNative > NATIVE_ABSENT ? survivingNative : 0),
+    recv: 0,
+  });
   await writePadBlob(record, key, salt, KDF_ITERS);
   return { key, salt, iters: KDF_ITERS };
 }
@@ -560,6 +619,17 @@ export async function unlockPad(padId, passphrase, opts = {}) {
   if (native > NATIVE_ABSENT && outerWm === null) {
     throw new Error(
       "the rollback record for this pad is missing — refusing to use the pad, because pad reuse could no longer be detected; exchange a fresh pad",
+    );
+  }
+  // …and the converse (2026-07-29 H-1): a blob written WHILE a floor was in
+  // force, with the floor now gone. Removing `clear()` from the bridge closed
+  // the JS route to this state, but file-level access can still delete the
+  // prefs entry, and that used to be completely silent — ABSENT reads as "no
+  // floor", so neither the branch above nor the max() below notices. `inner.nativeFloor`
+  // is inside the AEAD, so it cannot be stripped to hide the deletion.
+  if (inner.nativeFloor === true && native === NATIVE_ABSENT) {
+    throw new Error(
+      "this pad's device-protected rollback record has been deleted — refusing to use the pad, because pad reuse could no longer be detected; exchange a fresh pad",
     );
   }
   // Evidence that this pad has run here UNDER THE POST-FIX CODE, i.e. that a
@@ -740,11 +810,28 @@ export function forgetPad(padId) {
 // This is the ONE watermark reader that cannot authenticate what it reads:
 // importPad holds the pad file's TRANSFER passphrase, not the at-rest passphrase
 // that opens the authenticated record, and after `forgetPad` there is no blob to
-// derive a key from anyway. It therefore answers from evidence-of-presence — any
-// of the three markers — which is the fail-CLOSED direction: extra markers can
-// only cause a refusal, never an acceptance. Rollback decisions that CAN be
-// authenticated are made in unlockPad, against the AEAD record.
+// derive a key from anyway. It therefore answers from evidence-of-presence,
+// which is the fail-CLOSED direction: extra evidence can only cause a refusal,
+// never an acceptance. Rollback decisions that CAN be authenticated are made in
+// unlockPad, against the AEAD record.
+//
+// Pentest 2026-07-29 H-3: the three localStorage markers below are ALL
+// deletable, and this function was the only guard on the import path — so
+// `removeItem` x3, then re-import the (always pristine) pad file, rebuilt a
+// LEGITIMATE v3 pad at offset 0. No adoption prompt was possible, because the
+// result is a genuine v3 blob with a matching fresh watermark rather than a
+// legacy one. In the browser that is a permanent two-time pad.
+//
+// The native floor is the one input here an attacker holding the JS context
+// cannot delete, so it is consulted FIRST and it is decisive. It is also the
+// only one that survives the deletions, which is precisely why the PoC worked.
 export function padWasUsed(padId) {
+  if (nativeFloor) {
+    const native = nativeFloor.read(padId);
+    // TAMPERED (a forged record, or a marker with no working bridge) counts as
+    // used: an import must never be the way to escape a damaged floor.
+    if (native !== NATIVE_ABSENT) return true;
+  }
   return localStorage.getItem(usedKey(padId)) !== null ||
     localStorage.getItem(wmKey(padId)) !== null ||
     readLegacyHW(padId) > 0;

@@ -5,7 +5,7 @@
   "type": "module",
   "description": "secure-chat web client (E2EE, classical + post-quantum identity).",
   "scripts": {
-    "test": "node crypto.test.mjs && node identity.test.mjs && node contacts.test.mjs && node sealed.test.mjs && node otp-rollback.test.mjs && node vouch.test.mjs && node chats.test.mjs && node canonical-b64.test.mjs"
+    "test": "node crypto.test.mjs && node keyconfirm.test.mjs && node identity.test.mjs && node contacts.test.mjs && node sealed.test.mjs && node otp-rollback.test.mjs && node vouch.test.mjs && node chats.test.mjs && node canonical-b64.test.mjs && node no-fallback.test.mjs"
   },
   "dependencies": {
     "@noble/post-quantum": "^0.6.1",

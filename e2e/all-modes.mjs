@@ -47,8 +47,32 @@ if (PROXY) args.push(`--proxy-server=${PROXY}`);
 // origin: without it window.isSecureContext is false, crypto.subtle is
 // undefined, and the client cannot start. Tor Browser (Firefox) does not need
 // this. Never use it to paper over a finding — it is a diagnostic.
-for (const a of (process.env.SECURE_CHAT_E2E_CHROME_ARGS || "").split(/\s+/).filter(Boolean)) {
-  args.push(a);
+const extraArgs = (process.env.SECURE_CHAT_E2E_CHROME_ARGS || "").split(/\s+/).filter(Boolean);
+for (const a of extraArgs) args.push(a);
+
+// Pentest 2026-07-29 item 13. "Never use it to paper over a finding" was a
+// comment, and a comment is not a control: the run still printed "all modes
+// good" while --unsafely-treat-insecure-origin-as-secure was disabling the very
+// secure-context gate that makes the client refuse to run over a .onion in a
+// real Chromium. A green result in a configuration NO USER CAN REPRODUCE is
+// worse than a red one, because it gets quoted.
+//
+// So the run is now TAINTED: every line is marked, and the exit code is
+// non-zero unless the operator explicitly acknowledges it. The flag stays
+// available — it is genuinely the only way to exercise the stack over Tor
+// today (see M-4) — it just cannot masquerade as a passing run.
+const UNSAFE_RE = /--unsafely-treat-insecure-origin-as-secure|--disable-web-security|--allow-running-insecure-content|--ignore-certificate-errors/;
+const tainted = extraArgs.filter((a) => UNSAFE_RE.test(a));
+const taintAck = process.env.SECURE_CHAT_E2E_ACK_UNSAFE === "1";
+if (tainted.length) {
+  console.log("\n  !! TAINTED RUN — security gates are disabled by these flags:");
+  for (const a of tainted) console.log(`     ${a}`);
+  console.log("     Results below do NOT describe a configuration a real user can run.");
+  console.log(
+    taintAck
+      ? "     SECURE_CHAT_E2E_ACK_UNSAFE=1 set: exiting 0 anyway, on your head be it.\n"
+      : "     This run will exit NON-ZERO. Set SECURE_CHAT_E2E_ACK_UNSAFE=1 to override.\n",
+  );
 }
 
 const browser = await puppeteer.launch({
@@ -187,8 +211,18 @@ async function runMode(mode, alice, bob) {
   check(`${mode}: fresh room code`, /^[0-9a-f]{64}$/.test(code), code.slice(0, 12) + "…");
 
   await alice.page.click("#connect");
+  // Pentest 2026-07-29 item 13: this read `/connected/i`, which also matches
+  // "disconnected" — the status text left over from the previous mode's
+  // teardown. So from the second mode onward the wait returned INSTANTLY,
+  // before alice had actually joined, and bob then raced her to an empty room.
+  // Whoever joins an empty room first owns it, so when bob won he became the
+  // owner, never entered the approval queue, and his "waiting for approval"
+  // wait below timed out 45 s later. That is the flake: 2 in 5 runs, always at
+  // bob's approval wait, always in a later mode. Anchored, and the stale text
+  // is cleared first so nothing can match before the click takes effect.
   await alice.page.waitForFunction(
-    () => /connected/i.test(document.querySelector("#chatStatus").textContent), { timeout: T(45000) });
+    () => document.querySelector("#chatStatus").textContent.trim().toLowerCase() === "connected",
+    { timeout: T(45000) });
 
   await setValue(bob.page, "#room", code);
   await bob.page.click("#connect");
@@ -274,5 +308,11 @@ console.log(`  ${results.length - failed.length}/${results.length} checks passed
 if (failed.length) {
   console.log("  FAILED: " + failed.map((f) => f.name).join("; "));
   process.exit(1);
+}
+if (tainted.length) {
+  // Never the bare "all modes good" line while a gate was switched off.
+  console.log(`  all modes good — BUT THIS RUN IS TAINTED (${tainted.join(" ")})`);
+  console.log("  Do not quote this as evidence the stack works for users.\n");
+  process.exit(taintAck ? 0 : 2);
 }
 console.log("  all modes good\n");
