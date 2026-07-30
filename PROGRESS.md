@@ -2841,7 +2841,7 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
 Every finding in `secure-chat-pentest-2026-07-29.md` is fixed on branch
 `pentest-2026-07-29-fixes`. Backend **143 passed**, client **109 checks / 11
 suites**, `e2e/all-modes.mjs` **32/32 on 5 consecutive runs** (it used to fail 2
-in 5 — root-caused, below). Nothing is deployed; see DELIVERY at the end.
+in 5 — root-caused, below). **DEPLOYED 2026-07-30** — see DELIVERY at the end.
 
 Each fix carries a test that FAILS against the pre-fix code — verified by
 stashing the fix and re-running, not by assertion. Where that was not possible,
@@ -3182,8 +3182,64 @@ live local relay, and e2e `all-modes` **32/32**, `room-admission` 13/13,
   CLOSED (OTP bricked on the device) rather than open — but that is a reason
   to check, not a reason to assume.
 
-**⬜ DELIVERY — nothing here is deployed.** All of the above is committed on a
-branch and verified locally only. Still to do, in order:
+### ✅ DELIVERY — DONE 2026-07-30, all five items, verified not assumed
+Merged `--no-ff` as `2918986`, pushed with the branch. Then, in order:
+
+1. **✅ Reviewed + merged.** The review was not a formality — it found the
+   world-readable state directory above. Full local gate first: backend **152
+   passed**, client **112 checks / 10 suites**, the three integration suites
+   green against a live local relay, e2e `all-modes` **32/32**, `room-admission`
+   13/13, `no-dead-ends` 12/12, `two-user-flow` 8/8.
+2. **✅ Relay + client DEPLOYED**, via `deploy/deploy-2026-07-30.sh` (committed —
+   the usual two-line rsync recipe cannot express this release, because the DB
+   move is order-dependent and the unit is not covered by the rsync).
+   Backup at `/root/accounts.db.bak-2026-07-30-1822`. **The migration worked:
+   30 accounts, 2 vouches and 4 mailbox rows survived**, counted through the
+   read-only sqlite handle rather than inferred from the file size. `healthz`
+   and `/` both 200 over loopback, clearnet 200, no database left in the code
+   tree, `SECURE_CHAT_TRUSTED_PROXIES` still absent from the live process
+   environment and `--no-proxy-headers` still on its command line.
+   **`StateDirectoryMode=0700` was PROVED to be load-bearing, not decorative:**
+   `chmod 0755` on the live directory, `systemctl restart`, and systemd put it
+   back to `drwx------`. That is the claim the finding was about, so it was
+   measured rather than asserted.
+3. **✅ APK rebuilt + installed** on device `P21273004544`. Carries the
+   `PadFloor.kt` escape fix, compile-verified byte-identical (above).
+4. **✅ On-device native-floor proof re-run — 14/14 against the real
+   AndroidKeyStore.** The harness is now **committed** at
+   `android/native-floor-ondevice.mjs`; the 2026-07-28 one lived in a session
+   scratchpad and was gone, which is how a proof of the one control the JS
+   context cannot reach stops being re-runnable. It also asserted the OLD
+   contract. Proved on hardware: the marker survives `delete` and redefinition;
+   the interface is frozen and has **no `clear`**; an unknown pad reads `-1`;
+   `bump(500)` → 500 and `bump(5)` → still 500 through the real HMAC; `read()`
+   returns a **number**, so there is no parse step to poison; **H-A** —
+   replacing `SecureChatPadFloor` wholesale, and overwriting the frozen object's
+   own methods, both leave the floor reading 500; **round-2 H-1** — poisoning
+   `parseInt` AND `Math.max` together does not move it. Those last two are the
+   attacks the Node tests structurally cannot express, because a mock cannot be
+   substituted or poisoned.
+   *Residual:* the probe left an inert floor at `probe-native-floor-<ts>`. It
+   cannot be cleared from JS — by design, no lowering call exists — and no real
+   pad can carry that id. The phone still has **0** `sc.otp.*` keys.
+5. **✅ `onion-ws.mjs` run over real Tor — 10/10**, against the newly deployed
+   relay, through a local unprivileged `tor`. **Including the M-3 positive
+   control**, which had only ever been verified at the predicate: an allowed
+   Origin upgraded (HTTP 101) in the same run in which a foreign Origin was
+   refused (403), so the refusal is now known to be a refusal and not a Tor
+   hiccup at `HTTP 0`. Absent Origin still accepted, admission protocol intact
+   over the onion (owner seats first, second peer queued not seated, knock
+   verbatim, payloads unchanged both ways).
+
+**Still open, deliberately:** the `torrc` change (`HiddenServiceMaxStreams 24`)
+is NOT applied. The box's live tor config has never been diffed against the repo
+copy, so applying it blind risks clobbering settings that exist only on the box.
+The script prints the diff-then-reload recipe. This is a DoS price-raiser on an
+accepted DoS, so it is not urgent.
+
+**Previously (superseded by the block above): ⬜ DELIVERY — nothing here is
+deployed.** All of the above is committed on a branch and verified locally only.
+Still to do, in order:
   1. Review the diff (it touches crypto, at-rest storage, the relay and the
      admission path) and merge.
   2. Deploy the relay + client. **The systemd unit changed**: do the one-off DB

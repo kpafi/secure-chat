@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "permissions": {
+    "allow": [
+      "Bash(ssh root@138.199.144.35 *)",
+      "Bash(ssh -o BatchMode=yes root@138.199.144.35 *)",
+      "Bash(bash deploy/deploy-2026-07-30.sh)"
+    ]
+  }
+}
