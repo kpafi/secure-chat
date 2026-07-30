@@ -3162,7 +3162,7 @@ live local relay, and e2e `all-modes` **32/32**, `room-admission` 13/13,
   no longer writable", which was true, and the property that broke was one nobody
   had written down. Same shape as M-1 — a status line the measurement did not
   cover — one layer down.
-- **⬜ FLAGGED, not fixed: `PadFloor.kt` is invisible to `git diff`.** It contains
+- **✅ FIXED (in the APK-rebuild step): `PadFloor.kt` was invisible to `git diff`.** It contained
   raw NUL bytes in the HMAC domain separator at line 98
   (`"secure-chat/otp-pad-floor/v1\0$padId\0$value"`, written as literal U+0000 in
   the source rather than `\u0000`), so git classifies it as binary and every diff
@@ -3170,11 +3170,17 @@ live local relay, and e2e `all-modes` **32/32**, `room-admission` 13/13,
   **pre-existing on master, not introduced by this branch** — but it means the
   H-1 changes to the one file whose whole job is to be the control the JS context
   cannot reach went to review as an opaque blob. `git diff --text` was used here
-  instead and the content is correct. The fix is to spell the separator
-  `\u0000`, which is byte-identical after compilation (so the HMAC and every
-  stored floor are unaffected) and makes the file text again. Not done in this
-  commit because it wants a compile to confirm, and the APK rebuild is delivery
-  item 3 — do it there.
+  instead and the content is correct.
+  **Fixed at the APK rebuild, where a compile could confirm it:** the separator
+  is spelled `\u0000` and the file is `UTF-8 text` again, so it diffs normally
+  from here on. Byte-identity was not assumed, it was checked in the built
+  artifact: `classes3.dex` carries the constant as `secure-chat/otp-pad-floor/v1`
+  followed by `c0 80`, which is DEX's MUTF-8 encoding of U+0000. The string the
+  HMAC is taken over is therefore unchanged, so every floor already stored on the
+  phone still verifies. Worth stating the failure mode had it differed: every
+  existing floor would have failed its MAC and read as TAMPERED, which fails
+  CLOSED (OTP bricked on the device) rather than open — but that is a reason
+  to check, not a reason to assume.
 
 **⬜ DELIVERY — nothing here is deployed.** All of the above is committed on a
 branch and verified locally only. Still to do, in order:
