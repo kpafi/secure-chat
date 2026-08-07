@@ -102,13 +102,24 @@ console.log("OK  crypto.subtle absent: identity, every cipher mode, and the stor
     for (const [re, what] of banned) {
       assert.ok(!re.test(src), `${f} contains ${what} — that is a crypto.subtle fallback`);
     }
-    // Math.random is fine for UI jitter but never for key/nonce/id material.
-    for (const line of src.split("\n")) {
-      if (!/Math\.random/.test(line)) continue;
-      assert.ok(
-        !/key|nonce|iv|salt|secret|token|random(Bytes|Values)/i.test(line),
-        `${f}: Math.random on a security-relevant line: ${line.trim()}`,
-      );
+    // Math.random: banned outright in the client modules.
+    //
+    // Pentest 2026-08-07 F-CRYPTO-014. This used to allow Math.random on any
+    // line whose text lacked key/nonce/iv/salt/secret/token/randomBytes — a
+    // keyword grep of the same line. `const TAB_ID = Math.random()...` contains
+    // none of those words, so this check reported green on the one Math.random
+    // in the client that gated key material: TAB_ID was the sole discriminator
+    // for the OTP pad lease, i.e. the value standing between the user and a
+    // two-time pad. A rule that decides what is security-relevant by reading
+    // the words on the line will keep missing exactly the cases where the
+    // security relevance lives somewhere else, so it is now unconditional.
+    // If UI jitter ever genuinely needs it, add a named allowlist here rather
+    // than reopening the keyword heuristic.
+    for (const [i, line] of src.split("\n").entries()) {
+      // Skip comment lines only: `//`, a block-comment opener, or a
+      // continuation `*`. (The `/*` case was missing in the first cut.)
+      if (!/Math\.random/.test(line) || /^\s*(\/\/|\/\*|\*)/.test(line)) continue;
+      assert.fail(`${f}:${i + 1}: Math.random in a client module: ${line.trim()}`);
     }
   }
 }

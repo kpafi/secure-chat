@@ -892,3 +892,66 @@ console.log("    re-import still succeeds — documented residual, not covered b
 console.log("OK  F-2: `exported` cannot be cleared through the legacy migration");
 
 console.log("\nAll OTP rollback checks passed.");
+
+// --- F-ATREST-001 / F-ATREST-002 -------------------------------------------
+// The native floor covered the SEND offset only: 1 of ~5 rollback-sensitive
+// counters (F-ATREST-009). So on Android — the one platform with a floor at all
+// — a recv rollback replayed every frame the peer had already sent, and an
+// `exported` rollback re-armed export, and a second export of one pad is a
+// two-time pad.
+async function testRecvAndExportedFloors() {
+  const slots = new Map();
+  // Model of PadFloor.kt: monotone per opaque key, never lowers, MACs the key
+  // and value together so slots cannot be lifted between each other.
+  const floor = {
+    read: (k) => (slots.has(k) ? slots.get(k) : -1),
+    bump: (k, v) => {
+      if (v < 0) return floor.read(k);
+      const next = Math.max(floor.read(k), v);
+      slots.set(k, next);
+      return next;
+    },
+  };
+  Object.defineProperty(globalThis, "__SECURE_CHAT_NATIVE_FLOOR__", { value: true, configurable: true });
+  Object.defineProperty(globalThis, "__SECURE_CHAT_PAD_FLOOR__", { value: Object.freeze(floor), configurable: true });
+
+  const otp = await import(`./otp.js?floors=${Date.now()}`);
+  const PASS = "pad passphrase";
+  const pad = await otp.generatePad({ label: "floors", totalBytes: 64 * 1024 });
+
+  const atRest = await otp.saveNewPad(pad, PASS);
+  const pristine = localStorage.getItem(`sc.otp.pad.v1.${pad.padId}`);
+  const pristineWm = localStorage.getItem(`sc.otp.wm.v1.${pad.padId}`);
+
+  // Receive some traffic, then persist.
+  pad.recvHighWater = 4096;
+  await otp.savePadProgress(pad, atRest);
+  assert.strictEqual(floor.read(pad.padId + "#recv"), 4096, "the recv floor must be mirrored natively");
+
+  // The whole-storage rollback the send floor already refuses — now for recv.
+  localStorage.setItem(`sc.otp.pad.v1.${pad.padId}`, pristine);
+  localStorage.setItem(`sc.otp.wm.v1.${pad.padId}`, pristineWm);
+  await assert.rejects(() => otp.unlockPad(pad.padId, PASS), /receive state was rolled back/,
+    "restoring BOTH blob and watermark must still be caught by the native recv floor");
+  console.log("OK  F-ATREST-001: a recv rollback is refused even with blob+watermark restored");
+
+  // F-ATREST-002: export latches natively and outlives a pre-export snapshot.
+  localStorage.setItem(`sc.otp.pad.v1.${pad.padId}`, pristine);
+  localStorage.setItem(`sc.otp.wm.v1.${pad.padId}`, pristineWm);
+  slots.delete(pad.padId + "#recv"); // isolate: only the export latch under test
+  const fresh = await otp.unlockPad(pad.padId, PASS);
+  await otp.markExported(fresh.record, fresh.atRest);
+  assert.strictEqual(floor.read(pad.padId + "#exported"), 1, "export must latch natively");
+
+  localStorage.setItem(`sc.otp.pad.v1.${pad.padId}`, pristine);
+  localStorage.setItem(`sc.otp.wm.v1.${pad.padId}`, pristineWm);
+  await assert.rejects(() => otp.unlockPad(pad.padId, PASS), /already exported once/,
+    "a pre-export snapshot must not re-arm export — that is a two-time pad");
+  console.log("OK  F-ATREST-002: an `exported` rollback is refused by the native latch");
+
+  delete globalThis.__SECURE_CHAT_NATIVE_FLOOR__;
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+}
+
+await testRecvAndExportedFloors();
+console.log("All OTP native-floor scope checks passed.");

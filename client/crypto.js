@@ -499,6 +499,138 @@ const RSA_MSG_DOMAIN = "secure-chat/rsa-msg/v2";
 // we generate; 2048 is today's floor rather than a recommendation, which is why
 // DHKE/PQKEM are the preferred modes.
 const RSA_MIN_MODULUS_BITS = 2048;
+// Largest we will accept. An 8192-bit peer key still works; beyond that
+// `encrypt` throws inside the handshake, so a peer could only self-DoS.
+const RSA_MAX_MODULUS_BITS = 8192;
+// The only public exponent we generate (`init` below) and the only one we
+// accept. SP 800-56B allows 65537 <= e < 2^256 with e odd; there is no reason
+// for an honest secure-chat peer to be anywhere else in that range.
+const RSA_REQUIRED_EXPONENT = 65537n;
+// Trial-division bound for the peer modulus. See the assurance note below for
+// why this is hygiene rather than a defence.
+const RSA_TRIAL_DIVISION_LIMIT = 1 << 16;
+
+// ---- Peer RSA public-key assurance (pentest 2026-08-07 F-CRYPTO-009) -------
+//
+// The P-16 size gate used to be the ONLY check performed on a counterparty-
+// supplied transport key, and WebCrypto's SPKI import performs no public-key
+// assurance beyond DER well-formedness: e = 0, 1, 2, 3 and even moduli all
+// import happily and all report `modulusLength = 2048`, so all of them sailed
+// through. With e = 1 the OAEP "encryption" degenerates to the keyless,
+// fully invertible MGF1 encoding, so anyone who sees the handshake frame
+// recovers the 32-byte root secret with no private key — and that one root is
+// the sole HKDF IKM for BOTH direction chains, retroactively and prospectively.
+//
+// READ THIS BEFORE TRUSTING THE FUNCTION BELOW. Partial public-key validation
+// cannot certify that a modulus is the product of two large primes, and no
+// cheap check can. A counterparty who picks e = 65537 and
+// n = <one 24-bit factor> x <2024-bit prime> passes every test here and still
+// hands the whole session to a passive observer; that variant was demonstrated
+// against this file and is NOT closed by this code. Raising the trial-division
+// bound does not close it either — the attacker just picks a larger factor.
+//
+// Two things would actually close it, and both are protocol/product decisions
+// rather than a validation tweak:
+//   1. Make the root contributory — each side wraps its OWN secret to the
+//      OTHER party's key and both are folded into the HKDF IKM, so one bad key
+//      exposes only one half. `_derive` already handles a two-secret map (it
+//      has to, for the join-order race), but the two-frame offer/answer
+//      handshake has nowhere to put the offerer's ciphertext: a third frame
+//      would be needed, which app.js's "answer the initiator exactly once"
+//      invariant currently forbids.
+//   2. Do not use peer-chosen RSA key transport. DHKE and PQKEM carry no
+//      analogous risk — their peer material is a P-256 point (WebCrypto
+//      enforces on-curve and rejects the identity; P-256 has prime order, so
+//      there is no degenerate-parameter analogue) plus an ML-KEM encapsulation
+//      key.
+//
+// So what follows removes the trivially catastrophic keys and nothing more.
+// It is defence in depth under a hostile counterparty, not a guarantee.
+
+const B64URL_RE = /^[A-Za-z0-9_-]+$/;
+
+// JWK integers are unpadded base64url, so `b64ToBuf` (canonical standard
+// base64, H-1) cannot be reused here.
+function b64UrlToBigInt(s) {
+  if (typeof s !== "string" || !B64URL_RE.test(s)) {
+    throw new Error("malformed RSA key parameter");
+  }
+  const std = s.replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(std + "=".repeat((4 - (std.length % 4)) % 4));
+  let v = 0n;
+  for (let i = 0; i < bin.length; i++) v = (v << 8n) | BigInt(bin.charCodeAt(i) & 0xff);
+  return v;
+}
+
+function bitLength(n) {
+  return n === 0n ? 0 : n.toString(2).length;
+}
+
+// Integer k-th root by Newton descent; the seed is chosen above the true root
+// so the iteration is monotonically decreasing and terminates.
+function integerNthRoot(n, k) {
+  if (n < 2n) return n;
+  const kk = BigInt(k);
+  let x = 1n << BigInt(Math.ceil(bitLength(n) / k) + 1);
+  for (;;) {
+    const y = ((kk - 1n) * x + n / x ** (kk - 1n)) / kk;
+    if (y >= x) return x;
+    x = y;
+  }
+}
+
+// Primes below RSA_TRIAL_DIVISION_LIMIT, sieved once on first use.
+let _smallPrimes = null;
+function smallPrimes() {
+  if (_smallPrimes) return _smallPrimes;
+  const limit = RSA_TRIAL_DIVISION_LIMIT;
+  const composite = new Uint8Array(limit);
+  const out = [];
+  for (let i = 2; i < limit; i++) {
+    if (composite[i]) continue;
+    out.push(BigInt(i));
+    for (let j = i * i; j < limit; j += i) composite[j] = 1;
+  }
+  _smallPrimes = out;
+  return out;
+}
+
+// SP 800-56B Rev.2 §6.4.2.2 partial public-key validation, with the caveat
+// above. Throws with a specific reason rather than returning a boolean, so the
+// refusal reaches the user's "Key exchange failed" hint intact.
+function assertRsaPublicKeyUsable(n, e, declaredBits) {
+  if (e !== RSA_REQUIRED_EXPONENT) {
+    throw new Error(`peer RSA exponent is not 65537 (got ${e})`);
+  }
+  if (n <= 0n || (n & 1n) === 0n) {
+    throw new Error("peer RSA modulus is not a positive odd integer");
+  }
+  const bits = bitLength(n);
+  // The size gate ran against `algorithm.modulusLength`, which is the SPKI's
+  // claim. Re-derive it from the modulus itself so a padded or otherwise
+  // mis-declared key cannot claim a size it does not have.
+  if (bits !== declaredBits) {
+    throw new Error(`peer RSA modulus size disagrees with its own key material (${bits} vs ${declaredBits})`);
+  }
+  if (bits < RSA_MIN_MODULUS_BITS || bits > RSA_MAX_MODULUS_BITS) {
+    throw new Error(`peer RSA key is out of range (${bits} bits; allowed ${RSA_MIN_MODULUS_BITS}..${RSA_MAX_MODULUS_BITS})`);
+  }
+  for (const p of smallPrimes()) {
+    if (n % p === 0n) {
+      throw new Error(`peer RSA modulus has a small prime factor (${p})`);
+    }
+  }
+  // n = p^k is trivially factorable. Only prime exponents need testing: a
+  // composite k would already have been caught by its prime divisor.
+  for (const k of smallPrimes()) {
+    if (k > BigInt(bits)) break;
+    const kk = Number(k);
+    const r = integerNthRoot(n, kk);
+    if (r ** k === n) {
+      throw new Error(`peer RSA modulus is a perfect power (exponent ${kk})`);
+    }
+  }
+}
 
 class Rsa {
   constructor(roomId) {
@@ -547,8 +679,11 @@ class Rsa {
     // share a keypair, and identical pubs would collapse the direction chains.
     if (m.pub === this.myPub) throw new Error("reflected handshake rejected");
     if (m.pub && this.peerPubB64 === null) { // first key wins
+      // Imported EXTRACTABLE (F-CRYPTO-009) purely so the modulus and exponent
+      // can be read back for validation. It is a public key: exporting it
+      // discloses nothing the peer did not just send us in the clear.
       const peerPub = await crypto.subtle.importKey(
-        "spki", b64ToBuf(m.pub), { name: "RSA-OAEP", hash: "SHA-256" }, false, ["encrypt"],
+        "spki", b64ToBuf(m.pub), { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"],
       );
       // Pentest 2026-07-26 P-16: we are about to RSA-OAEP-encrypt this session's
       // 32-byte root secret to this key, so refuse a short modulus outright
@@ -557,6 +692,12 @@ class Rsa {
       if (typeof bits !== "number" || bits < RSA_MIN_MODULUS_BITS) {
         throw new Error(`peer RSA key is too small (${bits} bits; minimum ${RSA_MIN_MODULUS_BITS})`);
       }
+      // Pentest 2026-08-07 F-CRYPTO-009: the size gate above was the only check
+      // on this key, and it is the weakest of the parameters that matter. See
+      // the assurance note above `assertRsaPublicKeyUsable` — including what it
+      // still does NOT stop.
+      const jwk = await crypto.subtle.exportKey("jwk", peerPub);
+      assertRsaPublicKeyUsable(b64UrlToBigInt(jwk.n), b64UrlToBigInt(jwk.e), bits);
       this.peerPub = peerPub;
       this.peerPubB64 = m.pub;
     }

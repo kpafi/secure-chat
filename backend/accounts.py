@@ -64,7 +64,35 @@ _api_limiter = KeyedRateLimiter(config.API_RATE_CAPACITY, config.API_RATE_REFILL
 _lookup_limiter = KeyedRateLimiter(config.LOOKUP_RATE_CAPACITY, config.LOOKUP_RATE_REFILL_PER_SEC)
 
 # Dedicated, stricter bucket for minting login challenges (M-03).
+#
+# Pentest 2026-08-07 F-RELAY-003: keyed on `client_key`, which behind Tor is the
+# same loopback peer for everybody, so this was ONE GLOBAL bucket — 10 burst,
+# 0.5/s sustained — in front of an unauthenticated endpoint. Ten rapid requests
+# drained it and one request every two seconds held it empty, after which no
+# user anywhere could obtain a challenge, and with no challenge no one can reach
+# /auth/verify to get a session token. Login denied service-wide, by any onion
+# visitor, at near-zero cost.
+#
+# The keying has to give per-account fairness, and behind Tor the IP cannot
+# provide it. So the tight bucket is keyed on the USERNAME being logged in as:
+# draining it denies that one account, and denying everybody now costs one full
+# bucket per account rather than one bucket total.
+#
+# This does not weaken anti-enumeration (I1): a bucket is minted for any
+# well-formed username whether or not the account exists, so a 429 says only
+# "somebody has been asking about this name recently" — a state the asker can
+# always produce themselves — and never distinguishes a real account from a
+# nonexistent one.
 _challenge_limiter = KeyedRateLimiter(config.CHALLENGE_RATE_CAPACITY, config.CHALLENGE_RATE_REFILL_PER_SEC)
+
+# The absolute ceiling that the per-username buckets no longer provide. Keyed
+# on `client_key` exactly as before, so the shared-loopback collapse is
+# deliberate here: this is the "how much challenge minting will this relay do at
+# all" limit, and it is sized so that ordinary use never reaches it while an
+# attacker enumerating usernames to drain them one at a time still hits a wall.
+_challenge_global_limiter = KeyedRateLimiter(
+    config.CHALLENGE_GLOBAL_RATE_CAPACITY, config.CHALLENGE_GLOBAL_RATE_REFILL_PER_SEC
+)
 
 # Dedicated bucket for registration (P-09): it is the one namespace-existence
 # oracle we cannot remove, so it is throttled like the other sensitive paths —
@@ -210,7 +238,13 @@ def rate_limit(request: Request) -> None:
 
 
 def challenge_rate_limit(request: Request) -> None:
-    if not _challenge_limiter.allow(client_key(request)):
+    """The global backstop only — see F-RELAY-003.
+
+    The per-username charge cannot live in a dependency, because the username is
+    in the request BODY and dependencies run before it is parsed. It happens in
+    `auth_challenge` instead, right after the username is validated.
+    """
+    if not _challenge_global_limiter.allow(client_key(request)):
         raise HTTPException(status_code=429, detail="rate limited")
 
 
@@ -238,6 +272,15 @@ _REGISTER_DOMAIN = b"secure-chat/register/v1"
 # ECDH + ML-KEM-768) for the async sealed envelope, under a bumped domain so
 # v1 and v2 registration signatures can never be confused.
 _REGISTER_V2_DOMAIN = b"secure-chat/register/v2"
+
+# Bundle v3 (pentest 2026-08-07 F-RELAY-005): the signed message additionally
+# carries a monotone counter, so a same-identity re-registration cannot be
+# REPLAYED. Without it, every registration a user ever signed stayed valid
+# forever, and a hostile relay could resend an older one to roll their published
+# encryption keys back to a superseded pair — or, replaying a v1 registration,
+# strip them entirely, silently downgrading every future sealed message to an
+# account that can no longer receive one.
+_REGISTER_V3_DOMAIN = b"secure-chat/register/v3"
 
 # Login challenges are signed under their own domain prefix so a login signature
 # can never be mistaken for (or replayed as) a signature of any other protocol
@@ -324,6 +367,14 @@ def _register_message_v2(username: str, ed: str, mldsa: str, ecdh: str, mlkem: s
     )
 
 
+def _register_message_v3(username: str, ed: str, mldsa: str, ecdh: str, mlkem: str, seq: int) -> bytes:
+    return b"\n".join(
+        [_REGISTER_V3_DOMAIN, username.encode("ascii"), ed.encode("ascii"),
+         mldsa.encode("ascii"), ecdh.encode("ascii"), mlkem.encode("ascii"),
+         str(seq).encode("ascii")]
+    )
+
+
 # Web-of-trust vouch: the voucher dual-signs the TARGET's (username, bundle)
 # under its own domain, so a vouch can never be confused with a registration
 # or login signature. Client builds the identical bytes (account.js).
@@ -396,6 +447,11 @@ def init_db() -> None:
         if "ecdh_pub" not in cols:
             conn.execute("ALTER TABLE accounts ADD COLUMN ecdh_pub TEXT NOT NULL DEFAULT ''")
             conn.execute("ALTER TABLE accounts ADD COLUMN mlkem_pub TEXT NOT NULL DEFAULT ''")
+        # Pentest 2026-08-07 F-RELAY-005: monotone registration counter. Pre-v3
+        # rows start at 0, which is below every counter a v3 client will send,
+        # so an existing account can adopt the control by re-registering once.
+        if "reg_seq" not in cols:
+            conn.execute("ALTER TABLE accounts ADD COLUMN reg_seq INTEGER NOT NULL DEFAULT 0")
         # Web-of-trust vouches: one row per (voucher -> target) statement. The
         # signatures cover the target bundle AT VOUCH TIME; if the target's key
         # changes later, clients' signature checks fail and the vouch goes dead
@@ -449,6 +505,9 @@ class RegisterReq(BaseModel):
     # Bundle v2 (both or neither): public encryption keys for sealed messages.
     ecdh: str | None = None
     mlkem: str | None = None
+    # Bundle v3 (F-RELAY-005): monotone counter, signed. Absent from pre-v3
+    # clients; see `register` for what a registration without one may still do.
+    seq: int | None = Field(default=None, ge=1, le=2**53 - 1)
 
 
 class ChallengeReq(BaseModel):
@@ -461,6 +520,10 @@ class VerifyReq(BaseModel):
     username: str = Field(min_length=config.USERNAME_MIN, max_length=config.USERNAME_MAX)
     challenge: str
     sig: str
+    # Pentest 2026-08-07 F-RELAY-006: the ML-DSA half of the login proof.
+    # Optional in the model so a legacy client gets a clean 401 from the
+    # verification below rather than a 422 that would distinguish it.
+    mldsa_sig: str | None = None
 
 
 def _check_username(u: str) -> None:
@@ -499,7 +562,14 @@ def register(req: RegisterReq) -> dict:
     # ML-DSA proof stops binding a PQ public key the registrant does not hold.
     # v2 bundles sign the extended message (incl. the encryption keys) under
     # the v2 domain, binding those keys to the identity as well.
-    if req.ecdh is not None:
+    # F-RELAY-005: a v3 registration signs a monotone counter as well, which is
+    # what makes it un-replayable. The domain differs, so a v2 signature can
+    # never be read as a v3 one (or vice versa).
+    if req.seq is not None:
+        if req.ecdh is None:
+            raise HTTPException(status_code=422, detail="a counter-bearing registration must carry encryption keys")
+        msg = _register_message_v3(req.username, req.ed, req.mldsa, req.ecdh, req.mlkem, req.seq)
+    elif req.ecdh is not None:
         msg = _register_message_v2(req.username, req.ed, req.mldsa, req.ecdh, req.mlkem)
     else:
         msg = _register_message(req.username, req.ed, req.mldsa)
@@ -517,8 +587,9 @@ def register(req: RegisterReq) -> dict:
             raise HTTPException(status_code=503, detail="directory full")
         try:
             conn.execute(
-                "INSERT INTO accounts (username, ed_pub, mldsa_pub, lookup_token, ecdh_pub, mlkem_pub, created_at) VALUES (?,?,?,?,?,?,?)",
-                (req.username, req.ed, req.mldsa, token, req.ecdh or "", req.mlkem or "", int(time.time())),
+                "INSERT INTO accounts (username, ed_pub, mldsa_pub, lookup_token, ecdh_pub, mlkem_pub, created_at, reg_seq) VALUES (?,?,?,?,?,?,?,?)",
+                (req.username, req.ed, req.mldsa, token, req.ecdh or "", req.mlkem or "",
+                 int(time.time()), req.seq or 0),
             )
         except sqlite3.IntegrityError:
             # Same-identity re-registration = bundle refresh (e.g. an upgraded
@@ -527,11 +598,49 @@ def register(req: RegisterReq) -> dict:
             # match the stored row exactly, update the encryption keys and
             # return the EXISTING lookup token. Anyone else: taken.
             row = conn.execute(
-                "SELECT ed_pub, mldsa_pub, lookup_token FROM accounts WHERE username = ?",
+                "SELECT ed_pub, mldsa_pub, lookup_token, ecdh_pub, mlkem_pub, reg_seq FROM accounts WHERE username = ?",
                 (req.username,),
             ).fetchone()
             if row is None or row["ed_pub"] != req.ed or row["mldsa_pub"] != req.mldsa:
                 raise HTTPException(status_code=409, detail="username already taken")
+
+            # Pentest 2026-08-07 F-RELAY-005. The dual signature proves the
+            # registrant controls the identity keys, but it proves nothing about
+            # WHEN: every registration a user ever signed stayed valid forever,
+            # and this branch applied whichever one arrived last. So a hostile
+            # relay that captured an earlier registration could resend it to roll
+            # the victim's published encryption keys back to a superseded pair,
+            # or — replaying a v1 registration, which carries no encryption keys
+            # at all — clear them outright. Both are silent, and both downgrade
+            # every future sealed message to an account that cannot read it.
+            #
+            # A v3 registration carries a signed monotone counter, so a replay is
+            # a counter that does not move forward, and it is refused.
+            if req.seq is not None:
+                if req.seq <= row["reg_seq"]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="registration counter is not newer than the stored one (replayed registration)",
+                    )
+                conn.execute(
+                    "UPDATE accounts SET ecdh_pub = ?, mlkem_pub = ?, reg_seq = ? WHERE username = ?",
+                    (req.ecdh or "", req.mlkem or "", req.seq, req.username),
+                )
+                return {"status": "updated", "username": req.username, "lookup_token": row["lookup_token"]}
+
+            # No counter: a pre-v3 client, or a replay of one of its
+            # registrations. It cannot be told which, so it is allowed to do
+            # only the one thing a replay cannot abuse — ADD encryption keys to
+            # an account that has none (the v2 upgrade path, which is why this
+            # branch exists at all). It may never change or clear keys that are
+            # already published, because that is exactly the attack.
+            if row["ecdh_pub"] or row["mlkem_pub"]:
+                if (req.ecdh or "") != row["ecdh_pub"] or (req.mlkem or "") != row["mlkem_pub"]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="this account already publishes encryption keys; changing them needs a counter-bearing registration",
+                    )
+                return {"status": "updated", "username": req.username, "lookup_token": row["lookup_token"]}
             conn.execute(
                 "UPDATE accounts SET ecdh_pub = ?, mlkem_pub = ? WHERE username = ?",
                 (req.ecdh or "", req.mlkem or "", req.username),
@@ -572,6 +681,11 @@ def auth_challenge(req: ChallengeReq) -> dict:
     # whether or not it exists. A nonexistent account simply cannot produce a
     # valid signature at verify time, so this endpoint reveals nothing.
     _check_username(req.username)
+    # F-RELAY-003: the per-account bucket. Charged AFTER `_check_username` so a
+    # malformed name cannot mint buckets, and identically for existing and
+    # nonexistent accounts so the 429 is not an existence oracle.
+    if not _challenge_limiter.allow("challenge:" + req.username):
+        raise HTTPException(status_code=429, detail="rate limited")
     challenge = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
     # Prune + cap-check + insert must be one atomic step (P-12).
     with _store_lock:
@@ -595,14 +709,49 @@ def auth_verify(req: VerifyReq) -> dict:
     sig_raw = _b64decode_fixed(req.sig, config.ED25519_SIG_BYTES)
     with _db() as conn:
         row = conn.execute(
-            "SELECT ed_pub FROM accounts WHERE username = ?", (req.username,)
+            "SELECT ed_pub, mldsa_pub FROM accounts WHERE username = ?", (req.username,)
         ).fetchone()
     # Unknown user and bad signature are indistinguishable (both 401), so verify
-    # is not an existence oracle either (I1).
-    if row is None:
-        raise HTTPException(status_code=401, detail="challenge signature invalid")
-    ed_raw = base64.b64decode(row["ed_pub"], validate=True)
-    if not _ed25519_verify(ed_raw, sig_raw, _login_message(challenge_raw)):
+    # is not an existence oracle either (I1). Decoys keep the work identical on
+    # both branches so the 401 is not a timing oracle either — F-RELAY-007 noted
+    # the missing-user branch returned early, and the dual verification below
+    # would have widened that gap considerably.
+    ed_stored = row["ed_pub"] if row is not None else _DECOY_BUNDLE["ed_pub"]
+    mldsa_stored = row["mldsa_pub"] if row is not None else _DECOY_BUNDLE["mldsa_pub"]
+    msg = _login_message(challenge_raw)
+
+    # Pentest 2026-08-07 F-RELAY-006: login used to be Ed25519-ONLY.
+    #
+    # Registration proves control of BOTH identity keys and the handshake
+    # requires BOTH signatures (PR-3, AND-composed) — the whole point of the
+    # dual-scheme identity is that breaking one scheme is not enough. The
+    # directory session was the exception: a token minted on the classical
+    # signature alone, and that token drains and DELETES the account's mailbox
+    # and deletes its vouches. So an adversary who broke Ed25519 — the scheme
+    # the ML-DSA half exists to hedge against — got full directory control while
+    # every other surface still held.
+    #
+    # Both signatures now, over the same challenge, AND-composed exactly as the
+    # handshake does it.
+    ed_ok = _ed25519_verify(base64.b64decode(ed_stored, validate=True), sig_raw, msg)
+
+    mldsa_ok = False
+    if req.mldsa_sig is not None:
+        try:
+            mldsa_sig_raw = _b64decode_fixed(req.mldsa_sig, config.MLDSA65_SIG_BYTES)
+        except HTTPException:
+            mldsa_sig_raw = b"\x00" * config.MLDSA65_SIG_BYTES
+        mldsa_ok = _mldsa65_verify(base64.b64decode(mldsa_stored, validate=True), mldsa_sig_raw, msg)
+    else:
+        # Legacy client: run the verification anyway, against a signature that
+        # cannot pass, so the refusal costs the same time as a wrong one.
+        _mldsa65_verify(
+            base64.b64decode(mldsa_stored, validate=True),
+            b"\x00" * config.MLDSA65_SIG_BYTES,
+            msg,
+        )
+
+    if row is None or not ed_ok or not mldsa_ok:
         raise HTTPException(status_code=401, detail="challenge signature invalid")
 
     token = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")

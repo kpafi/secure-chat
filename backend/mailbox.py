@@ -29,7 +29,14 @@ import config
 from relay import KeyedRateLimiter
 from accounts import _db, current_user, _check_username, token_matches, client_key
 
+# Per-RECIPIENT bucket, charged only after the lookup token proves the sender
+# knows this handle (F-RELAY-004). Draining it now costs a valid token and
+# denies delivery to that one inbox, not to the whole relay.
 _post_limiter = KeyedRateLimiter(config.MAILBOX_RATE_CAPACITY, config.MAILBOX_RATE_REFILL_PER_SEC)
+# The absolute ceiling, keyed per client host as the old bucket was.
+_post_global_limiter = KeyedRateLimiter(
+    config.MAILBOX_GLOBAL_RATE_CAPACITY, config.MAILBOX_GLOBAL_RATE_REFILL_PER_SEC
+)
 _fetch_limiter = KeyedRateLimiter(
     config.MAILBOX_FETCH_RATE_CAPACITY, config.MAILBOX_FETCH_RATE_REFILL_PER_SEC
 )
@@ -53,8 +60,24 @@ def _fetch_rate_limit(request: Request) -> None:
 
 
 def _post_rate_limit(request: Request) -> None:
-    # Same trusted-proxy-aware keying as the /api limiters (pentest F-03).
-    if not _post_limiter.allow(client_key(request)):
+    """The global backstop for mailbox POST — see F-RELAY-004.
+
+    Pentest 2026-08-07 F-RELAY-004: this dependency used to be the WHOLE control,
+    and it ran before the handler body, i.e. before the lookup-token and
+    recipient-existence checks. Keyed on `client_key`, which behind Tor is one
+    shared loopback bucket for everybody. So an attacker with no token, no
+    account and no knowledge of any real handle could POST to a nonexistent
+    recipient and still spend a token from the shared budget on every request —
+    the 404 only came AFTER the charge. Draining it denied mail delivery for
+    every legitimate sender on the relay.
+
+    Two changes. The tight per-recipient charge now happens INSIDE the handler,
+    after the token gate, so unauthenticated garbage cannot spend a legitimate
+    sender's budget. What stays here is a much larger absolute ceiling, so
+    unauthenticated traffic is still bounded — it just can no longer be aimed at
+    anyone in particular.
+    """
+    if not _post_global_limiter.allow(client_key(request)):
         raise HTTPException(status_code=429, detail="rate limited")
 
 
@@ -98,6 +121,12 @@ def post_mail(recipient: str, req: PostReq, t: str = Query(default="", max_lengt
         stored = row["lookup_token"] if row is not None else secrets.token_urlsafe(config.LOOKUP_TOKEN_BYTES)
         if not token_matches(t, stored) or row is None:
             raise HTTPException(status_code=404, detail="no such user")
+        # F-RELAY-004: charge the tight bucket HERE — past the token gate, so a
+        # sender with no valid token cannot spend anyone's budget, and keyed per
+        # recipient, so a sender who does hold one can only exhaust the inbox
+        # they actually hold a token for.
+        if not _post_limiter.allow("mail:" + recipient):
+            raise HTTPException(status_code=429, detail="rate limited")
         total = conn.execute("SELECT COUNT(*) FROM mailbox").fetchone()[0]
         if total >= config.MAX_MAILBOX_TOTAL:
             raise HTTPException(status_code=503, detail="mailbox storage full")

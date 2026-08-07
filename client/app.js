@@ -22,6 +22,7 @@ import { makeCipher, isAscii, bufToB64, b64ToBuf } from "./crypto.js";
 import { Identity } from "./identity.js";
 import {
   signHandshake, verifyHandshake, freshNonce, isValidNonce, signKnock, verifyKnock,
+  signAdmission, verifyAdmission,
   unb64,
 } from "./auth.js";
 import * as account from "./account.js";
@@ -155,7 +156,15 @@ let cipher = null;
 let otpRecord = null;      // the OTP pad in use this session (bytes + offsets), or null
 let otpAtRest = null;      // cached at-rest key {key,salt,iters} for cheap re-saves
 let otpLockRelease = null; // releases this pad's exclusive same-origin lock
-const TAB_ID = Math.random().toString(36).slice(2) + Date.now().toString(36);
+// Pentest 2026-08-07 F-CRYPTO-014: there was a `TAB_ID` here, seeded from
+// `Math.random()`. It was the sole discriminator between "my pad lease" and
+// "someone else's" — the one value standing between the user and a two-time
+// pad, and the only Math.random in the client on a path that gated key
+// material. The lease it served is gone (see acquirePadLock), and with it the
+// id: nothing else ever read it. Deleted rather than kept "for bookkeeping",
+// which is what the first version of this fix wrongly claimed it was for. The
+// blanket Math.random ban in no-fallback.test.mjs now covers the original
+// concern without needing a value to point at.
 let joined = false;
 let verified = false; // in-person gate passed; gates RECEIVING as well as sending
 // Pentest 2026-07-26 P-19: the room id and algorithm this session actually
@@ -215,7 +224,7 @@ let msgChain = Promise.resolve(); // serializes async message handling (C-01)
 //   hello:     {hello: true, n, reply} — plaintext nonce exchange that seeds
 //              handshake freshness. Sent on join (reply=false); the receiver
 //              answers once (reply=true) and then sends its signed offer.
-//   handshake: {pub, reply, idb, sig} — `pub` is the sender's ephemeral/public
+//   handshake: {pub, reply, idb, sig, adm?} — `pub` is the sender's ephemeral/public
 //              key; `idb`+`sig` authenticate it over room + both nonces.
 // The `reply` flags prevent infinite ping-pong in both phases: the later
 // joiner initiates, the early joiner answers exactly once.
@@ -242,8 +251,18 @@ function unpackKey(b64) {
 // gate showed the benign first-contact prompt instead of the loud
 // "identity key CHANGED" alarm. Overwriting sc.contacts.v1 with garbage was
 // therefore enough to strip TOFU change detection for every contact.
+// Pentest 2026-08-07 F-ATREST-003 (confirmed), second half. `hasStore()` reads
+// a deletable localStorage key, so `!contacts.hasStore()` asserted "pins are
+// readable" precisely when an attacker had just deleted the store: this
+// returned TRUE while the store was locked, the loud branch below was skipped,
+// getPin() returned null, and every peer rendered as a benign first contact.
+// The alarm was inverted by the very act it was built to catch. "No store" is
+// only benign when this device never had one — which is what the identity-
+// anchored flag answers (and it answers `false` when it cannot know, so an
+// identity-less flow behaves exactly as before).
 function pinsReadable() {
-  return contacts.isUnlocked() || !contacts.hasStore();
+  if (contacts.isUnlocked()) return true;
+  return !contacts.hasStore() && !contacts.storeExpected();
 }
 function getPin(key) {
   return contacts.isUnlocked() ? contacts.getPin(key) : null;
@@ -531,6 +550,7 @@ async function createIdentity() {
     identity = await Identity.generate();
     const blob = await identity.export(pass);
     localStorage.setItem(LS_IDENTITY, blob);
+    installStoreAnchor(pass);
     await unlockContacts(pass); // contact store shares the identity passphrase
     els.idPass.value = "";
     await showIdentityUnlocked();
@@ -555,6 +575,7 @@ async function unlockWithPassphrase(pass) {
       // upgrade happens exactly once, then re-publish the bundle below.
       localStorage.setItem(LS_IDENTITY, await identity.export(pass));
     }
+    installStoreAnchor(pass);
     await unlockContacts(pass); // contact store shares the identity passphrase
     await showIdentityUnlocked();
     return null;
@@ -757,6 +778,7 @@ async function loginAccount() {
 // ---- users view (contact list + safety marks) -----------------------------
 
 let contactsError = null; // unlock failure message, shown in the Users view
+let chatsError = null;    // chat-store unlock failure, kept separate (F3)
 let apiToken = null;      // directory session token (from Log in), memory only
 
 // Unlock the contact store with the identity passphrase. Called wherever the
@@ -766,6 +788,23 @@ let apiToken = null;      // directory session token (from Log in), memory only
 // may legitimately have a foreign blob and want to wipe it), but it must be
 // visible wherever it matters — so besides `contactsError` for the Users view,
 // the room screen warns and the verification gate refuses to auto-accept.
+// F-ATREST-003/004: give the contact store its anti-deletion anchor before it
+// opens. The flag lives inside the identity's AEAD, so clearing it means
+// deleting the identity — loud, unlike deleting two localStorage keys.
+// `markEstablished` re-exports the identity, i.e. one PBKDF2; it runs once in
+// the life of the device, not once per save.
+function installStoreAnchor(pass) {
+  const anchorFor = (flag) => ({
+    established: identity.deviceFlags[flag] === true,
+    markEstablished: async () => {
+      identity.deviceFlags[flag] = true;
+      localStorage.setItem(LS_IDENTITY, await identity.export(pass));
+    },
+  });
+  contacts.setStoreAnchor(anchorFor("contactsEstablished"));
+  chats.setStoreAnchor(anchorFor("chatsEstablished")); // F-ATREST-005
+}
+
 async function unlockContacts(pass) {
   try {
     await contacts.unlock(pass);
@@ -776,8 +815,16 @@ async function unlockContacts(pass) {
   }
   try {
     await chats.unlock(pass); // chat history shares the at-rest posture
+    chatsError = null;
   } catch (e) {
+    // Fix review 2026-08-07 (F3): this used to fold into `contactsError` with no
+    // line of its own, so a chat store that refuses to open — which the new
+    // F-ATREST-005 rollback control can now do, loudly and on purpose — showed
+    // the user nothing but a locked Chats pane, and re-entering the passphrase
+    // failed identically with no explanation. Say what happened and why.
+    chatsError = e.message;
     contactsError = contactsError || e.message;
+    addLine("sys", "", `[chat history did not unlock — ${e.message}]`);
   }
 }
 
@@ -1127,8 +1174,14 @@ async function refreshVouchMarks() {
         ).catch(() => false);
         if (ok) names.push(v.voucher);
       }
-      await contacts.setVouches(c.username, names);
-      changed = true;
+      // F-PROTO-005: `c` is a snapshot taken before the awaited fetch above.
+      // Bind the write to the bundle the signatures were actually checked
+      // against, so a directory that stalls /vouches while the user re-adds the
+      // contact cannot land this mark on keys the voucher never signed.
+      const written = await contacts.setVouches(c.username, names, {
+        ed: c.ed, mldsa: c.mldsa, ecdh: c.ecdh ?? null, mlkem: c.mlkem ?? null,
+      });
+      if (written) changed = true;
     }
   } finally {
     vouchRefreshRunning = false;
@@ -1746,11 +1799,19 @@ async function connectInner() {
     }
     // Exclusive same-origin lock: a pad must be live in only ONE tab/window at a
     // time, or two sessions would draw the same keystream (two-time pad).
-    otpLockRelease = await acquirePadLock(padId);
-    if (!otpLockRelease) {
+    const padLock = await acquirePadLock(padId);
+    if (padLock === PAD_LOCK_UNSUPPORTED) {
+      // F-CRYPTO-014: no Web Locks means no way to prove the pad is not already
+      // open elsewhere, and guessing is how a two-time pad happens. Name the
+      // real limitation rather than blaming another tab.
+      hint("This browser is too old to guarantee a one-time pad is open only once (it has no Web Locks API), and using a pad twice would destroy its security. Use a current browser for one-time-pad mode, or pick another encryption mode.", true);
+      return;
+    }
+    if (!padLock) {
       hint("This one-time pad is open in another tab or window. Close it there first \u2014 using a pad twice at once would break its security.", true);
       return;
     }
+    otpLockRelease = padLock;
     try {
       const unlocked = await ensureUnlocked(padId); // decrypts the pad at rest
       otpRecord = unlocked.record;
@@ -2049,10 +2110,18 @@ async function signedHandshake(room) {
 }
 
 function sendSignedKey(room, reply) {
-  return signedHandshake(room).then(({ pub, sig }) => {
+  return signedHandshake(room).then(async ({ pub, sig }) => {
+    const frame = { pub, reply, idb: myBundle, sig };
+    // F-PROTO-001 (fix review F1): if we admitted this peer, prove it. This is
+    // the guest's ONLY evidence that a human approved them — everything else it
+    // could look at is written by the relay. Signed over the admitted bundle
+    // and both session nonces; see auth.js.
+    if (admittedBundle) {
+      frame.adm = await signAdmission(identity, room, [myNonce, peerNonce], admittedBundle);
+    }
     ws.send(JSON.stringify({
       type: "key", room, alg: sessionAlg,
-      payload: packKey({ pub, reply, idb: myBundle, sig }),
+      payload: packKey(frame),
     }));
   });
 }
@@ -2148,6 +2217,25 @@ async function finishSession(room) {
 }
 
 async function handleMessage(room, raw) {
+  // Pentest 2026-08-07 F-PROTO-002. Every authentication refusal in this file
+  // ends in a bare `ws.close()`, which stops nothing that is already in flight:
+  // `msgChain` is a FIFO promise chain, so frames the relay batched with the
+  // refused one were already queued and kept driving this state machine after
+  // the decision to refuse. Demonstrated end state, after the client printed
+  // "[a SECOND identity tried to complete the key exchange — refusing]": the
+  // channel was still derived, the receive gate still opened, relayed
+  // ciphertext was still decrypted and rendered as trusted peer content, the
+  // Send box was re-enabled on a socket that was going away, and the user was
+  // left reading "Verified. Messages are end-to-end encrypted." The loud
+  // warning survived only as a scrolled-past log line.
+  //
+  // `close()` moves readyState to CLOSING synchronously, so testing it here —
+  // at dispatch, not at queue time — drops every frame queued behind a refusal,
+  // whichever of the ~10 refusal sites fired. Nothing else in the session
+  // closes the socket while frames are still worth processing: a user
+  // disconnect and a relay-side close both want exactly this behaviour too.
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
   let m;
   try {
     m = JSON.parse(raw);
@@ -2346,7 +2434,7 @@ async function handleMessage(room, raw) {
         if (!cipher.needsHandshake) {
           throw new Error("unexpected key-exchange message for this mode");
         }
-        const { pub, reply, idb, sig } = p;
+        const { pub, reply, idb, sig, adm } = p;
         if (peerNonce === null) {
           throw new Error("peer sent a handshake before the nonce exchange");
         }
@@ -2374,6 +2462,20 @@ async function handleMessage(room, raw) {
           return;
         }
 
+        // F-PROTO-001 (fix review F1): does this peer hold a signed admission
+        // for US? Checked against `idbCanon` — the identity that just passed
+        // the handshake signature — so the two cannot be different parties.
+        // Verification failures are simply "no proof": the refusal decision is
+        // made once, below, so a forged proof and a missing one read alike.
+        let admissionProven = false;
+        if (adm && myBundle) {
+          try {
+            admissionProven = await verifyAdmission(idbCanon, room, [myNonce, peerNonce], myBundle, adm);
+          } catch {
+            admissionProven = false;
+          }
+        }
+
         // P-08: if WE admitted this peer, the handshake must come from the
         // identity we were shown and approved. This is the binding that makes
         // the approval prompt more than decoration: the relay picks who is
@@ -2394,9 +2496,36 @@ async function handleMessage(room, raw) {
         // only legitimate way a second member exists is that WE admitted it
         // (relay.py `admit` is the sole seat-granting path), so a handshake
         // with nobody admitted means the relay seated someone behind our back.
-        if (roomRole === "owner" && !admittedSomeone()) {
+        //
+        // Pentest 2026-08-07 F-PROTO-001, and its own fix review (F1/F2).
+        //
+        // The `roomRole === "owner" &&` conjunct that used to be here made the
+        // refusal conditional on the relay — exactly the failure mode the
+        // paragraph above warns about. Three relay frames turned it off.
+        //
+        // The first attempt replaced it with "...or we minted this room code",
+        // which was wrong in both directions: `selfMintedRooms` is empty after
+        // a reload and never holds a PASTED code, so the attack stayed open in
+        // the ordinary workflow; and room ownership on an honest relay goes to
+        // whoever JOINS FIRST, so an honest peer who connected before us made
+        // us a legitimate guest and the check fired on honest traffic.
+        //
+        // So the role is not consulted at all any more, in any form. There are
+        // exactly two ways a peer can legitimately be in this room, and both
+        // are things we can check for ourselves:
+        //
+        //   * WE admitted them — `admittedSomeone()`, set only by our own
+        //     admit prompt (relay.py `admit` is the sole seat-granting path);
+        //   * THEY admitted us, and signed that decision over our bundle and
+        //     this session's nonces — verified just above, against the same
+        //     identity that passed `verifyHandshake`.
+        //
+        // In the configuration the finding is about — the relay telling both
+        // parties they are guests, so nobody is ever asked to approve — neither
+        // holds, on both endpoints, and both refuse.
+        if (!admittedSomeone() && !admissionProven) {
           addLine("sys", "", "[a peer completed the key exchange without ever being approved — refusing]");
-          hint("Someone was connected to this room without your approval. The relay is not behaving. Disconnecting.", true);
+          hint("Nobody approved this connection: the other side cannot show that they let you in, and you did not let them in. The relay is not behaving. Disconnecting.", true);
           if (ws) ws.close();
           return;
         }
@@ -2737,34 +2866,50 @@ function otpPersistFailed(err) {
 // Prevents the concurrent-use two-time-pad break: two tabs each loading the same
 // pad at the same offset. Uses the Web Locks API (auto-released if the tab dies)
 // where available, with a localStorage-heartbeat lease as a fallback.
+// Returned instead of a release function when this engine has no Web Locks API.
+// Distinct from `null` ("someone else holds the pad") because the two need very
+// different sentences in front of the user.
+const PAD_LOCK_UNSUPPORTED = "unsupported";
+
+// Exclusive same-origin lock on a pad. OTP's entire information-theoretic claim
+// (P9) rests on no pad byte ever encrypting twice; within a tab that is
+// `sendOffset` monotonicity plus the P-01 zeroization guard, and ACROSS tabs it
+// is this and nothing else.
+//
+// Pentest 2026-08-07 F-CRYPTO-014: when Web Locks was absent this fell back to a
+// hand-rolled localStorage lease, which is not an exclusion primitive. `getItem`
+// and `setItem` are separate operations with no cross-tab atomicity, so two tabs
+// that both read "free" both acquired; and because nothing re-read the lease
+// after acquisition, a backgrounded tab whose 4 s heartbeat was throttled lost
+// its 12 s lease to a second tab and kept sending regardless. Both tabs then
+// held the same decrypted pad at the same `sendOffset`; the P-01 spent-keystream
+// guard reads each tab's own copy, so it passes in the stale one — a genuine
+// two-time pad on the wire plus a reused one-time MAC key, recoverable by
+// crib-dragging.
+//
+// A lease that cannot be made atomic in localStorage must not be presented as an
+// exclusion lock for that hazard, so the fallback is gone: no Web Locks, no OTP
+// mode. This is the same fail-closed stance the project takes on a missing
+// `crypto.subtle` (see no-fallback.test.mjs) — the affected engines are Chrome /
+// Android System WebView < 69, Firefox < 96 and Safari 15.0-15.3, and on those
+// the honest answer is that we cannot guarantee the pad is open only once.
+//
+// The Web Locks path itself needs no re-validation: the lock is held inside an
+// unresolved callback promise for the life of the session, and a rejected
+// request resolves `null`, which fails closed.
 function acquirePadLock(padId) {
   const name = "sc.otp.lock.v1." + padId;
-  if (navigator.locks && navigator.locks.request) {
-    return new Promise((resolveGot) => {
-      let releaseHeld;
-      navigator.locks.request(name, { ifAvailable: true }, (lock) => {
-        if (!lock) { resolveGot(null); return; } // held elsewhere
-        resolveGot(() => { if (releaseHeld) releaseHeld(); });
-        return new Promise((r) => { releaseHeld = r; }); // hold until released
-      }).catch(() => resolveGot(null));
-    });
+  if (!(navigator.locks && navigator.locks.request)) {
+    return Promise.resolve(PAD_LOCK_UNSUPPORTED);
   }
-  return Promise.resolve(acquireLeaseFallback(name));
-}
-function acquireLeaseFallback(name) {
-  const STALE = 12000;
-  try {
-    const cur = JSON.parse(localStorage.getItem(name) || "null");
-    if (cur && Date.now() - cur.ts < STALE && cur.owner !== TAB_ID) return null;
-  } catch { /* fall through */ }
-  const write = () => localStorage.setItem(name, JSON.stringify({ owner: TAB_ID, ts: Date.now() }));
-  write();
-  try { if (JSON.parse(localStorage.getItem(name)).owner !== TAB_ID) return null; } catch { return null; }
-  const hb = setInterval(write, 4000);
-  return () => {
-    clearInterval(hb);
-    try { if (JSON.parse(localStorage.getItem(name)).owner === TAB_ID) localStorage.removeItem(name); } catch { /* ignore */ }
-  };
+  return new Promise((resolveGot) => {
+    let releaseHeld;
+    navigator.locks.request(name, { ifAvailable: true }, (lock) => {
+      if (!lock) { resolveGot(null); return; } // held elsewhere
+      resolveGot(() => { if (releaseHeld) releaseHeld(); });
+      return new Promise((r) => { releaseHeld = r; }); // hold until released
+    }).catch(() => resolveGot(null));
+  });
 }
 function releaseOtpLock() {
   if (otpLockRelease) { try { otpLockRelease(); } catch { /* ignore */ } otpLockRelease = null; }

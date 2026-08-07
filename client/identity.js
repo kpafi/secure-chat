@@ -113,6 +113,42 @@ export class Identity {
     this._mlkemSecret = mlkemSecret || null; // Uint8Array
     this.mlkemPub = mlkemPub || null;    // Uint8Array(1184)
     this.upgraded = false; // true when import() added missing encryption keys
+    // Authenticated device facts, carried INSIDE this identity's AEAD.
+    //
+    // Pentest 2026-08-07 F-ATREST-003/004 (both confirmed). The contact store's
+    // anti-deletion control was a witness in localStorage, and its whole truth
+    // table bottomed out in "neither store nor witness present -> genuine first
+    // run -> proceed". Both are plain localStorage keys and deleting one needs
+    // no passphrase, so two `removeItem` calls produced a silent, empty,
+    // PIN-LESS store: key-change detection simply off, alarm inverted, evidence
+    // healed on the next persist. L-1 raised the cost from one removeItem to
+    // two and bought nothing else.
+    //
+    // The bit that says "a store was established on this device" therefore
+    // cannot live in a deletable key. It lives here instead. Contents are
+    // one-shot booleans (see contacts.js), so this costs one extra re-export
+    // over the life of the device, not one per save.
+    //
+    // HONEST LIMIT (fix review 2026-08-07, F4). An earlier version of this
+    // comment claimed the flag "cannot be deleted without deleting the identity
+    // itself", and that is FALSE. An attacker does not have to delete the blob
+    // — they roll it back. A restored older `sc.identity.v1` opens with the
+    // same passphrase and carries the same keys, fingerprint and safety number,
+    // so the user notices nothing; `import` below then reads no `flags`, the
+    // anchor reads false, and the contact store's deletion check takes its
+    // "genuine first run" path. Cost to the attacker: one setItem plus the two
+    // removeItem calls they already had.
+    //
+    // Note this is not hypothetical for existing devices: every identity blob
+    // written before this change has no `flags` field at all, so today's blob
+    // IS the archived artifact.
+    //
+    // The anchor is therefore only as strong as the identity blob's own
+    // rollback resistance, and F-ATREST-008 records that the identity blob has
+    // NO anti-rollback control. Closing F-ATREST-008 is what would make this
+    // argument hold; until then this raises the attacker's cost from two
+    // removeItem calls to two plus a saved copy of one file, and no further.
+    this.deviceFlags = {};
   }
 
   static async _genEncKeys() {
@@ -193,6 +229,10 @@ export class Identity {
       edPub: b64(this.edPubRaw),
       mldsaSecret: b64(this._mldsaSecret),
       mldsaPub: b64(this.mldsaPub),
+      // F-ATREST-003/004: inside the AEAD, so it cannot be forged or stripped
+      // without the passphrase — and cannot be deleted without deleting the
+      // identity itself.
+      flags: this.deviceFlags || {},
     };
     if (this._ecdhPriv) {
       const ecdhPkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", this._ecdhPriv));
@@ -252,6 +292,10 @@ export class Identity {
       fields.mlkemPub = unb64(o.mlkemPub);
     }
     const id = new Identity(fields);
+    // Absent on any blob written before F-ATREST-003/004, which reads as "this
+    // device has not recorded a contact store yet" — the safe default, since a
+    // device that genuinely has one will record it on the next unlock.
+    id.deviceFlags = (o.flags && typeof o.flags === "object" && !Array.isArray(o.flags)) ? o.flags : {};
     if (!o.ecdhPriv) {
       // Pre-v3 blob: add encryption keys now. The SIGNING identity (and thus
       // fingerprint/safety number/pins) is unchanged; the caller should

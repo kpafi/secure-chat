@@ -20,6 +20,23 @@
 // twice).
 
 const LS_CHATS = "sc.chats.v1";
+// Pentest 2026-08-07 F-ATREST-005 / F-CRYPTO-006. The chat store had no
+// generation counter, no witness and no domain tag — the only one of the four
+// at-rest stores with no rollback control at all. One `removeItem` silently
+// reset the P-13 envelope-replay ring (so every envelope the relay still holds
+// replays as new) and the negotiated AES256 mode (so a chat the user upgraded
+// falls back to SEALED with no notice). And because the wrapper was
+// byte-compatible with the contact store's and shared its passphrase, the chat
+// plaintext could be presented AS a contact store (F-ATREST-004(b)).
+//
+// Same three controls contacts.js carries, for the same reasons: a tag inside
+// the AEAD so no other module's plaintext can be adopted here (and this one
+// cannot be adopted elsewhere), a monotone generation, and a witness beside the
+// blob whose mere presence proves a store is supposed to exist — anchored, like
+// the contact store, to the identity AEAD so deleting both keys is not enough.
+const LS_CHATS_GEN = "sc.chats.gen.v1";
+const CHATS_DOMAIN = "secure-chat/chats-store/v2";
+const CHATS_GEN_DOMAIN = "secure-chat/chats-generation/v1";
 const KDF_ITERS = 600000;
 const MAX_MESSAGES_PER_CHAT = 500; // keep the newest; bound the blob size
 
@@ -64,6 +81,26 @@ async function deriveKey(passphrase, salt, iters) {
 let dataKey = null;
 let salt = null;
 let chats = null; // { username: chat } while unlocked
+let generation = 0; // monotone store generation (F-ATREST-005); bumped on persist
+
+// The anti-deletion anchor, injected by app.js — see contacts.js for the full
+// argument. `null` means "no identity to anchor to", which reads as "cannot
+// know" everywhere below and so never fires an alarm on its own.
+let anchor = null;
+
+export function setStoreAnchor(a) {
+  anchor = a;
+}
+
+export function storeExpected() {
+  return anchor !== null && anchor.established === true;
+}
+
+async function noteStoreEstablished() {
+  if (anchor === null || anchor.established === true) return;
+  await anchor.markEstablished();
+  anchor.established = true;
+}
 
 // Pentest 2026-07-26 P-20: the store is keyed by a directory username, and the
 // server's charset (^[a-z0-9_.-]+$, 3-32) makes `__proto__` and `constructor`
@@ -88,16 +125,23 @@ export function lock() {
   dataKey = null;
   salt = null;
   chats = null;
+  generation = 0;
 }
 
 export async function unlock(passphrase) {
   if (!passphrase) throw new Error("passphrase required to unlock the chat store");
   const raw = localStorage.getItem(LS_CHATS);
   if (!raw) {
+    // F-ATREST-005: "no store" is a first run only if this device never had
+    // one. Otherwise it is a deletion, and adopting a fresh empty store would
+    // silently reset the envelope-replay ring and every negotiated chat mode.
+    await assertStoreNotDeleted(passphrase);
     salt = crypto.getRandomValues(new Uint8Array(16));
     dataKey = await deriveKey(passphrase, salt, KDF_ITERS);
     chats = newStore();
+    generation = 0;
     await persist();
+    await noteStoreEstablished();
     return;
   }
   const blob = JSON.parse(raw);
@@ -110,10 +154,142 @@ export async function unlock(passphrase) {
     lock();
     throw new Error("chat store does not decrypt with this passphrase (different identity, or tampered)");
   }
+  const data = JSON.parse(dec.decode(plain));
+
+  // F-CRYPTO-006: the plaintext must be a chat STORE and not another record
+  // that happens to decrypt under the same key. Two acceptable shapes, exactly
+  // as contacts.js: tagged (normal), or the untagged pre-v2 bare map, which is
+  // adopted once and rewritten tagged. The discriminator is the tag INSIDE the
+  // AEAD, never the attacker-writable outer `v` byte.
+  const tagged = data !== null && typeof data === "object" && !Array.isArray(data) &&
+    Object.prototype.hasOwnProperty.call(data, "d");
+  const notAChatStore = () => {
+    lock();
+    return new Error(
+      "the chat history on this device is not a chat store — refusing to open it, because " +
+      "continuing would silently discard your message history and negotiated chat modes",
+    );
+  };
+  if (tagged && data.d !== CHATS_DOMAIN) throw notAChatStore();
+  if (!tagged) {
+    // A pre-v2 store is a plain map of username -> chat record. Require that
+    // shape rather than accepting any object, so no other module's plaintext
+    // can be laundered in here.
+    const isChatRecord = (c) => c !== null && typeof c === "object" && !Array.isArray(c) &&
+      (Array.isArray(c.messages) || typeof c.mode === "string");
+    const looksLikeChats = data !== null && typeof data === "object" && !Array.isArray(data) &&
+      Object.values(data).every(isChatRecord);
+    if (!looksLikeChats) throw notAChatStore();
+    // ...and once this device has recorded a real store, the legacy shape is a
+    // downgrade, not a migration: the migration provably already happened.
+    if (storeExpected()) {
+      lock();
+      throw new Error(
+        "your chat history has been replaced with an older-format copy that carries no rollback " +
+        "record — refusing to open it, because that would silently reset message-replay protection " +
+        "and any encryption mode you negotiated",
+      );
+    }
+  }
+
   // P-20: JSON.parse yields a normal object (with a prototype); re-key it into a
   // null-prototype store before anything indexes it by a username.
-  chats = newStore(JSON.parse(dec.decode(plain)));
-  if (sanitizeModes()) await persist();
+  chats = newStore(tagged ? data.chats : data);
+  generation = Number.isInteger(data.gen) ? data.gen : 0;
+  await assertNotRolledBack(Number.isInteger(data.gen) ? data.gen : null);
+  let dirty = sanitizeModes();
+  if (!tagged) dirty = true; // rewrite tagged, so adoption happens exactly once
+  if (dirty) await persist();
+  await noteStoreEstablished();
+}
+
+// ---- rollback / deletion detection (F-ATREST-005) --------------------------
+// Mirrors contacts.js. The witness carries its OWN salt so it stays readable
+// when the store that would otherwise hold the salt has been removed.
+async function readWitness(passphrase = null) {
+  const raw = localStorage.getItem(LS_CHATS_GEN);
+  if (!raw) return null;
+  let rec;
+  try {
+    rec = JSON.parse(raw);
+  } catch {
+    return { corrupt: true };
+  }
+  try {
+    const key = passphrase === null
+      ? dataKey
+      : await deriveKey(passphrase, unb64(rec.salt), rec.iters || KDF_ITERS);
+    const w = JSON.parse(dec.decode(await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: unb64(rec.iv) }, key, unb64(rec.ct),
+    )));
+    if (w.d !== CHATS_GEN_DOMAIN || !Number.isInteger(w.gen)) return { corrupt: true };
+    return w;
+  } catch {
+    return { corrupt: true };
+  }
+}
+
+async function writeWitness() {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plain = enc.encode(JSON.stringify({ d: CHATS_GEN_DOMAIN, gen: generation }));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, dataKey, plain));
+  localStorage.setItem(LS_CHATS_GEN, JSON.stringify({
+    salt: b64(salt), iters: KDF_ITERS, iv: b64(iv), ct: b64(ct),
+  }));
+}
+
+async function assertStoreNotDeleted(passphrase) {
+  const w = await readWitness(passphrase);
+  if (w === null) {
+    if (storeExpected()) {
+      lock();
+      throw new Error(
+        "your chat history and its generation record have BOTH been deleted from this device — " +
+        "refusing to start over with an empty store, because that would silently turn message-replay " +
+        "protection off and reset every negotiated chat mode",
+      );
+    }
+    return; // genuine first run
+  }
+  lock();
+  if (w.corrupt) {
+    throw new Error(
+      "a chat history was expected on this device but is missing, and its generation record does not " +
+      "decrypt — refusing to start over with an empty store",
+    );
+  }
+  throw new Error(
+    `your chat history (generation ${w.gen}) has been DELETED from this device — refusing to start ` +
+    "over with an empty store, because that would silently reset message-replay protection",
+  );
+}
+
+async function assertNotRolledBack(storeGen) {
+  const w = await readWitness();
+  if (w === null) {
+    // No witness. Fine only for a pre-v2 store, which has no generation either;
+    // a store that HAS one lost its witness, which is tampering.
+    if (Number.isInteger(storeGen)) {
+      lock();
+      throw new Error(
+        "the generation record for your chat history is missing — refusing to open the store, " +
+        "because a rollback could no longer be detected",
+      );
+    }
+    return;
+  }
+  if (w.corrupt) {
+    lock();
+    throw new Error("the generation record for your chat history is damaged or forged");
+  }
+  const gen = Number.isInteger(storeGen) ? storeGen : 0;
+  if (gen < w.gen) {
+    lock();
+    throw new Error(
+      `your chat history is OLDER than this device recorded (generation ${gen}, expected ${w.gen}) — ` +
+      "an earlier copy has been restored, which would replay old messages and undo negotiated modes",
+    );
+  }
 }
 
 // Repair a store written before the F-02 allow-list existed: a chat whose mode
@@ -139,17 +315,52 @@ function sanitizeModes() {
 
 async function persist() {
   if (!dataKey) throw new Error("chat store is locked");
+  // Pentest 2026-08-07 fix review (F3): the same L-3 compare-and-swap
+  // contacts.js has carried since 2026-07-29, which the first cut of this
+  // function omitted while copying everything around it.
+  //
+  // Two tabs both unlock at generation N and both write N+1; the second
+  // overwrites the first AND rewrites the witness, so the rollback check agrees
+  // and nothing notices. Here that silently discards exactly what the
+  // generation counter was added to protect: the P-13 `seenIds` envelope-replay
+  // ring and any negotiated AES256 mode. Unlike contacts, EVERY chat operation
+  // persists (ensure/append/markSeen/setMode), so concurrent writes are the
+  // ordinary case rather than an exotic one.
+  //
+  // Worse without the CAS: if a stale tab's whole persist lands between another
+  // tab's store and witness writes, the store ends up OLDER than the witness
+  // and `assertNotRolledBack` then refuses forever — an unrecoverable lockout
+  // caused by the user's own second tab.
+  //
+  // Not a security boundary against a device-local attacker (they can write the
+  // witness too); it is protection against the user's own second tab.
+  const witness = await readWitness();
+  if (witness && !witness.corrupt && witness.gen > generation) {
+    lock();
+    throw new Error(
+      "your chat history was changed in another tab (or another window) — this page is out of date. " +
+      "Reload before sending or reading more, so the other tab's messages are not lost.",
+    );
+  }
+  generation += 1;
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const plain = enc.encode(JSON.stringify(chats));
+  // F-CRYPTO-006 / F-ATREST-005: the domain tag and the generation live INSIDE
+  // the AEAD, so neither can be stripped or rewritten without the passphrase.
+  const plain = enc.encode(JSON.stringify({ d: CHATS_DOMAIN, gen: generation, chats }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, dataKey, plain));
   localStorage.setItem(
     LS_CHATS,
-    JSON.stringify({ v: 1, iters: KDF_ITERS, salt: b64(salt), iv: b64(iv), ct: b64(ct) }),
+    JSON.stringify({ v: 2, iters: KDF_ITERS, salt: b64(salt), iv: b64(iv), ct: b64(ct) }),
   );
+  // Witness last: if this throws, the store is newer than the witness, which
+  // reads as "fine" rather than as a rollback. The other order would lock the
+  // user out of their own history on a quota error.
+  await writeWitness();
 }
 
 export function wipe() {
   localStorage.removeItem(LS_CHATS);
+  localStorage.removeItem(LS_CHATS_GEN);
   lock();
 }
 

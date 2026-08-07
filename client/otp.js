@@ -106,6 +106,24 @@ const WM_DOMAIN = "secure-chat/otp-watermark/v1";
 const NATIVE_ABSENT = -1;
 const NATIVE_TAMPERED = -2;
 
+// Pentest 2026-08-07 F-ATREST-001 / F-ATREST-002. The native floor covered the
+// SEND offset only — F-ATREST-009 counted it as 1 of ~5 rollback-sensitive
+// counters — so on Android, the one platform where a floor exists at all:
+//
+//   * rolling back `recvHighWater` was undetected, and every OTP frame the peer
+//     had already sent re-authenticated as fresh (anti-replay gone);
+//   * rolling back the `exported` flag silently re-armed export, and a second
+//     export of the same pad is a two-time pad, which is the one failure OTP
+//     cannot survive.
+//
+// Both now get their own floor. `PadFloor.bump/read` key on an opaque string and
+// MAC the key together with the value (`…/v1\0<padId>\0<value>`), so a derived
+// id is a distinct, separately-authenticated slot — no Kotlin change needed, and
+// a floor still cannot be lifted from one slot to another.
+const floorKeySend = (padId) => padId;
+const floorKeyRecv = (padId) => padId + "#recv";
+const floorKeyExported = (padId) => padId + "#exported";
+
 // Pentest 2026-07-29 H-1. Feature-detecting the bridge alone was a silent
 // downgrade: `SecureChatPadFloor` is an ordinary writable global, so
 // `delete window.SecureChatPadFloor` at document-start made the code below
@@ -248,7 +266,7 @@ async function readWatermark(id, key) {
   }
 }
 
-async function writeWatermark(id, key, wm) {
+async function writeWatermark(id, key, wm, exportedNow = false) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const plain = encU.encode(JSON.stringify({
     d: WM_DOMAIN, padId: id, send: wm.send, recv: wm.recv,
@@ -260,11 +278,17 @@ async function writeWatermark(id, key, wm) {
   // holds only the TRANSFER passphrase and so cannot open the record above, can
   // still refuse to resurrect a consumed pad from its (always pristine) file.
   localStorage.setItem(usedKey(id), "1");
-  // F-1: mirror the SEND floor into the native store, where it cannot be
-  // deleted from the JS context and cannot be lowered at all. Only the send
-  // side — that is what keystream reuse turns on, and it keeps the bridge to a
-  // single integer per pad. The recv side stays AEAD-mirrored inside the blob.
-  if (nativeFloor) nativeFloor.bump(id, wm.send);
+  // F-1: mirror the floors into the native store, where they cannot be deleted
+  // from the JS context and cannot be lowered at all.
+  if (nativeFloor) {
+    nativeFloor.bump(floorKeySend(id), wm.send);
+    // F-ATREST-001: the recv high-water mark, which used to be AEAD-mirrored
+    // only — and an AEAD record can be restored wholesale from a snapshot.
+    nativeFloor.bump(floorKeyRecv(id), wm.recv);
+    // F-ATREST-002: monotone one-way latch. `bump` never lowers, so once this
+    // pad has been exported the fact survives any restore of the blob.
+    if (exportedNow) nativeFloor.bump(floorKeyExported(id), 1);
+  }
   // "Post-fix OTP has run on this device." Deletable like everything else here,
   // so it may only ESCALATE a warning, never authorise anything — see the
   // legacy-adoption gate in unlockPad.
@@ -287,8 +311,22 @@ export const PAD_SIZES = [
 // keystream keyed by their hash. XOR of independent sources is never weaker than
 // either: if getRandomValues were ever weak, the drawn entropy still randomizes
 // the pad; if the drawing were low-entropy, the CSPRNG still carries it.
+// Web Crypto hard-caps a single getRandomValues() call at 65536 bytes and
+// throws QuotaExceededError above it (Web Cryptography API §10.1.1). Pentest
+// 2026-08-07 F-CRYPTO-012: `randomPad` asked for the whole pad in one call, so
+// two of the three sizes PAD_SIZES advertises — 256 KiB and 1 MiB — could never
+// be generated at all. Fill in chunks; the CSPRNG is the same one either way.
+const CSPRNG_MAX_BYTES = 65536;
+
+function fillRandom(buf) {
+  for (let off = 0; off < buf.length; off += CSPRNG_MAX_BYTES) {
+    crypto.getRandomValues(buf.subarray(off, Math.min(off + CSPRNG_MAX_BYTES, buf.length)));
+  }
+  return buf;
+}
+
 async function randomPad(totalBytes, fingerBytes) {
-  const base = crypto.getRandomValues(new Uint8Array(totalBytes));
+  const base = fillRandom(new Uint8Array(totalBytes));
   if (!fingerBytes || fingerBytes.length === 0) return base;
   const seed = await crypto.subtle.digest("SHA-256", fingerBytes);
   const key = await crypto.subtle.importKey("raw", seed, { name: "AES-CTR" }, false, ["encrypt"]);
@@ -569,7 +607,7 @@ async function writePadBlob(record, key, salt, iters) {
     ct: b64(ct),
   }));
   writeIndexEntry(record, { exported: !!record.exported });
-  await writeWatermark(record.padId, key, wm);
+  await writeWatermark(record.padId, key, wm, !!record.exported);
 }
 
 // First save of a freshly generated/imported pad: derive a NEW at-rest key from
@@ -689,6 +727,26 @@ export async function unlockPad(padId, passphrase, opts = {}) {
       "the rollback record for this pad is missing — refusing to use the pad, because pad reuse could no longer be detected; exchange a fresh pad",
     );
   }
+  // F-ATREST-001/002: the two floors the send floor never covered. Read them in
+  // the same breath as the send floor and for the same reason — they are the one
+  // input here an attacker holding the JS context cannot touch.
+  const nativeRecv = nativeFloor ? nativeFloor.read(floorKeyRecv(padId)) : NATIVE_ABSENT;
+  const nativeExported = nativeFloor ? nativeFloor.read(floorKeyExported(padId)) : NATIVE_ABSENT;
+  if (nativeRecv === NATIVE_TAMPERED || nativeExported === NATIVE_TAMPERED) {
+    throw new Error(
+      "this pad's device-protected rollback record is damaged or forged — refusing to use the pad; exchange a fresh one",
+    );
+  }
+  // F-ATREST-002. `exported` is a one-way latch: exporting a pad twice hands the
+  // same keystream to two devices, which is a two-time pad — the one failure OTP
+  // cannot survive. The flag lived only inside the blob, so restoring a
+  // pre-export snapshot silently re-armed export. The native latch never lowers,
+  // so it outlives any restore of the blob.
+  if (nativeExported >= 1 && !inner.exported) {
+    throw new Error(
+      "this pad was already exported once, but its stored copy says otherwise — refusing to use it, because exporting the same pad twice would reuse key material; exchange a fresh pad",
+    );
+  }
   // …and the converse (2026-07-29 H-1): a blob written WHILE a floor was in
   // force, with the floor now gone. Removing `clear()` from the bridge closed
   // the JS route to this state, but file-level access can still delete the
@@ -737,7 +795,15 @@ export async function unlockPad(padId, passphrase, opts = {}) {
       readLegacyHW(padId),
       native > NATIVE_ABSENT ? native : 0,
     ),
-    recv: maxOf(outerWm ? outerWm.recv : 0, inner.hwRecv | 0),
+    // F-ATREST-001: the native recv floor joins the same max(). Without it a
+    // recv rollback was undetected even on Android — the AEAD record and its
+    // mirror can both be restored from one snapshot, and then every OTP frame
+    // the peer already sent authenticates again as fresh.
+    recv: maxOf(
+      outerWm ? outerWm.recv : 0,
+      inner.hwRecv | 0,
+      nativeRecv > NATIVE_ABSENT ? nativeRecv : 0,
+    ),
   };
   if (sendOffset < wm.send) {
     throw new Error("pad state was rolled back (consumed key material) — refusing to use it; exchange a fresh pad");

@@ -39,7 +39,23 @@ export function parseHandle(handle) {
 
 // Exact bytes the server reconstructs in accounts._register_message:
 //   DOMAIN \n username \n ed \n mldsa     (ASCII, newline-delimited)
-function registerMessageBytes(username, bundle) {
+//
+// Pentest 2026-08-07 F-RELAY-005: a v3 registration appends a monotone counter.
+// The dual signature proves control of the identity keys but says nothing about
+// WHEN it was made, so every registration a user had ever signed stayed valid
+// forever and the server applied whichever arrived last. A hostile relay could
+// therefore resend an older one to roll the published encryption keys back to a
+// superseded pair, or replay a v1 registration — which carries no encryption
+// keys at all — to strip them outright, silently making the account unable to
+// receive sealed mail. The counter makes a replay a counter that does not move
+// forward, which the server refuses.
+function registerMessageBytes(username, bundle, seq) {
+  if (bundle.ecdh && bundle.mlkem && Number.isInteger(seq)) {
+    return enc.encode(
+      [REGISTER_DOMAIN.replace("/v1", "/v3"), username, bundle.ed, bundle.mldsa,
+       bundle.ecdh, bundle.mlkem, String(seq)].join("\n"),
+    );
+  }
   // Bundle v2 (with encryption keys) signs the extended message under the v2
   // domain — matches accounts._register_message_v2 on the server.
   if (bundle.ecdh && bundle.mlkem) {
@@ -48,6 +64,24 @@ function registerMessageBytes(username, bundle) {
     );
   }
   return enc.encode([REGISTER_DOMAIN, username, bundle.ed, bundle.mldsa].join("\n"));
+}
+
+// The counter this device will sign into its next registration (F-RELAY-005).
+//
+// Kept in localStorage next to the identity and bumped on every registration,
+// so it moves forward across re-registrations and key rotations. It is not a
+// secret and it does not need to be unforgeable: the SIGNATURE is what the
+// server checks, and the counter only has to be strictly greater than the one
+// the server already stored. A device whose counter is behind (fresh install,
+// cleared storage) gets a 409 naming the stored value, and `register` below
+// retries once from there — so this is a convenience, not a trust anchor.
+const LS_REG_SEQ = "sc.regseq.v1";
+
+function nextRegSeq() {
+  const cur = Number.parseInt(localStorage.getItem(LS_REG_SEQ) || "0", 10);
+  const next = (Number.isFinite(cur) && cur > 0 ? cur : 0) + 1;
+  localStorage.setItem(LS_REG_SEQ, String(next));
+  return next;
 }
 
 async function asError(res) {
@@ -66,17 +100,44 @@ async function asError(res) {
 // + key binding + PQ ownership). Returns { username, lookup_token }.
 export async function register(base, identity, username) {
   const bundle = identity.publicBundle();
-  const { ed: sig, mldsa: mldsa_sig } = await identity.sign(registerMessageBytes(username, bundle));
-  const body = { username, ed: bundle.ed, mldsa: bundle.mldsa, sig, mldsa_sig };
-  if (bundle.ecdh && bundle.mlkem) {
-    body.ecdh = bundle.ecdh;
-    body.mlkem = bundle.mlkem;
+  const hasEncKeys = Boolean(bundle.ecdh && bundle.mlkem);
+
+  const attempt = async (seq) => {
+    const { ed: sig, mldsa: mldsa_sig } = await identity.sign(registerMessageBytes(username, bundle, seq));
+    const body = { username, ed: bundle.ed, mldsa: bundle.mldsa, sig, mldsa_sig };
+    if (hasEncKeys) {
+      body.ecdh = bundle.ecdh;
+      body.mlkem = bundle.mlkem;
+      if (Number.isInteger(seq)) body.seq = seq;
+    }
+    return fetch(base + "/api/register", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    });
+  };
+
+  // F-RELAY-005: a bundle with encryption keys registers under v3 with a
+  // counter. A pre-v3 identity (no encryption keys yet) has nothing to roll
+  // back and keeps using the v1 message.
+  let seq = hasEncKeys ? nextRegSeq() : null;
+  let res = await attempt(seq);
+
+  // The server refuses a counter that is not ahead of the one it stored. That
+  // is the replay defence doing its job, but it also catches an honest device
+  // whose local counter fell behind (reinstall, cleared storage), so retry once
+  // from a counter that is definitely ahead. The retry is bounded to one and
+  // still has to carry a valid signature, so it grants an attacker nothing:
+  // they cannot sign the retry.
+  if (!res.ok && res.status === 409 && Number.isInteger(seq)) {
+    const detail = await res.clone().text();
+    if (detail.includes("counter")) {
+      seq = Math.max(seq, Date.now());
+      localStorage.setItem(LS_REG_SEQ, String(seq));
+      res = await attempt(seq);
+    }
   }
-  const res = await fetch(base + "/api/register", {
-    method: "POST",
-    headers: JSON_HEADERS,
-    body: JSON.stringify(body),
-  });
+
   if (!res.ok) {
     const err = new Error(await asError(res));
     err.status = res.status;
@@ -181,11 +242,21 @@ export async function login(base, identity, username) {
 
   // Sign under the login domain prefix (matches accounts._login_message) so the
   // signature is bound to the login protocol and can't be cross-used elsewhere.
-  const sig = await identity.signEd(concat(enc.encode(LOGIN_DOMAIN + "\n"), unb64(challenge)));
+  //
+  // Pentest 2026-08-07 F-RELAY-006: this used to be the Ed25519 signature ALONE,
+  // making the directory session the one place the dual-scheme identity was not
+  // AND-composed. Registration proves control of both keys and the handshake
+  // requires both signatures; a session token minted on the classical key alone
+  // then drained and DELETED the mailbox and deleted the account's vouches. So
+  // an adversary who broke Ed25519 — precisely what the ML-DSA half is there to
+  // hedge — owned the directory session while every other surface held. Both
+  // signatures now, over the identical message.
+  const loginMsg = concat(enc.encode(LOGIN_DOMAIN + "\n"), unb64(challenge));
+  const { ed: sig, mldsa: mldsa_sig } = await identity.sign(loginMsg);
   const vRes = await fetch(base + "/api/auth/verify", {
     method: "POST",
     headers: JSON_HEADERS,
-    body: JSON.stringify({ username, challenge, sig }),
+    body: JSON.stringify({ username, challenge, sig, mldsa_sig }),
   });
   if (!vRes.ok) throw new Error("verify failed: " + (await asError(vRes)));
   return vRes.json(); // { token, ttl }

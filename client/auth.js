@@ -99,6 +99,79 @@ export async function verifyHandshake(peerBundle, roomId, nonces, ephemeralPubB6
   );
 }
 
+// ---- admission proof (pentest 2026-08-07 F-PROTO-001, fix review F1) -------
+//
+// The owner-side half of P-10 — "refuse a handshake from anyone we did not
+// admit" — is enforceable locally, because the owner ran the admit prompt
+// itself. The GUEST side had no equivalent: the only evidence it had of having
+// been approved was that the relay sent it a `pending` frame and then a
+// `joined` frame, both of which the relay writes for free. So a relay that told
+// BOTH parties they were guests left neither one asked to approve anybody, and
+// an unapproved identity completed the whole handshake.
+//
+// The first attempt inferred ownership from "we minted this room code", which
+// is wrong twice over: the Set is empty after a reload and never holds a pasted
+// code (so the attack stayed open in the common workflow), and room ownership
+// on an honest relay goes to whoever JOINS FIRST, not to whoever minted the
+// code (so it fired on honest traffic). Neither fact is about the code.
+//
+// This is the evidence that actually exists: when the owner admits a knocker it
+// SIGNS that decision, over the admitted bundle and this connection's nonces.
+// The guest verifies that signature against the same identity that just passed
+// `verifyHandshake`. A relay cannot forge it without the owner's identity key,
+// and cannot replay one issued to somebody else because the admitted bundle's
+// digest is inside it. In the both-guests configuration neither party ran an
+// admit prompt, so neither can produce one and both refuse — which is the whole
+// point.
+//
+// Deliberately a SEPARATE signature rather than a new field in the handshake
+// transcript: the transcript is `secure-chat/handshake/v3` and is verified
+// byte-for-byte on both sides, so extending it would be a silent wire break
+// between client versions. This adds a field that old clients simply never send
+// — which a new client refuses, loudly, as an unapproved peer.
+//
+// Freshness: both per-connection nonces are folded in, so an admission from an
+// earlier session of the same room does not verify. Binding: both the admitted
+// AND the admitting bundle are covered, so it cannot be re-pointed at another
+// identity in either direction.
+const ADMISSION_DOMAIN = new TextEncoder().encode("secure-chat/room-admission-proof/v1");
+
+async function admissionTranscript(roomId, nonces, admittedBundle, signerBundle) {
+  const [a, b] = nonces;
+  if (!isValidNonce(a) || !isValidNonce(b)) {
+    throw new Error("admission proof requires two valid session nonces");
+  }
+  if (!admittedBundle || !admittedBundle.ed || !admittedBundle.mldsa) {
+    throw new Error("admission proof requires the admitted identity bundle");
+  }
+  if (!signerBundle || !signerBundle.ed || !signerBundle.mldsa) {
+    throw new Error("admission proof requires the signer's identity bundle");
+  }
+  return concat(
+    ADMISSION_DOMAIN,
+    new TextEncoder().encode(roomId),
+    foldNonces(a, b),
+    await Identity.bundleDigest(admittedBundle),
+    await Identity.bundleDigest(signerBundle),
+  );
+}
+
+// Signed by the OWNER, for the peer it just let in.
+export async function signAdmission(identity, roomId, nonces, admittedBundle) {
+  return identity.sign(await admissionTranscript(roomId, nonces, admittedBundle, identity.publicBundle()));
+}
+
+// Checked by the GUEST: "this peer approved ME, in this room, in this session".
+// `myBundle` is the guest's own public bundle — the thing the owner saw in the
+// knock and signed over.
+export async function verifyAdmission(ownerBundle, roomId, nonces, myBundle, sigBundle) {
+  return Identity.verify(
+    ownerBundle,
+    await admissionTranscript(roomId, nonces, myBundle, ownerBundle),
+    sigBundle,
+  );
+}
+
 // ---- room admission (pentest 2026-07-26 P-08) ------------------------------
 // The knock is the introduction a waiting party sends to the room owner, who
 // decides whether to let them in. It is signed so the claim "these are my keys"

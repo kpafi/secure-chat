@@ -66,9 +66,12 @@ def _register(username):
 
 def _login(ident):
     ch = client.post("/api/auth/challenge", json={"username": ident["username"]}).json()["challenge"]
-    sig = ident["ed_priv"].sign(b"secure-chat/login/v1\n" + base64.b64decode(ch))
+    msg = b"secure-chat/login/v1\n" + base64.b64decode(ch)
     resp = client.post("/api/auth/verify", json={
-        "username": ident["username"], "challenge": ch, "sig": _b64(sig),
+        "username": ident["username"], "challenge": ch,
+        "sig": _b64(ident["ed_priv"].sign(msg)),
+        # F-RELAY-006: both schemes, AND-composed, as everywhere else.
+        "mldsa_sig": _b64(ML_DSA_65.sign(ident["mldsa_secret"], msg)),
     })
     assert resp.status_code == 200, resp.text
     return resp.json()["token"]

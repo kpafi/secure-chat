@@ -104,6 +104,12 @@ const poisoned = {
     { name: "AES-GCM", iv }, key, enc.encode(JSON.stringify(poisoned)),
   ));
   localStorage.setItem("sc.chats.v1", JSON.stringify({ ...blob, iv: b64(iv), ct: b64(ct) }));
+  // Pentest 2026-08-07 F-ATREST-005: the store now carries a generation and a
+  // witness beside it. `poisoned` is the shape an app version PREDATING both
+  // wrote, so a device holding it has no witness either — drop it, or this
+  // fixture is indistinguishable from a rollback (which the store is now
+  // required to refuse, and does; see chats-rollback.test.mjs).
+  localStorage.removeItem("sc.chats.gen.v1");
 }
 
 chats.lock();

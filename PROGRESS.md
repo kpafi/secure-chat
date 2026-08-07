@@ -3,7 +3,107 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (2026-07-28, Tor onion service LIVE)
+## ⮕ RESUME HERE (2026-08-07, the 2026-08-07 pentest: 15 of 15 fixed, ONE UNVERIFIED)
+
+Branch `pentest-2026-08-07-fixes`, **not merged, not deployed**. Backend
+**154 passed**, client **143 checks**, e2e **13/13 + 32/32 + 8/8 + 12/12**
+(room-admission, all-modes, two-user-flow, no-dead-ends). 20 files, ~1500 lines.
+
+**Read this first: one fix is NOT verified.** The rebuilt F-PROTO-001 admission
+check blocks the hostile-relay attack in both scenarios — but it does not stop
+at the new refusal. No refusal line in the victim log, socket still `connected`
+(so `ws.close()` never ran), no page errors, and both parties stall at the hello
+phase instead. Until that is explained the fix may be holding for an incidental
+reason, which is not a property to claim. Harness in the scratchpad `h/`
+(`hostile.mjs` on :8099 policy=demote + `proto001.mjs`); note its relay log only
+prints join/knock, so the absence of `key` lines there proves nothing.
+
+**What was fixed.** All 14 Medium findings plus three Lows whose severity is
+capped only by precondition (`F-CRYPTO-009` RSA parameter validation,
+`F-CRYPTO-012` unusable pad sizes, `F-CRYPTO-014` the OTP lease lock). Details
+per finding in the TODO section below.
+
+**The fix pass was itself pentested, and it found five things — two of them
+regressions this branch introduced.** That gate is why it is worth running:
+
+* **F1 (High)** — the first F-PROTO-001 fix inferred ownership from "we minted
+  this room code". Wrong twice: `selfMintedRooms` is empty after a reload and
+  never holds a PASTED code, so the attack stayed open in the ordinary
+  workflow. Rebuilt around a signed admission (below).
+* **F2 (Medium, introduced)** — the same fix fired on an HONEST relay. Room
+  ownership goes to whoever JOINS FIRST, not to whoever minted the code, so a
+  peer connecting first made the minter a legitimate guest and the client
+  disconnected them from their own room — silently, because `ws.onclose` →
+  `showScreen("room")` → `clearHints()` wipes the message and the log line is in
+  the hidden chat pane. Removed at the source.
+* **F3 (Medium, introduced)** — `chats.js persist()` copied the generation,
+  witness and write ordering from `contacts.js` but NOT its L-3 compare-and-swap.
+  Every chat operation persists, so two tabs is the ordinary case: the stale tab
+  silently discarded the `seenIds` replay ring and negotiated modes, and one
+  interleaving left store gen < witness gen = **permanent unrecoverable
+  lockout**. CAS ported; chats unlock failures now have their own message.
+* **F4 (Medium)** — the anchor comments claimed the flag "cannot be deleted
+  without deleting the identity". False: you roll the identity blob BACK, not
+  delete it, and every pre-fix blob has no `flags` field, so today's blob on
+  every device IS the archived artifact. Claim withdrawn in both files; the
+  dependency on **F-ATREST-008** (identity blob has no anti-rollback control) is
+  now stated where the fix lives.
+* **F5 (Low-Med)** — revocation deleted only `pins["user:"+name]`, but live-room
+  peers are pinned under `room:<id>` — usually the ONLY pin there is. Worse, the
+  new test asserted the residual was correct. Now sweeps by bundle.
+
+**Two contract changes that need saying out loud:**
+
+1. **Directory key rotation now requires a counter.** `register/v3` carries a
+   signed monotone `seq` (new `reg_seq` column). A registration WITHOUT one may
+   only ADD encryption keys to an account that has none — it can no longer
+   change or clear published ones, because a hostile replay is indistinguishable
+   from a genuine rotation. `test_same_identity_reregistration_refreshes_keys`
+   asserted the old, vulnerable contract and was rewritten.
+2. **Directory login is dual-scheme.** `/auth/verify` requires Ed25519 AND
+   ML-DSA over the same challenge. Old clients get a clean 401. Both decoy paths
+   run the ML-DSA verification anyway so the 401 does not become the timing
+   oracle F-RELAY-007 already noted (measured: ML-DSA verify ~7 ms).
+
+Also a wire break worth knowing: the admission proof (`adm` in the key frame,
+domain `secure-chat/room-admission-proof/v1`) is a separate signature rather
+than a new field in the `handshake/v3` transcript — deliberately, so the
+transcript is not silently changed — but a client that does not send it is
+refused as unapproved.
+
+**Not done, and deliberately not decided alone:**
+
+* **F-CRYPTO-009 residual.** Partial validation cannot certify a modulus is a
+  product of two large primes, so `e=65537` with `n = <small factor> × <large
+  prime>` still hands an RSA session to a passive observer. Closing it needs a
+  contributory root — which needs a THIRD handshake frame, breaking app.js's
+  "answer the initiator exactly once" invariant — or deprecating RSA transport.
+* **Lock-on-background (F-ANDROID-003).** `FLAG_SECURE` is set, which closes the
+  filed recents-snapshot leak. Lock-on-background is a different threat and would
+  re-prompt for the passphrase on every app switch.
+* **Anchor vs. identity restore.** There is no restore-from-backup flow today
+  (`Identity.import` only ever reads the localStorage blob; export is
+  clipboard-only), so this is unreachable — but if one is added, restoring a
+  backup carrying `contactsEstablished` onto a store-less device is a lockout.
+  Device-scoping the flag does NOT work: a device id in localStorage is
+  deletable, which reopens the original hole.
+* **Android build is unverified.** `FLAG_SECURE` is correct by inspection but was
+  never compiled: `./gradlew compileDebugKotlin` fails on this machine with
+  `25.0.3-ea` (JDK 25 vs this Gradle/AGP). Confirmed identical on unmodified
+  master, so it is pre-existing and not caused by the change. An open question
+  from the review: the JS `prompt` AlertDialog is a separate `Window` and may
+  need its own `FLAG_SECURE` on some API levels.
+
+**Run the relay for e2e with the venv, not `./run.sh`** — `run.sh` uses the
+system python and dies on `ModuleNotFoundError: dilithium_py`:
+
+```bash
+cd backend && SECURE_CHAT_DB=/tmp/e2e.db .venv/bin/python -m uvicorn main:app \
+  --host 127.0.0.1 --port 8000 --no-server-header --no-proxy-headers \
+  --no-access-log --log-level warning --ws-max-size 66560 &
+```
+
+## ⮕ (superseded) 2026-07-28, Tor onion service LIVE
 
 **The last never-started checklist item is done.** The relay is reachable at
 `http://626vkwn6znrko2xhorirvv5ttrbzcr3xkdjmk65cks26qkvadplyk5id.onion`
@@ -2836,6 +2936,84 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
   live integration suites, backend `pytest` 48 passed.
 
 ## TODO / NEXT (suggested order)
+
+### 🟡 OPEN — the 2026-08-07 pentest (branch `pentest-2026-08-07-fixes`, unmerged)
+All 15 planned items are implemented, but the branch is **not clean to merge**:
+one fix is unverified and three decisions are the user's. Report:
+`secure-chat-pentest-2026-08-07.md`; per-finding detail and PoCs live OUTSIDE
+the repo in `/home/kpafi/secure-chat-pentest/state/findings/`.
+
+**Blocking:**
+
+1. **⚠️ UNVERIFIED — F-PROTO-001's replacement.** The hostile-relay harness shows
+   the attack blocked in both scenarios (minted AND pasted code), but NOT at the
+   new refusal: no refusal line, socket still `connected`, both parties stalled
+   at the hello phase, no page errors. Find where it actually stops before
+   calling this closed. Harness: scratchpad `h/hostile.mjs` (:8099,
+   policy=demote) + `h/proto001.mjs`.
+2. **Re-run `pentest-new-code` over this round.** The first pass found 5 items,
+   2 of them regressions introduced by the fixes (see the RESUME entry). This
+   round is bigger and touches the relay protocol.
+
+**Decisions needed before merge:**
+
+3. **F-CRYPTO-009 residual** — a counterparty using `e=65537` with
+   `n = <small factor> × <large prime>` still hands the RSA session to a passive
+   observer. Partial validation cannot catch it. Either make the root
+   contributory (needs a third handshake frame, breaking "answer the initiator
+   exactly once") or deprecate peer-chosen RSA transport.
+4. **Lock-on-background (F-ANDROID-003)** — `FLAG_SECURE` closes the filed
+   recents leak; lock-on-background is a separate threat and re-prompts for the
+   passphrase on every app switch. Also open: does the JS `prompt` AlertDialog
+   need its own `FLAG_SECURE`?
+5. **Anchor vs. identity restore** — unreachable today (no restore flow), but a
+   future one plus a backup carrying `contactsEstablished` = lockout on a
+   store-less device. Device-scoping the flag does not work.
+6. **Android build unverified** — `FLAG_SECURE` never compiled here; the
+   toolchain failure (`25.0.3-ea`) is pre-existing on master.
+
+**Fixed on the branch, each with a regression test:**
+
+- **✅ F-ATREST-003 / F-ATREST-004** (the two CONFIRMED findings) — the "a store
+  was established here" bit moved out of two deletable localStorage keys into
+  the identity AEAD (`deviceFlags`), `looksLikeStore` now checks pin-map SHAPE
+  rather than the key name `pins`, and `pinsReadable()` no longer returns true
+  while the store is locked. **Honest limit:** defeated by an identity-blob
+  rollback — see F-ATREST-008, which this now depends on.
+- **✅ F-ATREST-005 / F-CRYPTO-006** — chat store gets the domain tag, generation
+  counter and witness contacts.js already had, plus the L-3 CAS (added after the
+  review caught its absence).
+- **✅ F-ATREST-001 / F-ATREST-002** — the native floor covered the SEND offset
+  only. The recv watermark and the `exported` latch now get their own slots via
+  derived ids (`<padId>#recv`, `<padId>#exported`). No Kotlin change: PadFloor
+  MACs key and value together, so each derived id is a separate authenticated
+  slot.
+- **✅ F-ATREST-007** — revocation sweeps every pin whose bundle matches the
+  contact, not just `user:<name>`.
+- **✅ F-PROTO-002** — `handleMessage` drops frames queued behind a refusal.
+  NOTE: the review could not reproduce the original finding in Chromium at all
+  (the browser's own readyState gate already drops the burst), so this is
+  defence-in-depth, and the finding's severity rested on shim behaviour.
+- **✅ F-PROTO-005** — the vouch mark is bound to the bundle its signatures were
+  verified against.
+- **✅ F-RELAY-001** — `config.py` no longer recommends
+  `TRUSTED_PROXIES=127.0.0.1`; Tor and Caddy share `127.0.0.1:8000`, so trusting
+  the IP trusts a raw TCP forward that appends nothing.
+- **✅ F-RELAY-003 / F-RELAY-004** — tight buckets keyed on username / recipient
+  with a larger per-host backstop; the mailbox charge moved past the token gate.
+- **✅ F-RELAY-005** — `register/v3` with a signed monotone counter.
+- **✅ F-RELAY-006** — `/auth/verify` requires both signature schemes.
+- **✅ F-ANDROID-003** — `FLAG_SECURE` (uncompiled, see above).
+- **✅ F-CRYPTO-009 / -012 / -014** — RSA peer-key validation; `randomPad`
+  chunked past the 64 KiB `getRandomValues` cap (2 of 3 advertised pad sizes
+  could never be generated); the OTP localStorage lease deleted in favour of
+  failing closed when Web Locks is absent.
+
+**Known test-coverage gaps (from the review, not yet closed):** no regression
+test for F-PROTO-001, F-PROTO-002, F-CRYPTO-014 or F-ANDROID-003;
+`otp-padgen.test.mjs` never exercises the partial-tail branch (all three pad
+sizes are exact multiples of 65536); `rsa-keyvalidation.test.mjs` asserts only
+`instanceof Error`, so a fixture could drift onto the wrong branch unnoticed.
 
 ### ✅ CLOSED — the 2026-07-29 pentest, all 13 items (fixed 2026-07-30)
 Every finding in `secure-chat-pentest-2026-07-29.md` is fixed on branch
