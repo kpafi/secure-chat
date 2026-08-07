@@ -2938,62 +2938,120 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
 ## TODO / NEXT (suggested order)
 
 ### 🟡 OPEN — the 2026-08-07 pentest (branch `pentest-2026-08-07-fixes`, unmerged)
-All 15 planned items are implemented, but the branch is **not clean to merge**:
-one fix is unverified and three decisions are the user's. Report:
-`secure-chat-pentest-2026-08-07.md`; per-finding detail and PoCs live OUTSIDE
-the repo in `/home/kpafi/secure-chat-pentest/state/findings/`.
+Committed as `ba4233e`. All 15 planned items implemented; backend **154
+passed**, client **143 checks**, e2e **13/13 + 32/32 + 8/8 + 12/12**. The branch
+is **NOT clean to merge** — everything below is what stands between it and
+master, in the order I would do it.
 
-**Blocking:**
+Report: `secure-chat-pentest-2026-08-07.md`. Per-finding detail and PoCs live
+OUTSIDE this repo, in `/home/kpafi/secure-chat-pentest/state/findings/`.
 
-1. **⚠️ UNVERIFIED — F-PROTO-001's replacement.** The hostile-relay harness shows
-   the attack blocked in both scenarios (minted AND pasted code), but NOT at the
-   new refusal: no refusal line, socket still `connected`, both parties stalled
-   at the hello phase, no page errors. Find where it actually stops before
-   calling this closed. Harness: scratchpad `h/hostile.mjs` (:8099,
-   policy=demote) + `h/proto001.mjs`.
-2. **Re-run `pentest-new-code` over this round.** The first pass found 5 items,
-   2 of them regressions introduced by the fixes (see the RESUME entry). This
-   round is bigger and touches the relay protocol.
+#### A. Blocking — must be resolved before merge
 
-**Decisions needed before merge:**
+1. **⚠️ Explain where the F-PROTO-001 attack actually stops.** The rebuilt
+   admission proof blocks the hostile-relay attack in BOTH scenarios (minted and
+   pasted code), but not at the new refusal: no refusal line in the victim log,
+   socket still `connected` (so `ws.close()` never ran), no page errors, and both
+   parties stall at the hello phase. Until that is explained the fix may be
+   holding for an incidental reason, which is not a property to claim.
+   Harness: scratchpad `h/hostile.mjs` (:8099, `policy=demote`) + `h/proto001.mjs`.
+   Its relay log only prints join/knock, so absent `key` lines prove nothing —
+   instrument the client instead.
+2. **Re-run `pentest-new-code` over the whole branch.** The first pass covered
+   round 1 only and found 5 items, 2 of them regressions introduced by the fixes.
+   Never reviewed: the round-2 repairs (CAS, pin sweep, admission proof) and all
+   five of the last batch — including the relay protocol and the registration /
+   login contract changes, which are the highest-risk code on the branch.
+3. **Re-run the four e2e suites after any change to (1) or (2).** They are the
+   only end-to-end check on the new registration counter, dual-scheme login and
+   admission proof. Relay must be started with the venv (see item 12).
 
-3. **F-CRYPTO-009 residual** — a counterparty using `e=65537` with
-   `n = <small factor> × <large prime>` still hands the RSA session to a passive
-   observer. Partial validation cannot catch it. Either make the root
-   contributory (needs a third handshake frame, breaking "answer the initiator
-   exactly once") or deprecate peer-chosen RSA transport.
-4. **Lock-on-background (F-ANDROID-003)** — `FLAG_SECURE` closes the filed
-   recents leak; lock-on-background is a separate threat and re-prompts for the
-   passphrase on every app switch. Also open: does the JS `prompt` AlertDialog
-   need its own `FLAG_SECURE`?
-5. **Anchor vs. identity restore** — unreachable today (no restore flow), but a
-   future one plus a backup carrying `contactsEstablished` = lockout on a
-   store-less device. Device-scoping the flag does not work.
-6. **Android build unverified** — `FLAG_SECURE` never compiled here; the
-   toolchain failure (`25.0.3-ea`) is pre-existing on master.
+#### B. Decisions for the user — each changes what gets built
 
-**Fixed on the branch, each with a regression test:**
+4. **F-CRYPTO-009 residual (RSA).** A counterparty using `e=65537` with
+   `n = <small factor> × <large prime>` still hands the session to a passive
+   observer; partial validation cannot catch it, and raising the trial-division
+   bound does not help. Either make the root contributory (needs a THIRD
+   handshake frame, breaking app.js's "answer the initiator exactly once"
+   invariant) or deprecate peer-chosen RSA key transport in favour of
+   DHKE/PQKEM. Documented at `assertRsaPublicKeyUsable` in crypto.js.
+5. **Lock-on-background (F-ANDROID-003).** `FLAG_SECURE` closes the filed
+   recents-snapshot leak. Lock-on-background is a different threat (device seized
+   while backgrounded and unlocked) and would re-prompt for the passphrase on
+   every app switch. Needs a new hook in the web client — the native shell does
+   not own lock state.
+6. **Anchor vs. a future identity-restore flow.** Unreachable today
+   (`Identity.import` only ever reads the localStorage blob; export is
+   clipboard-only). If a restore flow is added, a backup carrying
+   `contactsEstablished` restored onto a store-less device is a lockout.
+   Device-scoping the flag does NOT work — a device id in localStorage is
+   deletable, which reopens the original hole. Design it WITH the restore
+   feature, not before.
+7. **Merge / deploy plan for the two contract changes.** `register/v3` and
+   dual-scheme `/auth/verify` both refuse older clients. Decide whether the relay
+   and clients ship together (they are served from the same origin, so normally
+   yes) and whether existing accounts need a one-time re-registration to adopt
+   `reg_seq` — pre-v3 rows start at 0, so one v3 registration adopts the control.
+
+#### C. Work the review identified but this branch did not do
+
+8. **F-ATREST-008 — the identity blob has no anti-rollback control.** Still
+   `candidate`/low in the report, but the F-ATREST-003/004 fix is now
+   LOAD-BEARING on it: the anchor is defeated by rolling the identity blob back
+   rather than deleting it, and every pre-fix blob has no `flags` field, so
+   today's blob on every device is the archived artifact. Fixing this is what
+   would make the anchor argument actually hold.
+9. **Close the test-coverage gaps.** No regression test at all for F-PROTO-001,
+   F-PROTO-002, F-CRYPTO-014 or F-ANDROID-003. `otp-padgen.test.mjs` never
+   exercises the partial-tail branch (all three `PAD_SIZES` are exact multiples
+   of 65536 — add e.g. 100000). `rsa-keyvalidation.test.mjs` asserts only
+   `instanceof Error`, so a fixture could drift onto a different branch and still
+   pass green; assert the message. A cheap source-level test that `FLAG_SECURE`
+   appears before `setContentView` would at least catch deletion.
+10. **Verify `FLAG_SECURE` on real hardware, and check the AlertDialog.**
+    Never compiled here — `./gradlew compileDebugKotlin` fails with `25.0.3-ea`
+    (JDK 25 vs this Gradle/AGP), confirmed identical on unmodified master, so it
+    is pre-existing. Open question from the review: the JS `prompt` handler
+    builds an `AlertDialog` with a password field, which is a separate `Window`
+    and may need its own `FLAG_SECURE` on some API levels.
+11. **Get the pentest workspace under version control, or reference it.** The
+    committed report cross-references `state/findings/F-*.md` and
+    `state/coverage/<lane>.md` with no hint that they live in a sibling directory
+    outside the repo. Also `state/verified-sound.md` is an empty stub — the
+    cross-lane "attacked and held" digest exists only inside §5 of the report.
+
+#### D. Environment traps that cost time this session
+
+12. **`backend/run.sh` cannot run the relay for e2e.** It uses the system python
+    and dies on `ModuleNotFoundError: dilithium_py`. Use the venv:
+    ```bash
+    cd backend && SECURE_CHAT_DB=/tmp/e2e.db .venv/bin/python -m uvicorn main:app \
+      --host 127.0.0.1 --port 8000 --no-server-header --no-proxy-headers \
+      --no-access-log --log-level warning --ws-max-size 66560 &
+    ```
+    Worth fixing `run.sh` itself to prefer `.venv/bin/python`.
+
+#### Fixed on the branch, each with a regression test
 
 - **✅ F-ATREST-003 / F-ATREST-004** (the two CONFIRMED findings) — the "a store
   was established here" bit moved out of two deletable localStorage keys into
   the identity AEAD (`deviceFlags`), `looksLikeStore` now checks pin-map SHAPE
   rather than the key name `pins`, and `pinsReadable()` no longer returns true
-  while the store is locked. **Honest limit:** defeated by an identity-blob
-  rollback — see F-ATREST-008, which this now depends on.
+  while the store is locked. **Honest limit: see item 8.**
 - **✅ F-ATREST-005 / F-CRYPTO-006** — chat store gets the domain tag, generation
-  counter and witness contacts.js already had, plus the L-3 CAS (added after the
-  review caught its absence).
+  counter, witness and L-3 CAS that contacts.js already had.
 - **✅ F-ATREST-001 / F-ATREST-002** — the native floor covered the SEND offset
   only. The recv watermark and the `exported` latch now get their own slots via
   derived ids (`<padId>#recv`, `<padId>#exported`). No Kotlin change: PadFloor
   MACs key and value together, so each derived id is a separate authenticated
   slot.
 - **✅ F-ATREST-007** — revocation sweeps every pin whose bundle matches the
-  contact, not just `user:<name>`.
+  contact, not just `user:<name>` (live-room peers are pinned under `room:<id>`,
+  usually the only pin there is).
 - **✅ F-PROTO-002** — `handleMessage` drops frames queued behind a refusal.
-  NOTE: the review could not reproduce the original finding in Chromium at all
-  (the browser's own readyState gate already drops the burst), so this is
-  defence-in-depth, and the finding's severity rested on shim behaviour.
+  NOTE: the review could not reproduce the original finding in Chromium at all —
+  the browser's own readyState gate already drops the burst — so this is
+  defence-in-depth and the finding's severity rested on shim behaviour.
 - **✅ F-PROTO-005** — the vouch mark is bound to the bundle its signatures were
   verified against.
 - **✅ F-RELAY-001** — `config.py` no longer recommends
@@ -3003,17 +3061,26 @@ the repo in `/home/kpafi/secure-chat-pentest/state/findings/`.
   with a larger per-host backstop; the mailbox charge moved past the token gate.
 - **✅ F-RELAY-005** — `register/v3` with a signed monotone counter.
 - **✅ F-RELAY-006** — `/auth/verify` requires both signature schemes.
-- **✅ F-ANDROID-003** — `FLAG_SECURE` (uncompiled, see above).
-- **✅ F-CRYPTO-009 / -012 / -014** — RSA peer-key validation; `randomPad`
-  chunked past the 64 KiB `getRandomValues` cap (2 of 3 advertised pad sizes
-  could never be generated); the OTP localStorage lease deleted in favour of
-  failing closed when Web Locks is absent.
+- **✅ F-ANDROID-003** — `FLAG_SECURE` (uncompiled — see item 10).
+- **✅ F-CRYPTO-009 / -012 / -014** — RSA peer-key validation (residual: item 4);
+  `randomPad` chunked past the 64 KiB `getRandomValues` cap, which had made 2 of
+  3 advertised pad sizes ungeneratable; the OTP localStorage lease deleted in
+  favour of failing closed when Web Locks is absent.
 
-**Known test-coverage gaps (from the review, not yet closed):** no regression
-test for F-PROTO-001, F-PROTO-002, F-CRYPTO-014 or F-ANDROID-003;
-`otp-padgen.test.mjs` never exercises the partial-tail branch (all three pad
-sizes are exact multiples of 65536); `rsa-keyvalidation.test.mjs` asserts only
-`instanceof Error`, so a fixture could drift onto the wrong branch unnoticed.
+#### Fixed during the fix review (regressions this branch introduced)
+
+- **F1** — the first F-PROTO-001 fix inferred ownership from "we minted this room
+  code": empty after a reload, never true for a pasted code. Rebuilt around a
+  signed admission proof.
+- **F2** — the same fix fired on an HONEST relay (ownership goes to whoever joins
+  first, not whoever minted the code) and the disconnect was silent, because
+  `clearHints()` wipes the message and the log line sits in the hidden chat pane.
+- **F3** — `chats.js persist()` lacked the L-3 CAS: silent lost update, plus one
+  interleaving that left store gen < witness gen = permanent lockout.
+- **F4** — the anchor comments claimed a property the code does not have;
+  withdrawn rather than papered over.
+- **F5** — revocation missed `room:<id>` pins, and the new test asserted the
+  residual was correct.
 
 ### ✅ CLOSED — the 2026-07-29 pentest, all 13 items (fixed 2026-07-30)
 Every finding in `secure-chat-pentest-2026-07-29.md` is fixed on branch
