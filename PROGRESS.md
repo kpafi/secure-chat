@@ -3,64 +3,303 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (2026-08-10 evening — A2 closed, and the FIXES were pentested)
+## ⮕ RESUME HERE (2026-08-10 night — `40d132e`'s repairs pentested: 3 High, 4 Medium)
+
+**The previous TOP ITEM is DONE.** `pentest-new-code` was run over the repairs
+made AFTER the 2026-08-10 lanes reported — the code that had never been reviewed.
+It found **3 High and 4 Medium**, and **nothing is fixed yet**: this session
+ended at the report. That makes it a **fifth consecutive round in which the
+repair was more dangerous than the bug** (2026-07-29, 07-30, 08-08, 08-10, and
+now 08-10-night). Full detail in **section A4** below.
+
+Two things this round established that are worth carrying forward before the
+findings themselves:
+
+* **The regression tests are now the weakest part of this branch, not the code.**
+  Both lanes converged on this independently. Lane A found **8 changes with no
+  test that fails against the code they replaced**; lane B found that the test
+  written to pin item 14 — last round's High — **passes against the very mutant
+  it was written to catch**. The project's own rule ("every fix carries a test
+  verified to FAIL against the pre-fix code") was followed in letter and, in
+  these places, not in substance. Treat a green suite on this branch as weak
+  evidence until item 7 below is done.
+* **Item 18's protocol change got more load-bearing.** It was recorded as the
+  wrong-clock residual only. Lane B proved the same missing server echo also
+  causes an inert retry (A4/M-1) and a **two-device lockout at one hour of
+  skew** (A4/M-2) — and two devices on one identity is a supported flow
+  (`exportIdentity`, `app.js:673`). See item 6; it still needs the user.
 
 ### ⬜ NEXT SESSION — do these in order
 
-1. **⬜ TOP ITEM: pentest commit `40d132e` — the repairs made AFTER the lanes
-   reported.** This is the one thing that is definitely not done. The 2026-08-10
-   review covered the fixes as they stood mid-session; everything written to
-   answer its findings is **unreviewed new code**, and on this project the repair
-   has been more dangerous than the bug **four rounds running** (2026-07-29,
-   2026-07-30, 2026-08-08, and 2026-08-10 itself). Scope, in three lanes as
-   before:
-   - **Lane A — `client/otp.js`**: `armFloors` (the TAMPERED-vs-ABSENT refusal,
-     the read-back, arming before the blob write) and the new gates on
-     `savePadProgress`/`markExported`. Plus `client/contacts.js`
-     `rememberSupersededKeys`/`dropPinsFor` (the pin-retention rule and the
-     `claimedByAnother` skip) and `client/chats.js` (`navigator` guard, `!chats`
-     guard).
-   - **Lane B — `client/account.js`**: the relative two-sided `regSeqCeiling()`
-     bound and the rewritten 409 retry. Attack the clock input specifically.
-     Plus the new call-site assertion in `client/peer-approval.test.mjs`.
-   - **Lane C — nothing new**; the backend was clean and unchanged since.
-   Ask each lane explicitly whether the REPAIR reintroduced what it replaced, and
-   whether the new regression tests are vacuous. Baseline to beat: client **184**,
-   backend **165**, e2e **13/13 + 32/32 + 8/8 + 12/12**, hostile-relay
-   **5/5 + 9/9 + 9/9**.
-2. **⬜ Decide item 18's wrong-clock residual** — a badly wrong wall clock still
-   freezes an account permanently, and no client-side ceiling can fix it because
-   the ceiling is computed from the lying clock. The repair is a BACKEND change:
-   have `/api/register`'s 409 echo the stored `reg_seq` so a client can
-   resynchronise. Today it says only "not newer", which is why `Date.now()` had
-   to be guessed at. **Needs the user** — it is a wire/contract change, and it
-   leaks an account's counter to anyone who can produce a valid signature.
-3. **⬜ Close the harness gap lane B proved.** `e2e/hostile-relay/hostile.mjs`
-   serves no `/api/*` routes and `proto001.mjs` never types a handle, so
-   `expectedPeerBundle` is null in every run — the entire directory-driven flow
-   that item 14 is ABOUT is invisible end to end. Add a `DIRECTORY=hostile`
-   policy (the relay already sees the bundle in the knock) and a scenario that
-   connects by handle. Also make `EVIL_MODE=none` loud: it currently returns an
-   unpatched client with no warning, so `EVIL_MODE=none SCENARIO=attacker`
-   reports a clean 9/9 that proves nothing.
-4. **⬜ The small open residuals** (all recorded below, none fixed): `chats.js`
-   `unlock()` reads store and witness outside the lock so a benign second tab can
-   fire the rollback alarm; `withWriteLock` has no timeout, so a same-origin
-   script holding it hangs writes silently; `contacts.js` `list()`/`get()` return
-   a shallow spread that now shares `pinKeys` by reference, contradicting the
-   "defensive copy" comment; `app.js` `describeIdentity` still compares keys as
-   strings where the gate compares bytes (no-op today, permissive if `unb64` is
-   ever loosened); the peer-approval prompt inherits an attacker-choosable
-   display name for auto-contacts; and `app.js:2721`'s comment about a knock
-   queuing behind the peer prompt is false — the two prompts are mutually
-   exclusive, so that `showNextKnock()` and the `approvalPending` guard are
-   unreachable-in-effect.
-5. **⬜ Then** A2's remaining Low/Info (22, 23, rest of 24), A3's coverage gaps
-   (25-27), and section B's decisions for the user.
+1. **⬜ A4/F-A1 (High, REGRESSION, no attacker needed) — `armFloors` arms the
+   native floors BEFORE the blob that backs them is written.** `otp.js:649` bumps
+   all three slots to the new offsets; the blob is not persisted until `:702`,
+   with a `JSON.stringify` and an `await crypto.subtle.encrypt` in between. A
+   process kill or a `QuotaExceededError` in that window leaves the floor AHEAD
+   of the blob, which the next unlock reads as a rollback and refuses
+   **permanently** — `forgetPad` + re-import is blocked by `padWasUsed`. The
+   pre-fix code bumped inside `writeWatermark`, i.e. AFTER `setItem(padKey)`, so
+   an interruption left the floor BEHIND the blob and was harmless; confirmed as
+   a regression by running the PoC against `9eb6fdd`. `markExported`
+   (`otp.js:1061`) is worse: `app.js:3287` hands the file to the user BEFORE the
+   latch at `:3288`, so a failed export brands the pad "already exported once"
+   forever. This is the exact harm the trade-off comment at `otp.js:288` names as
+   the worse outcome — a false tamper alarm that teaches the user to disbelieve
+   it — and `otpPersistFailed` still advises "Free up storage, then reconnect",
+   which now leads to "exchange a fresh pad". **Fix:** decide `armed` from the
+   PREVIOUSLY persisted watermark (0 on first save), and advance the slots to the
+   new offsets only after `setItem(padKey)` succeeds — old ordering for the
+   value, new read-back for the claim.
+2. **⬜ A4/F-A2 (High, fail-open) — the `claimedByAnother` skip retains a pin that
+   revocation must kill.** `contacts.js:694-699`. Closing M-2 ("removing X must
+   not delete a third party's pin") opened its inverse: if ANY other contact
+   record names the superseded key, `Remove`/`Unverify` will not sweep the pin
+   naming it — and **the attacker chooses whether that record exists**. Two cheap
+   routes: a hostile relay answering one directory lookup with the old bundle
+   (`app.js:1259` upserts it), or one sealed envelope, which auto-creates a
+   contact at `app.js:1645` with no user action and no `verified` requirement —
+   `claimedByAnother` checks neither. The surviving pin then reaches
+   `unlockMessaging()` at `app.js:2860` with **no prompt and no safety-number
+   check**. That defeats post-compromise revocation and restores item 17's
+   residual. **Fix:** never let an `auto` or unverified record claim a key; on
+   collision prefer deleting the pin plus a `reverify` marker over silent
+   retention, so neither M-2's alarm inversion nor this silent trust can happen.
+3. **⬜ A4/H-1 (High) — the item-14 call-site pin does not pin the call site.**
+   `peer-approval.test.mjs:161-176` slices `src` from a COMMENT string, so
+   `between` is the 13 comment lines at `app.js:2686-2699` and contains **zero
+   executable code**: the assertion checks that a comment does not mention
+   `expectedPeerBundle`. Two mutants reproducing exactly the M-2 shape — one
+   inserted above the anchor comment, one moved into `requestPeerApproval`
+   (`app.js:2216`) — each skip the approval prompt against a hostile directory
+   and **pass 184/184**. The guard on last round's High is decorative. **Fix:**
+   scan from the `idbCanon` assignment (or the start of the handshake branch) to
+   the gate rather than from a comment, and assert `expectedPeerBundle` appears
+   nowhere in the decision path of `requestPeerApproval`/`renderPeerApproval` —
+   ideally as an exact-line allow-list of its 8 known display/mismatch sites.
+4. **⬜ A4/F-A3 (Medium) — `nativeFloor: armed.send` can seal a permanently false
+   floor claim into the AEAD.** `otp.js:682`/`:698`. If the prefs write silently
+   does not take on a pad's FIRST save (unwritable file, full disk — `PadFloor
+   .bump` discards `commit()`'s boolean), the blob is sealed claiming no floor
+   was in force. Both guards (`otp.js:861`, `:891`) are keyed on that claim, so
+   they can never fire for that blob, and because it is AEAD-sealed, healing the
+   floor later cannot repair it — a snapshot taken during the degraded window
+   stays exploitable forever, into keystream reuse. **Fix:** do not collapse
+   "arming failed" and "never armed" into the same `false` a plain browser
+   writes; a third value routes that blob through the existing
+   `LEGACY_PAD_ADOPTION` consent gate. **Also correct two false statements in the
+   trade-off comment at `otp.js:288-298`** while there: "the pad opens UNGUARDED
+   for that slot — the pre-fix behaviour" is wrong (the code it replaced
+   REFUSED), and "the guard re-arms on the next save that succeeds" is true of
+   the live pad but not of a snapshot.
+5. **⬜ A4/M-3 (Medium) — a counter 409 is reported to the user as "username
+   already taken".** `app.js:740-742` branches on `e.status === 409` alone, so
+   item 18's "registration counter is not newer" arrives misdiagnosed, and the
+   user is advised to pick another name — the one action that loses their handle
+   and every contact's pin. Worse, the path that actually matters, the republish
+   of a rotated bundle on unlock (`app.js:537`), is
+   `.catch(() => {})` — so "your published encryption keys are frozen and sealed
+   mail is going to a superseded key" is either silent or wrongly diagnosed,
+   never true. Item 18's own rationale objects that the pre-fix poisoning was bad
+   partly because "nothing on the device showed why"; that is still the case.
+   Both lines predate the fix, but the fix makes a counter 409 the most likely
+   409 an EXISTING user will ever see.
+6. **⬜ Decide item 18's protocol change — STILL NEEDS THE USER, now for three
+   findings rather than one.** Have `/api/register`'s 409 echo the stored
+   `reg_seq` so a client can jump to `stored + 1` instead of guessing. It is a
+   wire/contract change, and it leaks an account's counter to anyone who can
+   produce a valid signature — which is why it is the user's call. It is the real
+   repair for all three of:
+   - the **wrong-clock residual** (a badly wrong future clock still freezes an
+     account; no client-side ceiling can fix it, since the ceiling is computed
+     from the lying clock);
+   - **A4/M-1**: the retry is inert in exactly the state its own first firing
+     creates — once pinned at the ceiling, `nextRegSeq()` and `regSeqCeiling()`
+     return the same number, so it re-sends the refused value. That is the M-1
+     shape it claimed to have fixed, reproduced against the real endpoint;
+   - **A4/M-2**: because the retry jumps to `now + SLACK` rather than
+     `stored + 1`, **any skew between two registrants for one identity ratchets
+     the slower one out permanently** — reproduced at ONE HOUR of skew, far
+     inside the week of "acceptable slack", and re-locked on every registration
+     by the faster device. The comment at `account.js:136-138` claiming the
+     client "overtakes it on the next registration rather than being locked out"
+     is true for one device and false for two. The slack window is **not** the
+     safe-skew budget it is documented as.
+   If the user declines the contract change, the fallback is narrower: refuse to
+   re-send a value equal to the one just refused, and advance rather than jump.
+7. **⬜ Pay down the test debt this round exposed — treat as a finding, not
+   chores.** The suite is green against mutants it was written to kill:
+   - **F-A1 survives the entire suite** — nothing tests a save interrupted
+     mid-`writePadBlob`. Add one that fails the save and asserts the pad still
+     opens.
+   - **A4/H-1's two mutants pass 184/184** (item 3 above).
+   - **The sharpest example, verified at close: `regseq.test.mjs:173-186` is
+     named `item 18 / M-1: the 409 retry advances instead of resending the
+     refused value` — the exact bug A4/M-1 reports — and it PASSES.** It opens
+     with `reset()`, so it only ever exercises the FRESH state, where `cur = 0`
+     and the ceiling really is an advance. It never re-registers, so it never
+     reaches the pinned-at-ceiling state that the first retry itself creates,
+     which is the only state where M-1 bites. A test can carry the finding's own
+     name, assert the finding's own property, pass, and still not test it. Fix
+     this one first: it is the cheapest possible demonstration for whoever needs
+     convincing that the green suite is not evidence.
+   - `regseq.test.mjs`: mutating the retry to `seq = regSeqCeiling() * 2` writes a
+     floor ~58 years ahead that the next `nextRegSeq()` discards — **pass 2's
+     exact bug, relocated into the one place the shipped code writes
+     `localStorage` outside `nextRegSeq`** — and it passes 8/8 and 184/184. The
+     file is not vacuous overall (a faithful pass-2 reconstruction goes red at
+     `regseq.test.mjs:160`), but the retry path has no "stays a usable floor"
+     assertion.
+   - **No test stubs `Date.now` anywhere.** All 8 regseq checks run against the
+     real wall clock, so the entire clock dimension — the named priority of the
+     lane, and the fix's own stated risk area — is untested. No backward-clock,
+     frozen-clock or skew test.
+   - Green against deletion, i.e. testing nothing: the `broken` gates on
+     `savePadProgress`/`markExported`, `contacts.js:697`'s `typeof k.ed` guard,
+     `chats.js:393`'s `!chats` guard, `chats.js:374-376`'s `writeChain` intra-tab
+     layer (the shim always supplies Web Locks, so the no-Web-Locks path is never
+     exercised), and `chats.js:371`'s `typeof navigator` guard.
+   - Missing shapes: a `claimedByAnother` test where the claiming record is an
+     `auto` contact (the current control only covers an UNCLAIMED superseded
+     key); an integer assertion on `seq`; and a test that a counter 409 is not
+     surfaced as "username already taken".
+8. **⬜ Close the harness gap** (was item 3, unchanged). `e2e/hostile-relay/
+   hostile.mjs` serves no `/api/*` routes and `proto001.mjs` never types a
+   handle, so `expectedPeerBundle` is null in every run — the entire
+   directory-driven flow that item 14 is ABOUT is invisible end to end. Add a
+   `DIRECTORY=hostile` policy (the relay already sees the bundle in the knock)
+   and a scenario that connects by handle. Also make `EVIL_MODE=none` loud: it
+   currently returns an unpatched client with no warning, so
+   `EVIL_MODE=none SCENARIO=attacker` reports a clean 9/9 that proves nothing.
+   **Note the overlap with item 3**: this harness is why H-1 could only be proven
+   at the unit level.
+9. **⬜ A4's Low/Info.** `nextRegSeq` has no integer guard on its own output, so
+   a hooked `Date.now` returning a fraction makes both `registerMessageBytes` and
+   `attempt` take their `Number.isInteger` false branches and the client silently
+   emits a **v2, counter-free, replayable** registration (backend stays
+   fail-closed, so no key rollback follows — the objection is the silent
+   downgrade of a control by a device-local attacker). A backward clock discards
+   the stored counter and rewrites `sc.regseq.v1` into the past, persisted even
+   when both attempts 409 — self-healing, but the backward direction is
+   undocumented while the forward one is. `clampRegSeq` (`account.js:157`) is
+   **dead code, called nowhere in the tree**. `otp.js`'s new `broken` gates are
+   **unreachable** — every producer of `{record, atRest}` already refuses in that
+   state; the finding they cite IS closed, but by `armFloors`'s read-back, so the
+   comment credits the wrong line and a future reader could delete the
+   load-bearing half and keep the decorative one. `importPad` returns `o.padId`
+   with no type/charset/length check while slots are derived by string
+   concatenation (`otp.js:124-125`), so a pad file with `padId =
+   "<victim>#recv"` aliases another pad's derived slot — an arbitrary-pad brick
+   primitive, unreachable today only **by accident** (`padWasUsed` finds the
+   aliased slot present and refuses the import). `chats.js:371` reads
+   `navigator.locks` from a poisonable global with no "a lock was expected here"
+   marker, unlike the hardening `otp.js` applies everywhere.
+10. **⬜ MOST IMPORTANT STALE COMMENT — fix it whenever `account.js` is next
+    touched.** The block at `account.js:93-111` still describes **pass 2's**
+    design as current and references `REG_SEQ_SANE_MAX` and `REG_SEQ_MAX`,
+    **neither of which exists**. That is exactly how a fix gets reverted by a
+    well-meaning reader who trusts the prose over the code.
+11. **⬜ The small open residuals** (recorded, none fixed): `chats.js` `unlock()`
+    reads store and witness outside the lock so a benign second tab can fire the
+    rollback alarm; `withWriteLock` has no timeout, so a same-origin script
+    holding it hangs writes silently; `contacts.js` `list()`/`get()` return a
+    shallow spread that now shares `pinKeys` by reference, contradicting the
+    "defensive copy" comment; `app.js` `describeIdentity` still compares keys as
+    strings where the gate compares bytes (no-op today, permissive if `unb64` is
+    ever loosened); the peer-approval prompt inherits an attacker-choosable
+    display name for auto-contacts; and `app.js:2721`'s comment about a knock
+    queuing behind the peer prompt is false — the two prompts are mutually
+    exclusive, so that `showNextKnock()` and the `approvalPending` guard are
+    unreachable-in-effect.
+12. **⬜ Then** A2's remaining Low/Info (22, 23, rest of 24), A3's coverage gaps
+    (25-27), and section B's decisions for the user.
 
-**State at hand-off:** branch `pentest-2026-08-07-fixes`, working tree CLEAN, all
-work committed as `40d132e`. **Not pushed, not merged, not deployed.** `master`
-is still 1 commit ahead of `origin/master` from an earlier session.
+**State at hand-off:** branch `pentest-2026-08-07-fixes`, working tree CLEAN.
+`40d132e` is the last code commit; **this session added no code — only this
+report.** **Not pushed, not merged, not deployed.** `master` is still 1 commit
+ahead of `origin/master` from an earlier session. Both lanes reverted every
+mutant they installed; `git status` was verified clean after they finished, and
+`backend/accounts.db` was not touched.
+
+**Baselines re-run on the clean tree at close, not assumed:** client **184 OK,
+0 failures**; backend **165 passed**. e2e and hostile-relay were NOT re-run this
+session (neither lane touched them, and no code changed). Both numbers match the
+`40d132e` baseline exactly — which is the point of item 7: they matched while
+three Highs were open.
+
+**Do NOT merge this branch on the strength of a green suite.** Three Highs are
+open, and item 7 is the reason the green is not evidence.
+
+### A4 — the 2026-08-10-night review of `40d132e`'s repairs (2 lanes)
+
+Scope was defined by function name rather than by diff, because `40d132e`
+contains both the original fixes and the repairs to them, so they cannot be
+separated by commit. Lane A took `otp.js` `armFloors` + the
+`savePadProgress`/`markExported` gates, `contacts.js`
+`rememberSupersededKeys`/`dropPinsFor`, and `chats.js`'s two new guards. Lane B
+took `account.js`'s relative two-sided bound and rewritten 409 retry, with the
+clock as its named priority, plus the new call-site assertion in
+`peer-approval.test.mjs`. Lane C was not run: the backend was clean last round
+and unchanged since. Every finding is itemised as TODO items 1-5, 6 and 9 above.
+
+**What was attacked and HELD** — recorded so the next session does not re-spend
+the effort:
+
+* **The TAMPERED-vs-ABSENT refusal is genuinely closed and its test is not
+  vacuous** — deleting the `throw` at `otp.js:330` turns `otp-rollback.test.mjs`
+  red on "corrupting the SEND slot must FAIL CLOSED". The layer below was checked
+  too: `PadFloor.bump` (`PadFloor.kt:124-132`) returns `TAMPERED` and **writes
+  nothing** when the stored record does not verify, so bump-then-read cannot
+  launder a forged slot into a valid one. The read-back is real evidence.
+* **`bump(_, 0)` really does create the `#exported` slot** (`PadFloor.kt:128`:
+  `current == ABSENT` → `next = 0`, `0 != -1` → `commit()`), so that slot's
+  absence really is unambiguous evidence of deletion. The comment is accurate.
+* **The `derivedFloors` gate** is inside the AEAD (unstrippable), correctly keyed
+  on a NEW field rather than on `nativeFloor` (2026-07-29-era pads still open),
+  and strict `=== true`. Its only weakness is F-A3.
+* **A throwing save cannot cause keystream reuse** — `app.js:2977` persists
+  BEFORE `ws.send`, and `otpPersistFailed` clears `verified`, disables send and
+  closes the socket. Checked specifically because `armFloors`'s new `throw` fires
+  on the send path.
+* **M-1 (eviction order), M-2 (third-party pin) and item 17's base are closed** —
+  the mutants `history.slice(-MAX)`, removing `claimedByAnother`, and removing the
+  `rememberSupersededKeys` call site each turn `contacts-anchor.test.mjs` red on
+  the right assertion.
+* **The chats concurrency test is NOT the known vacuous shape** — it installs a
+  real FIFO Web Locks shim and redefines `globalThis.navigator`; dropping the
+  lock from `withWriteLock` kills it. (The warning recorded last round still
+  applies to any NEW such test.)
+* **Pass 2's freeze is genuinely gone.** `sc.regseq.v1` was poisoned with
+  `2**53-2`, `2**53-1`, `2**43`, `2**43±1`, `2**44` and `Date.now()+10×SLACK` and
+  driven through the real `/api/register`: every one heals on the first
+  registration, and three consecutive registrations then succeed. The new
+  inclusive bound does not recreate the self-discarding band, even with
+  `Date.now()` frozen so no millisecond can elapse.
+* **`detail.includes("counter")` cannot misfire on an honest server** — the only
+  other `accounts.py` 409 containing that substring is reachable only when
+  `req.seq is None`, while the client's branch requires `Number.isInteger(seq)`.
+* **Inducing the retry from a hostile relay yields no key rollback.** It does
+  harvest a valid dual signature dated ~7 days ahead, and the relay can then lie
+  `{"status":"updated"}` so nothing is visible to the user — but the client
+  persists the ceiling it signed, so every later registration is strictly above
+  it, and clearing `localStorage` routes through a retry that jumps to a LATER
+  ceiling. Moot against a hostile relay anyway: `/api/users` answers carry no
+  signature and item 14 already forbids trusting them.
+* **`Number.parseInt` junk** (`""`, `"NaN"`, `"1e999"`, `"-1"`, `"0"`, `"0x…"`,
+  `2**60`, non-safe-integer decimals) is all either discarded or yields a valid
+  counter. Intra-call clock skew between `ceiling` and `Date.now()` is absorbed
+  in both directions.
+* **The backend v2/v1 downgrade path is fail-closed** (`accounts.py:711-718`): a
+  no-counter registration may only ADD encryption keys to an account that has
+  none.
+
+**Not attacked / open uncertainty:** neither lane ran the Puppeteer e2e or
+hostile-relay suites (out of lane, and the tree was being mutated concurrently);
+H-1 is proven at source/unit level only, which item 8 is the reason for. F-A1 and
+F-A3 are argued from the JS ordering plus the Kotlin source with in-process PoCs,
+**not exercised on a real device**. The Android side beyond `PadFloor.kt` was not
+reviewed. M-2's severity depends on how real "two registrants for one identity"
+is in practice — `exportIdentity` exists, but the import path was not traced end
+to end. Baseline held throughout both lanes: client **184**, backend **165**.
 
 
 `pentest-new-code` was run over this session's own fixes, in three lanes. **It
