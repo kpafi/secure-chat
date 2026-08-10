@@ -192,4 +192,86 @@ async function testConcurrentTabWriteIsRefused() {
 }
 
 await testConcurrentTabWriteIsRefused();
+
+// --- pentest 2026-08-08, item 16 --------------------------------------------
+// The test above only covers the interleaving the CAS DOES catch: tab B
+// completes its whole write before tab A starts. The one that still lost data is
+// the other one — BOTH tabs read the witness before EITHER writes, so both see
+// generation N, both pass the check, and both write N+1.
+//
+// Node has no `navigator.locks`, so the cross-tab half of the fix is inert here
+// unless it is provided. This shim is a faithful minimal Web Locks: exclusive by
+// name, FIFO, held for the life of the callback's promise. It lives on
+// `globalThis`, so both module instances contend for the same lock exactly as
+// two tabs of one origin do.
+function installWebLocksShim() {
+  const held = new Map();   // name -> promise chain
+  const prev = globalThis.navigator;
+  const locks = {
+    request(name, fn) {
+      const tail = held.get(name) || Promise.resolve();
+      const run = () => Promise.resolve().then(fn);
+      const next = tail.then(run, run);
+      held.set(name, next.then(() => {}, () => {}));
+      return next;
+    },
+  };
+  // `navigator` exists but is read-only in Node, so redefine the property.
+  Object.defineProperty(globalThis, "navigator", {
+    value: { ...(prev || {}), locks },
+    configurable: true,
+    writable: true,
+  });
+  return () => Object.defineProperty(globalThis, "navigator", {
+    value: prev, configurable: true, writable: true,
+  });
+}
+
+async function testBothReadFirstInterleaving() {
+  const restore = installWebLocksShim();
+  try {
+    await deviceWithHistory();
+
+    const tabB = await import(`./chats.js?item16=b&t=${Date.now()}`);
+    tabB.setStoreAnchor(anchorFor({ chatsEstablished: true }));
+    await tabB.unlock(PASS);   // both tabs are now at the same generation
+
+    // Fire both writes WITHOUT awaiting the first, which is what puts both
+    // reads before both writes. Each adds a distinct entry to the P-13 replay
+    // ring — the structure a lost update silently empties.
+    const results = await Promise.allSettled([
+      chats.markSeen("alice", "env-A1"),
+      tabB.markSeen("alice", "env-B1"),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === "fulfilled" && r.value === true);
+    const refused = results.filter(
+      (r) => r.status === "rejected" && /changed in another tab/.test(String(r.reason)));
+
+    assert.strictEqual(fulfilled.length, 1,
+      "exactly one concurrent write may succeed — two successes IS the lost update");
+    assert.strictEqual(refused.length, 1,
+      "the loser must be told to reload, not silently discard the winner's history");
+
+    // The winner's entry must actually be on disk. Re-read from storage with a
+    // third instance so nothing in-memory can mask a lost write.
+    const reader = await import(`./chats.js?item16=r&t=${Date.now()}`);
+    reader.setStoreAnchor(anchorFor({ chatsEstablished: true }));
+    await reader.unlock(PASS);
+    const seen = reader.get("alice").seenIds;
+    assert.ok(seen.includes("env-A1") || seen.includes("env-B1"),
+      "the surviving write's replay-ring entry must be persisted");
+    console.log("OK  item 16: two tabs that both read first cannot both write");
+
+    // The lockout half: the store must never end up OLDER than its witness, or
+    // `assertNotRolledBack` refuses forever. Re-opening above already proves the
+    // pair is consistent — an inverted pair throws there — so assert it directly.
+    assert.ok(reader.isUnlocked(), "store and witness must stay consistent (no permanent lockout)");
+    console.log("OK  item 16: store and witness stay consistent, so no self-inflicted lockout");
+  } finally {
+    restore();
+  }
+}
+
+await testBothReadFirstInterleaving();
 console.log("All chat-store concurrency checks passed.");

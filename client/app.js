@@ -22,7 +22,6 @@ import { makeCipher, isAscii, bufToB64, b64ToBuf } from "./crypto.js";
 import { Identity } from "./identity.js";
 import {
   signHandshake, verifyHandshake, freshNonce, isValidNonce, signKnock, verifyKnock,
-  signAdmission, verifyAdmission,
   unb64,
 } from "./auth.js";
 import * as account from "./account.js";
@@ -58,6 +57,7 @@ const els = {
   // room admission (owner approves who may join)
   admit: $("admit"), admitFingerprint: $("admitFingerprint"), admitWho: $("admitWho"),
   admitWarn: $("admitWarn"), admitOk: $("admitOk"), admitNo: $("admitNo"),
+  admitTitle: $("admitTitle"), admitHint: $("admitHint"),
   idHint: $("idHint"), roomHint: $("roomHint"), roomHelp: $("roomHelp"),
   stepIdentity: $("stepIdentity"), stepRoom: $("stepRoom"),
   copyCode: $("copyCode"), algDetails: $("algDetails"), algSummary: $("algSummary"), peerFingerprint: $("peerFingerprint"),
@@ -181,11 +181,52 @@ let sessionAlg = null;
 // decides. The relay enforces the slots, but the decision — and the check that
 // the peer who then completes the handshake is the one that was let in — is
 // entirely client-side, because the relay is not trusted with either.
+//
+// Pentest 2026-08-07 F-PROTO-001, and the 2026-08-08 review of its own fix.
+//
+// The guest half of that promise was missing: a guest's only evidence of having
+// been approved was that the relay sent it `pending` and then `joined`, both of
+// which the relay writes for free. The first repair had the owner SIGN the
+// admission and the guest verify it — which is forgeable, because the signature
+// is checked against the peer's own bundle and nothing in it requires the signer
+// to be trusted or a human to have been asked. An attacker signs one for the
+// victim with a keypair it generates on the spot; verified end to end by
+// `SCENARIO=attacker node e2e/hostile-relay/proto001.mjs`, where the shipped
+// client plus ONE assignment walked an unapproved identity to the safety-number
+// screen.
+//
+// That approach cannot be repaired. The room id travels to the relay in
+// cleartext (it IS the `join` frame), so a hostile relay can always be a
+// legitimate code-knowing participant; any evidence such a peer offers about
+// itself is evidence the attacker chose. The only unforgeable, relay-independent
+// fact available here is what a human ON THIS DEVICE approved.
+//
+// So approval is symmetric now. Both sides refuse a handshake from an identity
+// this device's user did not approve — the owner through the knock prompt it
+// already had, the guest through the same prompt shown when the peer's signed
+// handshake arrives. Trust that is already established skips it — but ONLY the
+// kind that is genuinely local: a 🟢 key verified in person (see
+// `peerAlreadyTrusted`). Nothing the relay or the directory sends can switch it
+// off, because no relay frame and no server answer is consulted.
+//
+// The cost, stated honestly (it was understated here until 2026-08-08 item 14):
+// a repeat chat with a contact you have verified in person gains no click, and
+// EVERY other first handshake — including the first chat with a contact you
+// picked by handle — costs one approve/deny prompt before the safety-number
+// step. The earlier claim that the named-contact flow was free depended on
+// trusting an unsigned directory answer, which is the thing the relay can write.
 let roomRole = null;       // "owner" | "guest" for this connection
 let admittedBundle = null; // the identity WE let in (owner side), or null
 let admittedAnon = false;  // we let in someone with no identity at all
 let wasPending = false;    // we sat in the approval queue (M-2, guest side)
 let knockQueue = [];       // [{jid, bundle, anon}] waiting for our verdict
+// The identity a human on THIS device approved for this session, by either
+// route. This is the whole admission control: it is written only by a click.
+let approvedBundle = null;
+// Set while the peer-approval prompt is open: {bundle, resolve}. The message
+// pump is parked on this promise, so nothing else is processed until the user
+// decides or the socket closes.
+let approvalPending = null;
 let currentRoom = null;    // the room this connection is in (keyconfirm effects)
 // L-1: a backstop on the approval queue, NOT the control.
 //
@@ -224,8 +265,10 @@ let msgChain = Promise.resolve(); // serializes async message handling (C-01)
 //   hello:     {hello: true, n, reply} — plaintext nonce exchange that seeds
 //              handshake freshness. Sent on join (reply=false); the receiver
 //              answers once (reply=true) and then sends its signed offer.
-//   handshake: {pub, reply, idb, sig, adm?} — `pub` is the sender's ephemeral/public
+//   handshake: {pub, reply, idb, sig} — `pub` is the sender's ephemeral/public
 //              key; `idb`+`sig` authenticate it over room + both nonces.
+//              (A short-lived `adm` admission proof used to ride along here;
+//              it was removed as unsound — see the note at `approvedBundle`.)
 // The `reply` flags prevent infinite ping-pong in both phases: the later
 // joiner initiates, the early joiner answers exactly once.
 
@@ -1845,6 +1888,8 @@ async function connectInner() {
   roomRole = null;
   admittedBundle = null;
   admittedAnon = false;
+  approvedBundle = null;
+  resolvePeerApproval(false);
   wasPending = false;
   keyConfirm.reset();
   knockQueue = [];
@@ -1895,6 +1940,10 @@ async function connectInner() {
     roomRole = null;
     admittedBundle = null;
     admittedAnon = false;
+    approvedBundle = null;
+    // Unpark handleMessage: without this the promise never settles and the
+    // FIFO chain for this connection is wedged for as long as the page lives.
+    resolvePeerApproval(false);
     wasPending = false;
     keyConfirm.reset();
     knockQueue = [];
@@ -1991,6 +2040,12 @@ async function queueKnock(m) {
 let knockRenderGen = 0;
 
 async function showNextKnock() {
+  // The peer-approval prompt owns the panel while it is open, and the message
+  // pump is parked on it. Rendering a knock over it would swap the buttons out
+  // from under a decision the user is in the middle of making — and worse,
+  // `hideAdmitPrompt()` below would dismiss a prompt that nothing then settles.
+  // Knocks are not lost: the queue is re-rendered once the approval resolves.
+  if (approvalPending) return;
   const gen = ++knockRenderGen;
   if (!knockQueue.length) {
     hideAdmitPrompt();
@@ -2005,18 +2060,10 @@ async function showNextKnock() {
     // hashing. Whatever they decided is newer than this; do not write over it.
     if (gen !== knockRenderGen || knockQueue[0] !== k) return;
     els.admitFingerprint.textContent = fp;
-    // Who is this, in OUR terms? Matched on the keys themselves — never on a
-    // name the other side chose (F-01).
-    const known = contacts.isUnlocked()
-      ? contacts.list().find((c) => c.ed === k.bundle.ed && c.mldsa === k.bundle.mldsa)
-      : null;
-    els.admitWho.textContent = known
-      ? `${dirName(known)} — ${contactMark(known)}`
-      : (pinsReadable()
-        ? "Not in your users list — ⚪ you have never verified this key"
-        : "Unknown — your saved users could not be read, so trust cannot be checked");
+    const d = describeIdentity(k.bundle);
+    els.admitWho.textContent = d.who;
     // If this session was aimed at a specific contact, say whether it is them.
-    if (expectedPeerBundle && !sameBundle(expectedPeerBundle, k.bundle)) {
+    if (d.mismatch) {
       els.admitWarn.textContent =
         "⚠ This is NOT the user you selected for this session. Deny unless you know why.";
       els.admitWarn.className = "hint err";
@@ -2047,6 +2094,15 @@ async function showNextKnock() {
       "to talk to a different person, disconnect and start a new chat.";
     els.admitWarn.className = "hint";
   }
+  // Pentest 2026-08-08 item 20: which of the two prompts this is, as machine-
+  // readable state. `#admit` is shared by the owner's knock prompt and the
+  // guest's peer-approval prompt, so "is `#admit` visible" cannot tell them
+  // apart — and a harness check that the RECEIVING peer asks its user went green
+  // against the OWNER's knock prompt because of exactly that. The labels below
+  // already differ, but asserting on prose makes every test a hostage to
+  // copy-editing. Tests assert this AND the visible label, so the marker cannot
+  // silently drift away from what the human is actually being shown.
+  els.admit.dataset.mode = "knock";
   els.admit.hidden = false;
   if (knockQueue.length > 1) {
     els.admitWarn.textContent +=
@@ -2057,10 +2113,139 @@ async function showNextKnock() {
 
 function hideAdmitPrompt() {
   els.admit.hidden = true;
+  // Cleared, not left at its last value: a stale "peer" on a hidden panel is
+  // exactly the kind of residue a visibility-only check would misread (item 20).
+  delete els.admit.dataset.mode;
   els.admitOk.disabled = false;
   els.admitFingerprint.textContent = "";
   els.admitWho.textContent = "";
   els.admitWarn.textContent = "";
+  els.admitTitle.textContent = KNOCK_LABELS.title;
+  els.admitHint.textContent = KNOCK_LABELS.hint;
+  els.admitOk.textContent = KNOCK_LABELS.ok;
+  els.admitNo.textContent = KNOCK_LABELS.no;
+}
+
+// Who is this, in OUR terms? Matched on the keys themselves — never on a name
+// the other side chose (F-01). Shared by both prompts so the two can never
+// describe the same key differently.
+function describeIdentity(bundle) {
+  const known = contacts.isUnlocked()
+    ? contacts.list().find((c) => c.ed === bundle.ed && c.mldsa === bundle.mldsa)
+    : null;
+  return {
+    known,
+    who: known
+      ? `${dirName(known)} — ${contactMark(known)}`
+      : (pinsReadable()
+        ? "Not in your users list — ⚪ you have never verified this key"
+        : "Unknown — your saved users could not be read, so trust cannot be checked"),
+    mismatch: !!(expectedPeerBundle && !sameBundle(expectedPeerBundle, bundle)),
+  };
+}
+
+// ---- peer approval, guest side (F-PROTO-001, 2026-08-08) -------------------
+//
+// When this device did not run the knock prompt, the peer's signed handshake is
+// held here until a human looks at it. Exactly ONE way past without asking: the
+// peer is a key this user already verified in person (🟢 in the contacts store,
+// which is behind the at-rest passphrase). Anything else — every first contact,
+// and every hostile-relay configuration — is a prompt. That is the point: the
+// attack's whole effect was that nobody was ever asked.
+//
+// Pentest 2026-08-08 item 14. There used to be a second route: "the peer matches
+// `expectedPeerBundle`, the directory bundle for the contact the user picked".
+// It is deleted, because it was not a local fact at all. `expectedPeerBundle`
+// comes from `account.fetchBundle`, which canonicalises the base64 and
+// length-checks the keys and verifies NO SIGNATURE — nothing binds a handle to
+// its key material, and the handle's token is a random server-issued lookup
+// token. So a hostile directory answered with its own bundle, the prompt was
+// skipped, and the client printed an attacker-chosen reassurance naming the
+// victim's contact. The comment that both routes were "facts we hold locally and
+// the relay cannot write" was false of this one, and the route it guarded was
+// precisely the flow the rewrite advertised as costing no click.
+//
+// Not only a same-origin concern: `RELAY.api` exists so the Android app can
+// serve trusted client bytes locally while pointing at a remote directory —
+// honest client, attacker-controlled directory, one identical `fetch`.
+//
+// Restoring this route needs the directory answer to be SIGNED by the identity
+// it names, verified here against something the user already trusts. Until that
+// exists, first contact by handle costs one click — which is the same question
+// the safety-number step asks immediately afterwards anyway.
+function peerAlreadyTrusted(bundle) {
+  // Item 21: if the user picked a specific contact and this is not them, ASK —
+  // never fall through to the contacts route. Without this, a 🟢 contact who is
+  // not the contact you selected skipped the prompt: `describeIdentity` computes
+  // exactly that verdict (`mismatch`) and this gate never consulted it. The
+  // directory answer is untrusted (item 14 above), so a mismatch is not by
+  // itself proof of an attack — but it is always a reason to show the human the
+  // fingerprint rather than to wave it through.
+  if (expectedPeerBundle && !sameBundle(expectedPeerBundle, bundle)) return null;
+  if (contacts.isUnlocked()) {
+    // Item 24: compare decoded bytes, as every other bundle comparison here
+    // does, rather than base64 strings. Both sides are canonical today so this
+    // changes no verdict; it removes the standing trap that a spelling
+    // difference would silently read as a different identity.
+    const known = contacts.list().find((c) => sameSigning(c, bundle) && c.verified);
+    if (known) return `is the key you verified in person for "${dirName(known)}"`;
+  }
+  return null;
+}
+
+const KNOCK_LABELS = {
+  title: "Someone wants to join this chat",
+  hint: "They know your chat code. Let them in only if you are expecting them — " +
+    "check the key fingerprint below against the person you invited.",
+  ok: "Let them in",
+  no: "Deny",
+};
+
+const PEER_LABELS = {
+  title: "Someone is already in this chat — is it them?",
+  hint: "You were put into this chat without being asked to approve anyone. " +
+    "Check this key fingerprint against the person you meant to talk to BEFORE " +
+    "any keys are exchanged. If you cannot, refuse.",
+  ok: "Connect",
+  no: "Refuse",
+};
+
+// Registers the promise SYNCHRONOUSLY, then renders. The other order would let a
+// close arriving mid-render find no pending approval to cancel, and the message
+// pump would stay parked on a promise nothing could ever settle.
+function requestPeerApproval(bundle) {
+  const decided = new Promise((resolve) => { approvalPending = { bundle, resolve }; });
+  renderPeerApproval(bundle);
+  return decided;
+}
+
+async function renderPeerApproval(bundle) {
+  const fp = await Identity.fingerprintOf(bundle);
+  if (!approvalPending || approvalPending.bundle !== bundle) return; // decided already
+  const d = describeIdentity(bundle);
+  els.admitTitle.textContent = PEER_LABELS.title;
+  els.admitHint.textContent = PEER_LABELS.hint;
+  els.admitOk.textContent = PEER_LABELS.ok;
+  els.admitNo.textContent = PEER_LABELS.no;
+  els.admitFingerprint.textContent = fp;
+  els.admitWho.textContent = d.who;
+  els.admitWarn.textContent = d.mismatch
+    ? "⚠ This is NOT the user you selected for this session. Refuse unless you know why."
+    : "";
+  els.admitWarn.className = d.mismatch ? "hint err" : "hint";
+  els.admitOk.disabled = false;
+  els.admit.dataset.mode = "peer";   // item 20 — see the note in showAdmitPrompt
+  els.admit.hidden = false;
+}
+
+// Settles the parked handshake. Safe to call when nothing is pending, which is
+// what makes it usable straight from `ws.onclose`.
+function resolvePeerApproval(ok) {
+  if (!approvalPending) return;
+  const { resolve } = approvalPending;
+  approvalPending = null;
+  hideAdmitPrompt();
+  resolve(ok);
 }
 
 // The verdict. Admitting PINS the identity we let in: the handshake below
@@ -2079,6 +2264,7 @@ async function decideKnock(allow) {
   if (allow) {
     admittedBundle = k.bundle;
     admittedAnon = !k.bundle;
+    approvedBundle = k.bundle;  // the same local-approval fact, owner route
     addLine("sys", "", k.bundle
       ? "you let someone in — their key is now pinned for this session"
       : "you let someone in — they have no identity to pin");
@@ -2111,14 +2297,13 @@ async function signedHandshake(room) {
 
 function sendSignedKey(room, reply) {
   return signedHandshake(room).then(async ({ pub, sig }) => {
+    // No admission proof travels with this any more (F-PROTO-001, 2026-08-08):
+    // a signature the PEER makes about its own authority is worth nothing when
+    // the peer is the attacker, and sending one invited exactly the false
+    // confidence the review found. Approval is now decided locally on the
+    // receiving side. This also un-breaks the wire: the frame is `handshake/v3`
+    // again, with no field a client of either vintage must send.
     const frame = { pub, reply, idb: myBundle, sig };
-    // F-PROTO-001 (fix review F1): if we admitted this peer, prove it. This is
-    // the guest's ONLY evidence that a human approved them — everything else it
-    // could look at is written by the relay. Signed over the admitted bundle
-    // and both session nonces; see auth.js.
-    if (admittedBundle) {
-      frame.adm = await signAdmission(identity, room, [myNonce, peerNonce], admittedBundle);
-    }
     ws.send(JSON.stringify({
       type: "key", room, alg: sessionAlg,
       payload: packKey(frame),
@@ -2434,7 +2619,7 @@ async function handleMessage(room, raw) {
         if (!cipher.needsHandshake) {
           throw new Error("unexpected key-exchange message for this mode");
         }
-        const { pub, reply, idb, sig, adm } = p;
+        const { pub, reply, idb, sig } = p;
         if (peerNonce === null) {
           throw new Error("peer sent a handshake before the nonce exchange");
         }
@@ -2462,73 +2647,15 @@ async function handleMessage(room, raw) {
           return;
         }
 
-        // F-PROTO-001 (fix review F1): does this peer hold a signed admission
-        // for US? Checked against `idbCanon` — the identity that just passed
-        // the handshake signature — so the two cannot be different parties.
-        // Verification failures are simply "no proof": the refusal decision is
-        // made once, below, so a forged proof and a missing one read alike.
-        let admissionProven = false;
-        if (adm && myBundle) {
-          try {
-            admissionProven = await verifyAdmission(idbCanon, room, [myNonce, peerNonce], myBundle, adm);
-          } catch {
-            admissionProven = false;
-          }
-        }
-
         // P-08: if WE admitted this peer, the handshake must come from the
         // identity we were shown and approved. This is the binding that makes
         // the approval prompt more than decoration: the relay picks who is
         // routed to us, so without it a relay could show the owner a knock from
-        // a trusted contact and then hand the seat to someone else. (The guest
-        // side has no such check — it approved nobody — and keeps relying on
-        // the safety number and the pin, exactly as before.)
+        // a trusted contact and then hand the seat to someone else.
+        //
         // Keyed on admittedBundle ALONE, never on roomRole: the role comes from
         // the relay, so gating the check on it would let a relay switch the
-        // check off by re-sending `joined` with role "guest".
-        //
-        // Pentest 2026-07-27 M-2: keying on `admittedBundle` alone closes the
-        // role-flip door but leaves the check OFF BY DEFAULT — a relay that
-        // answers `join` with role "owner" to both parties and never delivers a
-        // `pending`/`knock` leaves admittedBundle null and admittedAnon false,
-        // so both gates below are skipped and P-08's approval control is fully
-        // negated. Refuse first, unconditionally: as the owner of a room, the
-        // only legitimate way a second member exists is that WE admitted it
-        // (relay.py `admit` is the sole seat-granting path), so a handshake
-        // with nobody admitted means the relay seated someone behind our back.
-        //
-        // Pentest 2026-08-07 F-PROTO-001, and its own fix review (F1/F2).
-        //
-        // The `roomRole === "owner" &&` conjunct that used to be here made the
-        // refusal conditional on the relay — exactly the failure mode the
-        // paragraph above warns about. Three relay frames turned it off.
-        //
-        // The first attempt replaced it with "...or we minted this room code",
-        // which was wrong in both directions: `selfMintedRooms` is empty after
-        // a reload and never holds a PASTED code, so the attack stayed open in
-        // the ordinary workflow; and room ownership on an honest relay goes to
-        // whoever JOINS FIRST, so an honest peer who connected before us made
-        // us a legitimate guest and the check fired on honest traffic.
-        //
-        // So the role is not consulted at all any more, in any form. There are
-        // exactly two ways a peer can legitimately be in this room, and both
-        // are things we can check for ourselves:
-        //
-        //   * WE admitted them — `admittedSomeone()`, set only by our own
-        //     admit prompt (relay.py `admit` is the sole seat-granting path);
-        //   * THEY admitted us, and signed that decision over our bundle and
-        //     this session's nonces — verified just above, against the same
-        //     identity that passed `verifyHandshake`.
-        //
-        // In the configuration the finding is about — the relay telling both
-        // parties they are guests, so nobody is ever asked to approve — neither
-        // holds, on both endpoints, and both refuse.
-        if (!admittedSomeone() && !admissionProven) {
-          addLine("sys", "", "[a peer completed the key exchange without ever being approved — refusing]");
-          hint("Nobody approved this connection: the other side cannot show that they let you in, and you did not let them in. The relay is not behaving. Disconnecting.", true);
-          if (ws) ws.close();
-          return;
-        }
+        // check off by re-sending `joined` with role "guest" (M-2, F-PROTO-001).
         if (admittedBundle && !sameBundle(admittedBundle, idbCanon)) {
           addLine("sys", "", "[the peer that connected is NOT the one you let in — refusing]");
           hint("The identity that completed the key exchange differs from the one you approved. Disconnecting.", true);
@@ -2540,6 +2667,68 @@ async function handleMessage(room, raw) {
         if (admittedAnon) {
           addLine("sys", "", "[the peer you let in had no identity but now sends one — refusing]");
           hint("This peer introduced itself without an identity and then produced one. Disconnecting.", true);
+          if (ws) ws.close();
+          return;
+        }
+        // The relay told us we own this room, and we admitted nobody — so it
+        // seated a second member behind our back. `relay.py admit` is the only
+        // seat-granting path, so an honest relay cannot produce this. Consulting
+        // a relay frame here is safe in the one direction it runs: it can only
+        // ever ADD a refusal, never skip the approval below (M-2's owner half,
+        // kept because it costs nothing).
+        if (roomRole === "owner" && !admittedSomeone()) {
+          addLine("sys", "", "[the relay seated someone in your room without asking you — refusing]");
+          hint("You own this chat and approved nobody, yet someone completed the key exchange. The relay is not behaving. Disconnecting.", true);
+          if (ws) ws.close();
+          return;
+        }
+
+        // F-PROTO-001, rebuilt 2026-08-08. See the note at `approvedBundle`.
+        //
+        // Everything above is the OWNER's half. This is the other one: if no
+        // human on this device has approved this identity, ask now — before any
+        // key material is touched — and refuse if they say no.
+        //
+        // The previous repair asked the PEER to prove it had admitted us, which
+        // is unsound in a way no binding fixes: the proof is verified against
+        // the peer's own bundle, so the attacker signs one with a keypair it
+        // generates on the spot. The relay already knows the room id (it is the
+        // `join` frame), so it can always be a code-knowing participant, and
+        // every claim such a participant makes about itself is the attacker's to
+        // choose. Local approval is the only input it cannot write.
+        if (!approvedBundle) {
+          const trusted = peerAlreadyTrusted(idbCanon);
+          if (trusted) {
+            // Not a click, but not the relay's word either: the one remaining
+            // route compares against a 🟢 key this user verified in person,
+            // held in the passphrase-backed contacts store. Item 14 deleted the
+            // route that compared against an unsigned directory answer.
+            approvedBundle = idbCanon;
+            addLine("sys", "", `peer key ${trusted} — no approval needed`);
+          } else {
+            addLine("sys", "", "[nobody has approved this connection — asking you before any keys are exchanged]");
+            const allowed = await requestPeerApproval(idbCanon);
+            // The socket can close under us while the prompt is open; the pump
+            // check at the top of handleMessage does not re-run after an await.
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            if (!allowed) {
+              addLine("sys", "", "[you refused this peer — disconnecting]");
+              hint("You refused the key that was offered. Nothing was exchanged.", true);
+              ws.close();
+              return;
+            }
+            approvedBundle = idbCanon;
+            addLine("sys", "", "you approved this peer — their key is now pinned for this session");
+            // A knock may have queued behind the prompt (an owner who was told
+            // it is a guest still receives them).
+            await showNextKnock();
+          }
+        }
+        // A second, different identity after an approval is a relay swapping the
+        // seat. C-01 below catches it too, but say the specific thing here.
+        if (!sameBundle(approvedBundle, idbCanon)) {
+          addLine("sys", "", "[a different identity than the one approved completed the key exchange — refusing]");
+          hint("The identity that completed the key exchange is not the one that was approved. Disconnecting.", true);
           if (ws) ws.close();
           return;
         }
@@ -3223,8 +3412,14 @@ els.connect.addEventListener("click", connect);
 els.form.addEventListener("submit", sendText);
 els.verifyOk.addEventListener("click", onVerifyOk);
 els.verifyNo.addEventListener("click", onVerifyNo);
-els.admitOk.addEventListener("click", () => decideKnock(true));
-els.admitNo.addEventListener("click", () => decideKnock(false));
+// One pair of buttons, two prompts. The peer-approval prompt owns them while it
+// is open (showNextKnock defers to it), so the dispatch cannot cross wires.
+els.admitOk.addEventListener("click", () => {
+  if (approvalPending) resolvePeerApproval(true); else decideKnock(true);
+});
+els.admitNo.addEventListener("click", () => {
+  if (approvalPending) resolvePeerApproval(false); else decideKnock(false);
+});
 
 // drawer menu + views
 els.menuBtn.addEventListener("click", () => setDrawer(els.drawer.hidden));

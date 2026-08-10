@@ -77,9 +77,92 @@ function registerMessageBytes(username, bundle, seq) {
 // retries once from there — so this is a convenience, not a trust anchor.
 const LS_REG_SEQ = "sc.regseq.v1";
 
+// Pentest 2026-08-08 item 18. The comment above says the counter "does not need
+// to be unforgeable". That is true for forgery FORWARD — a bogus value cannot
+// forge a registration, because the signature is still checked — and false for
+// EXHAUSTION, which is the direction nobody looked.
+//
+// `sc.regseq.v1` is plaintext and was unbounded. Write `2**53 - 2` into it and
+// the next registration signs `2**53 - 1`, which is EXACTLY the server's cap
+// (`seq: int | None = Field(..., le=2**53 - 1)` in accounts.py), so it is
+// accepted and stored. After that the account's keys are frozen forever:
+// anything higher is a 422 from the Pydantic bound, anything at or below is a
+// 409 as a replay. The one-shot recovery below only fires on 409 and only
+// raises to `Date.now()`, which is ~1.8e12 — six orders of magnitude BELOW the
+// poisoned value, so it cannot help. Confirmed end to end against the real
+// endpoint: seq=2**53-1 → `200 updated`, then 422 / 409 / 409 forever.
+//
+// Two bounds close it:
+//
+//   * Anything above `REG_SEQ_SANE_MAX` is treated as GARBAGE and ignored,
+//     rather than used as a floor. This function only ever writes `Date.now()`-
+//     scale values (~1.8e12); 2**43 is ~year 2248 in ms, so no value this code
+//     produces can reach it, and any value that does came from somewhere else.
+//     Discarding rather than throwing matters: the counter is attacker-writable
+//     plaintext, so refusing to proceed on a bad value would just convert the
+//     freeze into a local denial of service. Falling back to `Date.now()` heals
+//     it on the spot.
+//   * `Math.min(..., REG_SEQ_MAX)` guarantees we never SIGN a value the server
+//     will 422, so the client cannot walk an account up to the cap even by
+//     accident. Unreachable given the clamp above; it is here so the property
+//     holds by construction rather than by argument.
+//
+// `Date.now()` as the floor (not just `cur + 1`) is the same trick the 409 retry
+// already used, promoted to the normal path: it keeps the counter ahead across
+// a reinstall or cleared storage without a round trip.
+// Pentest 2026-08-10, second pass: the first repair did NOT close this, and an
+// ABSOLUTE ceiling never can — it only relocates the freeze.
+//
+// The freeze never required reaching the server's Pydantic cap. It only requires
+// the server's stored counter to exceed anything this client will sign again.
+// With `raw <= 2**43` as an INCLUSIVE acceptance bound, a stored `2**43` was
+// used as a floor and signed as `2**43 + 1` — which is ABOVE the bound, so the
+// next call discarded it and fell back to `Date.now()`, six orders of magnitude
+// below what the server now held. Executed end to end against the real endpoint:
+// the account's `ecdh`/`mlkem` could never be republished again, not even after
+// a key compromise, and the poisoned value silently overwrote itself so nothing
+// on the device showed why. The bug was the ASYMMETRY between what we accept as
+// a floor and what we are willing to sign.
+//
+// So the bound is now RELATIVE and TWO-SIDED, and the same number does both
+// jobs: never sign more than `REG_SEQ_SLACK_MS` beyond the current clock, and
+// never accept a stored floor above that same line. Two properties follow that
+// the absolute version did not have:
+//
+//   * Nothing this client signs can ever be un-signable later, because the
+//     ceiling moves forward with wall-clock. A poisoned store is discarded, and
+//     even a value written AT the ceiling stays acceptable a moment later and
+//     simply advances by one. There is no self-discarding band left.
+//   * An attacker with a localStorage write can push the server's counter at
+//     most `REG_SEQ_SLACK_MS` ahead of real time, and the client overtakes it on
+//     the next registration rather than being locked out.
+//
+// RESIDUAL, stated plainly because it needs a protocol change rather than
+// tuning: a device whose WALL CLOCK is badly wrong into the future still signs a
+// far-future counter, and once the server has stored it no correctly-clocked
+// client can overtake it. Nothing here can fix that — the ceiling is computed
+// from the same clock that is lying. The real repair is for the server to echo
+// its stored counter in the 409 body so a client can resynchronise; today the
+// 409 says only "not newer", which is why `Date.now()` had to be guessed at in
+// the first place. Recorded in PROGRESS.md as an open item.
+const REG_SEQ_SLACK_MS = 7 * 24 * 60 * 60 * 1000;   // one week of clock slack
+
+// The highest counter this device may sign right now, and equally the highest
+// stored value it will trust as a floor. One number, so the two can never drift
+// apart the way they did in the first repair.
+function regSeqCeiling() {
+  return Date.now() + REG_SEQ_SLACK_MS;
+}
+
+function clampRegSeq(n) {
+  return Math.min(Math.max(n, 1), regSeqCeiling());
+}
+
 function nextRegSeq() {
-  const cur = Number.parseInt(localStorage.getItem(LS_REG_SEQ) || "0", 10);
-  const next = (Number.isFinite(cur) && cur > 0 ? cur : 0) + 1;
+  const raw = Number.parseInt(localStorage.getItem(LS_REG_SEQ) || "0", 10);
+  const ceiling = regSeqCeiling();
+  const cur = Number.isInteger(raw) && raw > 0 && raw <= ceiling ? raw : 0;
+  const next = Math.min(Math.max(cur + 1, Date.now()), ceiling);
   localStorage.setItem(LS_REG_SEQ, String(next));
   return next;
 }
@@ -132,7 +215,16 @@ export async function register(base, identity, username) {
   if (!res.ok && res.status === 409 && Number.isInteger(seq)) {
     const detail = await res.clone().text();
     if (detail.includes("counter")) {
-      seq = Math.max(seq, Date.now());
+      // Item 18, second pass (M-1): this used to be
+      // `clampRegSeq(Math.max(seq, Date.now()))`, which recomputed EXACTLY the
+      // value that had just been refused — the first attempt already signs
+      // `max(cur + 1, Date.now())`, so `seq >= Date.now()` always held. Every
+      // counter 409 therefore cost a second ML-DSA signature and a second round
+      // trip for an outcome identical by construction, while the comment claimed
+      // it was a recovery. It is a real recovery now: jump to the ceiling, which
+      // is the furthest-ahead value this device may legitimately sign, so it
+      // overtakes anything the server can be holding within the slack window.
+      seq = regSeqCeiling();
       localStorage.setItem(LS_REG_SEQ, String(seq));
       res = await attempt(seq);
     }

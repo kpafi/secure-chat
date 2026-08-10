@@ -165,10 +165,34 @@ API_RATE_REFILL_PER_SEC = 5.0 # sustained requests/second
 # bucket behind Tor, so any unauthenticated visitor could hold it empty and deny
 # login to every account on the relay. It is now keyed per USERNAME (see
 # accounts.py), which is the only fairness axis available when every request
-# shares one loopback address. Same numbers: they were always meant to bound one
-# principal's login attempts, and that is what they now do.
+# shares one loopback address.
+#
+# Pentest 2026-08-08 item 19, and the refill is 2.0 rather than the original 0.5
+# because of it. The reasoning is counter-intuitive, so it is written down.
+#
+# Every challenge request is charged to the GLOBAL bucket below BEFORE this
+# per-username one is consulted, so an attacker's total spend is capped at
+# CHALLENGE_GLOBAL_RATE_REFILL_PER_SEC no matter how they aim it. Holding one
+# victim's bucket empty costs this refill rate. So:
+#
+#     simultaneous victims = CHALLENGE_GLOBAL_RATE_REFILL_PER_SEC
+#                          / CHALLENGE_RATE_REFILL_PER_SEC
+#
+# At the original 0.5/s that was 4/0.5 = EIGHT accounts one unauthenticated
+# visitor could silence at once. At 2.0/s it is two. Making this bucket LOOSER
+# shrinks the attacker's reach, because the binding constraint on them is the
+# global ceiling, not this one.
+#
+# It costs honest users nothing: a client mints one or two challenges per login
+# and logs in about once an hour, and the client's own `autoLogin` backoff caps
+# retries at one per 12 s even when it is failing. There is no legitimate caller
+# anywhere near 2/s for a single account.
+#
+# Do not "tighten" this back without redoing that division — a lower number here
+# looks stricter and is strictly worse. `test_rate_limit_invariants.py` pins the
+# ratio so the mistake fails a test instead of shipping.
 CHALLENGE_RATE_CAPACITY = 10        # burst allowance (challenges per username)
-CHALLENGE_RATE_REFILL_PER_SEC = 0.5 # sustained challenges/second per username
+CHALLENGE_RATE_REFILL_PER_SEC = 2.0 # sustained challenges/second per username
 
 # The global ceiling that used to be implicit in the shared bucket (F-RELAY-003).
 # Sized so honest traffic never meets it — a real user logging in spends 1-2

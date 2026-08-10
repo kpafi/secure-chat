@@ -556,6 +556,11 @@ export async function upsert({
       cur.ed !== ed || cur.mldsa !== mldsa ||
       (ecdh != null && (cur.ecdh ?? null) !== ecdh) ||
       (mlkem != null && (cur.mlkem ?? null) !== mlkem);
+    // Item 17: capture the outgoing signing keys BEFORE they are overwritten, so
+    // a later Remove/Unverify can still find pins filed under them. Only when
+    // the signing keys themselves move — an ecdh/mlkem-only change leaves the
+    // identity that pins are matched on untouched.
+    if (keyChanged && (cur.ed !== ed || cur.mldsa !== mldsa)) rememberSupersededKeys(cur);
     cur.ed = ed;
     cur.mldsa = mldsa;
     if (ecdh) cur.ecdh = ecdh;
@@ -607,15 +612,99 @@ export async function setVerified(username, on) {
 // room, the revocation deleted a key that was never written and left the pin
 // that actually gates auto-unlock. Revocation has to be about the KEYS, not
 // about the label they happen to be filed under, so sweep by bundle.
+// Pentest 2026-08-08 item 17: sweeping by the contact's CURRENT keys is not
+// enough, and the residual is the worst possible one.
+//
+// `upsert()` overwrites `cur.ed`/`cur.mldsa` on a key change without touching
+// `pins`. So after a rotation the record names K2 while the `room:<id>` pin
+// still names K1, the comparison below matches nothing, and Remove/Unverify
+// leave that pin in place. The key left behind is the SUPERSEDED one — exactly
+// the key a user revoking after a suspected compromise is trying to kill — and
+// anyone presenting K1 still matches a stored pin and still auto-unlocks
+// messaging with no prompt.
+//
+// Fixed by remembering superseded signing keys on the record (see
+// `rememberSupersededKeys`) and sweeping by the union: current bundle ∪ history.
+//
+// It does NOT over-sweep, which was checked in the other direction: a collateral
+// match needs both `ed` AND `mldsa` to equal this contact's, i.e. the same
+// identity filed under another label, and deleting that pin is correct.
+//
+// Honest limit: the history can only contain keys this store actually SAW being
+// replaced. A pin written under `room:<id>` at K1 by a device that never held a
+// contact record at K1 — pin first, contact added later already at K2 — is still
+// missed. Nothing in the record can recover a key it never stored; closing that
+// needs the pin to carry its owner, which is only knowable when a handle was
+// typed (`user:<name>` pins already carry it in the key).
+const MAX_PIN_KEY_HISTORY = 8;
+
+// Record the bundle a contact is moving AWAY from. Must be called BEFORE the new
+// keys are written over the record.
+function rememberSupersededKeys(cur) {
+  if (!cur || typeof cur.ed !== "string" || typeof cur.mldsa !== "string") return;
+  const history = Array.isArray(cur.pinKeys) ? cur.pinKeys : [];
+  if (history.some((k) => k.ed === cur.ed && k.mldsa === cur.mldsa)) return;
+  history.push({ ed: cur.ed, mldsa: cur.mldsa });
+  // Pentest 2026-08-10 (M-1): the first cut was `history.slice(-MAX)`, which
+  // drops the OLDEST superseded key — and the oldest is exactly the one whose
+  // pin has had the longest time to be written and forgotten. Nine rotations
+  // therefore evicted K1 while `room:<id>` still pinned K1, restoring verbatim
+  // the residual item 17 exists to close. Reproduced.
+  //
+  // The justification for capping at all was also simply wrong, and is corrected
+  // here rather than left as folklore: it claimed `upsert` is reachable from
+  // inbound mail. It is not, for this purpose — the inbound-mail path keys new
+  // records on `neutralName(senderBundle.ed)`, so a different key makes a
+  // different RECORD and never pushes onto an existing contact's history. Only a
+  // user action (re-adding a handle, or a live session with a rotated peer) can
+  // grow this list.
+  //
+  // So the bound never evicts a key that still has a pin naming it — those are
+  // the entries with work left to do. The cap only trims history that has become
+  // inert, which keeps the list bounded by the pins that actually exist.
+  const stillPinned = (k) =>
+    Object.values(pins).some((p) => p && p.ed === k.ed && p.mldsa === k.mldsa);
+  const keepFrom = Math.max(0, history.length - MAX_PIN_KEY_HISTORY);
+  cur.pinKeys = history.filter((k, i) => i >= keepFrom || stillPinned(k));
+}
+
 function dropPinsFor(contact) {
   if (!contact) return;
   delete pins["user:" + contact.username];
+  // Current keys ∪ every superseded pair we recorded for this contact.
+  const owned = [{ ed: contact.ed, mldsa: contact.mldsa }];
+  if (Array.isArray(contact.pinKeys)) {
+    // Pentest 2026-08-10 (M-2): a historical key is not necessarily this
+    // contact's. `pinKeys` is fed from whatever `upsert` was called with, which
+    // includes an UNSIGNED directory answer (see item 14 — the directory binds
+    // nothing). So a relay that answers one lookup for "mallory" with alice's
+    // real bundle gets K_alice written into mallory's history; the record
+    // self-corrects on the next honest answer, but the history keeps the lie,
+    // and removing mallory weeks later then deleted alice's pin. Alice's next
+    // session rendered as a benign first contact instead of "identity key
+    // CHANGED" — the alarm inverted, which is the shape this project has been
+    // bitten by before. Reproduced, and confirmed absent from the pre-fix code:
+    // the old current-key-only sweep was self-limiting, because it only matched
+    // while the record still NAMED the poisoned key. History made it permanent.
+    //
+    // So a historical key is skipped when it is some OTHER contact's CURRENT
+    // identity. That contact is the live owner of those keys; a stale entry in
+    // someone else's history is not authority to delete their pin. The contact
+    // being removed keeps its own current keys as authority regardless.
+    const claimedByAnother = (k) => contacts.some(
+      (c) => c !== contact && c.ed === k.ed && c.mldsa === k.mldsa);
+    for (const k of contact.pinKeys) {
+      if (!k || typeof k.ed !== "string" || typeof k.mldsa !== "string") continue;
+      if (claimedByAnother(k)) continue;
+      owned.push(k);
+    }
+  }
   for (const [key, pin] of Object.entries(pins)) {
     if (!pin) continue;
     // Signing keys alone are enough to identify the contact: they ARE the
     // identity (the fingerprint and safety number cover only them), and a pin
     // whose ed/mldsa match is a pin for this peer whatever else it carries.
-    if (pin.ed === contact.ed && pin.mldsa === contact.mldsa) delete pins[key];
+    if (owned.some((k) => pin.ed === k.ed && pin.mldsa === k.mldsa)) delete pins[key];
   }
 }
 

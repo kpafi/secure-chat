@@ -78,6 +78,43 @@ _lookup_limiter = KeyedRateLimiter(config.LOOKUP_RATE_CAPACITY, config.LOOKUP_RA
 # draining it denies that one account, and denying everybody now costs one full
 # bucket per account rather than one bucket total.
 #
+# Pentest 2026-08-08 item 19 — the accepted residual, stated properly, because
+# the sentence above used to treat "denies that one account" as though it
+# settled the matter. It does not: for an attacker whose goal is to silence one
+# specific person, denying that one account IS the objective, not a rounding
+# error on the way to a service-wide outage. This is a precise, unauthenticated,
+# targeted login lockout against any well-formed username, and the victim cannot
+# evade it — the bucket is keyed on the name they are known by.
+#
+# What it costs the victim, measured rather than assumed:
+#   * Nothing at all until their current session token expires (TOKEN_TTL_SEC,
+#     1 h). Live rooms are unaffected in any case — a room join touches no
+#     account API, so live chat keeps working throughout.
+#   * After that, sealed/async mail stops arriving. It is NOT silent: the client
+#     surfaces "Not signed in to the directory — sealed messages will not
+#     arrive" through hint() on the 1st and 4th consecutive failure. It is NOT
+#     permanent either: autoLogin keeps retrying on a capped backoff and the
+#     victim recovers ~2 s after the attacker stops paying.
+#
+# What it costs the attacker: CHALLENGE_RATE_REFILL_PER_SEC sustained, per
+# victim, forever, from an endpoint that is charged against the global bucket
+# first — see the arithmetic at CHALLENGE_RATE_REFILL_PER_SEC in config.py,
+# which is why that number was RAISED to 2.0. Two simultaneous victims, not
+# eight.
+#
+# ACCEPTED, deliberately, and here is the alternative that was rejected:
+# refunding the charge on a successful verify rewards honest logins but does not
+# help the victim, who needs one challenge to REACH verify and is being denied
+# exactly that. Closing this properly means making challenge minting cost the
+# asker something (proof-of-work) or gating it behind an authenticated
+# pre-token; both are design changes, not tuning, and neither is justified by an
+# outage whose worst case is delayed async mail with a visible warning.
+#
+# The service-wide DoS is NOT closed and cannot be by this bucket: 4 req/s
+# saturates the global ceiling and denies logins to everyone, because behind Tor
+# client_key carries no information to key on. F-RELAY-003 raised that from
+# 0.5 req/s to 4 req/s. That is an 8x improvement, not a fix.
+#
 # This does not weaken anti-enumeration (I1): a bucket is minted for any
 # well-formed username whether or not the account exists, so a 429 says only
 # "somebody has been asking about this name recently" — a state the asker can
@@ -346,9 +383,48 @@ def _ed25519_verify(pub_raw: bytes, sig: bytes, msg: bytes) -> bool:
         return False
 
 
+# Pentest 2026-08-08 item 15: `dilithium_py` is NOT thread-safe in this
+# deployment, and every endpoint that verifies an ML-DSA signature is a sync
+# `def` — which FastAPI runs in the anyio threadpool (see the note above the
+# endpoints). So these calls really are concurrent.
+#
+# The library prefers `xoflib`, whose `shake256(seed)` returns a FRESH reader per
+# call. Without it, it falls back to `dilithium_py/shake/shake_wrapper.py`, whose
+# `shake128`/`shake256` are MODULE-LEVEL SINGLETONS carrying mutable state
+# (`buf`, `index`, `xof_read`), imported at module scope by both
+# `ml_dsa.ml_dsa` and `polynomials.polynomials`. Two threads verifying at once
+# interleave `absorb`/`read` on the same object and read each other's keystream.
+#
+# There is no xoflib in this venv, and the effect is not subtle: 8 threads over
+# one VALID signature rejected 153 of 320. It FAILS CLOSED — a corrupted verify
+# returns False, never True, so this is a login denial-of-service and never an
+# auth bypass — but a login path that rejects half of its valid signatures under
+# ordinary concurrency is broken.
+#
+# Serialising is the fix rather than adding the dependency, because it is
+# correct WHATEVER backend is installed. That property is the point: the failure
+# mode being closed off here is "someone deploys without xoflib and nothing
+# says so". Adopting xoflib later is a fine change, but it is a separate one that
+# must come with the concurrency test below (`test_mldsa_verify_concurrent`) run
+# against the new backend — do not delete this lock on the strength of a
+# requirements pin alone.
+#
+# Cost, measured, not assumed: one verify is ~15 ms here, so this caps ML-DSA
+# verification at ~66/s process-wide. The relay's own throttles sit far below
+# that (per-username challenges refill at 0.5/s, the per-host backstop at 4/s),
+# and legitimate login traffic for a directory of this size is nowhere near it.
+# The lock serialises work that was already CPU-bound; it does not add any.
+#
+# This is the single call site for `dilithium_py` in the process, so the lock
+# here covers every path — `/auth/verify` and `register` both, which also closes
+# the same latent bug in `register` (it predates this branch).
+_mldsa_lock = threading.Lock()
+
+
 def _mldsa65_verify(pub_raw: bytes, sig: bytes, msg: bytes) -> bool:
     try:
-        return bool(ML_DSA_65.verify(pub_raw, msg, sig))
+        with _mldsa_lock:
+            return bool(ML_DSA_65.verify(pub_raw, msg, sig))
     except Exception:
         # A malformed key/sig must fail closed, never raise past the handler.
         return False
@@ -745,6 +821,26 @@ def auth_verify(req: VerifyReq) -> dict:
     else:
         # Legacy client: run the verification anyway, against a signature that
         # cannot pass, so the refusal costs the same time as a wrong one.
+        #
+        # Item 15 note: this decoy runs for legacy clients, so it is reachable by
+        # unauthenticated traffic. Before the verify was serialised that meant
+        # garbage requests could CORRUPT concurrent real logins; now the worst
+        # they do is hold the ML-DSA lock briefly, bounded by the challenge and
+        # per-host buckets far below its capacity. Keeping the decoy is
+        # deliberate — dropping it reopens the F-RELAY-006 timing oracle.
+        #
+        # Measured, because the first version of this note guessed and was wrong
+        # by ~45x: an all-zero signature is rejected in **0.33 ms**, not the
+        # ~14.5 ms a well-formed one costs, because ML-DSA rejects it on a
+        # structural check long before any expensive work. So this branch is a
+        # far smaller lock-holder than the real verify path.
+        #
+        # That asymmetry does NOT leak anything: it separates a legacy client
+        # from a dual-scheme one, which is already plain from whether the request
+        # carries `mldsa_sig` at all. The equalisation that actually matters —
+        # existing vs nonexistent user — is the `_DECOY_BUNDLE` above, which
+        # verifies the SUBMITTED signature against a decoy key and so costs the
+        # same as the real branch (measured 20.9 ms vs 21.2 ms median).
         _mldsa65_verify(
             base64.b64decode(mldsa_stored, validate=True),
             b"\x00" * config.MLDSA65_SIG_BYTES,

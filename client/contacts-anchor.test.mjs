@@ -263,6 +263,145 @@ async function testPinsDoNotOutliveRevocation() {
 }
 
 await testPinsDoNotOutliveRevocation();
+
+// --- pentest 2026-08-08, item 17 --------------------------------------------
+// The sweep above matches on the contact's CURRENT keys. `upsert()` overwrites
+// them on a key change without touching `pins`, so after a rotation the record
+// names K2 while the pin still names K1 and the sweep matches nothing. The pin
+// left behind names the SUPERSEDED key — precisely the key a user revoking after
+// a suspected compromise wants dead.
+async function testPinSweepSurvivesKeyChange() {
+  await freshDevice();
+  // Per-contact key material. An earlier version shared K1/K2 across every
+  // contact here, which quietly made them the SAME IDENTITY under different
+  // labels — so the test was also asserting that removing one label strips a
+  // different, still-trusted contact's pin. That is the M-2 collateral the
+  // 2026-08-10 pentest found, and it is not what this test is about.
+  const K1 = { ed: "ZXJpbjE", mldsa: "ZXJpbjFN" };
+  const K2 = { ed: "ZXJpbjI", mldsa: "ZXJpbjJN" };
+  const F1 = { ed: "ZnJhbmsx", mldsa: "ZnJhbmsxTQ" };
+  const F2 = { ed: "ZnJhbmsy", mldsa: "ZnJhbmsyTQ" };
+  const G1 = { ed: "Z2luYTE", mldsa: "Z2luYTFN" };
+  const G2 = { ed: "Z2luYTI", mldsa: "Z2luYTJN" };
+  const I1 = { ed: "aXZhbjE", mldsa: "aXZhbjFN" };
+  const I2 = { ed: "aXZhbjI", mldsa: "aXZhbjJN" };
+
+  // Live-room shape: pinned under `room:<id>` while the contact was still K1.
+  await contacts.upsert({ username: "erin", ed: K1.ed, mldsa: K1.mldsa });
+  await contacts.savePin("room:rotating-room", K1);
+  await contacts.setVerified("erin", true);
+  assert.ok(contacts.getPin("room:rotating-room"), "fixture: the K1 pin exists");
+
+  // The rotation. `verified` resets (H-01), but the pin is untouched by upsert.
+  await contacts.upsert({ username: "erin", ed: K2.ed, mldsa: K2.mldsa });
+  assert.strictEqual(contacts.get("erin").verified, false, "a key change resets 🟢");
+  assert.ok(contacts.getPin("room:rotating-room"), "precondition: the K1 pin still exists");
+
+  await contacts.remove("erin");
+  assert.strictEqual(contacts.getPin("room:rotating-room"), null,
+    "item 17: Remove must sweep the pin naming the SUPERSEDED key, not just the current one");
+  console.log("OK  item 17: a pin written before a key change is swept by Remove");
+
+  // The same through Unverify, the other caller of dropPinsFor.
+  await contacts.upsert({ username: "frank", ed: F1.ed, mldsa: F1.mldsa });
+  await contacts.savePin("room:frank-room", F1);
+  await contacts.setVerified("frank", true);
+  await contacts.upsert({ username: "frank", ed: F2.ed, mldsa: F2.mldsa });
+  await contacts.setVerified("frank", true);   // re-verified at the new key
+  assert.ok(contacts.getPin("room:frank-room"), "precondition: the K1 pin survived the rotation");
+  await contacts.setVerified("frank", false);
+  assert.strictEqual(contacts.getPin("room:frank-room"), null,
+    "item 17: Unverify must sweep the superseded key's pin too");
+  console.log("OK  item 17: ...and by Unverify");
+
+  // Two rotations: K1 -> K2 -> K3. Both older pins must go.
+  const G3 = { ed: "Z2luYTM", mldsa: "Z2luYTNN" };
+  await contacts.upsert({ username: "gina", ed: G1.ed, mldsa: G1.mldsa });
+  await contacts.savePin("room:gina-1", G1);
+  await contacts.upsert({ username: "gina", ed: G2.ed, mldsa: G2.mldsa });
+  await contacts.savePin("room:gina-2", G2);
+  await contacts.upsert({ username: "gina", ed: G3.ed, mldsa: G3.mldsa });
+  await contacts.remove("gina");
+  assert.strictEqual(contacts.getPin("room:gina-1"), null, "the oldest key's pin must go");
+  assert.strictEqual(contacts.getPin("room:gina-2"), null, "the intermediate key's pin must go");
+  console.log("OK  item 17: every superseded key in the chain is swept");
+
+  // Control, in the direction that matters: history must not become a licence to
+  // delete OTHER peers' pins. Only an exact ed+mldsa match may be swept.
+  const OTHER = { ed: "T1RIRVItZWQy", mldsa: "T1RIRVItbWxkc2Ey" };
+  await contacts.upsert({ username: "heidi", ed: OTHER.ed, mldsa: OTHER.mldsa });
+  await contacts.savePin("room:heidi-room", OTHER);
+  await contacts.upsert({ username: "ivan", ed: I1.ed, mldsa: I1.mldsa });
+  await contacts.upsert({ username: "ivan", ed: I2.ed, mldsa: I2.mldsa });
+  await contacts.remove("ivan");
+  assert.ok(contacts.getPin("room:heidi-room"),
+    "another peer's pin must not be collateral damage of the history sweep");
+  console.log("OK  item 17: control — the history sweep does not over-reach");
+
+  // The history is bounded, so a peer that can drive upsert cannot grow the
+  // record without limit.
+  await contacts.upsert({ username: "judy", ed: K1.ed, mldsa: K1.mldsa });
+  for (let i = 0; i < 30; i++) {
+    await contacts.upsert({ username: "judy", ed: `Uk9UQVRF${i}`, mldsa: `Uk9UQVRFTUw${i}` });
+  }
+  const hist = contacts.get("judy").pinKeys || [];
+  assert.ok(hist.length <= 8, `the superseded-key history must stay bounded, got ${hist.length}`);
+  console.log("OK  item 17: the superseded-key history is bounded");
+}
+
+await testPinSweepSurvivesKeyChange();
+
+// --- pentest 2026-08-10, findings against the item 17 fix -------------------
+async function testPinHistoryFindings() {
+  // M-1: the cap used to evict the OLDEST superseded key — precisely the one
+  // whose pin has had longest to be written and forgotten — restoring the exact
+  // residual item 17 closes. The bound must never drop a key a pin still names.
+  await freshDevice();
+  const K = (n) => ({ ed: `SzEt${n}`, mldsa: `SzJt${n}` });
+  await contacts.upsert({ username: "bob", ...K(1) });
+  await contacts.savePin("room:bobs-room", K(1));
+  for (let i = 2; i <= 12; i++) await contacts.upsert({ username: "bob", ...K(i) });
+  await contacts.remove("bob");
+  assert.strictEqual(contacts.getPin("room:bobs-room"), null,
+    "M-1: a pin naming a key evicted by the history cap must STILL be swept");
+  console.log("OK  item 17 / M-1: the history bound never evicts a key that still has a pin");
+
+  // ...and the bound still does its job on history that has gone inert.
+  await freshDevice();
+  await contacts.upsert({ username: "carol", ...K(1) });
+  for (let i = 2; i <= 30; i++) await contacts.upsert({ username: "carol", ...K(i) });
+  const hist = contacts.get("carol").pinKeys || [];
+  assert.ok(hist.length <= 8, `unpinned history must stay bounded, got ${hist.length}`);
+  console.log("OK  item 17 / M-1: history with no pins behind it is still bounded");
+
+  // M-2: `pinKeys` is fed from unsigned directory answers, so a hostile relay can
+  // plant a THIRD PARTY's key in someone's history; removing that someone then
+  // deleted the third party's pin, inverting the key-change alarm.
+  await freshDevice();
+  const ALICE = { ed: "QUxJQ0U", mldsa: "QUxJQ0VN" };
+  await contacts.upsert({ username: "alice", ...ALICE });
+  await contacts.savePin("user:alice", ALICE);
+  await contacts.upsert({ username: "mallory", ...ALICE });   // the poisoned answer
+  await contacts.upsert({ username: "mallory", ed: "TUFM", mldsa: "TUFMTQ" }); // corrects
+  await contacts.remove("mallory");
+  assert.ok(contacts.getPin("user:alice"),
+    "M-2: removing a contact must not delete a pin belonging to a DIFFERENT live contact");
+  console.log("OK  item 17 / M-2: a poisoned history entry cannot delete a third party's pin");
+
+  // Control: the skip must not become a way to KEEP a pin alive. A superseded key
+  // that no other contact claims is still swept.
+  await freshDevice();
+  await contacts.upsert({ username: "dave", ...K(1) });
+  await contacts.savePin("room:dave-room", K(1));
+  await contacts.upsert({ username: "dave", ...K(2) });
+  await contacts.remove("dave");
+  assert.strictEqual(contacts.getPin("room:dave-room"), null,
+    "control: an unclaimed superseded key must still be swept");
+  console.log("OK  item 17: control — the M-2 skip does not strand ordinary pins");
+}
+
+await testPinHistoryFindings();
+
 console.log("All F-ATREST-007 checks passed.");
 
 // --- F-PROTO-005 ------------------------------------------------------------

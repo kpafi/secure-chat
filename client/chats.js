@@ -313,8 +313,84 @@ function sanitizeModes() {
   return changed;
 }
 
+// ---- write serialisation (pentest 2026-08-08 item 16) ----------------------
+//
+// The CAS below is a compare-and-swap with a gap between the compare and the
+// swap: `readWitness` (one await), the check, then TWO more awaits (the encrypt
+// and `writeWitness`) before the store is written. Two tabs that both read the
+// witness BEFORE either writes therefore both see generation N, both pass the
+// check, and both write N+1 — the exact lost update the CAS was added to stop.
+// Reproduced in-process with two real module instances over one storage: both
+// `markSeen` calls returned true and `env-A1` vanished from the P-13 replay
+// ring, which means the relay can replay that envelope and it is accepted as
+// new. The CAS is a faithful port of `contacts.js:441-448`; the difference is
+// that chats persists on EVERY operation, so the residual that is rare there is
+// ordinary here.
+//
+// So the read-modify-write is serialised instead of merely checked. Two layers,
+// because they cover different races:
+//
+//   * `writeChain` serialises writes WITHIN this tab. `persist()` has awaits in
+//     it, so two overlapping operations in one tab (a `markSeen` and an
+//     `append`, say) can already interleave without any second tab involved.
+//   * `navigator.locks` serialises ACROSS tabs, which is what the finding is
+//     about. The lock is per-origin, so it also subsumes the first layer where
+//     it exists.
+//
+// With the lock held across compare AND swap, the losing tab now reads the
+// winner's witness and refuses loudly ("changed in another tab — reload")
+// instead of silently discarding its history. The permanent-lockout half goes
+// with it: store and witness are written as one critical section, so the store
+// can no longer end up older than the witness.
+//
+// The other fix shape considered — folding store and witness into ONE
+// localStorage value so there is a single atomic write — was REJECTED, and this
+// is worth recording because it looks tidier. The witness has to be separately
+// readable when the store is gone; that is the whole of F-ATREST-005's
+// deletion detection (`assertStoreNotDeleted` reads the witness precisely when
+// `LS_CHATS` is missing), and it carries its own salt for that reason. Merging
+// them makes one `removeItem` delete the evidence along with the data.
+//
+// Fallback posture, stated plainly rather than assumed: with no `navigator.locks`
+// the cross-tab layer is absent and the residual is exactly today's behaviour —
+// no worse, not fixed. This deliberately does NOT copy F-CRYPTO-014's
+// "no Web Locks, no OTP" stance, because the hazards are not comparable: there
+// the failure is keystream reuse and the feature can simply be withheld, here it
+// is a lost update in a replay ring and withholding it means the user cannot
+// open their own chat history at all. The engines involved are Chrome/WebView
+// < 69, Firefox < 96 and Safari 15.0-15.3.
+const WRITE_LOCK = "sc.chats.write.v1";
+let writeChain = Promise.resolve();
+
+function withWriteLock(fn) {
+  // `navigator` is guarded, not just `navigator.locks`: this module is imported
+  // by the Node test suite, and Node only grew a global `navigator` in 21.0.0.
+  // Without the guard `chats.unlock()` throws a TypeError on Node 20 — which the
+  // repo's own brief still targets — and it reads as a bug in the store rather
+  // than a missing global. Pentest 2026-08-10 (L-2).
+  const hasWebLocks = typeof navigator !== "undefined" &&
+    navigator.locks && typeof navigator.locks.request === "function";
+  const run = () => (hasWebLocks ? navigator.locks.request(WRITE_LOCK, fn) : fn());
+  // Chain on settle, not on success: one failed write must not wedge the queue.
+  const next = writeChain.then(run, run);
+  writeChain = next.then(() => {}, () => {});
+  return next;
+}
+
 async function persist() {
   if (!dataKey) throw new Error("chat store is locked");
+  return withWriteLock(persistLocked);
+}
+
+async function persistLocked() {
+  // Re-checked inside the lock: `lock()` can have run while we were queued.
+  //
+  // `chats` is checked as well as `dataKey`. `unlock()` sets `dataKey` before it
+  // finishes populating `chats`, so a queued write landing in that window would
+  // otherwise serialise `chats: null` and write an AGREEING witness beside it —
+  // silent, total history loss that the rollback check would then call healthy.
+  // Modelled by the 2026-08-10 pentest rather than executed; the guard is free.
+  if (!dataKey || !chats) throw new Error("chat store is locked");
   // Pentest 2026-08-07 fix review (F3): the same L-3 compare-and-swap
   // contacts.js has carried since 2026-07-29, which the first cut of this
   // function omitted while copying everything around it.

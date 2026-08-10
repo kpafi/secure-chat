@@ -936,22 +936,217 @@ async function testRecvAndExportedFloors() {
   console.log("OK  F-ATREST-001: a recv rollback is refused even with blob+watermark restored");
 
   // F-ATREST-002: export latches natively and outlives a pre-export snapshot.
-  localStorage.setItem(`sc.otp.pad.v1.${pad.padId}`, pristine);
-  localStorage.setItem(`sc.otp.wm.v1.${pad.padId}`, pristineWm);
-  slots.delete(pad.padId + "#recv"); // isolate: only the export latch under test
-  const fresh = await otp.unlockPad(pad.padId, PASS);
-  await otp.markExported(fresh.record, fresh.atRest);
-  assert.strictEqual(floor.read(pad.padId + "#exported"), 1, "export must latch natively");
+  //
+  // On a pad of its own, so the recv floor above cannot decide this case. The
+  // previous version of this test reached for `slots.delete(padId + "#recv")` to
+  // isolate the latch — deleting a control to test its neighbour — and that
+  // deletion is exactly the 2026-08-08 item 13 attack, which the assertions
+  // below now cover deliberately instead.
+  const exp = await otp.generatePad({ label: "export-latch", totalBytes: 64 * 1024 });
+  const expAtRest = await otp.saveNewPad(exp, PASS);
+  const expPristine = localStorage.getItem(`sc.otp.pad.v1.${exp.padId}`);
+  const expPristineWm = localStorage.getItem(`sc.otp.wm.v1.${exp.padId}`);
+  assert.strictEqual(floor.read(exp.padId + "#exported"), 0,
+    "item 13: the export slot must exist from the first save, so its ABSENCE is unambiguous");
 
-  localStorage.setItem(`sc.otp.pad.v1.${pad.padId}`, pristine);
-  localStorage.setItem(`sc.otp.wm.v1.${pad.padId}`, pristineWm);
-  await assert.rejects(() => otp.unlockPad(pad.padId, PASS), /already exported once/,
+  await otp.markExported(exp, expAtRest);
+  assert.strictEqual(floor.read(exp.padId + "#exported"), 1, "export must latch natively");
+
+  localStorage.setItem(`sc.otp.pad.v1.${exp.padId}`, expPristine);
+  localStorage.setItem(`sc.otp.wm.v1.${exp.padId}`, expPristineWm);
+  await assert.rejects(() => otp.unlockPad(exp.padId, PASS), /already exported once/,
     "a pre-export snapshot must not re-arm export — that is a two-time pad");
   console.log("OK  F-ATREST-002: an `exported` rollback is refused by the native latch");
+
+  // --- item 13 -------------------------------------------------------------
+  // The 2026-07-29 H-1 deletion guard reads the SEND slot only, so the two
+  // derived slots the F-ATREST-001/002 fix added could each be deleted in one
+  // file edit and read back as "no floor". Each derived id is its own
+  // SharedPreferences entry, so this needs no rollback of the send floor.
+
+  // (a) `#exported` deleted + a pre-export snapshot = a SECOND export of a
+  //     pristine pad. This is the two-time pad, and it is the whole point.
+  localStorage.setItem(`sc.otp.pad.v1.${exp.padId}`, expPristine);
+  localStorage.setItem(`sc.otp.wm.v1.${exp.padId}`, expPristineWm);
+  slots.delete(exp.padId + "#exported");
+  assert.strictEqual(floor.read(exp.padId + "#exported"), -1, "precondition: the slot is gone");
+  await assert.rejects(() => otp.unlockPad(exp.padId, PASS),
+    /device-protected rollback record has been deleted/,
+    "item 13: deleting the #exported slot must not re-arm export");
+  console.log("OK  item 13: a deleted `#exported` slot is refused, not read as 'never exported'");
+
+  // (b) `#recv` deleted — the M-7 replay window. The send floor is untouched and
+  //     the send guard therefore does not fire; only the derived check catches it.
+  localStorage.setItem(`sc.otp.pad.v1.${pad.padId}`, pristine);
+  localStorage.setItem(`sc.otp.wm.v1.${pad.padId}`, pristineWm);
+  slots.delete(pad.padId + "#recv");
+  assert.notStrictEqual(floor.read(pad.padId), -1, "precondition: the SEND floor is still present");
+  await assert.rejects(() => otp.unlockPad(pad.padId, PASS),
+    /device-protected rollback record has been deleted/,
+    "item 13: deleting the #recv slot must not reopen the replay window");
+  console.log("OK  item 13: a deleted `#recv` slot is refused, not read as 'no floor'");
+
+  // (c) The guard must not brick pads that predate the derived slots. A blob
+  //     with `nativeFloor: true` and no `derivedFloors` is the 2026-07-29 shape,
+  //     and it legitimately has no derived slots at all — this is why the check
+  //     is keyed on a new field instead of tightening the old one.
+  const old = await otp.generatePad({ label: "pre-derived", totalBytes: 64 * 1024 });
+  const oldAtRest = await otp.saveNewPad(old, PASS);
+  // Reconstruct the old writer's output: the same v3 blob minus the one field it
+  // never wrote, re-encrypted under the same at-rest key. `nativeFloor` stays
+  // true, which is what makes this the interesting case — the send guard fires
+  // on it, so only the `derivedFloors` gate keeps the derived check off.
+  const oldKey = "sc.otp.pad.v1." + old.padId;
+  const oldCur = JSON.parse(localStorage.getItem(oldKey));
+  const oldInner = JSON.parse(_dec.decode(await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: _unb64(oldCur.iv) }, oldAtRest.key, _unb64(oldCur.ct),
+  )));
+  assert.strictEqual(oldInner.derivedFloors, true, "precondition: the new writer sets the marker");
+  assert.strictEqual(oldInner.nativeFloor, true, "precondition: a floor was in force");
+  delete oldInner.derivedFloors;
+  const oldIv = crypto.getRandomValues(new Uint8Array(12));
+  const oldCt = new Uint8Array(await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: oldIv }, oldAtRest.key, _enc.encode(JSON.stringify(oldInner)),
+  ));
+  localStorage.setItem(oldKey, JSON.stringify({
+    v: oldCur.v, kdf: oldCur.kdf, iv: _b64(oldIv), ct: _b64(oldCt),
+  }));
+  // The state a 2026-07-29-era pad is actually in: no derived slots ever written.
+  slots.delete(old.padId + "#recv");
+  slots.delete(old.padId + "#exported");
+  const opened = await otp.unlockPad(old.padId, PASS);
+  assert.ok(opened.record, "a pre-derived-slot pad must still open with no derived slots present");
+  console.log("OK  item 13: pads written before the derived slots existed are not bricked");
 
   delete globalThis.__SECURE_CHAT_NATIVE_FLOOR__;
   delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
 }
 
 await testRecvAndExportedFloors();
+
+// --- item 13, second pass: the fix must not BRICK a pad --------------------
+// The first cut wrote `derivedFloors: !!nativeFloor` into the blob BEFORE the
+// bumps that back it, and discarded their return values. A derived bump that
+// failed or was interrupted during a pad's FIRST save therefore left the blob
+// asserting slots that were never written, and the guard above then refused the
+// pad forever — using the wording of the tamper alarm, and with `padWasUsed`
+// blocking re-import so the padId was burned. Found by pentest, reproduced, and
+// confirmed to open normally on the pre-fix code, i.e. a regression the fix
+// itself introduced.
+//
+// Neither layer reports a failed bump: the JS wrapper swallows bridge exceptions
+// into NATIVE_TAMPERED and PadFloor.bump ignores commit()'s boolean. So the flags
+// are decided by READING THE SLOTS BACK.
+async function testFailedBumpDoesNotBrickAPad() {
+  for (const failing of ["#recv", "#exported", ""]) {
+    const slots = new Map();
+    // A floor whose bump silently does nothing for ONE slot — a transient
+    // Keystore error, or a commit() that returned false on a full disk.
+    const floor = {
+      read: (k) => (slots.has(k) ? slots.get(k) : -1),
+      bump: (k, v) => {
+        if (k.endsWith(failing) && (failing !== "" || !k.includes("#"))) return floor.read(k);
+        if (v < 0) return floor.read(k);
+        const n = Math.max(floor.read(k), v);
+        slots.set(k, n);
+        return n;
+      },
+    };
+    Object.defineProperty(globalThis, "__SECURE_CHAT_NATIVE_FLOOR__", { value: true, configurable: true });
+    Object.defineProperty(globalThis, "__SECURE_CHAT_PAD_FLOOR__", { value: Object.freeze(floor), configurable: true });
+    const fresh = new Map();
+    globalThis.localStorage = {
+      getItem: (k) => (fresh.has(k) ? fresh.get(k) : null),
+      setItem: (k, v) => fresh.set(k, String(v)),
+      removeItem: (k) => fresh.delete(k),
+    };
+
+    const otp = await import(`./otp.js?brick=${failing}&t=${Date.now()}`);
+    const PASS = "pad passphrase";
+    const pad = await otp.generatePad({ label: "brick", totalBytes: 64 * 1024 });
+    await otp.saveNewPad(pad, PASS);
+
+    const which = failing === "" ? "the SEND slot" : `the ${failing} slot`;
+    const opened = await otp.unlockPad(pad.padId, PASS);
+    assert.ok(opened.record,
+      `item 13: a first save where ${which} failed to take must leave the pad USABLE, ` +
+      "not permanently refused — the fix must never brick a pad it was meant to protect");
+    assert.strictEqual(opened.record.sendOffset, 0, "...and at its true offset");
+    console.log(`OK  item 13: a first save with ${which} unwritable does not brick the pad`);
+
+    // ...and the guard must ARM as soon as the floor starts working again, so
+    // the degraded state is temporary rather than a permanent hole.
+    // Deliberately NOT pre-seeded: the point is that `armFloors` writes these
+    // slots itself once the floor works. Seeding them here would prove only that
+    // the guard fires when slots exist, which is a different (already covered)
+    // claim — flagged by the 2026-08-10 pentest.
+    const healthy = {
+      read: (k) => (slots.has(k) ? slots.get(k) : -1),
+      bump: (k, v) => { if (v < 0) return healthy.read(k); const n = Math.max(healthy.read(k), v); slots.set(k, n); return n; },
+    };
+    Object.defineProperty(globalThis, "__SECURE_CHAT_PAD_FLOOR__", { value: Object.freeze(healthy), configurable: true });
+    const otp2 = await import(`./otp.js?heal=${failing}&t=${Date.now()}`);
+    const r = await otp2.unlockPad(pad.padId, PASS);
+    r.record.recvHighWater = 4096;
+    await otp2.savePadProgress(r.record, r.atRest);   // a save with a working floor
+    slots.delete(pad.padId + "#recv");                 // now delete a derived slot
+    await assert.rejects(() => otp2.unlockPad(pad.padId, PASS),
+      /device-protected rollback record has been deleted/,
+      "item 13: once a save succeeds with a working floor, the guard must be armed again");
+    console.log(`OK  item 13: ...and the guard re-arms on the next healthy save (${which})`);
+
+    delete globalThis.__SECURE_CHAT_NATIVE_FLOOR__;
+    delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+  }
+}
+
+await testFailedBumpDoesNotBrickAPad();
+
+// A CORRUPTED slot is not the same as an absent one, and must not be handled the
+// same way. NATIVE_ABSENT (-1) is benign — nothing was ever written. TAMPERED
+// (-2) means something IS there and its Keystore MAC did not verify, which costs
+// an attacker exactly one file edit, the same as a deletion. The first repair
+// collapsed both with `>= 0`, so corrupting a slot silently disarmed the guard
+// that deleting it trips: fail-OPEN, where the code it replaced was fail-CLOSED.
+async function testTamperedSlotFailsClosed() {
+  for (const slot of ["", "#recv", "#exported"]) {
+    const slots = new Map();
+    let corrupt = null;
+    const floor = {
+      read: (k) => (k === corrupt ? -2 : (slots.has(k) ? slots.get(k) : -1)),
+      bump: (k, v) => {
+        if (k === corrupt) return -2;            // PadFloor never heals a forged record
+        if (v < 0) return floor.read(k);
+        const n = Math.max(floor.read(k), v);
+        slots.set(k, n);
+        return n;
+      },
+    };
+    Object.defineProperty(globalThis, "__SECURE_CHAT_NATIVE_FLOOR__", { value: true, configurable: true });
+    Object.defineProperty(globalThis, "__SECURE_CHAT_PAD_FLOOR__", { value: Object.freeze(floor), configurable: true });
+    const fresh = new Map();
+    globalThis.localStorage = {
+      getItem: (k) => (fresh.has(k) ? fresh.get(k) : null),
+      setItem: (k, v) => fresh.set(k, String(v)),
+      removeItem: (k) => fresh.delete(k),
+    };
+    const otp = await import(`./otp.js?tamper=${slot}&t=${Date.now()}`);
+    const PASS = "pad passphrase";
+    const pad = await otp.generatePad({ label: "tampered", totalBytes: 64 * 1024 });
+    const at = await otp.saveNewPad(pad, PASS);
+
+    corrupt = pad.padId + slot;                  // the attacker's one file edit
+    const which = slot === "" ? "the SEND slot" : `the ${slot} slot`;
+    await assert.rejects(
+      () => otp.savePadProgress(pad, at), /damaged or forged/,
+      `item 13: corrupting ${which} must FAIL CLOSED, never quietly write an unguarded blob`);
+    console.log(`OK  item 13: a corrupted ${which} is refused, not treated as 'no floor'`);
+
+    delete globalThis.__SECURE_CHAT_NATIVE_FLOOR__;
+    delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+  }
+}
+
+await testTamperedSlotFailsClosed();
+
 console.log("All OTP native-floor scope checks passed.");

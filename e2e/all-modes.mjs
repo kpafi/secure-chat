@@ -33,6 +33,32 @@ const SHARED_PASS = cfg.chatPassphrase;
 const PAD_XFER_PASS = "e2e pad transfer passphrase — test only";
 const PAD_LOCAL_PASS = "e2e pad at-rest passphrase — test only";
 
+// F-PROTO-001 (rebuilt 2026-08-08): the peer whose device did NOT run the knock
+// prompt is asked to approve the other side's key before the handshake
+// completes, unless that key is already trusted — which since 2026-08-08
+// item 14 means ONLY a 🟢 key verified in person, never a contact picked by
+// name. Every session here is a raw room code between strangers, so the guest
+// always gets it. Authenticated modes only — AES256/OTP exchange no
+// identity, so there is nothing to approve.
+//
+// Item 20 (2026-08-10): this waits for the PEER-approval prompt specifically.
+// `#admit` is shared with the owner's knock prompt, so "un-hidden" matched
+// either one — and this helper would then click "Let them in" on a knock while
+// reporting that the guest had approved a key. app.js marks the panel with
+// `data-mode`; the button label is checked too, so the marker cannot drift away
+// from what the user is shown.
+async function approvePeerKey(page, timeout = 45000) {
+  await page.waitForFunction(() => {
+    const el = document.querySelector("#admit");
+    return !!el && !el.hidden && el.dataset.mode === "peer";
+  }, { timeout });
+  const label = await page.evaluate(() => document.querySelector("#admitOk").textContent.trim());
+  if (label !== "Connect") {
+    throw new Error(`expected the peer-approval prompt ("Connect"), got ${JSON.stringify(label)}`);
+  }
+  await page.click("#admitOk");
+}
+
 const results = [];
 function check(name, ok, detail = "") {
   results.push({ name, ok });
@@ -249,6 +275,8 @@ async function runMode(mode, alice, bob) {
   check(`${mode}: owner sees the knocker's real fingerprint`, shownFp === bob.fingerprint,
     `${shownFp.slice(0, 20)}…`);
   await alice.page.click("#admitOk");
+  // The guest approves alice's key in turn (see approvePeerKey).
+  if (["DHKE", "RSA", "PQKEM"].includes(mode)) await approvePeerKey(bob.page, T(45000));
 
   // Each mode raises its own gate: the identity-authenticated ones show a
   // safety number, AES256/OTP unlock straight away. Wait for whichever comes.

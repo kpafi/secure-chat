@@ -49,13 +49,31 @@ Client A --[ciphertext]--> Relay server --[ciphertext]--> Client B
 ```
 - Transport: WebSocket (`/ws`).
 - Rooms: 256-bit random hex ids, max 2 members, vanish when empty.
-- **Entry is owner-approved.** The first party in owns the room; anyone else who
-  has the code is queued and must be let in by the owner, who is shown that
-  peer's key fingerprint and trust mark. Waiting occupies no member slot, so
-  knowing a code no longer lets a stranger take the room from the person you
-  invited (pentest P-08). The approval is only as good as its binding: the
+- **Entry is approved on both devices.** The first party in owns the room;
+  anyone else who has the code is queued and must be let in by the owner, who is
+  shown that peer's key fingerprint and trust mark. Waiting occupies no member
+  slot, so knowing a code no longer lets a stranger take the room from the person
+  you invited (pentest P-08). The approval is only as good as its binding: the
   client pins the identity it admitted and refuses a handshake from any other,
   because the relay chooses who is routed to whom.
+
+  Approval is **symmetric**, which is what makes it independent of the relay
+  (pentest F-PROTO-001). Each side refuses a handshake from an identity its own
+  user never approved: the owner through the queue prompt, the other side
+  through the same prompt shown when the peer's signed handshake arrives. One
+  thing skips it: a key you have already verified **in person** (🟢 in your users
+  list, behind the at-rest passphrase). Everything else — including your first
+  chat with a contact you picked by name — costs one approve/deny prompt, shown
+  immediately before the safety-number step. Nothing on the wire can switch it
+  off, because nothing on the wire is consulted: a relay knows the room code (it
+  is the join frame) and can always present itself as a legitimate participant,
+  so anything a peer says about its own authority is worthless.
+
+  Picking a contact by name used to skip the prompt too, by matching the peer
+  against the bundle fetched for that handle. That was removed (2026-08-08): the
+  directory answer carries **no signature**, so nothing binds a handle to its
+  key material, and a hostile directory could switch the approval off for exactly
+  the flow it was meant to protect. Restoring it needs signed directory answers.
 - Wire format: strict JSON envelope, printable ASCII only, validated by pydantic.
 - The encryption menu (RSA / AES-256 / DHKE / post-quantum KEM / OTP) is a
   **client** concern; the `alg` field is just an advisory tag the server relays.
