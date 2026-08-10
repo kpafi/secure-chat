@@ -5,6 +5,64 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
 
 ## ⮕ RESUME HERE (2026-08-10 evening — A2 closed, and the FIXES were pentested)
 
+### ⬜ NEXT SESSION — do these in order
+
+1. **⬜ TOP ITEM: pentest commit `40d132e` — the repairs made AFTER the lanes
+   reported.** This is the one thing that is definitely not done. The 2026-08-10
+   review covered the fixes as they stood mid-session; everything written to
+   answer its findings is **unreviewed new code**, and on this project the repair
+   has been more dangerous than the bug **four rounds running** (2026-07-29,
+   2026-07-30, 2026-08-08, and 2026-08-10 itself). Scope, in three lanes as
+   before:
+   - **Lane A — `client/otp.js`**: `armFloors` (the TAMPERED-vs-ABSENT refusal,
+     the read-back, arming before the blob write) and the new gates on
+     `savePadProgress`/`markExported`. Plus `client/contacts.js`
+     `rememberSupersededKeys`/`dropPinsFor` (the pin-retention rule and the
+     `claimedByAnother` skip) and `client/chats.js` (`navigator` guard, `!chats`
+     guard).
+   - **Lane B — `client/account.js`**: the relative two-sided `regSeqCeiling()`
+     bound and the rewritten 409 retry. Attack the clock input specifically.
+     Plus the new call-site assertion in `client/peer-approval.test.mjs`.
+   - **Lane C — nothing new**; the backend was clean and unchanged since.
+   Ask each lane explicitly whether the REPAIR reintroduced what it replaced, and
+   whether the new regression tests are vacuous. Baseline to beat: client **184**,
+   backend **165**, e2e **13/13 + 32/32 + 8/8 + 12/12**, hostile-relay
+   **5/5 + 9/9 + 9/9**.
+2. **⬜ Decide item 18's wrong-clock residual** — a badly wrong wall clock still
+   freezes an account permanently, and no client-side ceiling can fix it because
+   the ceiling is computed from the lying clock. The repair is a BACKEND change:
+   have `/api/register`'s 409 echo the stored `reg_seq` so a client can
+   resynchronise. Today it says only "not newer", which is why `Date.now()` had
+   to be guessed at. **Needs the user** — it is a wire/contract change, and it
+   leaks an account's counter to anyone who can produce a valid signature.
+3. **⬜ Close the harness gap lane B proved.** `e2e/hostile-relay/hostile.mjs`
+   serves no `/api/*` routes and `proto001.mjs` never types a handle, so
+   `expectedPeerBundle` is null in every run — the entire directory-driven flow
+   that item 14 is ABOUT is invisible end to end. Add a `DIRECTORY=hostile`
+   policy (the relay already sees the bundle in the knock) and a scenario that
+   connects by handle. Also make `EVIL_MODE=none` loud: it currently returns an
+   unpatched client with no warning, so `EVIL_MODE=none SCENARIO=attacker`
+   reports a clean 9/9 that proves nothing.
+4. **⬜ The small open residuals** (all recorded below, none fixed): `chats.js`
+   `unlock()` reads store and witness outside the lock so a benign second tab can
+   fire the rollback alarm; `withWriteLock` has no timeout, so a same-origin
+   script holding it hangs writes silently; `contacts.js` `list()`/`get()` return
+   a shallow spread that now shares `pinKeys` by reference, contradicting the
+   "defensive copy" comment; `app.js` `describeIdentity` still compares keys as
+   strings where the gate compares bytes (no-op today, permissive if `unb64` is
+   ever loosened); the peer-approval prompt inherits an attacker-choosable
+   display name for auto-contacts; and `app.js:2721`'s comment about a knock
+   queuing behind the peer prompt is false — the two prompts are mutually
+   exclusive, so that `showNextKnock()` and the `approvalPending` guard are
+   unreachable-in-effect.
+5. **⬜ Then** A2's remaining Low/Info (22, 23, rest of 24), A3's coverage gaps
+   (25-27), and section B's decisions for the user.
+
+**State at hand-off:** branch `pentest-2026-08-07-fixes`, working tree CLEAN, all
+work committed as `40d132e`. **Not pushed, not merged, not deployed.** `master`
+is still 1 commit ahead of `origin/master` from an earlier session.
+
+
 `pentest-new-code` was run over this session's own fixes, in three lanes. **It
 found 2 High and 3 Medium in the fix code — a fourth consecutive round in which
 the repair was more dangerous than the bug.** All are fixed, each with a
