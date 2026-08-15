@@ -3,7 +3,130 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (2026-08-10 night — `40d132e`'s repairs pentested: 3 High, 4 Medium)
+## ⮕ RESUME HERE (2026-08-15 — A4's three Highs FIXED; the H-1 fix was itself broken and re-fixed)
+
+**Items 1, 2 and 3 of the list below are DONE** (A4/F-A1, A4/F-A2, A4/H-1). Each
+carries a regression test **verified to fail against the code it replaces**, by
+running it against the pre-fix file rather than by assertion. `pentest-new-code`
+was then run over the fix code, as it must be.
+
+**It found the H-1 fix did not work — and it was right.** I reproduced its mutant
+before acting on it. That makes **six consecutive rounds** in which the repair
+was more dangerous, or emptier, than the bug. The re-fix is described below and
+every mutant is now dead, but read this entry as evidence for the rule, not
+against it.
+
+**What was fixed**
+
+1. **A4/F-A1 — `otp.js` floor/blob write ordering.** `armFloors` was split into
+   `probeFloors(id)` (bumps every slot with **0**, so it can only CREATE a slot,
+   never advance one; reads back; throws on TAMPERED) and `armFloors` (advances
+   to the real values, now called **only after** `setItem(padKey)`). The claim is
+   measured before the write, the value is raised after it, so a floor is never
+   above the blob it protects. `writeWatermark` became the pure `sealWatermark`,
+   and `writePadBlob` now finishes both crypto operations before the first
+   `setItem`, then writes blob → watermark → used → epoch → index → floors with
+   no `await` between writes that must agree. `app.js otpExport` now awaits
+   `markExported` **before** `downloadText`, so a failed latch cannot release a
+   pad file that nothing on the device records as exported.
+   *Verified:* the new test fails against `HEAD:client/otp.js` with `"pad state
+   was rolled back"`. The pentest's own fault-injection matrix (fail each of 5
+   localStorage key classes on 2 save paths) is **10/10 openable** on the new code
+   vs. 2 permanent bricks on HEAD.
+2. **A4/F-A2 — `contacts.js` revocation.** The `claimedByAnother` **retention**
+   rule is gone. A pin naming a revoked key is now **always** swept; the
+   collision is recorded as `reverify` on the other contact, and `app.js`
+   `enterVerification` reads that marker to render "Re-verify — their saved pin
+   was cleared" instead of the benign first-contact panel. Both M-2's alarm
+   inversion and F-A2's silent trust are removed without either side having to
+   win a key collision. Deliberately **not** conditioned on the other record
+   being `verified` or user-created — that dependency IS the bug.
+   *Verified:* an `auto`-contact control (one sealed envelope, no user action)
+   shows `SURVIVED (fail-open)` on HEAD and `swept` on the new code.
+3. **A4/H-1 — the call-site pin, twice.** First cut: anchor on the executable
+   `const idbCanon = ...` instead of a comment, plus an exact allow-list of the 8
+   `expectedPeerBundle` sites. **The pentest broke it**, and the lesson is worth
+   carrying: pinning the *identifier* is useless because the decision does not
+   need it. `describeIdentity()` re-exports the same directory comparison as
+   `.mismatch`, a decision-grade boolean on a plain object, so
+   `if (expectedPeerName && !d.mismatch) approvedBundle = canonicalBundle(idb)`
+   is item 14's deleted route with the forbidden string appearing nowhere — and
+   `canonicalBundle(idb)` also slipped the `approvedBundle = idbCanon` regex. It
+   passed 193/0. **Re-fixed by pinning the decision path, not the vocabulary:**
+   an exact allow-list of all **26** executable lines between the peer bundle and
+   the gate (nothing may be added there at all, whatever it is made of); an exact
+   body for `requestPeerApproval`; an assertion that `renderPeerApproval` cannot
+   settle the promise; and a call-site allow-list proving `describeIdentity` is
+   reachable **only** from the two prompt renderers.
+
+**Also fixed: three source anchors were satisfiable by a comment** — H-1's defect
+again, in two more files. `indexOf` over raw source let a mutant revert the
+`app.js` export order, and another delete the whole `reverify` branch, while a
+comment carrying the anchor string kept the check green (both passed 193/0). All
+source anchors now strip `//` lines first via a `codeOnly()` filter, and the
+F-A2 anchor gained shape assertions (`else if`, locked-store short-circuit, the
+`changed` styling).
+
+**Mutants re-run against the hardened tests — all four now RED:** the
+`requestPeerApproval` short-circuit, the call-site `describeIdentity().mismatch`
+skip, the comment-hidden export reorder, and the comment-hidden `reverify`
+deletion.
+
+**Baselines, measured on the clean tree at close:** client **195 OK, 0 failures**
+(was 184 at `40d132e`; +11 new checks). Backend **165 passed**. e2e and
+hostile-relay not re-run by me; the pentest ran `room-admission` 13/13,
+`two-user-flow` 8/8, `no-dead-ends` 12/12 against a scratch relay.
+
+### ⬜ NEXT — new findings from the pentest of these fixes (none fixed)
+
+Both Mediums were **confirmed as pre-existing residuals, not regressions** — the
+pentest ran the identical PoC against HEAD and got byte-identical output. They
+are recorded because each one falsifies a justification the fix leans on, and
+both code comments have been corrected to say so rather than left as folklore.
+
+* **⬜ F-A2-R1 (Medium) — the `reverify` marker misses two reachable shapes.**
+  It is keyed on a contact whose CURRENT keys are the swept ones, so a
+  `room:<id>` pin whose owner has no contact record (**the default** for Live-room
+  use) and a bystander who has since rotated both get the pin swept with **no
+  marker**, and still render as a benign first contact. Fix direction: the marker
+  belongs on the **pin key** as a tombstone, not on a contact record — the key is
+  in hand at deletion time and needs no guess about who holds those keys now.
+* **⬜ F-A1-R1 (Medium) — a pad's FIRST save is still all-or-nothing.**
+  `probeFloors` creates the send slot before any blob exists, and `padWasUsed`
+  counts a non-ABSENT send slot as used, so a failure during `saveNewPad` /
+  `importPad` / the v1-v2 migration rewrite **burns the padId** and the two people
+  must exchange a pad in person again. Identical on HEAD across all five write
+  classes. Fix direction: do not let `probeFloors` create the send slot before a
+  blob exists, or stop counting a bare send slot at exactly 0 (with no blob, no
+  watermark and no `usedKey`) as evidence of use.
+* **⬜ F-A1-R2 (Low, NEW in this diff) — `writeIndexEntry` moved after the
+  `usedKey`/`EPOCH_KEY` writes.** A kill in that 4-statement synchronous window
+  on a first save now also loses the index entry, so the pad is durable and
+  unlockable but invisible in `listPads()`. Recoverable state that used to be
+  fully usable.
+* **⬜ INFO — `reverify` is overloaded.** It already meant "your 🟢 predates
+  encryption-key coverage" (`contacts.js:414`). Consequences: a 🟢 contact whose
+  pin was just swept shows **nothing** in the Users list (`app.js:1092` renders it
+  only `if (c.reverify && !c.verified)`); a contact carrying the *migration*
+  marker now gets F-A2's wording, which is simply untrue of them; and
+  `setVerified(_, true)` from the one-click Users-list toggle clears the F-A2
+  marker **without any safety-number comparison and without restoring the pin**.
+  Consider a separate field.
+
+**Not attacked:** F-A1 was exercised against a JS stub of `PadFloor`, never on a
+real device. `e2e/hostile-relay/` was not run (item 8 below is why: it serves no
+`/api/*` routes, so it structurally cannot see the directory-driven mutants).
+`PadFloorBridge`'s Long↔JS-number marshalling and the Android side beyond
+`PadFloor.kt` were not reviewed.
+
+**State at hand-off:** branch `pentest-2026-08-07-fixes`, 6 modified files
+(`client/{app,contacts,otp}.js` + `client/{otp-rollback,contacts-anchor,
+peer-approval}.test.mjs`), **uncommitted**. Not pushed, not merged, not deployed.
+`backend/accounts.db` untouched. Items 4-12 below are unchanged and still open —
+in particular **item 6 still needs the user's decision** on the `/api/register`
+409 contract change.
+
+## ⮕ (2026-08-10 night — `40d132e`'s repairs pentested: 3 High, 4 Medium)
 
 **The previous TOP ITEM is DONE.** `pentest-new-code` was run over the repairs
 made AFTER the 2026-08-10 lanes reported — the code that had never been reviewed.
@@ -29,9 +152,9 @@ findings themselves:
   skew** (A4/M-2) — and two devices on one identity is a supported flow
   (`exportIdentity`, `app.js:673`). See item 6; it still needs the user.
 
-### ⬜ NEXT SESSION — do these in order
+### NEXT SESSION — do these in order (items 1-3 CLOSED 2026-08-15, see the entry above)
 
-1. **⬜ A4/F-A1 (High, REGRESSION, no attacker needed) — `armFloors` arms the
+1. **✅ FIXED 2026-08-15 — A4/F-A1 (High, REGRESSION, no attacker needed) — `armFloors` arms the
    native floors BEFORE the blob that backs them is written.** `otp.js:649` bumps
    all three slots to the new offsets; the blob is not persisted until `:702`,
    with a `JSON.stringify` and an `await crypto.subtle.encrypt` in between. A
@@ -50,7 +173,7 @@ findings themselves:
    PREVIOUSLY persisted watermark (0 on first save), and advance the slots to the
    new offsets only after `setItem(padKey)` succeeds — old ordering for the
    value, new read-back for the claim.
-2. **⬜ A4/F-A2 (High, fail-open) — the `claimedByAnother` skip retains a pin that
+2. **✅ FIXED 2026-08-15 — A4/F-A2 (High, fail-open) — the `claimedByAnother` skip retains a pin that
    revocation must kill.** `contacts.js:694-699`. Closing M-2 ("removing X must
    not delete a third party's pin") opened its inverse: if ANY other contact
    record names the superseded key, `Remove`/`Unverify` will not sweep the pin
@@ -64,7 +187,7 @@ findings themselves:
    residual. **Fix:** never let an `auto` or unverified record claim a key; on
    collision prefer deleting the pin plus a `reverify` marker over silent
    retention, so neither M-2's alarm inversion nor this silent trust can happen.
-3. **⬜ A4/H-1 (High) — the item-14 call-site pin does not pin the call site.**
+3. **✅ FIXED 2026-08-15 (in two passes — the first fix was bypassed) — A4/H-1 (High) — the item-14 call-site pin does not pin the call site.**
    `peer-approval.test.mjs:161-176` slices `src` from a COMMENT string, so
    `between` is the 13 comment lines at `app.js:2686-2699` and contains **zero
    executable code**: the assertion checks that a comment does not mention

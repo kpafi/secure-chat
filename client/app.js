@@ -2890,6 +2890,28 @@ async function enterVerification(room, verifiedBundle) {
       "device — but it is also what an interceptor looks like. Do NOT proceed until you have confirmed " +
       "this safety number with them over a trusted channel.";
     addLine("sys", "", "[pinned identity CHANGED — verification required]");
+    // `pinsReadable()` above is also true when this device has NO contact store
+    // at all, and `list()` throws in that state — so the unlock check is not
+    // redundant with it.
+  } else if (contacts.isUnlocked() &&
+             contacts.list().some((c) => sameSigning(c, bundle) && c.reverify)) {
+    // Pentest 2026-08-10-night F-A2. There is a third way to arrive here with no
+    // pin, besides "never seen" and "pin deleted by an attacker": this contact's
+    // pin was swept as COLLATERAL when the user revoked somebody else who had
+    // these same keys recorded in their history (see contacts.js dropPinsFor).
+    //
+    // Revocation deletes that pin unconditionally, because letting a second
+    // record decide what revocation may delete is what made F-A2 fail open. The
+    // cost of that is exactly this state — and rendering it as a benign first
+    // contact is M-2's alarm inversion, the failure the whole item is about. So
+    // the marker the sweep left behind is read here and said out loud.
+    els.verify.classList.add("changed");
+    els.verifyTitle.textContent = "Re-verify this contact — their saved pin was cleared";
+    els.verifyHint.textContent =
+      "This contact had a verified pin, and it was removed when you revoked or removed another " +
+      "contact that shared these keys. This is NOT a first contact: compare the safety number " +
+      "with them in person before you continue, exactly as you did the first time.";
+    addLine("sys", "", "[pin cleared by an earlier revocation — re-verification required]");
   } else {
     els.verify.classList.remove("changed");
     els.verifyTitle.textContent = "Verify your contact — in person";
@@ -3284,8 +3306,20 @@ async function otpExport() {
     }
     pendingReexportId = null;
     const text = await otp.exportPad(record, els.otpXferPass.value);
-    downloadText(`secure-chat-pad-${record.label || record.padId}.json`, text);
+    // Pentest 2026-08-10-night F-A1: LATCH BEFORE HANDING THE FILE OVER.
+    //
+    // This used to download first and latch second. `markExported` is the only
+    // thing that records "this pad has left the device", and it can fail (a full
+    // disk, a broken floor bridge) — so the old order could put a pristine pad
+    // file in the user's hands with nothing on the device remembering it. The
+    // re-export warning is then silent on the SECOND export, and one pad in two
+    // importers is a two-time pad, the one failure OTP cannot survive.
+    //
+    // Latching first inverts the failure: the export fails loudly and no file is
+    // produced. The cost of the bad case is one extra confirm click on the
+    // retry; the cost of the other one is unbounded.
     await otp.markExported(record, atRest);
+    downloadText(`secure-chat-pad-${record.label || record.padId}.json`, text);
     otpStatusMsg("Exported. Give the file to your contact in person; they Import it with the same TRANSFER passphrase.");
   } catch (e) {
     otpStatusMsg("Export failed: " + e.message, true);

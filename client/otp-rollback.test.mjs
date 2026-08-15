@@ -1149,4 +1149,130 @@ async function testTamperedSlotFailsClosed() {
 
 await testTamperedSlotFailsClosed();
 
+// ---------------------------------------------------------------------------
+// Pentest 2026-08-10-night F-A1: a save INTERRUPTED between the floor and the
+// blob must not brick the pad.
+//
+// The regression this pins: `writePadBlob` armed all three floors to the NEW
+// offsets, then did a `JSON.stringify` and an `await crypto.subtle.encrypt`, and
+// only then stored the blob. Anything that ended the save in that window — a
+// process kill, a QuotaExceededError — left the floor ABOVE the offsets the
+// stored blob carries. The next unlock reads that as a rollback and refuses, and
+// the refusal is PERMANENT: `forgetPad` + re-import cannot recover it either,
+// because `padWasUsed` consults the same floor. A brick, wearing the wording of
+// the tamper alarm.
+//
+// No attacker is involved. The interruption is modelled as the storage write
+// failing, which is exactly what a full disk does.
+//
+// This test fails against the pre-fix ordering with "pad state was rolled back",
+// on every one of the three save paths below.
+async function testInterruptedSaveDoesNotBrickAPad() {
+  for (const path of ["savePadProgress", "markExported"]) {
+    const slots = new Map();
+    const floor = {
+      read: (k) => (slots.has(k) ? slots.get(k) : -1),
+      bump: (k, v) => {
+        if (v < 0) return floor.read(k);
+        const n = Math.max(floor.read(k), v);
+        slots.set(k, n);
+        return n;
+      },
+    };
+    Object.defineProperty(globalThis, "__SECURE_CHAT_NATIVE_FLOOR__", { value: true, configurable: true });
+    Object.defineProperty(globalThis, "__SECURE_CHAT_PAD_FLOOR__", { value: Object.freeze(floor), configurable: true });
+
+    const store = new Map();
+    let failPadWrite = false;
+    globalThis.localStorage = {
+      getItem: (k) => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => {
+        // The pad blob is the big write, so it is the one a full disk refuses.
+        if (failPadWrite && k.startsWith("sc.otp.pad.v1.")) {
+          const e = new Error("QuotaExceededError");
+          e.name = "QuotaExceededError";
+          throw e;
+        }
+        store.set(k, String(v));
+      },
+      removeItem: (k) => store.delete(k),
+    };
+
+    const otp = await import(`./otp.js?interrupt=${path}&t=${Date.now()}`);
+    const PASS = "pad passphrase";
+    const pad = await otp.generatePad({ label: "interrupt", totalBytes: 64 * 1024 });
+    const at = await otp.saveNewPad(pad, PASS);
+
+    // A normal, completed save first, so there is real consumed state to lose.
+    pad.sendOffset = 500;
+    pad.recvHighWater = 700;
+    await otp.savePadProgress(pad, at);
+
+    // Now the save that gets interrupted, carrying HIGHER offsets. Whatever the
+    // floors are left at, they must not exceed what is actually on disk.
+    failPadWrite = true;
+    pad.sendOffset = 5000;
+    pad.recvHighWater = 6000;
+    await assert.rejects(
+      () => (path === "markExported"
+        ? otp.markExported(pad, at)
+        : otp.savePadProgress(pad, at)),
+      /QuotaExceededError/,
+      `${path}: the interrupted save must surface its failure to the caller`);
+    failPadWrite = false;
+
+    // The pad must still open, at the last offsets that were actually stored.
+    const opened = await otp.unlockPad(pad.padId, PASS);
+    assert.strictEqual(opened.record.sendOffset, 500,
+      `F-A1 (${path}): a save interrupted before the blob landed must leave the pad ` +
+      "USABLE at its last durable offset — a floor above the stored blob is read as a " +
+      "rollback and refuses the pad forever");
+    assert.strictEqual(opened.record.recvHighWater, 700, "...and the recv floor likewise");
+    console.log(`OK  F-A1: a ${path} interrupted before the blob lands does not brick the pad`);
+
+    // ...and the brick really would have been permanent: prove the recovery route
+    // an ordinary user would reach for is closed, so "it opens" is the only
+    // acceptable outcome above.
+    otp.forgetPad(pad.padId);
+    assert.ok(otp.padWasUsed(pad.padId),
+      `F-A1 (${path}): forgetPad + re-import cannot undo it — which is why the ` +
+      "interrupted save must not have produced a refusal in the first place");
+    console.log(`OK  F-A1: ...and forgetPad/re-import is not an escape (${path})`);
+
+    delete globalThis.__SECURE_CHAT_NATIVE_FLOOR__;
+    delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+  }
+}
+
+await testInterruptedSaveDoesNotBrickAPad();
+
+// The same finding's second half, which lives in app.js and so can only be
+// pinned at source level: the export handler must LATCH before it hands the pad
+// file to the user.
+//
+// `markExported` is the only record that a pad has left the device. Downloading
+// first and latching second means a failed latch leaves a pristine pad file in
+// the user's hands with nothing on the device remembering it — so the re-export
+// warning is silent on the SECOND export, and one pad in two importers is a
+// two-time pad. Anchored on executable statements, never on a comment (H-1).
+{
+  const appSrc = await readFile(new URL("./app.js", import.meta.url), "utf8");
+  // COMMENTS STRIPPED FIRST. The first cut of this check ran `indexOf` over raw
+  // source, so reverting the order and leaving a comment that mentions
+  // `await otp.markExported(record, atRest)` above the download satisfied it —
+  // the check passed while the code did the opposite. Found by the pentest of
+  // this very fix; it is H-1's defect, one file over.
+  const code = appSrc.split("\n").map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("//") && !l.startsWith("*") && !l.startsWith("/*"))
+    .join("\n");
+  const dl = code.indexOf("downloadText(`secure-chat-pad-");
+  const latch = code.indexOf("await otp.markExported(record, atRest)");
+  assert.notStrictEqual(dl, -1, "the pad export download call must still exist in app.js");
+  assert.notStrictEqual(latch, -1, "the pad export must still call markExported");
+  assert.ok(latch < dl,
+    "F-A1: app.js must await markExported BEFORE downloadText hands the pad file over — " +
+    "the other order can release a pad file that nothing on this device records as exported");
+  console.log("OK  F-A1: app.js latches the export before releasing the pad file");
+}
+
 console.log("All OTP native-floor scope checks passed.");

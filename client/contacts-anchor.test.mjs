@@ -377,6 +377,12 @@ async function testPinHistoryFindings() {
   // M-2: `pinKeys` is fed from unsigned directory answers, so a hostile relay can
   // plant a THIRD PARTY's key in someone's history; removing that someone then
   // deleted the third party's pin, inverting the key-change alarm.
+  //
+  // The first repair — skip a historical key that some other contact currently
+  // holds — is GONE, because the attacker chooses whether that other record
+  // exists (2026-08-10-night F-A2). The pin is deleted either way now; what M-2
+  // is owed is that the bystander's next session is not rendered as a benign
+  // first contact, and that is the `reverify` marker below.
   await freshDevice();
   const ALICE = { ed: "QUxJQ0U", mldsa: "QUxJQ0VN" };
   await contacts.upsert({ username: "alice", ...ALICE });
@@ -384,12 +390,40 @@ async function testPinHistoryFindings() {
   await contacts.upsert({ username: "mallory", ...ALICE });   // the poisoned answer
   await contacts.upsert({ username: "mallory", ed: "TUFM", mldsa: "TUFMTQ" }); // corrects
   await contacts.remove("mallory");
-  assert.ok(contacts.getPin("user:alice"),
-    "M-2: removing a contact must not delete a pin belonging to a DIFFERENT live contact");
-  console.log("OK  item 17 / M-2: a poisoned history entry cannot delete a third party's pin");
+  assert.strictEqual(contacts.getPin("user:alice"), null,
+    "F-A2: revocation is absolute — a pin naming a revoked key must not survive " +
+    "because some other record also names it");
+  assert.ok(contacts.get("alice").reverify,
+    "M-2: ...but the bystander whose pin went with it must be flagged, so their next " +
+    "session cannot render as a benign FIRST CONTACT (the inverted alarm)");
+  console.log("OK  item 17 / M-2+F-A2: collateral is swept AND flagged for re-verification");
 
-  // Control: the skip must not become a way to KEEP a pin alive. A superseded key
-  // that no other contact claims is still swept.
+  // ...and re-verifying in person clears the flag, so it does not become permanent
+  // noise that teaches the user to click past it.
+  await contacts.savePin("user:alice", ALICE);
+  assert.ok(!contacts.get("alice").reverify,
+    "an in-person re-verification (savePin) clears the marker");
+  console.log("OK  item 17 / M-2: the re-verification marker is cleared by re-verifying");
+
+  // Control: the sweep must not depend on the OTHER record being trustworthy —
+  // that dependency IS F-A2. An `auto` contact, which one sealed envelope creates
+  // with no user action at all, must not be able to preserve a revoked pin.
+  await freshDevice();
+  const BOB = { ed: "Qk9C", mldsa: "Qk9CTQ" };
+  await contacts.upsert({ username: "bob", ...BOB });
+  await contacts.savePin("room:bob-room", BOB);
+  await contacts.setVerified("bob", true);
+  await contacts.upsert({ username: "bob", ed: "Qk9CMg", mldsa: "Qk9CMk0" });  // rotates
+  await contacts.savePin("room:bob-room", BOB);            // the stale K1 pin lives on
+  // The attacker's one move: an auto-created record naming the superseded key.
+  await contacts.upsert({ username: "sc-abc123", ...BOB, auto: true });
+  await contacts.remove("bob");
+  assert.strictEqual(contacts.getPin("room:bob-room"), null,
+    "F-A2: an unverified auto-created contact must not be able to retain a pin that " +
+    "revocation is meant to kill — the attacker chooses whether that record exists");
+  console.log("OK  F-A2: an auto-created record cannot preserve a revoked pin");
+
+  // Control: a superseded key that no other contact claims is still swept.
   await freshDevice();
   await contacts.upsert({ username: "dave", ...K(1) });
   await contacts.savePin("room:dave-room", K(1));
@@ -397,10 +431,61 @@ async function testPinHistoryFindings() {
   await contacts.remove("dave");
   assert.strictEqual(contacts.getPin("room:dave-room"), null,
     "control: an unclaimed superseded key must still be swept");
-  console.log("OK  item 17: control — the M-2 skip does not strand ordinary pins");
+  console.log("OK  item 17: control — ordinary superseded pins are still swept");
 }
 
 await testPinHistoryFindings();
+
+// F-A2's other half lives in app.js, which has no export surface (it touches
+// `document` at module scope), so it is pinned at source level — anchored on
+// EXECUTABLE statements, never on a comment. That distinction is not pedantry:
+// the 2026-08-10-night pentest found the item-14 call-site guard was slicing
+// between two comments and therefore asserting nothing at all (H-1).
+//
+// What must hold: revocation now deletes a bystander's pin unconditionally, so
+// `renderVerify` has to recognise the marker that sweep leaves behind BEFORE it
+// reaches the benign "Verify your contact — in person" first-contact branch.
+// Reversing those two renders M-2's inverted alarm again.
+{
+  const { readFile } = await import("node:fs/promises");
+  const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
+  // COMMENTS STRIPPED FIRST. Running `indexOf` over raw source let a mutant
+  // DELETE the whole branch and satisfy this check with a comment containing the
+  // string `c.reverify` — the pentest of this fix demonstrated it passing 193/0
+  // with F-A2's user-facing half gone. Same defect as H-1, third file.
+  const code = app.split("\n").map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("//") && !l.startsWith("*") && !l.startsWith("/*"));
+  const joined = code.join("\n");
+  const pinRead = joined.indexOf("const pin = await getPin(currentPinKey);");
+  assert.notStrictEqual(pinRead, -1, "renderVerify must still read the pin for this room/user");
+  const tail = joined.slice(pinRead);
+  const firstContact = tail.indexOf('els.verifyTitle.textContent = "Verify your contact — in person"');
+  const marker = tail.indexOf("c.reverify");
+  assert.notStrictEqual(firstContact, -1, "the first-contact branch must still exist");
+  assert.notStrictEqual(marker, -1,
+    "F-A2: renderVerify must consult the `reverify` marker that dropPinsFor leaves on a " +
+    "contact whose pin was swept as collateral — without it that contact renders as a " +
+    "benign FIRST CONTACT, which is exactly M-2's inverted alarm");
+  assert.ok(marker < firstContact,
+    "F-A2: the `reverify` branch must be reached BEFORE the benign first-contact branch");
+
+  // ...and SHAPE, not just presence. Without these, `if (false && ... c.reverify)`
+  // or a branch that forgets the red styling would pass while saying nothing to
+  // the user. The pentest flagged the absence of these specifically.
+  const branch = code.find((l) => l.includes("c.reverify"));
+  assert.match(branch, /^\}\s*else if\s*\(/,
+    "F-A2: the marker must be tested as an `else if` on renderVerify's no-pin path — " +
+    `anywhere else and it is not what decides the prompt. Found:\n      ${branch}`);
+  assert.ok(/contacts\.isUnlocked\(\)/.test(branch) || code.some(
+    (l, i) => l.includes("c.reverify") && code[i - 1] && code[i - 1].includes("contacts.isUnlocked()")),
+  "F-A2: the branch must short-circuit on a locked store — `list()` throws there, and " +
+  "`pinsReadable()` is also true on a device with no store at all");
+  const after = tail.slice(marker, marker + 600);
+  assert.ok(/els\.verify\.classList\.add\("changed"\)/.test(after),
+    "F-A2: the re-verify branch must render as a WARNING (the `changed` styling), not as the " +
+    "neutral first-contact panel — the whole point is that this is not a first contact");
+  console.log("OK  F-A2: app.js warns on a pin cleared by revocation instead of rendering first contact");
+}
 
 console.log("All F-ATREST-007 checks passed.");
 

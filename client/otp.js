@@ -266,11 +266,11 @@ async function readWatermark(id, key) {
   }
 }
 
-// Raise all three native floors and report which of them are genuinely in place
-// afterwards. Item 13, second pass — see writePadBlob for why the answer has to
-// be verified rather than assumed.
+// Read all three native floors back and turn them into the two claims the blob
+// makes about itself. Item 13, second pass — see writePadBlob for why the answer
+// has to be measured rather than assumed.
 //
-// Verified by READING THE SLOTS BACK, not by trusting the bump. Neither layer
+// Measured by READING THE SLOTS BACK, not by trusting the bump. Neither layer
 // reports failure usefully: the JS wrapper swallows any bridge exception into
 // NATIVE_TAMPERED, and `PadFloor.bump` ignores the boolean from
 // `SharedPreferences.commit()`, so a full disk writes nothing and says nothing.
@@ -280,36 +280,8 @@ async function readWatermark(id, key) {
 // same defect the item 13 fix was written to repair, one level up: the 2026-07-29
 // H-1 flag is also a claim made before the bump that backs it, with the bump's
 // result discarded. It has always been able to brick a pad the same way. Both
-// flags are answers to "did this slot take?", so both are now measured.
-//
-// Called BEFORE the blob is serialised so the result can decide what the blob
-// claims. `bump` is monotone, so arming early can only raise a floor, never
-// lower one, and re-running it is harmless.
-//
-// TRADE-OFF, stated because it is a security choice and not an obvious one: when
-// arming fails the blob records `false` and the pad opens UNGUARDED for that
-// slot — the pre-fix behaviour — rather than being refused. A permanent brick
-// carrying the wording of the tamper alarm is the worse outcome: it destroys an
-// in-person key exchange, it cannot be undone by any user action, and it teaches
-// the user to disbelieve the alarm. The failure this protects against is
-// non-adversarial (a transient Keystore error, a full disk, a kill between two
-// JNI calls); an attacker who can actually suppress bumps is inside the native
-// floor's threat model and is caught by `broken`/NATIVE_TAMPERED, which still
-// refuse outright. The guard re-arms on the next save that succeeds.
-function armFloors(id, wm, exportedNow) {
-  if (!nativeFloor) return { send: false, derived: false };
-  nativeFloor.bump(floorKeySend(id), wm.send);
-  // F-ATREST-001: the recv high-water mark, which used to be AEAD-mirrored only
-  // — and an AEAD record can be restored wholesale from a snapshot.
-  nativeFloor.bump(floorKeyRecv(id), wm.recv);
-  // F-ATREST-002: monotone one-way latch. Bumped on EVERY save, with 0 when the
-  // pad has not been exported, so the slot exists from the pad's first save and
-  // its ABSENCE is unambiguous evidence of deletion rather than of a pad that
-  // was simply never exported. `bump(_, 0)` against an absent slot really does
-  // write it (PadFloor.ABSENT is -1, so `next` is 0 and differs from `current`);
-  // against a slot already at 1 it is a no-op, so an ordinary save cannot lower
-  // the latch.
-  nativeFloor.bump(floorKeyExported(id), exportedNow ? 1 : 0);
+// flags are answers to "does this slot exist?", so both are now measured.
+function readFloorClaims(id) {
   const s = nativeFloor.read(floorKeySend(id));
   const r = nativeFloor.read(floorKeyRecv(id));
   const e = nativeFloor.read(floorKeyExported(id));
@@ -332,34 +304,96 @@ function armFloors(id, wm, exportedNow) {
       "this pad's device-protected rollback record is damaged or forged — refusing to use the pad; exchange a fresh one",
     );
   }
+  // Note what these two claims say, because the guards in unlockPad test exactly
+  // this and nothing more: "a slot for this pad EXISTED when the blob was
+  // written", so a later ABSENT is evidence of deletion. They deliberately say
+  // nothing about the slot's VALUE — the value is covered by the max() in
+  // unlockPad, and tying the claim to a value is what made F-A1 possible.
   return { send: s >= 0, derived: r >= 0 && e >= 0 };
 }
 
-async function writeWatermark(id, key, wm, exportedNow = false) {
+// Ensure the three slots EXIST, without advancing any of them, and report what
+// is genuinely in place. Called before the blob is serialised so its claims can
+// be decided by measurement.
+//
+// `bump(_, 0)` is the whole trick. Against an ABSENT slot it really does write
+// it (PadFloor.ABSENT is -1, so `next` is 0 and differs from `current`), which is
+// what lets a pad's FIRST save claim a floor honestly; against any existing slot
+// it is a no-op, because `bump` is monotone. So this creates what is missing and
+// can never move a floor AHEAD of the blob that is about to be written — which
+// is the ordering property F-A1 is about (see writePadBlob).
+//
+// TRADE-OFF, stated because it is a security choice and not an obvious one: when
+// a slot cannot be created the blob records `false` and the pad opens UNGUARDED
+// for that slot, rather than being refused. A permanent brick carrying the
+// wording of the tamper alarm is the worse outcome: it destroys an in-person key
+// exchange, it cannot be undone by any user action, and it teaches the user to
+// disbelieve the alarm. The failure this protects against is non-adversarial (a
+// transient Keystore error, a full disk, a kill between two JNI calls); an
+// attacker who can actually suppress bumps is inside the native floor's threat
+// model and is caught by `broken`/NATIVE_TAMPERED, which still refuse outright.
+//
+// The claim re-arms on the next save whose probe succeeds — but note the limit,
+// because it is easy to over-read: that heals the LIVE pad only. A blob written
+// during the degraded window is sealed saying `false`, and no later save can
+// reach back into an AEAD that has already been snapshotted, so a copy taken
+// then keeps the weaker claim for as long as it exists. Narrowing that is
+// A4/F-A3, which is a separate open finding.
+function probeFloors(id) {
+  if (!nativeFloor) return { send: false, derived: false };
+  nativeFloor.bump(floorKeySend(id), 0);
+  // F-ATREST-001: the recv high-water mark, which used to be AEAD-mirrored only
+  // — and an AEAD record can be restored wholesale from a snapshot.
+  nativeFloor.bump(floorKeyRecv(id), 0);
+  // F-ATREST-002: monotone one-way latch. Created at 0 on a pad's first save, so
+  // the slot exists from then on and its ABSENCE is unambiguous evidence of
+  // deletion rather than of a pad that was simply never exported.
+  nativeFloor.bump(floorKeyExported(id), 0);
+  return readFloorClaims(id);
+}
+
+// Raise all three floors to the state the blob on disk now describes.
+//
+// Pentest 2026-08-10-night F-A1: this MUST run after the blob has been
+// persisted, and it is the only place that advances a floor.
+//
+// The previous cut advanced the floors up front, so that their read-back could
+// decide the blob's claims — and thereby put the floor AHEAD of the blob for the
+// whole of a `JSON.stringify` plus an `await crypto.subtle.encrypt`. A process
+// kill or a QuotaExceededError in that window left a floor above the offsets the
+// stored blob carries, which the next unlock reads as a ROLLBACK and refuses
+// permanently: `forgetPad` + re-import cannot recover it, because `padWasUsed`
+// sees the floor and refuses the import too. That is a brick wearing the tamper
+// alarm's own wording — the exact outcome probeFloors' trade-off note calls the
+// worse one — and it was a REGRESSION: the code this replaced bumped from
+// `writeWatermark`, i.e. after the blob was already on disk, so an interruption
+// left the floor BEHIND the blob, which is harmless (the blob's own authenticated
+// `hwSend`/`hwRecv` are the higher input to unlockPad's max()).
+//
+// So the ordering is split by what each half is for: the CLAIM is measured
+// before the write (probeFloors, which cannot advance anything), the VALUE is
+// raised after it (here). A floor is never above the blob it is meant to protect.
+function armFloors(id, wm, exportedNow) {
+  if (!nativeFloor) return { send: false, derived: false };
+  nativeFloor.bump(floorKeySend(id), wm.send);
+  nativeFloor.bump(floorKeyRecv(id), wm.recv);
+  // Bumped with 0 when the pad has not been exported, so an ordinary save keeps
+  // the slot alive without lowering the latch (`bump` never lowers).
+  nativeFloor.bump(floorKeyExported(id), exportedNow ? 1 : 0);
+  return readFloorClaims(id);
+}
+
+// Seal the authenticated watermark. PURE: it returns the record to store and
+// writes nothing, so writePadBlob can do all of its crypto first and all of its
+// storage writes afterwards, back to back — see the note there.
+async function sealWatermark(id, key, wm) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const plain = encU.encode(JSON.stringify({
     d: WM_DOMAIN, padId: id, send: wm.send, recv: wm.recv,
   }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain));
-  localStorage.setItem(wmKey(id), JSON.stringify({ iv: b64(iv), ct: b64(ct) }));
-  // Plaintext "this pad has run on this device" marker. It carries no offsets
-  // and is not trusted for a rollback decision — it exists so importPad, which
-  // holds only the TRANSFER passphrase and so cannot open the record above, can
-  // still refuse to resurrect a consumed pad from its (always pristine) file.
-  localStorage.setItem(usedKey(id), "1");
-  // F-1: mirror the floors into the native store, where they cannot be deleted
-  // from the JS context and cannot be lowered at all.
-  // All three slots are armed earlier, in `armFloors`, because the blob's
-  // `nativeFloor`/`derivedFloors` claims depend on whether they took (item 13).
-  // Re-armed here so they still move forward with every watermark write; `bump`
-  // is monotone, so doing it twice costs nothing and can only raise. Not
-  // load-bearing — the write that matters already happened.
-  armFloors(id, wm, exportedNow);
-  // "Post-fix OTP has run on this device." Deletable like everything else here,
-  // so it may only ESCALATE a warning, never authorise anything — see the
-  // legacy-adoption gate in unlockPad.
-  localStorage.setItem(EPOCH_KEY, "1");
-  wmCache.set(id, { send: wm.send, recv: wm.recv });
+  plain.fill(0);
+  return JSON.stringify({ iv: b64(iv), ct: b64(ct) });
 }
 
 // Pad size presets (total bytes; each direction gets half). XOR-OTP spends one
@@ -642,11 +676,17 @@ async function writePadBlob(record, key, salt, iters) {
   // file could not be re-imported either, and the padId was burned. Verified as
   // a real regression: the same interruption opens normally on the pre-fix code.
   //
-  // So the claim is now MADE ONLY WHERE IT IS TRUE: arm the slots first, verify
-  // them, and let that verdict decide what the blob says. A bridge that fails
-  // yields `derivedFloors: false` — the pad still opens, unguarded, exactly as
-  // it would have before this fix existed — instead of a permanent brick.
-  const armed = armFloors(record.padId, wm, !!record.exported);
+  // So the claim is now MADE ONLY WHERE IT IS TRUE: ensure the slots exist,
+  // verify that by reading them back, and let that verdict decide what the blob
+  // says. A bridge that fails yields `derivedFloors: false` — the pad still
+  // opens, unguarded, exactly as it would have before this fix existed —
+  // instead of a permanent brick.
+  //
+  // Pentest 2026-08-10-night F-A1, third pass: the probe may only CREATE slots,
+  // never advance them, or the claim's read-back reintroduces the brick from the
+  // other side (floor above the blob for the length of the encrypt below). The
+  // advance happens after the blob is on disk — see armFloors.
+  const armed = probeFloors(record.padId);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const plain = encU.encode(JSON.stringify({
     padId: record.padId,
@@ -699,14 +739,55 @@ async function writePadBlob(record, key, salt, iters) {
   }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain));
   plain.fill(0);
-  localStorage.setItem(padKey(record.padId), JSON.stringify({
+  const blobJson = JSON.stringify({
     v: PAD_BLOB_V,
     kdf: { salt: b64(salt), iters },
     iv: b64(iv),
     ct: b64(ct),
-  }));
+  });
+  // F-A1, the other half. Every remaining step is ordered so that an interruption
+  // leaves a state the next unlock accepts ON AN ESTABLISHED PAD, and both crypto
+  // operations are finished before the first byte is stored so that no `await`
+  // sits between two writes that have to agree:
+  //
+  // Say "established" precisely, because the unqualified claim is false and was
+  // measured to be (pentest of this fix, F-A1-R1). On a pad's FIRST save —
+  // `saveNewPad`, `importPad`, or the v1/v2 migration rewrite — `probeFloors` has
+  // just created the send slot, so `padWasUsed` answers true while no blob,
+  // watermark or `usedKey` exists yet. Any failure below therefore burns the
+  // padId and the two people must exchange a pad in person again. That is a
+  // residual, not a regression (HEAD burns it identically, on all five write
+  // classes), and closing it means not letting `probeFloors` create the send slot
+  // before a blob exists, or not counting a bare send slot at exactly 0 as
+  // evidence of use. Open finding.
+  //
+  //   1. the blob FIRST. It carries the new offsets inside its AEAD, so a stored
+  //      blob with a stale watermark beside it is fine — unlockPad's max() takes
+  //      the blob's own `hwSend`/`hwRecv`. The reverse order is NOT safe: a new
+  //      watermark over an old blob reads as `sendOffset < wm.send`, i.e. a
+  //      rollback refusal, which is the brick this finding is about.
+  //   2. the watermark, `usedKey` and the epoch marker, synchronously and
+  //      adjacent, so the only survivable gap on a pad's FIRST save (where
+  //      `outerWm === null` plus an existing floor is itself a refusal) is
+  //      between two adjacent statements rather than across an encrypt.
+  //   3. the floors LAST, once everything they could contradict is durable.
+  const wmJson = await sealWatermark(record.padId, key, wm);
+  localStorage.setItem(padKey(record.padId), blobJson);
+  localStorage.setItem(wmKey(record.padId), wmJson);
+  // Plaintext "this pad has run on this device" marker. It carries no offsets
+  // and is not trusted for a rollback decision — it exists so importPad, which
+  // holds only the TRANSFER passphrase and so cannot open the record above, can
+  // still refuse to resurrect a consumed pad from its (always pristine) file.
+  localStorage.setItem(usedKey(record.padId), "1");
+  // "Post-fix OTP has run on this device." Deletable like everything else here,
+  // so it may only ESCALATE a warning, never authorise anything — see the
+  // legacy-adoption gate in unlockPad.
+  localStorage.setItem(EPOCH_KEY, "1");
   writeIndexEntry(record, { exported: !!record.exported });
-  await writeWatermark(record.padId, key, wm, !!record.exported);
+  // F-1: mirror the floors into the native store, where they cannot be deleted
+  // from the JS context and cannot be lowered at all.
+  armFloors(record.padId, wm, !!record.exported);
+  wmCache.set(record.padId, { send: wm.send, recv: wm.recv });
 }
 
 // First save of a freshly generated/imported pad: derive a NEW at-rest key from

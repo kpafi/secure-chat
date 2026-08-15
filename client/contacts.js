@@ -479,6 +479,15 @@ export async function savePin(key, bundle) {
     ed: bundle.ed, mldsa: bundle.mldsa,
     ecdh: bundle.ecdh ?? null, mlkem: bundle.mlkem ?? null,
   };
+  // F-A2: saving a pin IS the in-person safety-number confirmation, so it clears
+  // the "your pin was cleared by someone else's revocation" marker for these
+  // keys. Without this the marker would outlive the re-verification it asks for
+  // on the room-pin path, where `onVerifyOk` has no handle to upsert against.
+  if (contacts) {
+    for (const c of contacts) {
+      if (c.ed === bundle.ed && c.mldsa === bundle.mldsa) delete c.reverify;
+    }
+  }
   await persist();
 }
 
@@ -674,37 +683,70 @@ function dropPinsFor(contact) {
   // Current keys ∪ every superseded pair we recorded for this contact.
   const owned = [{ ed: contact.ed, mldsa: contact.mldsa }];
   if (Array.isArray(contact.pinKeys)) {
-    // Pentest 2026-08-10 (M-2): a historical key is not necessarily this
-    // contact's. `pinKeys` is fed from whatever `upsert` was called with, which
-    // includes an UNSIGNED directory answer (see item 14 — the directory binds
-    // nothing). So a relay that answers one lookup for "mallory" with alice's
-    // real bundle gets K_alice written into mallory's history; the record
-    // self-corrects on the next honest answer, but the history keeps the lie,
-    // and removing mallory weeks later then deleted alice's pin. Alice's next
-    // session rendered as a benign first contact instead of "identity key
-    // CHANGED" — the alarm inverted, which is the shape this project has been
-    // bitten by before. Reproduced, and confirmed absent from the pre-fix code:
-    // the old current-key-only sweep was self-limiting, because it only matched
-    // while the record still NAMED the poisoned key. History made it permanent.
-    //
-    // So a historical key is skipped when it is some OTHER contact's CURRENT
-    // identity. That contact is the live owner of those keys; a stale entry in
-    // someone else's history is not authority to delete their pin. The contact
-    // being removed keeps its own current keys as authority regardless.
-    const claimedByAnother = (k) => contacts.some(
-      (c) => c !== contact && c.ed === k.ed && c.mldsa === k.mldsa);
     for (const k of contact.pinKeys) {
       if (!k || typeof k.ed !== "string" || typeof k.mldsa !== "string") continue;
-      if (claimedByAnother(k)) continue;
       owned.push(k);
     }
   }
+  // Pentest 2026-08-10 (M-2) and its repair's own defect (2026-08-10-night F-A2).
+  //
+  // M-2 first. `pinKeys` is fed from whatever `upsert` was called with, which
+  // includes an UNSIGNED directory answer (see item 14 — the directory binds
+  // nothing). So a relay that answers one lookup for "mallory" with alice's real
+  // bundle gets K_alice written into mallory's history; the record self-corrects
+  // on the next honest answer, but the history keeps the lie, and removing
+  // mallory weeks later deleted alice's pin. Alice's next session then rendered
+  // as a benign FIRST CONTACT — the alarm inverted, which is the shape this
+  // project has been bitten by before.
+  //
+  // The first repair was to SKIP a historical key that is some other contact's
+  // current identity. That inverted the failure instead of removing it: the
+  // attacker chooses whether such a record exists. One directory lookup answered
+  // with the superseded bundle (app.js upserts it), or one sealed envelope, which
+  // auto-creates a contact with no user action at all, is enough to manufacture
+  // the claimant — and the retained pin then reaches `unlockMessaging()` with no
+  // prompt and no safety-number check. Post-compromise revocation, defeated by
+  // the thing that was supposed to protect a bystander.
+  //
+  // Both failures come from trying to settle a key COLLISION by choosing which
+  // contact keeps the pin. There is no safe answer to that: retention is
+  // fail-open, deletion is a silent downgrade. So neither is used. The pin is
+  // ALWAYS deleted — revocation must be absolute, and the user asked for it —
+  // and the collision is recorded on the other contact instead, so their next
+  // session cannot be rendered as a benign first contact.
+  //
+  // KNOWN LIMIT, measured rather than assumed (pentest of this fix, F-A2-R1).
+  // The marker is keyed on a contact whose CURRENT keys are the swept ones, so
+  // it does not cover two reachable shapes: a `room:<id>` pin whose owner has no
+  // contact record at all (the DEFAULT for Live-room use — app.js only mirrors a
+  // record when a handle was typed), and a bystander who has since rotated, whose
+  // stale pin names keys the record no longer has. In both, the pin is swept and
+  // NO marker is set, so that peer's next session still renders benign. This is a
+  // residual and not a regression — the predicate here is the same one the
+  // deleted `claimedByAnother` used, so it covers exactly the set the old code
+  // retained — but it means "nobody loses an alarm" is NOT true of this code, and
+  // must not be written as if it were. Closing it needs the marker to live on the
+  // PIN KEY (a tombstone) rather than on a contact, which is knowable here
+  // without guessing who holds those keys now. Open finding.
+  //
+  // Deliberately NOT conditioned on the other record being `verified` or
+  // user-created: an attacker-made record is exactly the case that must not be
+  // able to change what revocation deletes.
+  const otherHolderOf = (k) => contacts.find(
+    (c) => c !== contact && c.ed === k.ed && c.mldsa === k.mldsa);
   for (const [key, pin] of Object.entries(pins)) {
     if (!pin) continue;
     // Signing keys alone are enough to identify the contact: they ARE the
     // identity (the fingerprint and safety number cover only them), and a pin
     // whose ed/mldsa match is a pin for this peer whatever else it carries.
-    if (owned.some((k) => pin.ed === k.ed && pin.mldsa === k.mldsa)) delete pins[key];
+    const hit = owned.find((k) => pin.ed === k.ed && pin.mldsa === k.mldsa);
+    if (!hit) continue;
+    delete pins[key];
+    // Collateral: these keys are some OTHER live contact's current identity, so
+    // that contact has just silently lost their pin. Mark it, so app.js says
+    // "re-verify — your saved pin was cleared" instead of "first contact".
+    const other = otherHolderOf(hit);
+    if (other) other.reverify = true;
   }
 }
 
