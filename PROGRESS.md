@@ -3,20 +3,159 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (2026-08-15 — A4's three Highs FIXED; the H-1 fix was itself broken and re-fixed)
+## ⮕ RESUME HERE (2026-08-15 — A4's 3 Highs fixed in CODE; the item-14 TEST control still does not bind — 3 new Highs)
 
-**Items 1, 2 and 3 of the list below are DONE** (A4/F-A1, A4/F-A2, A4/H-1). Each
-carries a regression test **verified to fail against the code it replaces**, by
-running it against the pre-fix file rather than by assertion. `pentest-new-code`
-was then run over the fix code, as it must be.
+**Committed: `fc566dd`.** Working tree CLEAN. Not pushed, not merged, not
+deployed. `master` is still 1 commit ahead of `origin/master` from an earlier
+session. `backend/accounts.db` untouched.
 
-**It found the H-1 fix did not work — and it was right.** I reproduced its mutant
-before acting on it. That makes **six consecutive rounds** in which the repair
-was more dangerous, or emptier, than the bug. The re-fix is described below and
-every mutant is now dead, but read this entry as evidence for the rule, not
-against it.
+**Read this before anything else.** `pentest-new-code` was run TWICE this
+session, and the second run is the one that matters.
 
-**What was fixed**
+* **Round 1** reviewed the three fixes. It broke the H-1 fix, correctly. I
+  reproduced its mutant, re-fixed, and every mutant it named went red.
+* **Round 2** reviewed the re-fix — the part written *after* round 1 finished,
+  which nothing had reviewed. **It found 3 more Highs and installed 5 mutants
+  that restore the item-14 directory skip and pass the suite 195/195.** I
+  verified the cheapest two by hand before accepting them; both reproduce
+  exactly.
+
+So: **A4 items 1 and 2 are genuinely fixed in the runtime code. Item 3 is NOT.**
+Three attempts at pinning it have each produced a green control that does not
+bind. The runtime code in `fc566dd` is not itself vulnerable — `peerAlreadyTrusted`
+and the call site are correct as committed — but nothing stops a future commit
+from reintroducing the route, which is the entire job item 3 exists to do.
+
+**The pattern is now the finding.** Source-anchored tests over `app.js` (which
+cannot be imported — it touches `document` at module scope) have failed three
+rounds running, each time passing while the property was gone. A fourth, sharper
+regex is probably the wrong move. See item 1 below.
+
+### ⬜ NEXT SESSION — do these in order
+
+1. **⬜ ROUND-2/F-1 + F-2 (High, together) — the "comment stripper" is a prefix
+   test, and `lift()` never uses it.** Two independent holes that make every new
+   source-level check in all three test files bypassable:
+   - `codeOnly()` (`peer-approval.test.mjs:40-43`, plus inline copies at
+     `contacts-anchor.test.mjs:459-460` and `otp-rollback.test.mjs:1263-1264`)
+     drops any line whose trim starts with `/*`. **`/**/ statement;` is
+     executable JavaScript that satisfies that test.** Verified by hand:
+     `/**/ if (expectedPeerBundle && sameBundle(expectedPeerBundle, idbCanon))
+     approvedBundle = idbCanon;` is filtered out as a comment *and* executes and
+     assigns. One 4-character prefix defeats `EXPECTED_WINDOW`, the whole-file
+     `expectedPeerBundle` allow-list, the `describeIdentity` caller walk, and both
+     app.js anchors — including the F-A1 export-order check, where the mutant
+     hands the pad file over before the latch.
+   - `lift()` (`peer-approval.test.mjs:19-31`) does `src.indexOf("function
+     <name>(")` on **raw source**; `codeOnly` is applied only to its *output*, so
+     it can never undo a bad anchor. A `/* … */` block containing a decoy copy of
+     the function is found first. One mutant made **all 13 peer-approval checks,
+     including the 9 behavioural ones, assert against a comment.**
+   **Fix:** strip block comments AND line comments from `src` once, at load, and
+   run `lift()`/`indexOf`/the allow-lists over the stripped text. Assert `lift()`
+   matched exactly one `function <name>(` in the stripped source. A prefix test is
+   not a comment stripper and must not be spelled like one.
+2. **⬜ ROUND-2/F-3 (High) — the pinned window starts too late, and the
+   `describeIdentity` caller allow-list is line-based.** No comment tricks; this
+   is the ordinary-looking-commit version, and it is the same mutant shape round 1
+   used, one level out.
+   - `EXPECTED_WINDOW` begins **at** `const idbCanon = canonicalBundle(idb);`
+     (`peer-approval.test.mjs:186`). Everything earlier in the `key`-frame branch
+     is unconstrained, and `approvedBundle` assigned there makes the
+     `if (!approvedBundle)` gate at `app.js:2699` never run at all.
+   - the caller walk (`peer-approval.test.mjs:295-314`) attributes a call to the
+     nearest preceding `/^(?:async\s+)?function\s+(\w+)\s*\(/` — anchored at
+     **column 0**, so it cannot see arrow functions, class or object methods, or
+     an indented declaration. A module-scope
+     `const dirVerdict = (b) => describeIdentity(b);` placed after
+     `renderPeerApproval` is attributed to `renderPeerApproval`, and the
+     allow-list still reads `["renderPeerApproval","showNextKnock"]`. It also
+     pushes one owner per matching LINE, not per call.
+   **Fix, and this is the one worth doing properly:** stop policing
+   `describeIdentity` and remove the thing being laundered. It returns
+   `mismatch`, a decision-grade boolean, purely so two renderers can draw a ⚠
+   line — **have it return the rendered string (or take the element to write
+   into) so there is no boolean for a decision path to read.** That deletes the
+   whole attack class instead of naming it. Then start the window where
+   `approvedBundle` could first be written for the connection, not at `idbCanon`.
+3. **⬜ ROUND-2/F-4 (Medium) — F-A2's shape assertions validate the wrong line.**
+   `contacts-anchor.test.mjs:485` does `code.find((l) => l.includes("c.reverify"))`
+   over the whole stripped file, so it returns the **first** hit — `app.js:1092`,
+   `} else if (c.reverify && !c.verified) {` in the **Users-list renderer**, an
+   unrelated site. Verified by hand. So `assert.match(branch, /^\}\s*else if\s*\(/)`
+   never looks at `renderVerify` at all, and a mutant adding `&& !pinsReadable()`
+   — always false there, because `app.js:2845-2858` returns early when it is false
+   — makes F-A2's branch **dead code** while every shape assertion passes. The
+   bystander falls through to the benign first-contact panel: M-2's inverted
+   alarm, restored. **Fix:** anchor the `find` inside the `renderVerify` region
+   (slice from `const pin = await getPin(currentPinKey);` first) and assert the
+   SAME line carries both the `else if` shape and the unlock short-circuit.
+   `code[i-1]` is off-by-one safe (filtered array, `i===0` guarded) but is a weak
+   proxy that the dead branch satisfies.
+4. **⬜ ROUND-2/F-5 (Medium — I recorded this as Low and was wrong) —
+   `writeIndexEntry` moved late, and it BURNS the pad.** `fc566dd` reordered
+   `writePadBlob` to blob → wm → used → epoch → `writeIndexEntry` → `armFloors`.
+   A kill or quota error between the watermark and the index on a pad's FIRST save
+   leaves this, verified by PoC on the committed tree:
+   ```
+   keys on disk: [ sc.otp.pad.v1.<id>, sc.otp.wm.v1.<id> ]
+   listPads(): 0   padMeta(): null
+   pad IS durable and unlockable, sendOffset = 0
+   padWasUsed(): true     after forgetPad, padWasUsed(): true
+   ```
+   `refreshOtpPads` (`app.js:3179-3193`) builds the selector from `listPads()`,
+   and the selector is the ONLY route to `unlockPad` — so there is no UI path to
+   the pad. `padWasUsed()` then refuses re-import, and `forgetPad` deliberately
+   keeps the watermark. **The pad is gone and the two people must meet in person
+   again.** On a plain browser this window is strictly WORSE than F-A1-R1's (that
+   one leaves no keys and re-import is allowed). Same harm class as the bug
+   `fc566dd` was fixing, minus the alarm wording, which makes it harder to
+   diagnose. **This is a genuine regression introduced by `fc566dd`.**
+   **Fix — one line:** move `writeIndexEntry(record, …)` to immediately after
+   `setItem(padKey…)`, before the watermark. Nothing in the ordering rationale at
+   `otp.js:764-773` requires it to be late; the index is a render cache and
+   carries no security decision.
+5. **⬜ ROUND-2/F-6 (Info) — a comment of mine over-claims.** `contacts.js`
+   dropPinsFor says the marker "covers exactly the set the old code retained".
+   Not exactly: `claimedByAnother` applied only to `contact.pinKeys`, while
+   `otherHolderOf` is applied to every element of `owned` **including the
+   contact's own current keys** — so the marker set is a strict SUPERSET. Error is
+   in the conservative direction, but the sentence is load-bearing prose bounding
+   a residual. Reword to "at least the set the old code retained."
+6. **⬜ Test debt this round exposed** (distinct from item 12's older list):
+   - **F-5 has no test at all.** `testInterruptedSaveDoesNotBrickAPad`
+     (`otp-rollback.test.mjs:1170-1247`) only fails the BLOB write and only on an
+     ESTABLISHED pad. A one-line change to the fail predicate (`sc.otp.used.v1.`
+     on a first save) would fail against `fc566dd` and pass against `cbcedf9` —
+     i.e. it would have caught the regression the commit shipped. Write it first.
+   - `savePin`'s reverify-clearing has a positive test but no negative one:
+     nothing asserts that `savePin` for a DIFFERENT bundle leaves the marker alone.
+   - The `describeIdentity` caller allow-list has **no self-test**. Every other new
+     check is justified by a named mutant that beat the previous version; this one
+     is not, and it is the one that fails silently under aliasing.
+7. **⬜ The three A4 findings still open from round 1** — F-A2-R1 and F-A1-R1
+   (both Medium, both confirmed **pre-existing residuals, not regressions**:
+   the identical PoC gives byte-identical output on HEAD), and the `reverify`
+   overloading Info. All three are described in full in the round-1 block below.
+
+**Then** continue with items 8 onward (the old numbering, unchanged): item 6's
+`/api/register` 409 contract change **still needs the user's decision**, item 7's
+older test debt, item 8's harness gap, and the rest.
+
+**Baselines, measured on the committed tree:** client **195 OK, 0 failures**.
+Backend **165 passed**. Round 2 did not run e2e (no `backend/` change in the
+commit); round 1 ran `room-admission` 13/13, `two-user-flow` 8/8, `no-dead-ends`
+12/12 against a scratch relay. **Note what that green means: five mutants that
+skip the approval prompt against a hostile directory also score 195/195.** Do NOT
+merge this branch on the strength of a green suite.
+
+**Not attacked in either round:** F-A1 was exercised against a JS stub of
+`PadFloor`, never on a real device. `e2e/hostile-relay/` structurally cannot see
+any of the directory-driven mutants (it serves no `/api/*` routes — item 8 below
+is exactly this). `PadFloorBridge`'s Long↔JS-number marshalling and the Android
+side beyond `PadFloor.kt` were not reviewed.
+
+### Round 1 — what `fc566dd` actually fixed, and how it was verified
 
 1. **A4/F-A1 — `otp.js` floor/blob write ordering.** `armFloors` was split into
    `probeFloors(id)` (bumps every slot with **0**, so it can only CREATE a slot,
@@ -58,6 +197,10 @@ against it.
    body for `requestPeerApproval`; an assertion that `renderPeerApproval` cannot
    settle the promise; and a call-site allow-list proving `describeIdentity` is
    reachable **only** from the two prompt renderers.
+   **⚠ THE RE-FIX DOES NOT BIND EITHER — see items 1-3 at the top of this file.**
+   Round 2 defeated all four of those checks. "Proving" in the sentence above is
+   too strong and is left standing only so the next reader can see exactly which
+   claim failed and why.
 
 **Also fixed: three source anchors were satisfiable by a comment** — H-1's defect
 again, in two more files. `indexOf` over raw source let a mutant revert the
@@ -67,17 +210,16 @@ source anchors now strip `//` lines first via a `codeOnly()` filter, and the
 F-A2 anchor gained shape assertions (`else if`, locked-store short-circuit, the
 `changed` styling).
 
-**Mutants re-run against the hardened tests — all four now RED:** the
-`requestPeerApproval` short-circuit, the call-site `describeIdentity().mismatch`
-skip, the comment-hidden export reorder, and the comment-hidden `reverify`
-deletion.
+**Round 1's four mutants were re-run against the hardened tests and all went
+RED** (the `requestPeerApproval` short-circuit, the call-site
+`describeIdentity().mismatch` skip, the comment-hidden export reorder, and the
+comment-hidden `reverify` deletion). **That result stands but means much less
+than it looked like at the time** — round 2 then found five DIFFERENT mutants
+that pass, via `/**/`-prefixed code, a block-comment decoy for `lift()`, and an
+arrow-function alias. Killing the named mutants is not the same as binding the
+property. See items 1-3 at the top.
 
-**Baselines, measured on the clean tree at close:** client **195 OK, 0 failures**
-(was 184 at `40d132e`; +11 new checks). Backend **165 passed**. e2e and
-hostile-relay not re-run by me; the pentest ran `room-admission` 13/13,
-`two-user-flow` 8/8, `no-dead-ends` 12/12 against a scratch relay.
-
-### ⬜ NEXT — new findings from the pentest of these fixes (none fixed)
+### Round 1's own findings (still open — none fixed)
 
 Both Mediums were **confirmed as pre-existing residuals, not regressions** — the
 pentest ran the identical PoC against HEAD and got byte-identical output. They
@@ -99,11 +241,11 @@ both code comments have been corrected to say so rather than left as folklore.
   classes. Fix direction: do not let `probeFloors` create the send slot before a
   blob exists, or stop counting a bare send slot at exactly 0 (with no blob, no
   watermark and no `usedKey`) as evidence of use.
-* **⬜ F-A1-R2 (Low, NEW in this diff) — `writeIndexEntry` moved after the
-  `usedKey`/`EPOCH_KEY` writes.** A kill in that 4-statement synchronous window
-  on a first save now also loses the index entry, so the pad is durable and
-  unlockable but invisible in `listPads()`. Recoverable state that used to be
-  fully usable.
+* **⬜ F-A1-R2 — SUPERSEDED by ROUND-2/F-5 (item 4 at the top). I rated this Low
+  and called it "recoverable state"; both were wrong.** Round 2's PoC shows the
+  padId is BURNED on both platforms and there is no UI route to the pad. It is a
+  Medium and a genuine regression shipped by `fc566dd`. Corrected here rather
+  than left to mislead the next reader.
 * **⬜ INFO — `reverify` is overloaded.** It already meant "your 🟢 predates
   encryption-key coverage" (`contacts.js:414`). Consequences: a 🟢 contact whose
   pin was just swept shows **nothing** in the Users list (`app.js:1092` renders it
@@ -119,12 +261,8 @@ real device. `e2e/hostile-relay/` was not run (item 8 below is why: it serves no
 `PadFloorBridge`'s Long↔JS-number marshalling and the Android side beyond
 `PadFloor.kt` were not reviewed.
 
-**State at hand-off:** branch `pentest-2026-08-07-fixes`, 6 modified files
-(`client/{app,contacts,otp}.js` + `client/{otp-rollback,contacts-anchor,
-peer-approval}.test.mjs`), **uncommitted**. Not pushed, not merged, not deployed.
-`backend/accounts.db` untouched. Items 4-12 below are unchanged and still open —
-in particular **item 6 still needs the user's decision** on the `/api/register`
-409 contract change.
+(Round 1's "state at hand-off" paragraph is superseded — that work is now
+committed as `fc566dd`. See the top of this file for the current state.)
 
 ## ⮕ (2026-08-10 night — `40d132e`'s repairs pentested: 3 High, 4 Medium)
 
