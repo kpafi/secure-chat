@@ -30,43 +30,131 @@
 // Replace every comment in `src` with equivalent-length whitespace (newlines
 // preserved), so byte offsets and line numbers are unchanged and no two tokens
 // that were on separate lines get fused. Understands `'...'`, `"..."`,
-// `` `...` `` (including `\` escapes), `//` line comments and `/* */` block
-// comments. Regex literals are NOT parsed — see the note below; app.js has none
-// at the sites these tests inspect, and treating `/` as division-or-comment-only
-// is safe for that source.
+// `` `...` `` templates INCLUDING nested `${ ... }` substitutions (which may
+// contain further strings/templates/regex), `//` line comments, `/* */` block
+// comments, and REGEX literals — so a `/[/*]/` or `/a\/\//` does not spuriously
+// open a comment or line-comment and swallow real code after it. Regex-vs-division
+// is decided by the standard "what can precede a regex" heuristic on the previous
+// meaningful token; a misjudgement would at worst make an exact-match anchor fail
+// LOUD, never silently pass. Strings/templates/regex are copied verbatim so the
+// code around them is preserved; only comments become whitespace.
+//
+// Implemented as a stack of frames so `${...}` inside a template can itself hold a
+// template, and so on. Each code frame tracks its own brace depth so the `}` that
+// closes a substitution is told apart from the `}` of a nested block.
+const REGEX_PRECEDING_KEYWORDS = new Set([
+  "return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "do",
+  "else", "yield", "await", "case", "throw",
+]);
+const IDENT_CHAR = /[A-Za-z0-9_$]/;
+
 export function stripComments(src) {
-  let out = "";
-  let i = 0;
+  const out = [];
   const n = src.length;
-  // states: 0 code, 1 line-comment, 2 block-comment, 3 '..', 4 "..", 5 `..`
-  let state = 0;
+  // Frame types: "code" (braceDepth used for ${} exit), "tmpl" (template literal).
+  const stack = [{ type: "code", brace: 0 }];
+  let lastMeaningful = ""; // last non-space code char, for regex/division
+  let lastWord = "";       // last identifier run in code, for keyword check
+  let word = "";
+
+  const top = () => stack[stack.length - 1];
+  const blank = (c) => (c === "\n" ? "\n" : c === "\t" ? "\t" : " ");
+  const finishWord = () => { if (word) { lastWord = word; word = ""; } };
+
+  let i = 0;
   while (i < n) {
     const c = src[i];
     const d = i + 1 < n ? src[i + 1] : "";
-    if (state === 0) {
-      if (c === "/" && d === "/") { state = 1; out += "  "; i += 2; continue; }
-      if (c === "/" && d === "*") { state = 2; out += "  "; i += 2; continue; }
-      if (c === "'") { state = 3; out += c; i++; continue; }
-      if (c === '"') { state = 4; out += c; i++; continue; }
-      if (c === "`") { state = 5; out += c; i++; continue; }
-      out += c; i++; continue;
+    const frame = top();
+
+    if (frame.type === "code") {
+      if (c === "/" && d === "/") { // line comment
+        finishWord();
+        let j = i + 2;
+        out.push("  ");
+        while (j < n && src[j] !== "\n") { out.push(blank(src[j])); j++; }
+        i = j; continue;
+      }
+      if (c === "/" && d === "*") { // block comment
+        finishWord();
+        let j = i + 2;
+        out.push("  ");
+        while (j < n && !(src[j] === "*" && src[j + 1] === "/")) { out.push(blank(src[j])); j++; }
+        out.push("  "); // the closing */
+        i = j + 2; continue;
+      }
+      if (c === "/") { // regex literal, or division?
+        // A `/` starts a regex unless the previous meaningful token ENDS a value:
+        // an identifier/number (unless it is a regex-preceding keyword like
+        // `return`/`typeof`), or a `)` / `]`. Everything else (operators, `(`,
+        // `,`, `;`, `=`, `{`, a block-closing `}`, or start-of-input) precedes a
+        // regex. A wrong guess only ever makes an exact-match anchor fail loud.
+        let isRegex;
+        if (lastMeaningful === "") isRegex = true;
+        else if (IDENT_CHAR.test(lastMeaningful)) isRegex = REGEX_PRECEDING_KEYWORDS.has(lastWord);
+        else if (lastMeaningful === ")" || lastMeaningful === "]") isRegex = false;
+        else isRegex = true;
+        if (isRegex) {
+          finishWord();
+          out.push(c); // copy the regex verbatim
+          let j = i + 1;
+          let inClass = false;
+          for (; j < n; j++) {
+            const rc = src[j];
+            out.push(rc);
+            if (rc === "\\") { if (j + 1 < n) { out.push(src[j + 1]); j++; } continue; }
+            if (rc === "[") inClass = true;
+            else if (rc === "]") inClass = false;
+            else if (rc === "/" && !inClass) { j++; break; }
+            else if (rc === "\n") break; // unterminated; bail defensively
+          }
+          while (j < n && /[a-z]/.test(src[j])) { out.push(src[j]); j++; } // flags
+          lastMeaningful = "/"; lastWord = "";
+          i = j; continue;
+        }
+        // division
+        out.push(c); lastMeaningful = "/"; finishWord(); i++; continue;
+      }
+      if (c === "'" || c === '"') { // string
+        finishWord();
+        out.push(c);
+        let j = i + 1;
+        for (; j < n; j++) {
+          out.push(src[j]);
+          if (src[j] === "\\") { if (j + 1 < n) { out.push(src[j + 1]); j++; } continue; }
+          if (src[j] === c) { j++; break; }
+          if (src[j] === "\n") { j++; break; } // unterminated; bail
+        }
+        lastMeaningful = c; i = j; continue;
+      }
+      if (c === "`") { // enter template
+        finishWord();
+        out.push(c); stack.push({ type: "tmpl" }); lastMeaningful = "`"; i++; continue;
+      }
+      if (c === "{") { frame.brace++; out.push(c); lastMeaningful = "{"; finishWord(); i++; continue; }
+      if (c === "}") {
+        finishWord();
+        if (frame.brace === 0 && stack.length > 1) { // closes a ${ } substitution
+          stack.pop(); out.push(c); lastMeaningful = "}"; i++; continue;
+        }
+        frame.brace--; out.push(c); lastMeaningful = "}"; i++; continue;
+      }
+      // ordinary code char
+      out.push(c);
+      if (!/\s/.test(c)) lastMeaningful = c;
+      if (IDENT_CHAR.test(c)) word += c; else finishWord();
+      i++; continue;
     }
-    if (state === 1) { // line comment: keep newlines, blank the rest
-      if (c === "\n") { state = 0; out += c; i++; continue; }
-      out += c === "\t" ? "\t" : " "; i++; continue;
+
+    // template-literal frame
+    if (c === "\\") { out.push(c + (d ?? "")); i += 2; continue; }
+    if (c === "`") { stack.pop(); out.push(c); lastMeaningful = "`"; word = ""; i++; continue; }
+    if (c === "$" && d === "{") { // enter substitution (a code frame)
+      out.push("${"); stack.push({ type: "code", brace: 0 }); lastMeaningful = ""; lastWord = ""; word = ""; i += 2; continue;
     }
-    if (state === 2) { // block comment
-      if (c === "*" && d === "/") { state = 0; out += "  "; i += 2; continue; }
-      out += c === "\n" ? "\n" : (c === "\t" ? "\t" : " "); i++; continue;
-    }
-    // string / template states: copy verbatim, honour backslash escapes
-    if (c === "\\") { out += c + (d ?? ""); i += 2; continue; }
-    if (state === 3 && c === "'") { state = 0; out += c; i++; continue; }
-    if (state === 4 && c === '"') { state = 0; out += c; i++; continue; }
-    if (state === 5 && c === "`") { state = 0; out += c; i++; continue; }
-    out += c; i++;
+    out.push(c); i++;
   }
-  return out;
+  return out.join("");
 }
 
 // Trimmed, non-empty lines of already-stripped source. Pass the OUTPUT of

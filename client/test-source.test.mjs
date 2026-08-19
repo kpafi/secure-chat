@@ -118,4 +118,53 @@ const ok = (m) => { n++; console.log("ok", m); };
   ok("referencesOf ignores a reference that lives only in a comment");
 }
 
+// --- ROUND-3 F-2: regex literals must not open comments/line-comments --------
+{
+  // `/[/*]/` contains `/*`; a naive stripper opens a block comment here and
+  // blanks the rest of the FILE up to the next `*/`.
+  const src = "const p = /[/*]/; describeIdentity(x);";
+  const stripped = stripComments(src);
+  assert.match(stripped, /describeIdentity\(x\)/,
+    "code after a regex containing /* must survive — the regex is not a comment");
+  assert.strictEqual(referencesOf(stripped, "describeIdentity").length, 1,
+    "a call after a /[/*]/ regex must still be reported");
+  ok("regex containing /* does not swallow the code after it");
+}
+{
+  // `/a\/\//` produces `//`; a naive stripper reads it as a line comment and
+  // eats the rest of the line, hiding a same-line reference.
+  const src = "if (/a\\/\\//.test(v)) describeIdentity(y);";
+  const stripped = stripComments(src);
+  assert.strictEqual(referencesOf(stripped, "describeIdentity").length, 1,
+    "a reference after a regex containing // must still be reported (round-3 F-2)");
+  ok("regex containing // does not hide a same-line reference");
+}
+{
+  // Division must still NOT be treated as a regex (would swallow to the next /).
+  const src = "const r = (a) / b; const s = c / d; describeIdentity(z);";
+  const stripped = stripComments(src);
+  assert.match(stripped, /const r = \(a\) \/ b;/, "division after ) stays division");
+  assert.strictEqual(referencesOf(stripped, "describeIdentity").length, 1, "division does not eat code");
+  ok("division operators are not misread as regex");
+}
+
+// --- ROUND-3 F-2: nested template substitutions ------------------------------
+{
+  const src = "const t = `${a ? `x//y` : `z`}`; describeIdentity(w);";
+  const stripped = stripComments(src);
+  assert.strictEqual(referencesOf(stripped, "describeIdentity").length, 1,
+    "a reference after a nested template must still be reported");
+  assert.match(stripped, /describeIdentity\(w\)/, "code after a nested template survives");
+  ok("nested template substitutions do not desync the scanner");
+}
+{
+  // A `//` inside a ${} substitution's string is not a comment; a real comment
+  // inside the substitution IS stripped.
+  const src = "const t = `a${ b // gone\n }c`; keep;";
+  const stripped = stripComments(src);
+  assert.match(stripped, /keep;/, "code after the template survives");
+  assert.doesNotMatch(stripped, /gone/, "a line comment inside ${} is still stripped");
+  ok("comments inside a template substitution are stripped, code preserved");
+}
+
 console.log(`\nOK test-source (${n} checks)`);

@@ -182,10 +182,26 @@ const ok = (name) => { n++; console.log("OK  " + name); };
   const anchor = src.indexOf("if (!cipher.needsHandshake) {");
   assert.notStrictEqual(anchor, -1, "the key-frame branch must still guard on cipher.needsHandshake");
   const site = src.slice(anchor);
-  const gate = site.indexOf("if (!approvedBundle) {");
-  assert.notStrictEqual(gate, -1, "the approval gate must still exist at the handshake call site");
+  const gateOpen = site.indexOf("if (!approvedBundle) {");
+  assert.notStrictEqual(gateOpen, -1, "the approval gate must still exist at the handshake call site");
 
-  const between = site.slice(0, gate);
+  // ROUND-3 F-1 (2026-08-15, pentest of the F-3 fix): the window used to END at
+  // the gate line, so the gate's BODY — where `requestPeerApproval` is actually
+  // called and where `approvedBundle` is actually set — was pinned by nothing. A
+  // mutant could drop `approvedBundle = idbCanon;` straight into the `else` branch
+  // (a blanket skip), or reconstitute item 14 there via `expectedPeerName` +
+  // `account.fetchBundle` (never naming `expectedPeerBundle`), and pass the whole
+  // suite. So the window now runs THROUGH the gate block: the decision body is
+  // pinned exactly, and the only path that sets `approvedBundle` without a human
+  // is the `peerAlreadyTrusted` (🟢-verified-in-person) branch.
+  let depth = 0;
+  let gateEnd = -1;
+  for (let k = site.indexOf("{", gateOpen); k < site.length; k++) {
+    if (site[k] === "{") depth++;
+    else if (site[k] === "}" && --depth === 0) { gateEnd = k + 1; break; }
+  }
+  assert.notStrictEqual(gateEnd, -1, "the approval gate block must be brace-balanced");
+  const between = site.slice(0, gateEnd);
 
   // The H-1 meta-check: prove this region is code before trusting what it says
   // about the code. A comment-anchored slice fails here immediately.
@@ -248,17 +264,40 @@ const ok = (name) => { n++; console.log("OK  " + name); };
     "if (ws) ws.close();",
     "return;",
     "}",
+    // The approval gate BODY, pinned exactly (ROUND-3 F-1). `approvedBundle` may
+    // be set in exactly two places here: the `peerAlreadyTrusted` branch (a 🟢 key
+    // verified in person — the one non-prompt route item 14 left standing) and
+    // after `allowed` comes back true from `requestPeerApproval` (the human said
+    // yes). Any other statement in this block — a blanket `approvedBundle =
+    // idbCanon`, or an `else if` consulting a directory answer — fails here.
+    "if (!approvedBundle) {",
+    "const trusted = peerAlreadyTrusted(idbCanon);",
+    "if (trusted) {",
+    "approvedBundle = idbCanon;",
+    'addLine("sys", "", `peer key ${trusted} — no approval needed`);',
+    "} else {",
+    'addLine("sys", "", "[nobody has approved this connection — asking you before any keys are exchanged]");',
+    "const allowed = await requestPeerApproval(idbCanon);",
+    "if (!ws || ws.readyState !== WebSocket.OPEN) return;",
+    "if (!allowed) {",
+    'addLine("sys", "", "[you refused this peer — disconnecting]");',
+    'hint("You refused the key that was offered. Nothing was exchanged.", true);',
+    "ws.close();",
+    "return;",
+    "}",
+    "approvedBundle = idbCanon;",
+    'addLine("sys", "", "you approved this peer — their key is now pinned for this session");',
+    "await showNextKnock();",
+    "}",
+    "}",
   ];
   assert.deepStrictEqual(codeLines, EXPECTED_WINDOW,
-    "item 14 / H-1: the statements between the peer bundle and the approval gate are pinned " +
-    "EXACTLY. Every line here must be a refusal — nothing may compute, cache or consult a " +
-    "trust verdict before the human is asked. If you are adding a legitimate refusal, add it " +
-    "to EXPECTED_WINDOW in this test and say why in the commit.");
+    "item 14 / H-1 / ROUND-3 F-1: the key-frame branch THROUGH the approval-gate body is pinned " +
+    "EXACTLY. Before the gate, every line must be a refusal; inside the gate, `approvedBundle` may " +
+    "be set only by the peerAlreadyTrusted (🟢) branch or after the user's `allowed`. If you are " +
+    "changing this decision path deliberately, update EXPECTED_WINDOW and say why in the commit.");
 
-  const body = site.slice(gate, gate + 400);
-  assert.ok(/peerAlreadyTrusted\(idbCanon\)/.test(body),
-    "the gate must decide via peerAlreadyTrusted, so this file's checks actually bind");
-  ok(`item 14: the ${codeLines.length} statements before the approval gate are exactly the pinned refusals`);
+  ok(`item 14: the ${codeLines.length} statements from the key-frame branch through the approval gate are pinned exactly`);
 }
 
 // --- H-1 second pass: the prompt itself, which no window can reach -----------
@@ -318,7 +357,22 @@ const ok = (name) => { n++; console.log("OK  " + name); };
     "prompt renderers (showNextKnock, renderPeerApproval). A new reference is how a directory " +
     "verdict comes back as a value a decision path can read. References found:\n      " +
     refs.map((r) => `app.js:${r.line}  ${r.text}`).join("\n      "));
-  ok("item 14: describeIdentity is referenced only by its definition and the two prompt renderers");
+
+  // ROUND-3 F-3: `referencesOf` matches `name(` — an immediate call. A VALUE
+  // reference (`const alias = describeIdentity;` then `alias(...)`,
+  // `foo(describeIdentity)`, `[describeIdentity]`) would escape it. That laundering
+  // is defanged today because describeIdentity returns nothing, but do not rely on
+  // one control: assert that EVERY occurrence of the bare identifier in the
+  // (comment-stripped) source is immediately followed by `(`, so it can only ever
+  // be a call, never be captured as a value.
+  const bare = new RegExp("\\bdescribeIdentity\\b(.?)", "g");
+  for (let m; (m = bare.exec(src)); ) {
+    assert.strictEqual(m[1], "(",
+      "item 14 / H-1: `describeIdentity` must only ever be CALLED, never taken as a value — a " +
+      "value can be aliased and called from a decision path where this allow-list cannot see it. " +
+      `Found the identifier followed by ${JSON.stringify(m[1])} at index ${m.index}.`);
+  }
+  ok("item 14: describeIdentity is only ever called (never aliased) and only from the two renderers");
 }
 
 // --- H-1, the other half: an exact allow-list over the WHOLE file -----------
