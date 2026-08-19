@@ -3,6 +3,7 @@
 // tripwire. Run: node otp-rollback.test.mjs
 import assert from "node:assert";
 import { readFile } from "node:fs/promises";
+import { stripComments, codeLines } from "./test-source.mjs";
 
 const mem = new Map();
 globalThis.localStorage = {
@@ -676,7 +677,7 @@ console.log("OK  H-1: the native floor cannot be cleared or feature-detected awa
   assert.match(inject, /configurable:\s*false/, "H-A: the published name must be non-configurable");
   // otp.js must not read the writable global at all any more.
   const otpSrc = await readFile(new URL("./otp.js", import.meta.url), "utf8");
-  const code = otpSrc.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  const code = stripComments(otpSrc);
   assert.ok(!/globalThis\.SecureChatPadFloor/.test(code),
     "H-A: otp.js must read only the protected name, never the writable global");
 
@@ -764,7 +765,7 @@ console.log("OK  H-A: a bridge that LIES is refused, not just one that is delete
 
   // The source must not reintroduce a poisonable step on the rollback path.
   const src = await readFile(new URL("./otp.js", import.meta.url), "utf8");
-  const code = src.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  const code = stripComments(src);
   const rollback = code.slice(code.indexOf("export async function unlockPad"));
   for (const bad of [/\bMath\.max\(/, /\bparseInt\(/, /\bNumber\.isFinite\(/]) {
     assert.ok(!bad.test(rollback), `H-1: ${bad} is poisonable and must not decide a rollback`);
@@ -1262,9 +1263,7 @@ await testInterruptedSaveDoesNotBrickAPad();
   // `await otp.markExported(record, atRest)` above the download satisfied it —
   // the check passed while the code did the opposite. Found by the pentest of
   // this very fix; it is H-1's defect, one file over.
-  const code = appSrc.split("\n").map((l) => l.trim())
-    .filter((l) => l && !l.startsWith("//") && !l.startsWith("*") && !l.startsWith("/*"))
-    .join("\n");
+  const code = codeLines(stripComments(appSrc)).join("\n");
   const dl = code.indexOf("downloadText(`secure-chat-pad-");
   const latch = code.indexOf("await otp.markExported(record, atRest)");
   assert.notStrictEqual(dl, -1, "the pad export download call must still exist in app.js");

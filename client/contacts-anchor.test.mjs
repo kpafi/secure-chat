@@ -26,6 +26,7 @@
 // Run: node contacts-anchor.test.mjs   (server not required)
 import assert from "node:assert";
 import * as contacts from "./contacts.js";
+import { stripComments, codeLines } from "./test-source.mjs";
 
 const PASS = "correct horse battery staple";
 const LS_CONTACTS = "sc.contacts.v1";
@@ -449,38 +450,57 @@ await testPinHistoryFindings();
 {
   const { readFile } = await import("node:fs/promises");
   const app = await readFile(new URL("./app.js", import.meta.url), "utf8");
-  // COMMENTS STRIPPED FIRST. Running `indexOf` over raw source let a mutant
-  // DELETE the whole branch and satisfy this check with a comment containing the
-  // string `c.reverify` — the pentest of this fix demonstrated it passing 193/0
-  // with F-A2's user-facing half gone. Same defect as H-1, third file.
-  const code = app.split("\n").map((l) => l.trim())
-    .filter((l) => l && !l.startsWith("//") && !l.startsWith("*") && !l.startsWith("/*"));
+  // COMMENTS STRIPPED FIRST, with the shared scanner (test-source.mjs). Running
+  // `indexOf` over raw source let a mutant DELETE the whole branch and satisfy
+  // this check with a comment containing the string `c.reverify` — the pentest of
+  // this fix demonstrated it passing 193/0 with F-A2's user-facing half gone. Same
+  // defect as H-1, third file. The earlier prefix-filter was itself bypassable
+  // (round 2), so this now uses the real scanner shared with the other anchors.
+  const stripped = stripComments(app);
+  const code = codeLines(stripped);
   const joined = code.join("\n");
   const pinRead = joined.indexOf("const pin = await getPin(currentPinKey);");
   assert.notStrictEqual(pinRead, -1, "renderVerify must still read the pin for this room/user");
   const tail = joined.slice(pinRead);
   const firstContact = tail.indexOf('els.verifyTitle.textContent = "Verify your contact — in person"');
-  const marker = tail.indexOf("c.reverify");
   assert.notStrictEqual(firstContact, -1, "the first-contact branch must still exist");
+  // ROUND-2 F-4 (2026-08-15): confine EVERYTHING to the renderVerify no-pin ladder
+  // — `tail` from the pin read up to the first-contact branch. The previous check
+  // did `code.find((l) => l.includes("c.reverify"))` over the WHOLE file, which
+  // returns app.js's FIRST `c.reverify` — the Users-list renderer
+  // (`} else if (c.reverify && !c.verified) {`), an unrelated site — so the shape
+  // assertions validated a bystander line and never looked at renderVerify. A
+  // mutant adding `&& !pinsReadable()` here (always false: renderVerify returns
+  // early when pins are unreadable) made THIS branch dead code while every shape
+  // check passed against the other file location. So: region-confined, and the
+  // branch condition pinned EXACTLY rather than matched by "contains c.reverify".
+  const region = tail.slice(0, firstContact);
+  const marker = region.indexOf("c.reverify");
   assert.notStrictEqual(marker, -1,
     "F-A2: renderVerify must consult the `reverify` marker that dropPinsFor leaves on a " +
     "contact whose pin was swept as collateral — without it that contact renders as a " +
     "benign FIRST CONTACT, which is exactly M-2's inverted alarm");
-  assert.ok(marker < firstContact,
-    "F-A2: the `reverify` branch must be reached BEFORE the benign first-contact branch");
 
-  // ...and SHAPE, not just presence. Without these, `if (false && ... c.reverify)`
-  // or a branch that forgets the red styling would pass while saying nothing to
-  // the user. The pentest flagged the absence of these specifically.
-  const branch = code.find((l) => l.includes("c.reverify"));
-  assert.match(branch, /^\}\s*else if\s*\(/,
-    "F-A2: the marker must be tested as an `else if` on renderVerify's no-pin path — " +
-    `anywhere else and it is not what decides the prompt. Found:\n      ${branch}`);
-  assert.ok(/contacts\.isUnlocked\(\)/.test(branch) || code.some(
-    (l, i) => l.includes("c.reverify") && code[i - 1] && code[i - 1].includes("contacts.isUnlocked()")),
-  "F-A2: the branch must short-circuit on a locked store — `list()` throws there, and " +
-  "`pinsReadable()` is also true on a device with no store at all");
-  const after = tail.slice(marker, marker + 600);
+  // The exact branch condition, pinned. It spans two stripped lines today; both
+  // are required, consecutively, so a mutant cannot bolt an always-false term
+  // (`&& !pinsReadable()`, the F-4 dead-code shape) onto the condition without
+  // failing here. If this branch is legitimately reshaped, update BOTH lines and
+  // say why — that is the review this pin exists to force.
+  const EXPECTED_BRANCH = [
+    "} else if (contacts.isUnlocked() &&",
+    "contacts.list().some((c) => sameSigning(c, bundle) && c.reverify)) {",
+  ];
+  const regionLines = region.split("\n");
+  const bi = regionLines.findIndex((l) => l === EXPECTED_BRANCH[0]);
+  assert.notStrictEqual(bi, -1,
+    "F-A2: renderVerify's reverify branch must open exactly `} else if (contacts.isUnlocked() &&` " +
+    "on the no-pin path — the unlock short-circuit is required (`list()` throws on a locked store, " +
+    "and `pinsReadable()` is also true on a device with no store at all)");
+  assert.strictEqual(regionLines[bi + 1], EXPECTED_BRANCH[1],
+    "F-A2: the reverify branch condition is pinned exactly; nothing may be added to it. Found:\n" +
+    `      ${regionLines[bi]}\n      ${regionLines[bi + 1] ?? "<eof>"}`);
+
+  const after = region.slice(marker, marker + 600);
   assert.ok(/els\.verify\.classList\.add\("changed"\)/.test(after),
     "F-A2: the re-verify branch must render as a WARNING (the `changed` styling), not as the " +
     "neutral first-contact panel — the whole point is that this is not a first contact");

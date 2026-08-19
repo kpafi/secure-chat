@@ -12,35 +12,23 @@
 // loudly rather than passing vacuously.
 import assert from "node:assert";
 import { readFile } from "node:fs/promises";
+import { stripComments, codeLines, liftFunction, referencesOf } from "./test-source.mjs";
 
-const src = await readFile(new URL("./app.js", import.meta.url), "utf8");
+const rawSrc = await readFile(new URL("./app.js", import.meta.url), "utf8");
 
-// Lift `function peerAlreadyTrusted(...) { ... }` by brace matching.
-function lift(name) {
-  const start = src.indexOf(`function ${name}(`);
-  assert.notStrictEqual(start, -1, `${name} must exist in app.js`);
-  let depth = 0;
-  let i = src.indexOf("{", start);
-  const open = i;
-  for (; i < src.length; i++) {
-    if (src[i] === "{") depth++;
-    else if (src[i] === "}" && --depth === 0) return src.slice(start, i + 1);
-  }
-  throw new Error(`unbalanced braces in ${name}`);
-  void open;
-}
+// EVERY source-level anchor in this project runs over COMMENT-STRIPPED source.
+// A plain indexOf/regex over raw source also matches inside comments, so a
+// reverted change can carry a comment that mentions the anchor string and
+// satisfy the check while doing the opposite (H-1's defect, found in three
+// files). The previous fix was a prefix filter — drop a line whose trim starts
+// with `//`/`*`/`/*` — which round 2 walked past three ways (`/**/ stmt;`,
+// a block-comment decoy for the lift, a `/* code */ realCode` one-liner). The
+// stripper in test-source.mjs is a real scanner that knows strings and template
+// literals. `src` below is the stripped text; nothing here reads `rawSrc`.
+const src = stripComments(rawSrc);
+const codeOnly = (text) => codeLines(text);
 
-const body = lift("peerAlreadyTrusted");
-
-// Executable lines only, trimmed. EVERY source-level anchor in this project must
-// go through this: a plain `indexOf`/regex over raw source also matches inside
-// comments, so a reverted change can carry a comment that mentions the anchor
-// string and satisfy the check while doing the opposite. That is H-1's exact
-// defect, and it was found a second time in two other files.
-function codeOnly(text) {
-  return text.split("\n").map((l) => l.trim())
-    .filter((l) => l && !l.startsWith("//") && !l.startsWith("*") && !l.startsWith("/*"));
-}
+const body = liftFunction(src, "peerAlreadyTrusted", assert);
 
 // Byte-wise key equality, standing in for app.js's sameKey/sameBundle/
 // sameSigning. Deliberately compares DECODED bytes, so a test that passes here
@@ -183,8 +171,16 @@ const ok = (name) => { n++; console.log("OK  " + name); };
 // under test actually contains executable code, so this specific failure cannot
 // recur silently.
 {
-  const anchor = src.indexOf("const idbCanon = canonicalBundle(idb);");
-  assert.notStrictEqual(anchor, -1, "the handshake branch must still canonicalise the peer bundle");
+  // ROUND-2 F-3 (2026-08-15): the window used to start AT `const idbCanon =
+  // canonicalBundle(idb);`. Everything earlier in the key-frame branch was
+  // unconstrained — a mutant writing `approvedBundle = idbCanon` right after the
+  // payload is destructured makes the `if (!approvedBundle)` gate never run, and
+  // no line in the old window is even reached. So the window now starts at the
+  // TOP of the key-frame branch (`if (!cipher.needsHandshake) {`), i.e. the first
+  // statement executed once a handshake frame is in hand, and runs to the gate.
+  // Nothing may assign, cache, or consult a trust verdict anywhere in here.
+  const anchor = src.indexOf("if (!cipher.needsHandshake) {");
+  assert.notStrictEqual(anchor, -1, "the key-frame branch must still guard on cipher.needsHandshake");
   const site = src.slice(anchor);
   const gate = site.indexOf("if (!approvedBundle) {");
   assert.notStrictEqual(gate, -1, "the approval gate must still exist at the handshake call site");
@@ -195,27 +191,37 @@ const ok = (name) => { n++; console.log("OK  " + name); };
   // about the code. A comment-anchored slice fails here immediately.
   const codeLines = codeOnly(between);
   assert.ok(codeLines.length >= 5,
-    `H-1: the region between the peer bundle and the approval gate holds only ` +
+    `H-1: the region between the key-frame branch and the approval gate holds only ` +
     `${codeLines.length} executable lines — this assertion is testing comments, not code, ` +
     "which is exactly how the previous version of this check passed against live mutants");
 
   // H-1, SECOND pass (pentest of the H-1 fix itself). Naming the forbidden
   // identifier is not enough, because the decision does not need that identifier.
-  // `describeIdentity` (app.js) re-exports the very same directory comparison as
+  // `describeIdentity` used to RETURN the same directory comparison as
   // `.mismatch`, a decision-grade boolean on a plain object — so
   //
   //     const d = describeIdentity(idbCanon);
   //     if (expectedPeerName && !d.mismatch) approvedBundle = canonicalBundle(idb);
   //
-  // is item 14's deleted route, reconstituted, with the string
-  // "expectedPeerBundle" appearing nowhere. It passed the whole suite. The
-  // `approvedBundle = idbCanon` regex missed it too, because `canonicalBundle(idb)`
-  // is the same value spelled differently.
+  // was item 14's deleted route, reconstituted, with the string
+  // "expectedPeerBundle" appearing nowhere. It passed the whole suite. (That
+  // boolean is now gone — describeIdentity writes the DOM and returns nothing —
+  // but the window is what makes any such route unreachable regardless.)
   //
   // A deny-list cannot win this: the attacker picks the spelling. So this is an
   // ALLOW-LIST of every executable line in the window. Nothing may be added here
   // at all, whatever it is made of.
   const EXPECTED_WINDOW = [
+    "if (!cipher.needsHandshake) {",
+    'throw new Error("unexpected key-exchange message for this mode");',
+    "}",
+    "const { pub, reply, idb, sig } = p;",
+    "if (peerNonce === null) {",
+    'throw new Error("peer sent a handshake before the nonce exchange");',
+    "}",
+    "if (!idb || !sig) {",
+    'throw new Error("peer sent an unauthenticated handshake");',
+    "}",
     "const idbCanon = canonicalBundle(idb);",
     "const ok = await verifyHandshake(idbCanon, room, [myNonce, peerNonce], pub, sig);",
     "if (!ok) {",
@@ -269,7 +275,7 @@ const ok = (name) => { n++; console.log("OK  " + name); };
     "return decided;",
     "}",
   ];
-  assert.deepStrictEqual(codeOnly(lift("requestPeerApproval")), REQUEST_BODY,
+  assert.deepStrictEqual(codeOnly(liftFunction(src, "requestPeerApproval", assert)), REQUEST_BODY,
     "item 14 / H-1: `requestPeerApproval` is pinned exactly. It must do nothing but park a " +
     "promise, render, and return it — any other statement is a route that can settle the " +
     "approval without a human, which is the whole of F-PROTO-001");
@@ -278,7 +284,7 @@ const ok = (name) => { n++; console.log("OK  " + name); };
   // so it cannot be pinned by exact body without pinning the UI copy. What it
   // must never do is SETTLE the promise: only `resolvePeerApproval`, driven by
   // the two buttons, may call `resolve`.
-  const render = codeOnly(lift("renderPeerApproval"));
+  const render = codeOnly(liftFunction(src, "renderPeerApproval", assert));
   for (const l of render) {
     assert.ok(!/\bresolve\b|approvalPending\s*=/.test(l),
       "item 14 / H-1: `renderPeerApproval` may not settle or clear the pending approval — " +
@@ -288,31 +294,31 @@ const ok = (name) => { n++; console.log("OK  " + name); };
 }
 
 // --- H-1 second pass: close the laundering channel at its source -------------
-// `describeIdentity().mismatch` IS the directory comparison. As long as any
-// decision path can call it, the allow-list on `expectedPeerBundle` is
-// decorative. It has exactly two callers, both of which only draw a prompt.
+// `describeIdentity` computes the unsigned directory comparison. It used to
+// RETURN it as `.mismatch` — a decision-grade boolean any path could read — and
+// that has been removed: it now writes the prompt DOM and returns nothing, so
+// there is no verdict to launder (ROUND-2 F-3). This check is the belt to that
+// braces: every textual reference to `describeIdentity(` must be one of the
+// three known-good ones (its definition and the two prompt renderers). A NEW
+// reference — an arrow alias `const v = (b) => describeIdentity(b)`, a method,
+// an indented declaration — is exactly how a return value would be reintroduced
+// and read, and it shows up here whatever function encloses it. The previous
+// version walked back to a column-0 `function <name>(`, which could not see
+// arrow functions or methods and mis-attributed them to the nearest declaration.
 {
-  const callers = [];
-  const lines = src.split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    if (!/\bdescribeIdentity\s*\(/.test(lines[i])) continue;
-    const l = lines[i].trim();
-    if (l.startsWith("//") || l.startsWith("*") || l.startsWith("/*")) continue;
-    if (/^function describeIdentity\(/.test(l)) continue; // the definition itself
-    // Walk back to the enclosing `function <name>(`.
-    let owner = "?";
-    for (let j = i; j >= 0; j--) {
-      const m = lines[j].match(/^(?:async\s+)?function\s+(\w+)\s*\(/);
-      if (m) { owner = m[1]; break; }
-    }
-    callers.push(owner);
-  }
-  assert.deepStrictEqual(callers.sort(), ["renderPeerApproval", "showNextKnock"],
-    "item 14 / H-1: `describeIdentity` returns `.mismatch`, which is the unsigned directory " +
-    "comparison item 14 deleted as a trust route. It may only be called by the two functions " +
-    "that DRAW a prompt. A new caller is how that route comes back without ever naming " +
-    `expectedPeerBundle. Callers found: ${callers.join(", ")}`);
-  ok("item 14: the directory verdict is reachable only from the two prompt renderers");
+  const refs = referencesOf(src, "describeIdentity");
+  const ALLOWED_DESCRIBE = [
+    "function describeIdentity(bundle, whoEl, warnEl, mismatchMsg) {",
+    "describeIdentity(k.bundle, els.admitWho, els.admitWarn,",
+    "describeIdentity(bundle, els.admitWho, els.admitWarn,",
+  ];
+  const seen = refs.map((r) => r.text).sort();
+  assert.deepStrictEqual(seen, [...ALLOWED_DESCRIBE].sort(),
+    "item 14 / H-1: `describeIdentity` may be referenced ONLY by its definition and the two " +
+    "prompt renderers (showNextKnock, renderPeerApproval). A new reference is how a directory " +
+    "verdict comes back as a value a decision path can read. References found:\n      " +
+    refs.map((r) => `app.js:${r.line}  ${r.text}`).join("\n      "));
+  ok("item 14: describeIdentity is referenced only by its definition and the two prompt renderers");
 }
 
 // --- H-1, the other half: an exact allow-list over the WHOLE file -----------
@@ -329,18 +335,19 @@ const ok = (name) => { n++; console.log("OK  " + name); };
 // cannot rot into vacuity the way a regex can.
 {
   const ALLOWED = new Map([
-    // The declaration, and the fetch path that fills it.
-    ["let expectedPeerBundle = null; // bundle fetched from the directory (or null)", 1],
+    // The declaration, and the fetch path that fills it. (The trailing comment on
+    // the declaration line is stripped away before we get here.)
+    ["let expectedPeerBundle = null;", 1],
     ["expectedPeerBundle = null;", 1],
     ["expectedPeerBundle = await account.fetchBundle(API_BASE, contact);", 1],
     ["if (!expectedPeerBundle) {", 1],
-    // DISPLAY only: describeIdentity computes the ⚠ mismatch line for the prompt.
-    ["mismatch: !!(expectedPeerBundle && !sameBundle(expectedPeerBundle, bundle)),", 1],
-    // REFUSALS only. Each of these can add a prompt or a warning; none of them
-    // can skip one. That asymmetry is the whole of item 14 — a directory answer
-    // may accuse, never vouch.
+    // REFUSALS or DISPLAY only. Each of these can add a prompt or a warning; none
+    // of them can skip one. That asymmetry is the whole of item 14 — a directory
+    // answer may accuse, never vouch. The `{`-form appears twice: describeIdentity
+    // (draws the ⚠ mismatch line — display) and renderVerify's early return
+    // (refuses to auto-accept a directory-mismatched key). Both are non-granting.
     ["if (expectedPeerBundle && !sameBundle(expectedPeerBundle, bundle)) return null;", 1],
-    ["if (expectedPeerBundle && !sameBundle(expectedPeerBundle, bundle)) {", 1],
+    ["if (expectedPeerBundle && !sameBundle(expectedPeerBundle, bundle)) {", 2],
     // The one remaining positive mention: a "still verify in person" line printed
     // in the first-contact branch, which grants nothing.
     ["if (expectedPeerBundle) {", 1],
@@ -350,7 +357,6 @@ const ok = (name) => { n++; console.log("OK  " + name); };
   for (const raw of src.split("\n")) {
     const l = raw.trim();
     if (!l.includes("expectedPeerBundle")) continue;
-    if (l.startsWith("//") || l.startsWith("*") || l.startsWith("/*")) continue; // prose
     seen.set(l, (seen.get(l) || 0) + 1);
   }
 

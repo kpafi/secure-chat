@@ -2060,14 +2060,8 @@ async function showNextKnock() {
     // hashing. Whatever they decided is newer than this; do not write over it.
     if (gen !== knockRenderGen || knockQueue[0] !== k) return;
     els.admitFingerprint.textContent = fp;
-    const d = describeIdentity(k.bundle);
-    els.admitWho.textContent = d.who;
-    // If this session was aimed at a specific contact, say whether it is them.
-    if (d.mismatch) {
-      els.admitWarn.textContent =
-        "⚠ This is NOT the user you selected for this session. Deny unless you know why.";
-      els.admitWarn.className = "hint err";
-    }
+    describeIdentity(k.bundle, els.admitWho, els.admitWarn,
+      "⚠ This is NOT the user you selected for this session. Deny unless you know why.");
   } else if (k.unproven) {
     els.admitFingerprint.textContent = "—";
     els.admitWho.textContent = "Presented an identity it could not prove.";
@@ -2129,19 +2123,33 @@ function hideAdmitPrompt() {
 // Who is this, in OUR terms? Matched on the keys themselves — never on a name
 // the other side chose (F-01). Shared by both prompts so the two can never
 // describe the same key differently.
-function describeIdentity(bundle) {
+//
+// Pentest 2026-08-15 (ROUND-2 F-3): this used to RETURN a `mismatch` boolean.
+// That boolean was the whole item-14 attack surface in a new disguise — a
+// decision-grade verdict on a plain object that a single added line
+// (`if (!describeIdentity(idb).mismatch) approvedBundle = idbCanon;`) could read
+// to wave a hostile-directory peer straight past the approval gate, with the
+// forbidden identifiers appearing nowhere. So there is no boolean to read: this
+// function is display-only. It WRITES the "who" and the mismatch warning into
+// the elements it is handed and returns nothing. The gate's own mismatch check
+// lives independently in `peerAlreadyTrusted`, which recomputes it from bytes.
+function describeIdentity(bundle, whoEl, warnEl, mismatchMsg) {
   const known = contacts.isUnlocked()
     ? contacts.list().find((c) => c.ed === bundle.ed && c.mldsa === bundle.mldsa)
     : null;
-  return {
-    known,
-    who: known
-      ? `${dirName(known)} — ${contactMark(known)}`
-      : (pinsReadable()
-        ? "Not in your users list — ⚪ you have never verified this key"
-        : "Unknown — your saved users could not be read, so trust cannot be checked"),
-    mismatch: !!(expectedPeerBundle && !sameBundle(expectedPeerBundle, bundle)),
-  };
+  whoEl.textContent = known
+    ? `${dirName(known)} — ${contactMark(known)}`
+    : (pinsReadable()
+      ? "Not in your users list — ⚪ you have never verified this key"
+      : "Unknown — your saved users could not be read, so trust cannot be checked");
+  // If this session was aimed at a specific contact, say whether it is them.
+  if (expectedPeerBundle && !sameBundle(expectedPeerBundle, bundle)) {
+    warnEl.textContent = mismatchMsg;
+    warnEl.className = "hint err";
+  } else {
+    warnEl.textContent = "";
+    warnEl.className = "hint";
+  }
 }
 
 // ---- peer approval, guest side (F-PROTO-001, 2026-08-08) -------------------
@@ -2222,17 +2230,13 @@ function requestPeerApproval(bundle) {
 async function renderPeerApproval(bundle) {
   const fp = await Identity.fingerprintOf(bundle);
   if (!approvalPending || approvalPending.bundle !== bundle) return; // decided already
-  const d = describeIdentity(bundle);
   els.admitTitle.textContent = PEER_LABELS.title;
   els.admitHint.textContent = PEER_LABELS.hint;
   els.admitOk.textContent = PEER_LABELS.ok;
   els.admitNo.textContent = PEER_LABELS.no;
   els.admitFingerprint.textContent = fp;
-  els.admitWho.textContent = d.who;
-  els.admitWarn.textContent = d.mismatch
-    ? "⚠ This is NOT the user you selected for this session. Refuse unless you know why."
-    : "";
-  els.admitWarn.className = d.mismatch ? "hint err" : "hint";
+  describeIdentity(bundle, els.admitWho, els.admitWarn,
+    "⚠ This is NOT the user you selected for this session. Refuse unless you know why.");
   els.admitOk.disabled = false;
   els.admit.dataset.mode = "peer";   // item 20 — see the note in showAdmitPrompt
   els.admit.hidden = false;
