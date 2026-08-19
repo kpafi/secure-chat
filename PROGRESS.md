@@ -979,7 +979,7 @@ distinguishes the two hypotheses on the number alone.
 > which land in the SAME branch, so the probe never separated the hypotheses at
 > all — it only ever measured one bucket twice. Every `/api` limiter is 2×, and
 > an attacker can starve the bucket honest traffic uses while working the
-> uncontended one. See M-1 in `secure-chat-pentest-2026-07-29.md` and item 1 of
+> uncontended one. See M-1 in `docs/pentests/secure-chat-pentest-2026-07-29.md` and item 1 of
 > the TODO. The claim is repeated verbatim in `deploy/README.md` and in commit
 > `d338e15`'s message; both need the same correction when it is fixed.
 >
@@ -1070,7 +1070,7 @@ nobody has *watched* the bypass happen on this deployment.
 
 ## ⮕ (superseded) snapshot as of 2026-07-28, every 2026-07-27 pentest finding fixed
 
-**All 4 High, all 7 Medium, and L-1..L-6 from `secure-chat-pentest-2026-07-27.md`
+**All 4 High, all 7 Medium, and L-1..L-6 from `docs/pentests/secure-chat-pentest-2026-07-27.md`
 are fixed, with regression tests.** **Committed and pushed 2026-07-28**
 (`dc182d7` on `pentest-2026-07-27-fixes`, merged `--no-ff` as `97c0754`; both on
 `origin`). **DEPLOYED to Hetzner + APK installed on the phone 2026-07-28** —
@@ -1500,7 +1500,7 @@ running a broken app for the duration.
 
 ## (2026-07-26, first full pentest of the final product — ALL FIXED)
 **Full pentest + remediation in one session.** Report:
-`secure-chat-pentest-2026-07-26.md` (findings in §4-6, remediation table in §9).
+`docs/pentests/secure-chat-pentest-2026-07-26.md` (findings in §4-6, remediation table in §9).
 Method: the two test agents (`e2e/two-user-flow.mjs`) plus a new PQKEM live-room
 canary harness drove two real browser peers while **tshark** captured loopback;
 four specialist agents then attacked in parallel (packet exploitation + live
@@ -1690,7 +1690,7 @@ localStorage and so no identity blob at all, which tests nothing.
 ## ⮕ (2026-07-25) pentest: ALL 8 findings fixed
 **The remaining six findings (F-01, F-03, F-05, F-06, F-07, F-08) are now fixed,
 tested and verified against their own PoCs.** See the updated
-`secure-chat-pentest-2026-07-25.md`. Backend **103 passed**, client `npm test`
+`docs/pentests/secure-chat-pentest-2026-07-25.md`. Backend **103 passed**, client `npm test`
 green, Android unit tests green, all browser harnesses green.
 
 - **F-01 (Medium) — contact injection.** The local contact label is now always
@@ -1742,7 +1742,7 @@ store** — only do it with an exported backup or a fresh identity.
 
 ## ⮕ (superseded) snapshot as of 2026-07-25, in-depth pentest: 2 of 8 fixed
 **Full-stack pentest run against `4b9f270`; report in
-`secure-chat-pentest-2026-07-25.md`. The crypto core held — nothing broke in
+`docs/pentests/secure-chat-pentest-2026-07-25.md`. The crypto core held — nothing broke in
 the handshake, ratchet, OTP, sealed envelope or web-of-trust. Every finding is
 in the layer ABOVE the crypto: the async mailbox treats AUTHENTICATED data (the
 sender really signed it) as TRUSTED (they are who they claim, and their values
@@ -2076,7 +2076,7 @@ android/app/build/outputs/apk/debug/app-debug.apk` when the phone is back.
 
 ## ⮕ RESUME HERE (snapshot as of 2026-07-18, Codex-Terra audit fixes)
 **A second external audit ("Codex Terra", pushed to GitHub as
-`secure-chat-security-audit-2026-07-18.md`, auditing commit 70bbfcc) found
+`docs/pentests/secure-chat-security-audit-2026-07-18.md`, auditing commit 70bbfcc) found
 1 High + 3 Medium + 3 Low. ALL 7 ARE FIXED, TESTED, AND DEPLOYED TO THE
 HETZNER BOX** (deploy commands were run by hand because the session's
 permission system blocked remote writes; ownership gotcha below).
@@ -3783,7 +3783,7 @@ what stands between it and master, in the order I would do it.
 3 High + 5 Medium open against it, none fixed. The green numbers above do not
 cover any of them (see A3).
 
-Report: `secure-chat-pentest-2026-08-07.md`. Per-finding detail and PoCs live
+Report: `docs/pentests/secure-chat-pentest-2026-08-07.md`. Per-finding detail and PoCs live
 OUTSIDE this repo, in `/home/kpafi/secure-chat-pentest/state/findings/`.
 
 #### A. Blocking — must be resolved before merge
@@ -4520,7 +4520,7 @@ while the socket is open).
   residual was correct.
 
 ### ✅ CLOSED — the 2026-07-29 pentest, all 13 items (fixed 2026-07-30)
-Every finding in `secure-chat-pentest-2026-07-29.md` is fixed on branch
+Every finding in `docs/pentests/secure-chat-pentest-2026-07-29.md` is fixed on branch
 `pentest-2026-07-29-fixes`. Backend **143 passed**, client **109 checks / 11
 suites**, `e2e/all-modes.mjs` **32/32 on 5 consecutive runs** (it used to fail 2
 in 5 — root-caused, below). **DEPLOYED 2026-07-30** — see DELIVERY at the end.
@@ -4937,7 +4937,7 @@ Still to do, in order:
 
 
 ### ⬜ OPEN from the 2026-07-27 pentest — SHIPPING, not fixing
-Every finding in `secure-chat-pentest-2026-07-27.md` is fixed and now merged to
+Every finding in `docs/pentests/secure-chat-pentest-2026-07-27.md` is fixed and now merged to
 `master` (see the snapshot at the top). What is left is entirely delivery — and
 after item 2 was dropped, none of it protects a running instance:
 
@@ -5043,7 +5043,7 @@ after item 2 was dropped, none of it protects a running instance:
    changes, not another localStorage key.
 
 ### ⬜ OPEN from the 2026-07-26 pentest (everything else in it is fixed + shipped)
-Full detail per item in `secure-chat-pentest-2026-07-26.md` (§4-6 findings,
+Full detail per item in `docs/pentests/secure-chat-pentest-2026-07-26.md` (§4-6 findings,
 §9 remediation). These are the deliberate leftovers, not forgotten work.
 
 1. ~~**P-08 (Low) — room-slot squatting.**~~ **FIXED 2026-07-27** with
