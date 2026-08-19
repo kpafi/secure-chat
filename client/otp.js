@@ -766,6 +766,10 @@ async function writePadBlob(record, key, salt, iters) {
   //      the blob's own `hwSend`/`hwRecv`. The reverse order is NOT safe: a new
   //      watermark over an old blob reads as `sendOffset < wm.send`, i.e. a
   //      rollback refusal, which is the brick this finding is about.
+  //   1b. the index entry, right after the blob (ROUND-2 F-5). It is the only
+  //      thing listPads() reads and so the only route to the pad in the UI; a
+  //      durable pad that is not indexed is a burned pad. It carries no security
+  //      decision, so it is safe this early and unsafe any later.
   //   2. the watermark, `usedKey` and the epoch marker, synchronously and
   //      adjacent, so the only survivable gap on a pad's FIRST save (where
   //      `outerWm === null` plus an existing floor is itself a refusal) is
@@ -773,6 +777,17 @@ async function writePadBlob(record, key, salt, iters) {
   //   3. the floors LAST, once everything they could contradict is durable.
   const wmJson = await sealWatermark(record.padId, key, wm);
   localStorage.setItem(padKey(record.padId), blobJson);
+  // The index entry, immediately after the blob (ROUND-2 F-5). `listPads()` reads
+  // ONLY the index, and `refreshOtpPads` builds the pad selector — the sole route
+  // to `unlockPad` — from `listPads()`. If the index is written LAST (after the
+  // watermark/used/epoch), a kill or QuotaExceededError on a pad's FIRST save
+  // between the blob and the index leaves the pad durable and (via probeFloors)
+  // counted as used, but absent from the selector: no UI route to it and
+  // re-import refused, i.e. the padId is burned. The index carries no security
+  // decision (unauthenticated render metadata), so nothing about the ordering
+  // rationale below requires it to be late; it must be early enough that a
+  // durable pad is always reachable.
+  writeIndexEntry(record, { exported: !!record.exported });
   localStorage.setItem(wmKey(record.padId), wmJson);
   // Plaintext "this pad has run on this device" marker. It carries no offsets
   // and is not trusted for a rollback decision — it exists so importPad, which
@@ -783,7 +798,6 @@ async function writePadBlob(record, key, salt, iters) {
   // so it may only ESCALATE a warning, never authorise anything — see the
   // legacy-adoption gate in unlockPad.
   localStorage.setItem(EPOCH_KEY, "1");
-  writeIndexEntry(record, { exported: !!record.exported });
   // F-1: mirror the floors into the native store, where they cannot be deleted
   // from the JS context and cannot be lowered at all.
   armFloors(record.padId, wm, !!record.exported);

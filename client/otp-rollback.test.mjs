@@ -1247,6 +1247,85 @@ async function testInterruptedSaveDoesNotBrickAPad() {
 
 await testInterruptedSaveDoesNotBrickAPad();
 
+// ---------------------------------------------------------------------------
+// ROUND-2 F-5 (2026-08-15): a pad's FIRST save must not leave it DURABLE-BUT-
+// INVISIBLE. `fc566dd` reordered writePadBlob to blob -> wm -> used -> epoch ->
+// writeIndexEntry -> floors, i.e. the index entry (the ONLY thing listPads()
+// reads, and the ONLY route to unlockPad through refreshOtpPads) is written
+// LAST. A kill or QuotaExceededError after the blob but before the index, on a
+// pad's first save, leaves the blob on disk and the index empty: the pad is
+// durable and — because probeFloors already created the native send slot —
+// padWasUsed() is true, so re-import is refused too. The pad is gone and the two
+// people must meet in person again. This is strictly worse than the alarm this
+// commit was fixing, and it is a genuine regression the commit shipped.
+//
+// The discriminator: fail the WATERMARK write. In the buggy order the index has
+// not been written yet, so listPads() is empty. In the fixed order (index
+// immediately after the blob, before the watermark) the pad is already listed.
+async function testFirstSaveStaysVisibleIfInterrupted() {
+  const slots = new Map();
+  const floor = {
+    read: (k) => (slots.has(k) ? slots.get(k) : -1),
+    bump: (k, v) => {
+      if (v < 0) return floor.read(k);
+      const n = Math.max(floor.read(k), v);
+      slots.set(k, n);
+      return n;
+    },
+  };
+  Object.defineProperty(globalThis, "__SECURE_CHAT_NATIVE_FLOOR__", { value: true, configurable: true });
+  Object.defineProperty(globalThis, "__SECURE_CHAT_PAD_FLOOR__", { value: Object.freeze(floor), configurable: true });
+
+  const store = new Map();
+  let failWmWrite = false;
+  globalThis.localStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => {
+      // Model a full disk that refuses the watermark write specifically — any
+      // write can fail on a nearly-full disk, and this is the one that sits
+      // AFTER the index in the correct ordering and BEFORE it in the buggy one.
+      if (failWmWrite && k.startsWith("sc.otp.wm.v1.")) {
+        const e = new Error("QuotaExceededError");
+        e.name = "QuotaExceededError";
+        throw e;
+      }
+      store.set(k, String(v));
+    },
+    removeItem: (k) => store.delete(k),
+  };
+
+  const otp = await import(`./otp.js?f5&t=${Date.now()}`);
+  const PASS = "pad passphrase";
+  const pad = await otp.generatePad({ label: "first-save", totalBytes: 64 * 1024 });
+
+  // Interrupt the VERY FIRST save (saveNewPad), before any completed save.
+  failWmWrite = true;
+  await assert.rejects(() => otp.saveNewPad(pad, PASS), /QuotaExceededError/,
+    "F-5: the interrupted first save must surface its failure to the caller");
+  failWmWrite = false;
+
+  // The blob is durable...
+  assert.notStrictEqual(store.get(`sc.otp.pad.v1.${pad.padId}`), undefined,
+    "F-5 setup: the blob write landed before the interruption, as intended");
+  // ...and probeFloors already marked the pad used, so re-import is refused.
+  assert.ok(otp.padWasUsed(pad.padId),
+    "F-5: a first save that got as far as the blob leaves the pad counted as used");
+  // THE REGRESSION: the pad must still be reachable in the selector. Under the
+  // buggy ordering listPads() is empty here and there is no UI route to the pad.
+  const listed = otp.listPads().some((p) => p.padId === pad.padId);
+  assert.ok(listed,
+    "F-5: a durable, used pad MUST be listed by listPads() — otherwise refreshOtpPads " +
+    "cannot offer it and there is no route to unlockPad, so the padId is burned. " +
+    "writeIndexEntry must run right after the blob, not after the watermark.");
+  assert.notStrictEqual(otp.padMeta(pad.padId), null, "F-5: padMeta must resolve for a durable pad");
+  console.log("OK  F-5: a first save interrupted after the blob still lists the pad (not burned)");
+
+  delete globalThis.__SECURE_CHAT_NATIVE_FLOOR__;
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+}
+
+await testFirstSaveStaysVisibleIfInterrupted();
+
 // The same finding's second half, which lives in app.js and so can only be
 // pinned at source level: the export handler must LATCH before it hands the pad
 // file to the user.
