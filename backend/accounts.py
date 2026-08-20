@@ -678,7 +678,10 @@ def register(req: RegisterReq) -> dict:
                 (req.username,),
             ).fetchone()
             if row is None or row["ed_pub"] != req.ed or row["mldsa_pub"] != req.mldsa:
-                raise HTTPException(status_code=409, detail="username already taken")
+                raise HTTPException(status_code=409, detail={
+                    "error": "username_taken",
+                    "message": "username already taken",
+                })
 
             # Pentest 2026-08-07 F-RELAY-005. The dual signature proves the
             # registrant controls the identity keys, but it proves nothing about
@@ -694,10 +697,28 @@ def register(req: RegisterReq) -> dict:
             # a counter that does not move forward, and it is refused.
             if req.seq is not None:
                 if req.seq <= row["reg_seq"]:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="registration counter is not newer than the stored one (replayed registration)",
-                    )
+                    # The 409 ECHOES the stored counter (decided with the owner,
+                    # 2026-08-21). Without it a client can only GUESS its way
+                    # forward, and the guess is computed from its own clock — so a
+                    # device whose clock is wrong, or merely skewed against a
+                    # second device registering the same identity, ratchets itself
+                    # out permanently (A4/M-1, A4/M-2, and the wrong-clock
+                    # residual: three findings with one repair). With the stored
+                    # value in hand the client jumps to `stored + 1` and converges
+                    # in one retry.
+                    #
+                    # Who learns it: this branch is reachable only AFTER both
+                    # ownership signatures verified over this exact bundle AND the
+                    # stored row's ed/mldsa matched the requester. So the counter
+                    # is disclosed only to whoever already controls the identity
+                    # keys that own the account — its owner. It is not an oracle
+                    # for anyone else, and it says nothing about accounts you
+                    # cannot already sign for.
+                    raise HTTPException(status_code=409, detail={
+                        "error": "stale_counter",
+                        "stored_seq": row["reg_seq"],
+                        "message": "registration counter is not newer than the stored one (replayed registration)",
+                    })
                 conn.execute(
                     "UPDATE accounts SET ecdh_pub = ?, mlkem_pub = ?, reg_seq = ? WHERE username = ?",
                     (req.ecdh or "", req.mlkem or "", req.seq, req.username),
@@ -712,10 +733,10 @@ def register(req: RegisterReq) -> dict:
             # already published, because that is exactly the attack.
             if row["ecdh_pub"] or row["mlkem_pub"]:
                 if (req.ecdh or "") != row["ecdh_pub"] or (req.mlkem or "") != row["mlkem_pub"]:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="this account already publishes encryption keys; changing them needs a counter-bearing registration",
-                    )
+                    raise HTTPException(status_code=409, detail={
+                        "error": "keys_locked",
+                        "message": "this account already publishes encryption keys; changing them needs a counter-bearing registration",
+                    })
                 return {"status": "updated", "username": req.username, "lookup_token": row["lookup_token"]}
             conn.execute(
                 "UPDATE accounts SET ecdh_pub = ?, mlkem_pub = ? WHERE username = ?",

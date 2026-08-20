@@ -212,3 +212,74 @@ def test_v1_registration_still_works():
     r = client.get("/api/users/v1-eve", params={"t": r.json()["lookup_token"]})
     assert r.status_code == 200
     assert "ecdh" not in r.json()  # no enc keys published
+
+
+# --- the 409 contract (owner decision, 2026-08-21) --------------------------
+# `/api/register` produces three different 409s, and until now all three were an
+# opaque human string. The client branched on the STATUS ALONE, so a counter
+# replay was reported to the user as "username already taken" and they were
+# advised to pick another name — the one action that loses their handle and every
+# contact's pin (A4/M-3). Worse, a client that lost its counter could only guess
+# its way forward from its own clock, so a wrong or merely skewed clock ratcheted
+# the account out permanently (A4/M-1, A4/M-2, wrong-clock residual).
+#
+# So each 409 now carries a machine-readable `error`, and the counter case echoes
+# the stored value so the client can jump to `stored + 1` and converge in one
+# retry.
+
+def test_409_errors_are_machine_readable_and_distinct():
+    ident, enc1, enc2 = _new_identity(), _enc_keys(), _enc_keys()
+    r = client.post("/api/register", json=_v3_body("c409-alice", ident, enc1, 5))
+    assert r.status_code == 200, r.text
+
+    # 1. a DIFFERENT identity claiming the name: the genuine "taken".
+    other = _new_identity()
+    r = client.post("/api/register", json=_v3_body("c409-alice", other, _enc_keys(), 1))
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["error"] == "username_taken"
+    assert "stored_seq" not in r.json()["detail"], (
+        "the counter must NOT be echoed to someone who does not own the account — "
+        "this branch is reached by anyone who can pick the same name"
+    )
+
+    # 2. the owner replaying/lagging its counter: distinct code, and the stored
+    #    value is echoed so the client can advance instead of guessing.
+    r = client.post("/api/register", json=_v3_body("c409-alice", ident, enc2, 5))
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "stale_counter"
+    assert detail["stored_seq"] == 5, "the 409 must echo the stored counter"
+
+    # ...and acting on the echo converges in exactly one retry.
+    r = client.post("/api/register", json=_v3_body("c409-alice", ident, enc2, detail["stored_seq"] + 1))
+    assert r.status_code == 200 and r.json()["status"] == "updated", r.text
+
+
+def test_409_keys_locked_is_distinct_from_username_taken():
+    # 3. a pre-v3 (counter-less) client trying to CHANGE already-published keys.
+    ident, enc1, enc2 = _new_identity(), _enc_keys(), _enc_keys()
+    r = client.post("/api/register", json=_v2_body("c409-bob", ident, enc1))
+    assert r.status_code == 200, r.text
+    r = client.post("/api/register", json=_v2_body("c409-bob", ident, enc2))
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["error"] == "keys_locked", (
+        "a counter-less key change must not be reported as 'username already taken' — "
+        "the account is the caller's own and renaming would lose it"
+    )
+    assert "stored_seq" not in r.json()["detail"]
+
+
+def test_stale_counter_echo_requires_proving_ownership():
+    # The echo is only reachable AFTER both ownership signatures verified over
+    # this exact bundle AND the stored row's ed/mldsa matched. A bad signature
+    # dies at 400 long before any counter is read, so the endpoint is not a
+    # counter oracle for a name you cannot sign for.
+    ident, enc = _new_identity(), _enc_keys()
+    r = client.post("/api/register", json=_v3_body("c409-carol", ident, enc, 9))
+    assert r.status_code == 200, r.text
+
+    body = _v3_body("c409-carol", ident, enc, 9)
+    body["sig"] = _b64(b"\x00" * 64)          # forged Ed25519 signature
+    r = client.post("/api/register", json=body)
+    assert r.status_code == 400, r.text
+    assert "stored_seq" not in str(r.json()), "no counter may leak on a failed signature"
