@@ -750,16 +750,14 @@ async function writePadBlob(record, key, salt, iters) {
   // operations are finished before the first byte is stored so that no `await`
   // sits between two writes that have to agree:
   //
-  // Say "established" precisely, because the unqualified claim is false and was
-  // measured to be (pentest of this fix, F-A1-R1). On a pad's FIRST save —
-  // `saveNewPad`, `importPad`, or the v1/v2 migration rewrite — `probeFloors` has
-  // just created the send slot, so `padWasUsed` answers true while no blob,
-  // watermark or `usedKey` exists yet. Any failure below therefore burns the
-  // padId and the two people must exchange a pad in person again. That is a
-  // residual, not a regression (HEAD burns it identically, on all five write
-  // classes), and closing it means not letting `probeFloors` create the send slot
-  // before a blob exists, or not counting a bare send slot at exactly 0 as
-  // evidence of use. Open finding.
+  // The claim used to need the qualifier "on an established pad", because on a
+  // pad's FIRST save — `saveNewPad`, `importPad`, or the v1/v2 migration rewrite
+  // — `probeFloors` has just created the send slot, and `padWasUsed` counted that
+  // bare slot as use while no blob, watermark or `usedKey` existed yet. Any
+  // failure here therefore burned the padId (F-A1-R1). CLOSED 2026-08-20 by the
+  // second of the two options that finding named: `padWasUsed` no longer treats
+  // the probe-only triple (0,0,0) as evidence — see the note there. The slots are
+  // still created early, which is what keeps the claim honest and H-3 refused.
   //
   //   1. the blob FIRST. It carries the new offsets inside its AEAD, so a stored
   //      blob with a stale watermark beside it is fine — unlockPad's max() takes
@@ -1196,10 +1194,26 @@ export function forgetPad(padId) {
 export function padWasUsed(padId) {
   if (nativeFloor && nativeFloor.broken) return true;   // fail closed
   if (nativeFloor) {
-    const native = nativeFloor.read(padId);
+    const send = nativeFloor.read(floorKeySend(padId));
+    const recv = nativeFloor.read(floorKeyRecv(padId));
+    const exported = nativeFloor.read(floorKeyExported(padId));
     // TAMPERED (a forged record, or a marker with no working bridge) counts as
     // used: an import must never be the way to escape a damaged floor.
-    if (native !== NATIVE_ABSENT) return true;
+    if (send === NATIVE_TAMPERED || recv === NATIVE_TAMPERED || exported === NATIVE_TAMPERED) return true;
+    // F-A1-R1 (pentest of the F-A1 fix): "a slot exists" is NOT "the pad ran".
+    // `probeFloors` creates all three slots at exactly 0 BEFORE the blob is
+    // written, so a first save interrupted before the blob lands — a failed
+    // write, a kill between the JNI probe and the setItem — used to answer true
+    // here and BURN the padId, for a pad that spent no keystream at all. The two
+    // people then have to exchange a pad in person again.
+    //
+    // So the probe-only triple (0, 0, 0) is not by itself evidence: it falls
+    // through to the localStorage markers below, exactly like a device with no
+    // native floor. Anything ABOVE 0 in any slot IS evidence and is decisive —
+    // real send/recv consumption or an export latch — and that is the state H-3
+    // is about (delete the deletable markers, re-import a consumed pad), so that
+    // refusal is unchanged: those floors are undeletable and never lowered.
+    if (send > 0 || recv > 0 || exported > 0) return true;
   }
   return localStorage.getItem(usedKey(padId)) !== null ||
     localStorage.getItem(wmKey(padId)) !== null ||

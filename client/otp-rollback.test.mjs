@@ -1307,9 +1307,15 @@ async function testFirstSaveStaysVisibleIfInterrupted() {
   // The blob is durable...
   assert.notStrictEqual(store.get(`sc.otp.pad.v1.${pad.padId}`), undefined,
     "F-5 setup: the blob write landed before the interruption, as intended");
-  // ...and probeFloors already marked the pad used, so re-import is refused.
-  assert.ok(otp.padWasUsed(pad.padId),
-    "F-5: a first save that got as far as the blob leaves the pad counted as used");
+  // ...and with F-A1-R1 fixed the probe-only floors (0,0,0) are no longer read as
+  // "used", so the re-import route is open as well. Both halves of the burn are
+  // therefore closed: the pad is reachable in the selector AND re-importable.
+  // (unlockPad itself still fails closed here — the watermark never landed — which
+  // is correct: it cannot tell that state from an attacker deleting a consumed
+  // pad's watermark. Re-import is the recovery, and it must exist.)
+  assert.strictEqual(otp.padWasUsed(pad.padId), false,
+    "F-5/F-A1-R1: a first save interrupted before the watermark spent no keystream, so the " +
+    "padId must stay re-importable rather than being burned");
   // THE REGRESSION: the pad must still be reachable in the selector. Under the
   // buggy ordering listPads() is empty here and there is no UI route to the pad.
   const listed = otp.listPads().some((p) => p.padId === pad.padId);
@@ -1325,6 +1331,88 @@ async function testFirstSaveStaysVisibleIfInterrupted() {
 }
 
 await testFirstSaveStaysVisibleIfInterrupted();
+
+// ---------------------------------------------------------------------------
+// F-A1-R1 (round 1, still open): a pad's FIRST save must be all-or-nothing in
+// the RIGHT direction. `probeFloors` creates the send/recv/exported slots at 0
+// before the blob is written, and `padWasUsed` counted any non-ABSENT send slot
+// as evidence of use — so an interruption BEFORE the blob lands (a failed blob
+// write, a kill between the JNI probe and the setItem) left the three slots at
+// (0,0,0) with nothing else on disk, and `padWasUsed` answered true. That burns
+// the padId: saveNewPad/importPad both refuse it, and the two people must meet
+// again — for a pad that consumed no keystream at all.
+//
+// The fix: a slot triple that is exactly (0,0,0) — the probe-only state — is NOT
+// evidence of use on its own; it defers to the localStorage markers. A slot
+// ABOVE 0 (real send/recv consumption or an export) stays decisive and
+// undeletable, so H-3 (delete the markers, re-import a CONSUMED pad) is still
+// refused.
+async function testInterruptedFirstSaveIsReimportable() {
+  const slots = new Map();
+  const floor = {
+    read: (k) => (slots.has(k) ? slots.get(k) : -1),
+    bump: (k, v) => {
+      if (v < 0) return floor.read(k);
+      const n = Math.max(floor.read(k), v);
+      slots.set(k, n);
+      return n;
+    },
+  };
+  Object.defineProperty(globalThis, "__SECURE_CHAT_NATIVE_FLOOR__", { value: true, configurable: true });
+  Object.defineProperty(globalThis, "__SECURE_CHAT_PAD_FLOOR__", { value: Object.freeze(floor), configurable: true });
+
+  const store = new Map();
+  let failPadWrite = false;
+  globalThis.localStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => {
+      if (failPadWrite && k.startsWith("sc.otp.pad.v1.")) {
+        const e = new Error("QuotaExceededError");
+        e.name = "QuotaExceededError";
+        throw e;
+      }
+      store.set(k, String(v));
+    },
+    removeItem: (k) => store.delete(k),
+  };
+
+  const otp = await import(`./otp.js?far1&t=${Date.now()}`);
+  const PASS = "pad passphrase";
+
+  // (1) FIRST save interrupted before the blob lands: probeFloors created the
+  // (0,0,0) slots, then the blob write threw. Nothing durable exists.
+  const fresh = await otp.generatePad({ label: "fresh", totalBytes: 64 * 1024 });
+  failPadWrite = true;
+  await assert.rejects(() => otp.saveNewPad(fresh, PASS), /QuotaExceededError/,
+    "F-A1-R1 setup: the interrupted first save must surface its failure");
+  failPadWrite = false;
+  assert.strictEqual(store.get(`sc.otp.pad.v1.${fresh.padId}`), undefined,
+    "F-A1-R1 setup: the blob write did NOT land (this is the pre-blob interruption)");
+  assert.strictEqual(otp.padWasUsed(fresh.padId), false,
+    "F-A1-R1: a first save interrupted before the blob leaves only the probe slots at 0 — " +
+    "no keystream was spent, so the padId must be re-importable, not burned");
+  // And re-import actually works: saveNewPad no longer refuses it.
+  const at = await otp.saveNewPad(fresh, PASS);
+  assert.ok(at && at.key, "F-A1-R1: the pad re-imports cleanly after the interrupted first save");
+  console.log("OK  F-A1-R1: a first save interrupted before the blob is re-importable, not burned");
+
+  // (2) H-3 still holds: a CONSUMED pad, then all localStorage deleted, is still
+  // refused because the native send floor is above 0 and undeletable.
+  const used = await otp.generatePad({ label: "used", totalBytes: 64 * 1024 });
+  const usedAt = await otp.saveNewPad(used, PASS);
+  used.sendOffset = 4096;
+  await otp.savePadProgress(used, usedAt);
+  for (const k of [...store.keys()]) if (k.includes(used.padId)) store.delete(k);
+  assert.strictEqual(otp.padWasUsed(used.padId), true,
+    "H-3: a consumed pad whose localStorage markers were deleted is STILL used — the native " +
+    "send floor is above 0 and cannot be deleted or lowered from the JS context");
+  console.log("OK  H-3 preserved: a consumed pad with markers deleted is still refused");
+
+  delete globalThis.__SECURE_CHAT_NATIVE_FLOOR__;
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+}
+
+await testInterruptedFirstSaveIsReimportable();
 
 // The same finding's second half, which lives in app.js and so can only be
 // pinned at source level: the export handler must LATCH before it hands the pad
