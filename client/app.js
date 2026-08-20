@@ -3157,11 +3157,18 @@ async function ensureUnlocked(padId) {
     // attack the victim is looking at a pad they have used for months, and
     // "no usage record" is the sentence that should stop them.
     if (e.code !== "LEGACY_PAD_ADOPTION") throw e;
-    const warn = e.suspicious
-      ? "WARNING: this device HAS used one-time pads under the current version, " +
-        "so this pad having no usage record is a strong sign its rollback " +
-        "protection was tampered with.\n\n"
-      : "";
+    // A4/F-A3: two different unverifiable states reach this gate, and the
+    // escalation has to say something TRUE of the one at hand. "No usage record"
+    // is the sentence that should stop a user looking at a pad they have used for
+    // months; it is simply wrong about a pad whose floor could not be WRITTEN.
+    const warn = !e.suspicious ? ""
+      : e.reason === "unarmable-floor"
+        ? "WARNING: this device HAS used one-time pads under the current version, " +
+          "so its protected storage failing on this pad specifically is a strong " +
+          "sign its rollback protection was interfered with.\n\n"
+        : "WARNING: this device HAS used one-time pads under the current version, " +
+          "so this pad having no usage record is a strong sign its rollback " +
+          "protection was tampered with.\n\n";
     if (!confirm(
       warn + e.message +
       "\n\nAdopt it anyway? Only do this if you are certain the pad has never " +

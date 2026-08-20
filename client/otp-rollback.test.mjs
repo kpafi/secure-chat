@@ -1068,12 +1068,23 @@ async function testFailedBumpDoesNotBrickAPad() {
     await otp.saveNewPad(pad, PASS);
 
     const which = failing === "" ? "the SEND slot" : `the ${failing} slot`;
-    const opened = await otp.unlockPad(pad.padId, PASS);
+    // A4/F-A3 (2026-08-20) changed what this state looks like on the way out, and
+    // the change is the point: an unarmable slot is no longer sealed as the same
+    // `false` a plain browser writes, so unlockPad now routes the pad through the
+    // adoption consent gate instead of opening it on a claim nothing can check.
+    // What must NOT change is that the pad is not BRICKED — the gate is passable,
+    // and item 13's whole lesson was that a permanent refusal here destroys an
+    // in-person key exchange.
+    await assert.rejects(() => otp.unlockPad(pad.padId, PASS),
+      (e) => e.code === "LEGACY_PAD_ADOPTION",
+      `F-A3: a first save where ${which} failed to take must be GATED — the blob carries a ` +
+      "floor claim that nothing on this device can verify");
+    const opened = await otp.unlockPad(pad.padId, PASS, { adoptLegacy: true });
     assert.ok(opened.record,
       `item 13: a first save where ${which} failed to take must leave the pad USABLE, ` +
       "not permanently refused — the fix must never brick a pad it was meant to protect");
     assert.strictEqual(opened.record.sendOffset, 0, "...and at its true offset");
-    console.log(`OK  item 13: a first save with ${which} unwritable does not brick the pad`);
+    console.log(`OK  item 13: a first save with ${which} unwritable is gated but not bricked`);
 
     // ...and the guard must ARM as soon as the floor starts working again, so
     // the degraded state is temporary rather than a permanent hole.
@@ -1087,7 +1098,11 @@ async function testFailedBumpDoesNotBrickAPad() {
     };
     Object.defineProperty(globalThis, "__SECURE_CHAT_PAD_FLOOR__", { value: Object.freeze(healthy), configurable: true });
     const otp2 = await import(`./otp.js?heal=${failing}&t=${Date.now()}`);
-    const r = await otp2.unlockPad(pad.padId, PASS);
+    // Still adopted explicitly: the blob on disk was sealed during the degraded
+    // window and keeps its unverifiable claim until a healthy save rewrites it.
+    // That permanence is the F-A3 finding's core point — an AEAD already written
+    // cannot be reached back into — so the gate correctly still fires here.
+    const r = await otp2.unlockPad(pad.padId, PASS, { adoptLegacy: true });
     r.record.recvHighWater = 4096;
     await otp2.savePadProgress(r.record, r.atRest);   // a save with a working floor
     slots.delete(pad.padId + "#recv");                 // now delete a derived slot
@@ -1413,6 +1428,108 @@ async function testInterruptedFirstSaveIsReimportable() {
 }
 
 await testInterruptedFirstSaveIsReimportable();
+
+// ---------------------------------------------------------------------------
+// A4/F-A3: a floor that could not be ARMED must not be sealed as "no floor".
+//
+// `PadFloor.bump` discards `commit()`'s boolean, so a prefs write that silently
+// does not take (unwritable file, full disk) left probeFloors reporting the same
+// `false` a plain browser legitimately reports. Both unlock guards are keyed on
+// that claim being true, so they could never fire for that blob — and the claim
+// is AEAD-sealed, so a later save that succeeds cannot repair a snapshot taken
+// during the degraded window. It stayed exploitable forever, into keystream
+// reuse.
+async function testUnarmableFloorIsNotSealedAsAbsent() {
+  const slots = new Map();
+  let acceptBumps = true;
+  const floor = {
+    read: (k) => (slots.has(k) ? slots.get(k) : -1),
+    bump: (k, v) => {
+      // The failure being modelled: bump reports success (it returns a number)
+      // but the write does not persist. This is what a discarded commit() looks
+      // like from the JS side.
+      if (!acceptBumps) return -1;
+      if (v < 0) return floor.read(k);
+      const n = Math.max(floor.read(k), v);
+      slots.set(k, n);
+      return n;
+    },
+  };
+  Object.defineProperty(globalThis, "__SECURE_CHAT_NATIVE_FLOOR__", { value: true, configurable: true });
+  Object.defineProperty(globalThis, "__SECURE_CHAT_PAD_FLOOR__", { value: Object.freeze(floor), configurable: true });
+
+  const store = new Map();
+  globalThis.localStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k),
+  };
+
+  const otp = await import(`./otp.js?fa3&t=${Date.now()}`);
+  const PASS = "pad passphrase";
+
+  // Save a pad while the floor cannot be armed.
+  acceptBumps = false;
+  const pad = await otp.generatePad({ label: "degraded", totalBytes: 64 * 1024 });
+  const at = await otp.saveNewPad(pad, PASS);
+  pad.sendOffset = 1024;
+  await otp.savePadProgress(pad, at);
+
+  // The blob must NOT claim "no floor was in force" — that claim is what a plain
+  // browser writes, and it makes both unlock guards structurally unable to fire.
+  const blob = JSON.parse(store.get(`sc.otp.pad.v1.${pad.padId}`));
+  assert.ok(blob && blob.ct, "F-A3 setup: a pad blob was written");
+
+  // Unlock must not open it silently: an unverifiable claim takes the same
+  // consent route as any other unverifiable consumption state.
+  await assert.rejects(() => otp.unlockPad(pad.padId, PASS),
+    (e) => {
+      assert.strictEqual(e.code, "LEGACY_PAD_ADOPTION",
+        "F-A3: a pad sealed while the floor could not be armed must route through the adoption " +
+        "consent gate, not open silently on a claim nothing can check");
+      assert.match(e.message, /could not write its tamper-proof usage record/,
+        "F-A3: the prompt must say what is actually wrong — the floor could not be written — " +
+        "rather than the legacy wording about a missing usage record");
+      return true;
+    },
+    "F-A3: unlockPad must refuse without explicit adoption");
+  console.log("OK  F-A3: a pad saved with an unarmable floor is gated, not silently trusted");
+
+  // With explicit consent it opens (a brick would destroy an in-person exchange),
+  // and once the floor works again a fresh save re-arms the claim.
+  const opened = await otp.unlockPad(pad.padId, PASS, { adoptLegacy: true });
+  assert.strictEqual(opened.record.sendOffset, 1024, "F-A3: adoption opens the pad at its stored offset");
+  acceptBumps = true;
+  await otp.savePadProgress(opened.record, opened.atRest);
+  const healed = await otp.unlockPad(pad.padId, PASS);
+  assert.strictEqual(healed.record.sendOffset, 1024,
+    "F-A3: once the floor can be written again, a save re-arms the claim and the gate stops firing");
+  console.log("OK  F-A3: the claim heals on the next save whose probe succeeds");
+
+  // CONTROL: a plain browser (no bridge at all) must NOT be pushed through the
+  // gate — that is the legitimate `false`, and gating it would prompt every
+  // browser user on every unlock.
+  delete globalThis.__SECURE_CHAT_NATIVE_FLOOR__;
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+  const store2 = new Map();
+  globalThis.localStorage = {
+    getItem: (k) => (store2.has(k) ? store2.get(k) : null),
+    setItem: (k, v) => store2.set(k, String(v)),
+    removeItem: (k) => store2.delete(k),
+  };
+  const otp2 = await import(`./otp.js?fa3b&t=${Date.now()}`);
+  const pad2 = await otp2.generatePad({ label: "browser", totalBytes: 64 * 1024 });
+  const at2 = await otp2.saveNewPad(pad2, PASS);
+  pad2.sendOffset = 512;
+  await otp2.savePadProgress(pad2, at2);
+  const browserOpen = await otp2.unlockPad(pad2.padId, PASS);
+  assert.strictEqual(browserOpen.record.sendOffset, 512,
+    "F-A3 control: a plain browser has no floor to arm, which is not a degraded state — it must " +
+    "open normally, or every browser user is prompted on every unlock");
+  console.log("OK  F-A3 control: a plain browser is unaffected by the new claim value");
+}
+
+await testUnarmableFloorIsNotSealedAsAbsent();
 
 // The same finding's second half, which lives in app.js and so can only be
 // pinned at source level: the export handler must LATCH before it hands the pad

@@ -324,23 +324,42 @@ function readFloorClaims(id) {
 // is the ordering property F-A1 is about (see writePadBlob).
 //
 // TRADE-OFF, stated because it is a security choice and not an obvious one: when
-// a slot cannot be created the blob records `false` and the pad opens UNGUARDED
-// for that slot, rather than being refused. A permanent brick carrying the
-// wording of the tamper alarm is the worse outcome: it destroys an in-person key
-// exchange, it cannot be undone by any user action, and it teaches the user to
-// disbelieve the alarm. The failure this protects against is non-adversarial (a
-// transient Keystore error, a full disk, a kill between two JNI calls); an
-// attacker who can actually suppress bumps is inside the native floor's threat
-// model and is caught by `broken`/NATIVE_TAMPERED, which still refuse outright.
+// a slot cannot be created the pad is not REFUSED outright. A permanent brick
+// carrying the wording of the tamper alarm is the worse outcome: it destroys an
+// in-person key exchange, it cannot be undone by any user action, and it teaches
+// the user to disbelieve the alarm. The failure this protects against is
+// non-adversarial (a transient Keystore error, a full disk, a kill between two
+// JNI calls); an attacker who can actually suppress bumps is inside the native
+// floor's threat model and is caught by `broken`/NATIVE_TAMPERED, which still
+// refuse outright.
 //
-// The claim re-arms on the next save whose probe succeeds — but note the limit,
-// because it is easy to over-read: that heals the LIVE pad only. A blob written
-// during the degraded window is sealed saying `false`, and no later save can
-// reach back into an AEAD that has already been snapshotted, so a copy taken
-// then keeps the weaker claim for as long as it exists. Narrowing that is
-// A4/F-A3, which is a separate open finding.
+// What it does instead (A4/F-A3, fixed 2026-08-20): the blob records
+// CLAIM_UNCONFIRMED — NOT the `false` a plain browser writes — and unlockPad
+// routes it through the adoption consent gate. Two earlier sentences here were
+// wrong and are worth naming, because they described a safety that did not exist:
+//   * "the pad opens UNGUARDED for that slot — the pre-fix behaviour" — the code
+//     this replaced REFUSED; unguarded was never the status quo it restored.
+//   * "the claim re-arms on the next save that succeeds" — true of the LIVE pad
+//     only. A blob written during the degraded window is sealed, and no later
+//     save can reach back into an AEAD that has already been snapshotted, so a
+//     copy taken then keeps the weaker claim forever. That permanence is exactly
+//     why a silent `false` was unacceptable and why the third value exists.
+// The three claim values, and why "arming failed" may not collapse into "never
+// armed" (A4/F-A3). `nativeFloor: false` is what a plain browser legitimately
+// writes on every save; if a bridge IS present but its prefs write silently does
+// not take (unwritable file, full disk — `PadFloor.bump` discards `commit()`'s
+// boolean), the old code recorded that same `false`. Both unlock guards are keyed
+// on the claim being `true`, so they could never fire for that blob — and because
+// the claim is AEAD-sealed, a later save that succeeds cannot repair a snapshot
+// taken during the degraded window. It stayed exploitable forever, into keystream
+// reuse. UNCONFIRMED keeps the two cases apart, and routes such a blob through the
+// existing adoption consent gate instead of opening it silently.
+const CLAIM_ARMED = true;          // slot existed and was read back
+const CLAIM_NONE = false;          // no bridge on this device (a plain browser)
+const CLAIM_UNCONFIRMED = "unconfirmed"; // bridge present, slot could not be created
+
 function probeFloors(id) {
-  if (!nativeFloor) return { send: false, derived: false };
+  if (!nativeFloor) return { send: CLAIM_NONE, derived: CLAIM_NONE };
   nativeFloor.bump(floorKeySend(id), 0);
   // F-ATREST-001: the recv high-water mark, which used to be AEAD-mirrored only
   // — and an AEAD record can be restored wholesale from a snapshot.
@@ -349,7 +368,14 @@ function probeFloors(id) {
   // the slot exists from then on and its ABSENCE is unambiguous evidence of
   // deletion rather than of a pad that was simply never exported.
   nativeFloor.bump(floorKeyExported(id), 0);
-  return readFloorClaims(id);
+  const claims = readFloorClaims(id);
+  // A bridge is present, so a slot that is STILL absent after the bump above
+  // means the write did not take. That is not "this device has no floor" — say so
+  // (F-A3), and let unlockPad ask the user rather than sealing a false negative.
+  return {
+    send: claims.send ? CLAIM_ARMED : CLAIM_UNCONFIRMED,
+    derived: claims.derived ? CLAIM_ARMED : CLAIM_UNCONFIRMED,
+  };
 }
 
 // Raise all three floors to the state the blob on disk now describes.
@@ -1064,13 +1090,29 @@ export async function unlockPad(padId, passphrase, opts = {}) {
   // `EPOCH_KEY` and `usedKey` only ESCALATE the wording. They are deletable, so
   // depending on them would rebuild the hole this closes; their absence must
   // never turn the gate off.
-  const needsAdoption = (legacy || (o.v || 1) < PAD_BLOB_V) && outerWm === null;
+  // A4/F-A3: a blob sealed while the native floor could not be armed carries a
+  // claim nothing can check. That is exactly the "consumption state nothing can
+  // verify" the gate below exists for, so it takes the same route rather than
+  // opening silently on a claim that both unlock guards are structurally unable
+  // to test. Unlike the legacy case this does not require `outerWm === null`: the
+  // watermark is deletable, so requiring its absence would let one `removeItem`
+  // turn the gate off.
+  const floorUnconfirmed = inner.nativeFloor === CLAIM_UNCONFIRMED ||
+    inner.derivedFloors === CLAIM_UNCONFIRMED;
+  const needsAdoption = floorUnconfirmed ||
+    ((legacy || (o.v || 1) < PAD_BLOB_V) && outerWm === null);
   if (needsAdoption && !opts.adoptLegacy) {
-    const err = new Error(
-      "this pad has no usage record on this device. If it has ever sent a message, that record has been deleted and the pad is NOT safe to use — exchange a fresh one.",
+    const err = new Error(floorUnconfirmed
+      ? "this pad was saved while this device could not write its tamper-proof usage record, so nothing here can prove whether the pad has been rewound. If it has ever sent a message, it is NOT safe to use — exchange a fresh one."
+      : "this pad has no usage record on this device. If it has ever sent a message, that record has been deleted and the pad is NOT safe to use — exchange a fresh one.",
     );
     err.code = "LEGACY_PAD_ADOPTION";
     err.padId = padId;
+    // Which of the two unverifiable states this is, so the UI can escalate with a
+    // sentence that is TRUE of it (F-A3). "No usage record at all" and "the record
+    // could not be written when this pad was last saved" are different facts, and
+    // the warning that should stop the user differs accordingly.
+    err.reason = floorUnconfirmed ? "unarmable-floor" : "legacy";
     // True = this device has demonstrably run OTP under the current code, so a
     // pad with no record is a much stronger signal of tampering than it would be
     // on a device that just upgraded.
