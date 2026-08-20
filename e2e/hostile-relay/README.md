@@ -21,7 +21,26 @@ SCENARIO=control node e2e/hostile-relay/proto001.mjs
 POLICY=demote node e2e/hostile-relay/hostile.mjs &
 node e2e/hostile-relay/proto001.mjs                    # both peers shipped, 9/9
 SCENARIO=attacker node e2e/hostile-relay/proto001.mjs  # peer runs a patched client, 9/9
+
+# item 14 end to end: the DIRECTORY lies. Needs DIRECTORY=hostile, which is read
+# at startup like POLICY. Expect 13/13.
+POLICY=demote DIRECTORY=hostile node e2e/hostile-relay/hostile.mjs &
+SCENARIO=directory node e2e/hostile-relay/proto001.mjs
 ```
+
+`DIRECTORY` defaults to `honest`. Under `hostile` the relay answers a lookup for
+ANY handle with a DIFFERENT registered identity's bundle — "you asked for bob,
+here are mallory's keys" — which is precisely the answer item 14's deleted route
+treated as grounds to skip the approval prompt. `SCENARIO=directory` has the peer
+register as `mallory`, has the victim look up `bob#harnesstoken`, and asserts the
+victim is asked anyway. Until this existed, `expectedPeerBundle` was null in every
+run of this harness and the entire directory-driven flow was invisible end to end
+(pentest item 8); item 14 could only be argued at the unit level.
+
+If `DIRECTORY=hostile` is set but only one identity has registered, there is no
+other bundle to lie with — the relay logs that the lookup was answered honestly
+and that the run proves nothing, rather than quietly turning the attack into a
+control.
 
 `SCENARIO` defaults to `shipped`. Running the control without it (as this file
 told you to until 2026-08-10) runs the ATTACK assertions against an HONEST relay:

@@ -127,6 +127,7 @@ const snap = (a) => a.page.evaluate(() => {
     promptTitle: t("#admitTitle"),
     promptFingerprint: t("#admitFingerprint"),
     promptWho: t("#admitWho"),
+    promptWarn: t("#admitWarn"),
     verifyShown: vis("#verify"),
     safetyNumber: t("#safetyNumber"),
     canSend: !document.querySelector("#text").disabled,
@@ -142,12 +143,68 @@ function dump(label, s) {
   for (const f of s.frames) console.log(`     ${String(f.t).padStart(6)}ms ${f.dir.padEnd(4)} ${String(f.type).padEnd(7)} ${f.kind}`);
 }
 
+// What the relay actually served under /evil/. `none` means the shipped client
+// was served unpatched, i.e. nothing is attacking in this run.
+async function peerEvilMode() {
+  return peer.page.evaluate(() => globalThis.__HARNESS_EVIL_MODE__ || "patched");
+}
+
 console.log(`\n=== F-PROTO-001: hostile relay, scenario=${SCENARIO} (${APP}) ===\n`);
 
 // alice always runs the shipped client. In `attacker` she is the victim; in
 // `shipped` she is the one that answers the hello and sends the first handshake.
 const alice = await agent("alice", "/");
-const peer = await agent("peer", SCENARIO === "attacker" ? "/evil/" : "/");
+// `directory` uses the attacker client too: the victim is the side that TYPED a
+// handle, and she only reaches her own decision once the other side stops
+// waiting on its prompt. An honest peer would park on its own approval prompt
+// and the victim's decision — the thing under test — would never be reached.
+const peer = await agent("peer",
+  SCENARIO === "attacker" || SCENARIO === "directory" ? "/evil/" : "/");
+
+// Item 8, second half: `EVIL_MODE=none SCENARIO=attacker` used to serve the
+// SHIPPED client under /evil/ and report a clean 9/9. Nothing attacked in that
+// run, so the pass was worthless — and it is an easy invocation to mistype. The
+// relay now stamps a marker into the bytes it serves; refuse to continue.
+if (SCENARIO === "attacker") {
+  const mode = await peerEvilMode();
+  if (mode === "none") {
+    console.log(
+      "\n  !! SCENARIO=attacker but the relay is running EVIL_MODE=none, so /evil/\n" +
+      "     served the UNPATCHED shipped client. There is no attacker in this run\n" +
+      "     and a pass would prove nothing. Restart the relay without EVIL_MODE=none\n" +
+      "     (the default is EVIL_MODE=autoapprove), or run SCENARIO=control.\n");
+    process.exit(2);
+  }
+}
+
+// --- SCENARIO=directory (pentest item 8 / item 14) --------------------------
+// The gap this closes: this harness served no /api/* routes and nothing ever
+// typed a handle, so `expectedPeerBundle` was null in every run and the whole
+// directory-driven flow item 14 is ABOUT was invisible end to end.
+//
+// The attack, end to end: the victim asks for the handle of the person they mean
+// to talk to. The directory is the attacker's, so it answers with the keys of
+// whoever is actually going to connect. The bundle the victim was handed and the
+// bundle that shows up therefore MATCH — which is exactly the condition item 14's
+// deleted route used to treat as "no need to ask". The client must still ask.
+if (SCENARIO === "directory") {
+  // The peer registers under a name the victim is NOT looking for, so the
+  // hostile directory has somebody else's keys to answer with.
+  await peer.page.click("#toIdentity");
+  await peer.page.waitForFunction(() => !document.querySelector("#scrIdentity").hidden, { timeout: 20000 });
+  await peer.page.type("#username", "mallory");
+  await peer.page.click("#register");
+  await peer.page.waitForFunction(
+    () => /registered|already/i.test(document.querySelector("#accountStatus").textContent),
+    { timeout: 20000 });
+  await peer.page.click("#toRoom");
+  await peer.page.waitForFunction(() => !document.querySelector("#scrRoom").hidden, { timeout: 20000 });
+
+  // The victim looks up "bob" — a handle the directory has never seen. Under
+  // DIRECTORY=hostile it answers with mallory's bundle anyway.
+  await alice.page.type("#contact", "bob#harnesstoken");
+  console.log("  setup: peer registered as \"mallory\"; alice will look up \"bob#harnesstoken\"\n");
+}
 
 const code = await alice.page.evaluate(() => document.querySelector("#room").value.trim());
 await alice.page.click("#connect");
@@ -258,6 +315,35 @@ check("the prompt shows the peer's REAL fingerprint",
 check("no safety number and no messaging on either side while it is unanswered",
   !snapA.verifyShown && !snapP.verifyShown && !snapA.canSend && !snapP.canSend,
   `verify=${snapA.verifyShown}/${snapP.verifyShown} send=${snapA.canSend}/${snapP.canSend}`);
+
+// --- item 14, end to end ----------------------------------------------------
+if (SCENARIO === "directory") {
+  // Vacuity guard FIRST. If the lookup had failed, alice would have refused to
+  // connect at all and every check above would be measuring an empty session —
+  // a green that proves nothing, which is the failure mode this whole scenario
+  // exists to stop repeating.
+  check("the victim's directory lookup was answered (the scenario is not vacuous)",
+    !snapA.log.some((l) => /No one found for the handle/i.test(l)) &&
+    snapA.frames.length > 0,
+    `alice frames=${snapA.frames.length}`);
+
+  // THE FINDING. The bundle the directory handed alice and the bundle that
+  // connected are the same — the exact condition item 14's deleted route read as
+  // "no need to ask". The prompt must appear anyway, on the victim's side.
+  check("item 14: a MATCHING hostile-directory answer does NOT skip the prompt",
+    isPeerPrompt(snapA),
+    `alice prompt mode=${snapA.promptMode || "none"} — the directory named "bob" and handed ` +
+    "over the keys of the peer that connected; pre-fix this skipped the human");
+  check("item 14: and the client does not print a directory-sourced reassurance",
+    !snapA.log.some((l) => /matches the directory key/i.test(l)),
+    snapA.log.filter((l) => /directory/i.test(l)).join(" | ") || "(no directory line)");
+  // The bundles match, so there is nothing to warn about — the point is that a
+  // MATCH is not a reason to skip. A ⚠ here would mean the harness failed to
+  // make the directory lie in the way this scenario intends.
+  check("item 14: the prompt shows no mismatch warning (the lie was consistent)",
+    !/NOT the user you selected/i.test(snapA.promptWarn),
+    JSON.stringify(snapA.promptWarn));
+}
 
 // Refusing must end it, not merely postpone it.
 //
