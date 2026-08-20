@@ -360,6 +360,10 @@ function sanitizeModes() {
 // open their own chat history at all. The engines involved are Chrome/WebView
 // < 69, Firefox < 96 and Safari 15.0-15.3.
 const WRITE_LOCK = "sc.chats.write.v1";
+// Generous: a legitimate persist is a PBKDF2-free encrypt plus two localStorage
+// writes (single-digit ms), and the queue can hold a few of those. Anything past
+// this is a holder that is not coming back, not a slow disk.
+const WRITE_LOCK_TIMEOUT_MS = 10_000;
 let writeChain = Promise.resolve();
 
 function withWriteLock(fn) {
@@ -370,9 +374,36 @@ function withWriteLock(fn) {
   // than a missing global. Pentest 2026-08-10 (L-2).
   const hasWebLocks = typeof navigator !== "undefined" &&
     navigator.locks && typeof navigator.locks.request === "function";
+  // `navigator.locks` is a poisonable global, and this is the one place that
+  // decides whether cross-tab ordering happens at all. Marked explicitly so its
+  // absence is a stated fallback rather than an invisible one: everywhere else in
+  // this project a missing primitive fails closed, but here it cannot — the
+  // browsers listed above genuinely lack it, and refusing would lock those users
+  // out of their own history. The intra-tab `writeChain` below still orders
+  // writes, so what is lost with no Web Locks is ONLY cross-tab ordering, which is
+  // exactly what the compare-and-swap in persistLocked is there to catch.
+  //
+  // A same-origin script that deletes `navigator.locks` therefore downgrades this
+  // to the documented no-Web-Locks path; it cannot silently disable the CAS.
+  // Two-argument form deliberately: exclusive-and-wait is the Web Locks default,
+  // so passing an options object would add nothing but a shape for a shim or a
+  // polyfill to get wrong.
   const run = () => (hasWebLocks ? navigator.locks.request(WRITE_LOCK, fn) : fn());
   // Chain on settle, not on success: one failed write must not wedge the queue.
-  const next = writeChain.then(run, run);
+  //
+  // TIMEOUT (item 11): a same-origin script — or a tab wedged inside its own
+  // callback — holding WRITE_LOCK used to hang every subsequent write forever,
+  // silently, because there is no user-visible signal that a persist never
+  // returned. Losing history quietly is the failure this store is built to avoid,
+  // so a stuck lock now surfaces as an error the caller can report instead.
+  const guarded = () => Promise.race([
+    run(),
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error("the chat store's write lock did not become available — another tab or script is holding it; your last change was NOT saved")),
+      WRITE_LOCK_TIMEOUT_MS,
+    )),
+  ]);
+  const next = writeChain.then(guarded, guarded);
   writeChain = next.then(() => {}, () => {});
   return next;
 }

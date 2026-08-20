@@ -92,24 +92,16 @@ const LS_REG_SEQ = "sc.regseq.v1";
 // poisoned value, so it cannot help. Confirmed end to end against the real
 // endpoint: seq=2**53-1 → `200 updated`, then 422 / 409 / 409 forever.
 //
-// Two bounds close it:
+// The first repair (pass 2) used two ABSOLUTE bounds — a "sane max" above which
+// a stored value was discarded, and a hard cap on what would be signed. Those
+// constants are GONE; do not go looking for them. What replaced them, and why, is
+// the next paragraph, which describes the code as it actually stands.
 //
-//   * Anything above `REG_SEQ_SANE_MAX` is treated as GARBAGE and ignored,
-//     rather than used as a floor. This function only ever writes `Date.now()`-
-//     scale values (~1.8e12); 2**43 is ~year 2248 in ms, so no value this code
-//     produces can reach it, and any value that does came from somewhere else.
-//     Discarding rather than throwing matters: the counter is attacker-writable
-//     plaintext, so refusing to proceed on a bad value would just convert the
-//     freeze into a local denial of service. Falling back to `Date.now()` heals
-//     it on the spot.
-//   * `Math.min(..., REG_SEQ_MAX)` guarantees we never SIGN a value the server
-//     will 422, so the client cannot walk an account up to the cap even by
-//     accident. Unreachable given the clamp above; it is here so the property
-//     holds by construction rather than by argument.
+// `Date.now()` as the floor (not just `cur + 1`) survived from that pass and is
+// still here: it is the same trick the 409 retry uses, promoted to the normal
+// path, and it keeps the counter ahead across a reinstall or cleared storage
+// without a round trip.
 //
-// `Date.now()` as the floor (not just `cur + 1`) is the same trick the 409 retry
-// already used, promoted to the normal path: it keeps the counter ahead across
-// a reinstall or cleared storage without a round trip.
 // Pentest 2026-08-10, second pass: the first repair did NOT close this, and an
 // ABSOLUTE ceiling never can — it only relocates the freeze.
 //
@@ -154,15 +146,23 @@ function regSeqCeiling() {
   return Date.now() + REG_SEQ_SLACK_MS;
 }
 
-function clampRegSeq(n) {
-  return Math.min(Math.max(n, 1), regSeqCeiling());
-}
-
 function nextRegSeq() {
   const raw = Number.parseInt(localStorage.getItem(LS_REG_SEQ) || "0", 10);
   const ceiling = regSeqCeiling();
   const cur = Number.isInteger(raw) && raw > 0 && raw <= ceiling ? raw : 0;
   const next = Math.min(Math.max(cur + 1, Date.now()), ceiling);
+  // Guard the OUTPUT, not just the stored input (A4 Low). Every caller tests
+  // `Number.isInteger(seq)` and silently falls back to a v2, counter-free —
+  // i.e. REPLAYABLE — registration when it fails. So a `Date.now()` hooked to
+  // return a fraction (a device-local attacker, or a broken polyfill) used to
+  // switch this control off with nothing said. The backend stays fail-closed
+  // either way, so no key rollback follows; what is unacceptable is the SILENCE.
+  // Refusing is safe here because, unlike the stored counter, this value is not
+  // attacker-writable — it is computed fresh — so throwing cannot be used to
+  // wedge the client.
+  if (!Number.isInteger(next) || next < 1) {
+    throw new Error("this device's clock produced an unusable registration counter — registration refused rather than sent without replay protection");
+  }
   localStorage.setItem(LS_REG_SEQ, String(next));
   return next;
 }

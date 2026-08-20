@@ -274,4 +274,61 @@ async function testBothReadFirstInterleaving() {
 }
 
 await testBothReadFirstInterleaving();
+
+// --- item 11: a stuck write lock must SURFACE, not hang silently -------------
+// `withWriteLock` had no timeout, so a same-origin script (or a tab wedged inside
+// its own callback) holding WRITE_LOCK hung every subsequent write forever with
+// nothing shown to the user. Quiet history loss is the exact failure this store
+// exists to prevent, so a lock that never frees must produce an error the caller
+// can report.
+//
+// Waiting out the real 10s timeout would put a 10-second stall in the suite, so
+// the timer itself is stubbed: `setTimeout` fires immediately for exactly the
+// production delay. That keeps the assertion on the REAL code path (the race in
+// withWriteLock, the real error) with no test-only hook in chats.js — a knob a
+// same-origin script could turn is precisely what this project does not want.
+async function testStuckWriteLockSurfaces() {
+  const prevNav = globalThis.navigator;
+  const realSetTimeout = globalThis.setTimeout;
+  let firedForProductionDelay = false;
+  Object.defineProperty(globalThis, "navigator", {
+    value: {
+      ...(prevNav || {}),
+      // Never settles: exactly a lock held by somebody who is not coming back.
+      locks: { request: () => new Promise(() => {}) },
+    },
+    configurable: true,
+    writable: true,
+  });
+  globalThis.setTimeout = (fn, ms, ...rest) => {
+    if (ms === 10_000) { firedForProductionDelay = true; return realSetTimeout(fn, 0); }
+    return realSetTimeout(fn, ms, ...rest);
+  };
+  try {
+    fakeLocalStorage();
+    const chats = await import(`./chats.js?stuck=${Date.now()}`);
+    // unlock() creates the store before the lock is wedged...
+    Object.defineProperty(globalThis, "navigator", { value: prevNav, configurable: true, writable: true });
+    await chats.unlock(PASS);
+    // ...and now a real write has to acquire a lock nobody will ever release.
+    Object.defineProperty(globalThis, "navigator", {
+      value: { ...(prevNav || {}), locks: { request: () => new Promise(() => {}) } },
+      configurable: true, writable: true,
+    });
+    await assert.rejects(() => chats.ensure("bob"),
+      /write lock did not become available/,
+      "item 11: a write lock nobody releases must REJECT, not hang forever — a silently dropped " +
+      "write is indistinguishable from a saved one to the user, and quiet history loss is the " +
+      "exact failure this store exists to prevent");
+    assert.ok(firedForProductionDelay,
+      "item 11: the rejection must come from withWriteLock's own 10s timeout, not from something " +
+      "else failing — otherwise this test would pass with the timeout deleted");
+    console.log("OK  item 11: a write lock nobody releases surfaces instead of hanging");
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    Object.defineProperty(globalThis, "navigator", { value: prevNav, configurable: true, writable: true });
+  }
+}
+
+await testStuckWriteLockSurfaces();
 console.log("All chat-store concurrency checks passed.");
