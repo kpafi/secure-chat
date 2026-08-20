@@ -2895,25 +2895,33 @@ async function enterVerification(room, verifiedBundle) {
       "this safety number with them over a trusted channel.";
     addLine("sys", "", "[pinned identity CHANGED — verification required]");
     // `pinsReadable()` above is also true when this device has NO contact store
-    // at all, and `list()` throws in that state — so the unlock check is not
-    // redundant with it.
-  } else if (contacts.isUnlocked() &&
-             contacts.list().some((c) => sameSigning(c, bundle) && c.reverify)) {
+    // at all, and `pinWasSwept()` throws in that state — so the unlock check is
+    // not redundant with it.
+  } else if (contacts.isUnlocked() && contacts.pinWasSwept(currentPinKey)) {
     // Pentest 2026-08-10-night F-A2. There is a third way to arrive here with no
-    // pin, besides "never seen" and "pin deleted by an attacker": this contact's
-    // pin was swept as COLLATERAL when the user revoked somebody else who had
-    // these same keys recorded in their history (see contacts.js dropPinsFor).
+    // pin, besides "never seen" and "pin deleted by an attacker": this pin was
+    // swept as COLLATERAL when the user revoked somebody else who had these same
+    // keys recorded in their history (see contacts.js dropPinsFor).
     //
     // Revocation deletes that pin unconditionally, because letting a second
     // record decide what revocation may delete is what made F-A2 fail open. The
     // cost of that is exactly this state — and rendering it as a benign first
     // contact is M-2's alarm inversion, the failure the whole item is about. So
-    // the marker the sweep left behind is read here and said out loud.
+    // the tombstone the sweep left behind is read here and said out loud.
+    //
+    // Keyed on the PIN KEY, not on a contact record (F-A2-R1): a `room:<id>` pin
+    // whose owner has no record — the default for Live-room use — and a bystander
+    // who has since rotated both used to be swept with no marker at all, and
+    // still rendered benign.
     els.verify.classList.add("changed");
     els.verifyTitle.textContent = "Re-verify this contact — their saved pin was cleared";
+    // Wording note: the tombstone covers every pin the sweep deleted, which
+    // includes the revoked contact's own — so this must not claim the revocation
+    // was of "another contact". It says what is true of every case: a pin existed
+    // here and a revocation removed it.
     els.verifyHint.textContent =
-      "This contact had a verified pin, and it was removed when you revoked or removed another " +
-      "contact that shared these keys. This is NOT a first contact: compare the safety number " +
+      "There was a verified pin for this key, and it was removed when you revoked or removed a " +
+      "contact that used these keys. This is NOT a first contact: compare the safety number " +
       "with them in person before you continue, exactly as you did the first time.";
     addLine("sys", "", "[pin cleared by an earlier revocation — re-verification required]");
   } else {

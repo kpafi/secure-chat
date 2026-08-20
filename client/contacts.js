@@ -81,6 +81,10 @@ let dataKey = null;
 let salt = null;
 let contacts = null; // array of contact records while unlocked
 let pins = null;     // { "<key>": {ed, mldsa} } — TOFU identity pins (M-02)
+// F-A2-R1: { "<pin key>": {at} } — tombstones for pins deleted as collateral of
+// SOMEONE ELSE's revocation. Keyed by the pin key, which is in hand at deletion
+// time, so it needs no guess about who holds those keys now. See dropPinsFor.
+let swept = null;
 let generation = 0;  // monotonic store generation (L-1); bumped on every persist
 
 // ---- the anti-deletion anchor (pentest 2026-08-07 F-ATREST-003/004) --------
@@ -137,6 +141,7 @@ export function lock() {
   salt = null;
   contacts = null;
   pins = null;
+  swept = null;
   generation = 0;
 }
 
@@ -156,6 +161,7 @@ export async function unlock(passphrase) {
     dataKey = await deriveKey(passphrase, salt, KDF_ITERS);
     contacts = [];
     pins = {};
+    swept = {};
     generation = 0;
     dropLegacyPins();
     await persist();
@@ -242,9 +248,14 @@ export async function unlock(passphrase) {
   if (Array.isArray(data)) {
     contacts = data;
     pins = {};
+    swept = {};
   } else {
     contacts = data.contacts || [];
     pins = data.pins || {};
+    // F-A2-R1: tombstones for pins swept by someone else's revocation, keyed by
+    // the PIN KEY. Absent in pre-2026-08-20 stores, which is simply "no sweep has
+    // happened here yet".
+    swept = (data.swept && typeof data.swept === "object") ? data.swept : {};
   }
   generation = Number.isInteger(data.gen) ? data.gen : 0;
   await assertNotRolledBack(data.gen);
@@ -450,7 +461,7 @@ async function persist() {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   // `d` is the H-2 domain tag: it makes this plaintext unmistakably a STORE, so
   // no other record encrypted under the same key can be substituted for it.
-  const plain = enc.encode(JSON.stringify({ d: STORE_DOMAIN, contacts, pins, gen: generation }));
+  const plain = enc.encode(JSON.stringify({ d: STORE_DOMAIN, contacts, pins, swept, gen: generation }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, dataKey, plain));
   localStorage.setItem(
     LS_CONTACTS,
@@ -480,14 +491,13 @@ export async function savePin(key, bundle) {
     ecdh: bundle.ecdh ?? null, mlkem: bundle.mlkem ?? null,
   };
   // F-A2: saving a pin IS the in-person safety-number confirmation, so it clears
-  // the "your pin was cleared by someone else's revocation" marker for these
-  // keys. Without this the marker would outlive the re-verification it asks for
-  // on the room-pin path, where `onVerifyOk` has no handle to upsert against.
-  if (contacts) {
-    for (const c of contacts) {
-      if (c.ed === bundle.ed && c.mldsa === bundle.mldsa) delete c.reverify;
-    }
-  }
+  // the "your pin was cleared by someone else's revocation" tombstone for this
+  // key. Without this the marker would outlive the re-verification it asks for on
+  // the room-pin path, where `onVerifyOk` has no handle to upsert against.
+  //
+  // Keyed on the pin key, so re-verifying one key does NOT silence the alarm for
+  // a different key that was swept in the same revocation.
+  if (swept) delete swept[key];
   await persist();
 }
 
@@ -715,25 +725,25 @@ function dropPinsFor(contact) {
   // and the collision is recorded on the other contact instead, so their next
   // session cannot be rendered as a benign first contact.
   //
-  // KNOWN LIMIT, measured rather than assumed (pentest of this fix, F-A2-R1).
-  // The marker is keyed on a contact whose CURRENT keys are the swept ones, so
-  // it does not cover two reachable shapes: a `room:<id>` pin whose owner has no
-  // contact record at all (the DEFAULT for Live-room use — app.js only mirrors a
-  // record when a handle was typed), and a bystander who has since rotated, whose
-  // stale pin names keys the record no longer has. In both, the pin is swept and
-  // NO marker is set, so that peer's next session still renders benign. This is a
-  // residual and not a regression — the predicate here is the same one the
-  // deleted `claimedByAnother` used, so it covers exactly the set the old code
-  // retained — but it means "nobody loses an alarm" is NOT true of this code, and
-  // must not be written as if it were. Closing it needs the marker to live on the
-  // PIN KEY (a tombstone) rather than on a contact, which is knowable here
-  // without guessing who holds those keys now. Open finding.
+  // The marker is a TOMBSTONE ON THE PIN KEY (F-A2-R1, closed 2026-08-20).
   //
-  // Deliberately NOT conditioned on the other record being `verified` or
+  // It used to be a `reverify` flag on a contact whose CURRENT keys were the
+  // swept ones. That was measured to miss two reachable shapes: a `room:<id>` pin
+  // whose owner has no contact record at all (the DEFAULT for Live-room use —
+  // app.js only mirrors a record when a handle was typed), and a bystander who
+  // has since rotated, whose stale pin names keys the record no longer has. In
+  // both, the pin was swept and NO marker was set, so that peer's next session
+  // still rendered as a benign first contact — the alarm inversion this whole
+  // item is about, just narrower.
+  //
+  // The pin KEY is in hand right here, at the moment of deletion, and it is
+  // exactly what `renderVerify` looks the pin up by. So the tombstone is filed
+  // under it and needs no guess about who holds those keys now. Every swept pin
+  // gets one, so the coverage is the swept set itself rather than a subset of it.
+  //
+  // Deliberately NOT conditioned on any other record being `verified` or
   // user-created: an attacker-made record is exactly the case that must not be
-  // able to change what revocation deletes.
-  const otherHolderOf = (k) => contacts.find(
-    (c) => c !== contact && c.ed === k.ed && c.mldsa === k.mldsa);
+  // able to change what revocation deletes, or what it announces.
   for (const [key, pin] of Object.entries(pins)) {
     if (!pin) continue;
     // Signing keys alone are enough to identify the contact: they ARE the
@@ -742,12 +752,19 @@ function dropPinsFor(contact) {
     const hit = owned.find((k) => pin.ed === k.ed && pin.mldsa === k.mldsa);
     if (!hit) continue;
     delete pins[key];
-    // Collateral: these keys are some OTHER live contact's current identity, so
-    // that contact has just silently lost their pin. Mark it, so app.js says
-    // "re-verify — your saved pin was cleared" instead of "first contact".
-    const other = otherHolderOf(hit);
-    if (other) other.reverify = true;
+    // The tombstone records the keys the swept pin named, so the next session on
+    // that key can be told apart from a genuine first contact even if the peer's
+    // record is gone, was never there, or has since rotated.
+    swept[key] = { ed: pin.ed, mldsa: pin.mldsa };
   }
+}
+
+// Was the pin under this key deleted as collateral of someone else's revocation?
+// Read by app.js's no-pin path so that arrival renders as "re-verify", never as a
+// benign first contact (F-A2 / F-A2-R1).
+export function pinWasSwept(key) {
+  if (!pins) throw new Error("contact store is locked");
+  return Boolean(swept && swept[key]);
 }
 
 // Cache the locally VERIFIED voucher names for a contact (the 🟡 mark). Only

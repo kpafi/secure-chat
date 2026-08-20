@@ -383,7 +383,7 @@ async function testPinHistoryFindings() {
   // holds — is GONE, because the attacker chooses whether that other record
   // exists (2026-08-10-night F-A2). The pin is deleted either way now; what M-2
   // is owed is that the bystander's next session is not rendered as a benign
-  // first contact, and that is the `reverify` marker below.
+  // first contact, and that is the tombstone below.
   await freshDevice();
   const ALICE = { ed: "QUxJQ0U", mldsa: "QUxJQ0VN" };
   await contacts.upsert({ username: "alice", ...ALICE });
@@ -394,7 +394,7 @@ async function testPinHistoryFindings() {
   assert.strictEqual(contacts.getPin("user:alice"), null,
     "F-A2: revocation is absolute — a pin naming a revoked key must not survive " +
     "because some other record also names it");
-  assert.ok(contacts.get("alice").reverify,
+  assert.ok(contacts.pinWasSwept("user:alice"),
     "M-2: ...but the bystander whose pin went with it must be flagged, so their next " +
     "session cannot render as a benign FIRST CONTACT (the inverted alarm)");
   console.log("OK  item 17 / M-2+F-A2: collateral is swept AND flagged for re-verification");
@@ -402,9 +402,59 @@ async function testPinHistoryFindings() {
   // ...and re-verifying in person clears the flag, so it does not become permanent
   // noise that teaches the user to click past it.
   await contacts.savePin("user:alice", ALICE);
-  assert.ok(!contacts.get("alice").reverify,
-    "an in-person re-verification (savePin) clears the marker");
+  assert.ok(!contacts.pinWasSwept("user:alice"),
+    "an in-person re-verification (savePin) clears the tombstone");
   console.log("OK  item 17 / M-2: the re-verification marker is cleared by re-verifying");
+
+  // F-A2-R1 (2026-08-20): the two shapes the old contact-keyed marker MISSED.
+  // Both are ordinary, not adversarial, and both used to render benign.
+  //
+  // (a) a `room:<id>` pin whose owner has NO contact record at all — the default
+  //     for Live-room use, where app.js only mirrors a record when a handle was
+  //     typed. There is no record to carry a flag, so the old marker could not
+  //     exist; the tombstone is filed under the pin key regardless.
+  await freshDevice();
+  const DANA = { ed: "REFOQQ", mldsa: "REFOQU0" };
+  await contacts.savePin("room:danas-room", DANA);            // no upsert: no record
+  await contacts.upsert({ username: "mallory", ...DANA });    // poisoned history
+  await contacts.upsert({ username: "mallory", ed: "TUFM", mldsa: "TUFMTQ" });
+  await contacts.remove("mallory");
+  assert.strictEqual(contacts.getPin("room:danas-room"), null, "the room pin is swept");
+  assert.ok(contacts.pinWasSwept("room:danas-room"),
+    "F-A2-R1(a): a room pin with no contact record behind it must still be tombstoned — " +
+    "this is the DEFAULT shape for Live-room use and it used to render as a first contact");
+  console.log("OK  F-A2-R1: a room pin with no contact record is tombstoned");
+
+  // (b) a bystander who has SINCE ROTATED: the stale pin names keys their record
+  //     no longer has, so a contact-keyed marker had nothing to match on.
+  await freshDevice();
+  const ERIN1 = { ed: "RVJJTjE", mldsa: "RVJJTjFN" };
+  await contacts.upsert({ username: "erin", ...ERIN1 });
+  await contacts.savePin("user:erin", ERIN1);
+  await contacts.upsert({ username: "erin", ed: "RVJJTjI", mldsa: "RVJJTjJN" }); // rotates
+  await contacts.upsert({ username: "mallory", ...ERIN1 });   // poisoned with the OLD keys
+  await contacts.upsert({ username: "mallory", ed: "TUFM", mldsa: "TUFMTQ" });
+  await contacts.remove("mallory");
+  assert.strictEqual(contacts.getPin("user:erin"), null, "erin's stale pin is swept");
+  assert.ok(contacts.pinWasSwept("user:erin"),
+    "F-A2-R1(b): a bystander who has since rotated must still be tombstoned — the swept pin " +
+    "names keys their record no longer holds, so a contact-keyed marker missed them entirely");
+  console.log("OK  F-A2-R1: a rotated bystander is tombstoned");
+
+  // ...and the tombstone is per-KEY: re-verifying one swept pin must not silence
+  // the alarm for a different pin swept by the same revocation.
+  await freshDevice();
+  const FAY = { ed: "RkFZ", mldsa: "RkFZTQ" };
+  await contacts.savePin("room:one", FAY);
+  await contacts.savePin("room:two", FAY);
+  await contacts.upsert({ username: "mallory", ...FAY });
+  await contacts.upsert({ username: "mallory", ed: "TUFM", mldsa: "TUFMTQ" });
+  await contacts.remove("mallory");
+  await contacts.savePin("room:one", FAY);                   // re-verified in person
+  assert.ok(!contacts.pinWasSwept("room:one"), "the re-verified key is cleared");
+  assert.ok(contacts.pinWasSwept("room:two"),
+    "F-A2-R1: clearing one tombstone must not clear another — they are per pin key");
+  console.log("OK  F-A2-R1: tombstones are per pin key, not global");
 
   // Control: the sweep must not depend on the OTHER record being trustworthy —
   // that dependency IS F-A2. An `auto` contact, which one sealed envelope creates
@@ -466,39 +516,33 @@ await testPinHistoryFindings();
   assert.notStrictEqual(firstContact, -1, "the first-contact branch must still exist");
   // ROUND-2 F-4 (2026-08-15): confine EVERYTHING to the renderVerify no-pin ladder
   // — `tail` from the pin read up to the first-contact branch. The previous check
-  // did `code.find((l) => l.includes("c.reverify"))` over the WHOLE file, which
-  // returns app.js's FIRST `c.reverify` — the Users-list renderer
-  // (`} else if (c.reverify && !c.verified) {`), an unrelated site — so the shape
-  // assertions validated a bystander line and never looked at renderVerify. A
-  // mutant adding `&& !pinsReadable()` here (always false: renderVerify returns
-  // early when pins are unreadable) made THIS branch dead code while every shape
-  // check passed against the other file location. So: region-confined, and the
-  // branch condition pinned EXACTLY rather than matched by "contains c.reverify".
+  // searched the WHOLE file for the marker and so validated app.js's Users-list
+  // renderer, an unrelated site, never renderVerify. A mutant adding
+  // `&& !pinsReadable()` here (always false: renderVerify returns early when pins
+  // are unreadable) made THIS branch dead code while every shape check passed
+  // against the other file location. So: region-confined, and the branch
+  // condition pinned EXACTLY rather than matched by "contains the marker".
   const region = tail.slice(0, firstContact);
-  const marker = region.indexOf("c.reverify");
+  const marker = region.indexOf("pinWasSwept");
   assert.notStrictEqual(marker, -1,
-    "F-A2: renderVerify must consult the `reverify` marker that dropPinsFor leaves on a " +
-    "contact whose pin was swept as collateral — without it that contact renders as a " +
-    "benign FIRST CONTACT, which is exactly M-2's inverted alarm");
+    "F-A2: renderVerify must consult the tombstone dropPinsFor leaves under the PIN KEY of a " +
+    "pin swept as collateral — without it that peer renders as a benign FIRST CONTACT, " +
+    "which is exactly M-2's inverted alarm");
 
-  // The exact branch condition, pinned. It spans two stripped lines today; both
-  // are required, consecutively, so a mutant cannot bolt an always-false term
-  // (`&& !pinsReadable()`, the F-4 dead-code shape) onto the condition without
-  // failing here. If this branch is legitimately reshaped, update BOTH lines and
-  // say why — that is the review this pin exists to force.
-  const EXPECTED_BRANCH = [
-    "} else if (contacts.isUnlocked() &&",
-    "contacts.list().some((c) => sameSigning(c, bundle) && c.reverify)) {",
-  ];
+  // The exact branch condition, pinned. Nothing may be added to it — that is how
+  // the F-4 dead-code mutant (`&& !pinsReadable()`) got in. If this branch is
+  // legitimately reshaped, update the line here and say why; that review is the
+  // whole point of pinning it.
+  const EXPECTED_BRANCH = "} else if (contacts.isUnlocked() && contacts.pinWasSwept(currentPinKey)) {";
   const regionLines = region.split("\n");
-  const bi = regionLines.findIndex((l) => l === EXPECTED_BRANCH[0]);
-  assert.notStrictEqual(bi, -1,
-    "F-A2: renderVerify's reverify branch must open exactly `} else if (contacts.isUnlocked() &&` " +
-    "on the no-pin path — the unlock short-circuit is required (`list()` throws on a locked store, " +
-    "and `pinsReadable()` is also true on a device with no store at all)");
-  assert.strictEqual(regionLines[bi + 1], EXPECTED_BRANCH[1],
-    "F-A2: the reverify branch condition is pinned exactly; nothing may be added to it. Found:\n" +
-    `      ${regionLines[bi]}\n      ${regionLines[bi + 1] ?? "<eof>"}`);
+  assert.ok(regionLines.includes(EXPECTED_BRANCH),
+    "F-A2/F-A2-R1: renderVerify's swept-pin branch must read exactly:\n" +
+    `      ${EXPECTED_BRANCH}\n` +
+    "    The unlock short-circuit is required (`pinWasSwept()` throws on a locked store, and " +
+    "`pinsReadable()` is also true on a device with no store at all), and the lookup must be by " +
+    "the PIN KEY — keying it on a contact record is F-A2-R1, which missed room pins with no " +
+    "record and bystanders who had since rotated. Lines seen in the region:\n      " +
+    regionLines.filter((l) => l.includes("else if")).join("\n      "));
 
   const after = region.slice(marker, marker + 600);
   assert.ok(/els\.verify\.classList\.add\("changed"\)/.test(after),
