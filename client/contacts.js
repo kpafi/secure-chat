@@ -762,9 +762,35 @@ function dropPinsFor(contact) {
 // Was the pin under this key deleted as collateral of someone else's revocation?
 // Read by app.js's no-pin path so that arrival renders as "re-verify", never as a
 // benign first contact (F-A2 / F-A2-R1).
-export function pinWasSwept(key) {
+export function pinWasSwept(key, bundle = null) {
   if (!pins) throw new Error("contact store is locked");
-  return Boolean(swept && swept[key]);
+  if (!swept) return false;
+  if (swept[key]) return true;
+
+  // ROUND-3 F-3 (pentest of this fix). Keyed on the pin key ALONE, the alarm
+  // followed the label rather than the peer — and `room:<id>` keys are per chat
+  // code, so the same person in a different room came back as a benign FIRST
+  // CONTACT. That is M-2's inverted alarm returning through a side door, and it
+  // is the DEFAULT shape for Live-room use. The tombstone already recorded the
+  // swept pin's ed/mldsa; nothing read them.
+  //
+  // Signing keys only, as everywhere else here: they are the identity (the
+  // fingerprint and safety number cover only them).
+  if (!bundle || !bundle.ed || !bundle.mldsa) return false;
+  const sameId = (x) => Boolean(x) && x.ed === bundle.ed && x.mldsa === bundle.mldsa;
+  if (!Object.values(swept).some(sameId)) return false;
+
+  // ...but a pin SAVED for this identity since the sweep is the in-person
+  // safety-number check the alarm exists to demand, and that check authenticates
+  // the PERSON, not the room it happened to be done in. So it settles the whole
+  // identity. Without this the alarm would be unclearable for every other room —
+  // and an alarm that cannot be cleared is one users are trained to click past,
+  // which costs more than it buys.
+  //
+  // Note this deliberately does NOT clear sibling TOMBSTONES (see the per-key
+  // test): a key that was swept keeps its own marker, so re-verifying in one room
+  // cannot silence the specific room whose pin is still missing.
+  return !Object.values(pins).some(sameId);
 }
 
 // Cache the locally VERIFIED voucher names for a contact (the 🟡 mark). Only

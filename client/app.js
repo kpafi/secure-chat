@@ -2897,7 +2897,7 @@ async function enterVerification(room, verifiedBundle) {
     // `pinsReadable()` above is also true when this device has NO contact store
     // at all, and `pinWasSwept()` throws in that state — so the unlock check is
     // not redundant with it.
-  } else if (contacts.isUnlocked() && contacts.pinWasSwept(currentPinKey)) {
+  } else if (contacts.isUnlocked() && contacts.pinWasSwept(currentPinKey, bundle)) {
     // Pentest 2026-08-10-night F-A2. There is a third way to arrive here with no
     // pin, besides "never seen" and "pin deleted by an attacker": this pin was
     // swept as COLLATERAL when the user revoked somebody else who had these same

@@ -456,6 +456,36 @@ async function testPinHistoryFindings() {
     "F-A2-R1: clearing one tombstone must not clear another — they are per pin key");
   console.log("OK  F-A2-R1: tombstones are per pin key, not global");
 
+  // ROUND-3 F-3 (pentest of the F-A2-R1 fix): the alarm must follow the PEER, not
+  // just the label. `room:<id>` pin keys are per chat code, so a lookup keyed only
+  // on the pin key loses the alarm the moment the same person appears in a
+  // different room — and that arrival then renders as a benign FIRST CONTACT,
+  // which is M-2's inverted alarm coming back through the side door. The
+  // tombstone already records the swept pin's ed/mldsa; nothing read them.
+  await freshDevice();
+  const GIL = { ed: "R0lM", mldsa: "R0lMTQ" };
+  await contacts.savePin("room:alpha", GIL);
+  await contacts.upsert({ username: "mallory", ...GIL });
+  await contacts.upsert({ username: "mallory", ed: "TUFM", mldsa: "TUFMTQ" });
+  await contacts.remove("mallory");
+  assert.ok(contacts.pinWasSwept("room:alpha", GIL), "the swept key itself still alarms");
+  assert.ok(contacts.pinWasSwept("room:beta", GIL),
+    "ROUND-3 F-3: the same peer in a DIFFERENT room must still alarm — pin keys are per " +
+    "chat code, so keying the alarm on them alone loses it exactly when the peer moves rooms");
+  assert.ok(!contacts.pinWasSwept("room:beta", { ed: "T1RIRVI", mldsa: "T1RIRVJN" }),
+    "ROUND-3 F-3: ...and an unrelated identity in that room must NOT alarm");
+  console.log("OK  F-A2-R1/F-3: the alarm follows the peer's keys across pin keys");
+
+  // ...and re-verifying settles the IDENTITY, not merely the label it was saved
+  // under: the in-person safety-number check the alarm asks for is a check of the
+  // person, so a new room with them afterwards is a genuine first contact for that
+  // room. Without this the alarm could never be cleared for room:beta at all.
+  await contacts.savePin("room:alpha", GIL);                 // re-verified in person
+  assert.ok(!contacts.pinWasSwept("room:beta", GIL),
+    "ROUND-3 F-3: once the peer has been re-verified in person, a further room must not " +
+    "keep alarming — otherwise the alarm is unclearable and users learn to ignore it");
+  console.log("OK  F-A2-R1/F-3: re-verifying the peer settles the identity, not just one key");
+
   // Control: the sweep must not depend on the OTHER record being trustworthy —
   // that dependency IS F-A2. An `auto` contact, which one sealed envelope creates
   // with no user action at all, must not be able to preserve a revoked pin.
@@ -533,7 +563,7 @@ await testPinHistoryFindings();
   // the F-4 dead-code mutant (`&& !pinsReadable()`) got in. If this branch is
   // legitimately reshaped, update the line here and say why; that review is the
   // whole point of pinning it.
-  const EXPECTED_BRANCH = "} else if (contacts.isUnlocked() && contacts.pinWasSwept(currentPinKey)) {";
+  const EXPECTED_BRANCH = "} else if (contacts.isUnlocked() && contacts.pinWasSwept(currentPinKey, bundle)) {";
   const regionLines = region.split("\n");
   assert.ok(regionLines.includes(EXPECTED_BRANCH),
     "F-A2/F-A2-R1: renderVerify's swept-pin branch must read exactly:\n" +
