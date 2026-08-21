@@ -3,7 +3,109 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (2026-08-15 — A4's 3 Highs fixed in CODE; the item-14 TEST control still does not bind — 3 new Highs)
+> **Read the git log before trusting the top entry.** A session in progress can
+> land several commits between updates to this file, and this file's top section
+> going stale has already cost one session an afternoon of duplicated work
+> (2026-08-21: Phase 2 was re-implemented from scratch against a stale entry that
+> said it was still open). `git log --oneline -15` is the authority on what has
+> landed; this file is the authority on WHY.
+
+## ⮕ RESUME HERE (2026-08-21 — working the approved completion plan; 8 commits landed)
+
+**HEAD: `5c8dbcf`** on `pentest-2026-08-07-fixes`. Tree clean. Not pushed, not
+merged, not deployed. Client suite **221 OK / exit 0**, backend **168 passed**,
+hostile-relay `SCENARIO=directory` **13/13**.
+
+Working from a user-approved plan (phases 0-9). Three decisions were taken by the
+user on 2026-08-21 and are now settled:
+
+* **`/api/register`'s 409 echoes the stored `reg_seq`.** Approved as a wire change.
+* **Peer-chosen RSA key transport is to be DEPRECATED** (F-CRYPTO-009), rather
+  than adding a third handshake frame.
+* **Scope of "finished" = fixes + merge + deploy + an Android on-device pass.**
+  Lock-on-background (B5) is explicitly OUT. The anchor/restore design (B6) stays
+  deferred until a restore feature exists.
+
+### What landed (newest first)
+
+* `5c8dbcf` **android** — the `window.prompt()` password dialog now sets its OWN
+  `FLAG_SECURE`. A Dialog has its own Window and FLAG_SECURE marks a surface, so
+  the Activity's flag never covered it: a capture during the passphrase prompt
+  blacked out the activity and rendered the dialog legibly. Answers the open
+  question in §C10. **Also: the build is not broken** — `assembleDebug` succeeds
+  with JDK 21; the recorded breakage was the system default being a JDK 25 EA.
+* `ac36381` **Phase 6, item 8** — the hostile relay now serves a DIRECTORY
+  (`/api/register`, `/api/users/<name>`, auth/session, empty mailbox) behind
+  `DIRECTORY=honest|hostile`, plus `SCENARIO=directory`. Item 14 is visible end to
+  end for the first time: the directory names "bob", hands over the keys of the
+  peer that actually connects, and the client must still prompt. 13/13.
+  `EVIL_MODE=none` + `SCENARIO=attacker` now refuses to run instead of reporting
+  a meaningless 9/9.
+* `ea4afe9` **Phase 3 (backend)** — the three 409s carry `error` codes
+  (`username_taken`, `stale_counter`, `keys_locked`); `stale_counter` echoes
+  `stored_seq`. Reachable only after both ownership signatures verified AND the
+  stored row's keys matched, i.e. only the owner learns it. 3 tests pin that.
+* `7a0f6e3`, `7b1a933`, `c86fb74`, `08a20ef`, `ee13fdc` **Phase 2** — small
+  residuals (regseq output guard, `withWriteLock` timeout, stale prose); F-A3
+  ("arming failed" told apart from "never armed"); F-A2-R1 (the revocation marker
+  is now a TOMBSTONE on the pin key, not a contact record); F-A1-R1 (a probe-only
+  floor triple is no longer evidence of use, so an interrupted first save no
+  longer burns the padId); F-5 (the pad index is written right after the blob —
+  writing it last burned padIds, a regression `fc566dd` had shipped).
+* `568d3e3`, `f47c0df` **Phase 1** — the item-14 source controls now BIND. New
+  `client/test-source.mjs` replaces three inline prefix-filters with a real
+  comment scanner (knows strings, template literals, regex literals, nested
+  `${}`), a brace-matching `liftFunction` that asserts exactly one definition, and
+  a `referencesOf` allow-list. `describeIdentity` no longer returns a `mismatch`
+  boolean — it writes the prompt DOM and returns nothing, deleting the laundering
+  channel rather than naming it. `EXPECTED_WINDOW` now runs from the top of the
+  key-frame branch THROUGH the approval-gate body.
+  **The pentest of `f47c0df` found a High and it is fixed in `568d3e3`:** the
+  window ended AT the gate line, so the gate's body was unpinned and both a
+  blanket `approvedBundle = idbCanon` and item 14 rebuilt via `expectedPeerName`
+  passed 207/207. Both are RED now, as are an alias mutant and a regex-hiding
+  mutant.
+* `ccd7ffb` **docs** — reports moved to `docs/pentests/`, security history split
+  out of the README.
+
+### ⬜ NEXT — in order
+
+1. **⬜ The Phase-2 pentest gate is still OWED.** The agent reviewing
+   `568d3e3..7a0f6e3` was interrupted twice (once by a session limit) and has not
+   reported. Do not treat those five commits as reviewed. The highest-risk change
+   in them is **F-A1-R1, because it LOOSENS `padWasUsed`** — the guard against
+   one-time-pad reuse. Anything that makes a genuinely-consumed pad re-importable
+   at offset 0 reopens H-3 and is a Critical.
+2. **⬜ Prove `SCENARIO=directory` BINDS.** Install the item-14 route as a mutant
+   in `app.js` and confirm the scenario goes RED. Until that is shown, 13/13 is
+   not evidence — this project has produced three rounds of green-but-vacuous
+   controls and the harness is not exempt from the rule.
+3. **⬜ Phase 3, client half** — retry on `stored_seq + 1` instead of jumping to
+   `now + SLACK`; never re-send a refused value; stop reporting a counter 409 as
+   "username already taken" (`app.js:740-742`); replace `app.js:537`'s
+   `.catch(() => {})` with a visible warning. Then the `regseq.test.mjs` rework:
+   the M-1 test opens with `reset()` so it only ever exercises the fresh state and
+   passes while the bug it names is live; add `Date.now` stubs (no test stubs the
+   clock today, in the lane whose whole subject is clock skew).
+4. **⬜ Phase 4 — deprecate RSA** via the existing `UNAVAILABLE` mechanism in
+   `crypto.js:1132`; `makeCipher` refuses; the mode picker disables it with the
+   reason; an inbound mode-change to RSA is refused loudly; `all-modes.mjs`
+   expects 4 modes + a refusal.
+5. **⬜ Phase 5 — the rest of the test debt** (item 7 and §C9).
+6. **⬜ F-ATREST-008** — the identity blob has no anti-rollback control, and the
+   contacts anchor is load-bearing on it: the anchor is defeated by ROLLING BACK
+   the identity blob rather than deleting it, and every pre-fix blob has no
+   `flags` field at all, so today's blob on every device is the archived artifact.
+   Needs a monotone generation inside the blob's AEAD mirrored into the native
+   floor (that plumbing lives in `otp.js` and would want extracting).
+7. **⬜ Phase 7** — pentest the WHOLE branch, then merge.
+8. **⬜ Phase 8** — deploy (relay + client ship together; `register/v3`,
+   dual-scheme `/auth/verify` and now the 409 body all refuse older clients).
+9. **⬜ Phase 9** — Android on-device: recents snapshot blank, the password prompt
+   not capturable (the fix in `5c8dbcf` is UNVERIFIED on hardware), PadFloor proof.
+   No device was attached on 2026-08-21.
+
+## ⮕ (2026-08-15 — A4's 3 Highs fixed in CODE; the item-14 TEST control still does not bind — 3 new Highs)
 
 **Committed: `fc566dd`.** Working tree CLEAN. Not pushed, not merged, not
 deployed. `master` is still 1 commit ahead of `origin/master` from an earlier
