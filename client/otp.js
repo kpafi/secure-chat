@@ -401,12 +401,57 @@ function probeFloors(id) {
 // raised after it (here). A floor is never above the blob it is meant to protect.
 function armFloors(id, wm, exportedNow) {
   if (!nativeFloor) return { send: false, derived: false };
+  const wantExported = exportedNow ? 1 : 0;
   nativeFloor.bump(floorKeySend(id), wm.send);
   nativeFloor.bump(floorKeyRecv(id), wm.recv);
   // Bumped with 0 when the pad has not been exported, so an ordinary save keeps
   // the slot alive without lowering the latch (`bump` never lowers).
-  nativeFloor.bump(floorKeyExported(id), exportedNow ? 1 : 0);
-  return readFloorClaims(id);
+  nativeFloor.bump(floorKeyExported(id), wantExported);
+  const claims = readFloorClaims(id);   // throws on TAMPERED
+
+  // ROUND-3 F-1 (pentest of the F-A1-R1 fix, 2026-08-21). This return value used
+  // to be DISCARDED, and "a slot exists" was the only thing anyone checked — so a
+  // floor FROZEN at its current value (an unwritable prefs file; on Android
+  // `SharedPreferences.commit()`'s boolean is dropped too) let this function
+  // report success while the durable floor did not move at all.
+  //
+  // Why that was catastrophic rather than untidy: `app.js` persists BEFORE it
+  // transmits (P-04), so "the save succeeded" is precisely the signal that
+  // releases keystream onto the wire. The floor stayed at the probe-only 0, and
+  // since F-A1-R1 a probe-only triple is deliberately NOT evidence of use — so
+  // deleting the (deletable) localStorage markers and re-importing the (always
+  // pristine) pad file brought the pad back at sendOffset 0 and spent the same
+  // keystream twice. C1 XOR C2 = P1 XOR P2: the one failure a one-time pad cannot
+  // survive, and the exact hole H-3 closed.
+  //
+  // Tightening `padWasUsed` again is not the repair — every input it has left is
+  // attacker-deletable, and tightening it is what burned padIds and produced
+  // F-A1-R1 in the first place. The repair is to stop the SAVE from succeeding
+  // when the floor it depends on did not take.
+  //
+  // Scoped deliberately to slots the blob CLAIMS are armed. `probeFloors` makes a
+  // different trade for a slot it could not create at all — it records
+  // CLAIM_UNCONFIRMED and routes the pad through the adoption consent gate rather
+  // than refusing, because a permanent brick is the worse outcome there. That
+  // decision is untouched: this only fires when a slot exists, i.e. when the blob
+  // is about to promise a guard that is not actually in force.
+  const readBack = {
+    send: nativeFloor.read(floorKeySend(id)),
+    recv: nativeFloor.read(floorKeyRecv(id)),
+    exported: nativeFloor.read(floorKeyExported(id)),
+  };
+  const stuck = (claims.send === CLAIM_ARMED && readBack.send < wm.send)
+    || (claims.derived === CLAIM_ARMED
+      && (readBack.recv < wm.recv || readBack.exported < wantExported));
+  if (stuck) {
+    throw new Error(
+      "this device's rollback guard did not record this pad's progress (the protected floor " +
+      `did not move: send ${readBack.send}/${wm.send}, recv ${readBack.recv}/${wm.recv}). ` +
+      "Nothing was sent. The pad is unchanged on this device — free some storage and try " +
+      "again; if it keeps happening, exchange a fresh pad in person rather than continuing.",
+    );
+  }
+  return claims;
 }
 
 // Seal the authenticated watermark. PURE: it returns the record to store and

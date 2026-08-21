@@ -1558,4 +1558,105 @@ await testUnarmableFloorIsNotSealedAsAbsent();
   console.log("OK  F-A1: app.js latches the export before releasing the pad file");
 }
 
+// ---------------------------------------------------------------------------
+// ROUND-3 F-1 (2026-08-21, pentest of the F-A1-R1 fix): a floor that does not
+// actually MOVE must fail the save, loudly, before any keystream is transmitted.
+//
+// How F-A1-R1 reopened H-3. `armFloors`' return value was discarded, and
+// `readFloorClaims` only throws on TAMPERED — a slot still sitting at 0 after
+// `bump(k, 4096)` reads back as `s >= 0`, i.e. "armed". So a floor frozen at 0
+// (an unwritable prefs file; on Android `SharedPreferences.commit()`'s boolean is
+// also dropped) let `writePadBlob` return SUCCESS. app.js persists before it
+// transmits (P-04), so success is exactly the signal that releases the keystream
+// onto the wire — and the durable floor stayed at the probe-only 0, which after
+// F-A1-R1 is no longer evidence of use. Delete the (deletable) localStorage
+// markers, re-import the (always pristine) pad file, and the pad comes back at
+// sendOffset 0: the SAME keystream is spent twice. C1 XOR C2 = P1 XOR P2, the one
+// failure a one-time pad cannot survive.
+//
+// The fix is not to tighten `padWasUsed` again — every input it has left is
+// attacker-deletable, and tightening it is what burned padIds in the first place.
+// It is to stop the save from SUCCEEDING when the floor it depends on did not
+// take: verify the read-back covers the watermark just sealed, and throw if it
+// does not. Then the keystream is never sent, and the state left behind is
+// forward-consistent (the blob carries the higher offsets; unlockPad's max()
+// takes them).
+async function testFrozenFloorFailsTheSaveBeforeSending() {
+  const slots = new Map();
+  let freeze = false;
+  const floor = {
+    read: (k) => (slots.has(k) ? slots.get(k) : -1),
+    bump: (k, v) => {
+      // A frozen store: the value is refused, but the slot that already exists
+      // still reads back fine. This is the shape the pentest's PoC used, and it
+      // is what an unwritable prefs file does.
+      if (freeze) return floor.read(k);
+      if (v < 0) return floor.read(k);
+      const n = Math.max(floor.read(k), v);
+      slots.set(k, n);
+      return n;
+    },
+  };
+  Object.defineProperty(globalThis, "__SECURE_CHAT_NATIVE_FLOOR__", { value: true, configurable: true });
+  Object.defineProperty(globalThis, "__SECURE_CHAT_PAD_FLOOR__", { value: Object.freeze(floor), configurable: true });
+
+  const store = new Map();
+  globalThis.localStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k),
+  };
+
+  const otp = await import(`./otp.js?frozen&t=${Date.now()}`);
+  const PASS = "pad passphrase";
+  const pad = await otp.generatePad({ label: "frozen", totalBytes: 64 * 1024 });
+  const at = await otp.saveNewPad(pad, PASS);
+
+  // Now the prefs file becomes unwritable, and the pad consumes keystream.
+  freeze = true;
+  pad.sendOffset = 4096;
+  await assert.rejects(() => otp.savePadProgress(pad, at), /rollback guard|floor/i,
+    "ROUND-3 F-1: a save whose floor did not move must FAIL. app.js persists before it " +
+    "transmits, so returning success here is what puts the keystream on the wire while " +
+    "nothing durable records that it was spent.");
+  console.log("OK  F-1: a frozen native floor fails the save instead of returning success");
+
+  // THE INVARIANT this restores, stated as the property rather than as one of its
+  // consequences: **if a save RESOLVES, the durable floor covers the offsets that
+  // save recorded.** That is what makes `padWasUsed` sound after F-A1-R1 — a
+  // probe-only (0,0,0) can then only mean "no keystream was ever transmitted",
+  // because app.js persists before it transmits and a persist that did not reach
+  // the floor now rejects.
+  //
+  // Note what is NOT asserted here, because getting it wrong is how the previous
+  // round talked itself into a hole: after the REFUSED save the pad is still
+  // re-importable at 0, and that is CORRECT, not a residual. The save threw, so
+  // app.js never sent, so bytes 0..4096 are unspent. Re-importing spends them
+  // once. The danger was never "the pad came back"; it was "the pad came back
+  // AFTER the keystream had already gone out".
+  assert.strictEqual(floor.read(pad.padId), 0, "F-1 setup: the floor really is stuck at 0");
+
+  freeze = false;
+  const pad2 = await otp.generatePad({ label: "healthy", totalBytes: 64 * 1024 });
+  const at2 = await otp.saveNewPad(pad2, PASS);
+  pad2.sendOffset = 4096;
+  await otp.savePadProgress(pad2, at2);          // resolves...
+  assert.ok(floor.read(pad2.padId) >= 4096,      // ...so the floor MUST cover it
+    "ROUND-3 F-1: a save that resolves must leave the protected floor covering the offsets " +
+    `it recorded — got ${floor.read(pad2.padId)}, expected >= 4096. If this can fail, a pad ` +
+    "whose keystream is already on the wire can still look unused, which is H-3.");
+
+  // ...and therefore the H-3 attack fails on it: markers deleted, re-import refused.
+  for (const k of [...store.keys()]) store.delete(k);
+  assert.strictEqual(otp.padWasUsed(pad2.padId), true,
+    "ROUND-3 F-1: H-3 stays closed for a pad that actually transmitted — every deletable " +
+    "marker is gone and the undeletable floor still refuses the re-import");
+  console.log("OK  F-1: a save that resolves always leaves a floor covering it (H-3 closed)");
+
+  delete globalThis.__SECURE_CHAT_NATIVE_FLOOR__;
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+}
+
+await testFrozenFloorFailsTheSaveBeforeSending();
+
 console.log("All OTP native-floor scope checks passed.");
