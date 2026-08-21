@@ -396,16 +396,32 @@ function withWriteLock(fn) {
   // silently, because there is no user-visible signal that a persist never
   // returned. Losing history quietly is the failure this store is built to avoid,
   // so a stuck lock now surfaces as an error the caller can report instead.
-  const guarded = () => Promise.race([
-    run(),
+  // ROUND-3 F-6 (pentest 2026-08-21). The timeout used to be raced against the
+  // work AND used as the link in the chain, so a slow write was ABANDONED rather
+  // than cancelled: `Promise.race` does not stop `run()`. The chain advanced at
+  // the timeout, the next `persistLocked` started while the first was still in
+  // flight, and the loser then wrote store `gen N+1` on top of the winner's `N+2`
+  // while `writeWitness()` read the module-level generation — store older than
+  // witness, which `assertNotRolledBack` refuses PERMANENTLY. That is precisely
+  // the unrecoverable lockout the CAS exists to prevent, manufactured by the
+  // guard meant to prevent a hang.
+  //
+  // So the chain now follows the REAL completion and the timeout only REPORTS.
+  // Subsequent writes still queue behind a genuinely stuck one — that is correct,
+  // they must — but nobody waits silently any more, which was the whole point of
+  // adding a timeout. Visibility without concurrency.
+  const started = writeChain.then(run, run);
+  writeChain = started.then(() => {}, () => {});
+  return Promise.race([
+    started,
     new Promise((_, reject) => setTimeout(
-      () => reject(new Error("the chat store's write lock did not become available — another tab or script is holding it; your last change was NOT saved")),
+      // Worded to be TRUE in both worlds: under Web Locks the abandoned callback
+      // does eventually run when the holder releases, so the old "your last change
+      // was NOT saved" was a claim this code cannot make.
+      () => reject(new Error("the chat store's write is taking too long — another tab or script may be holding the lock. Your last change may not have been saved; do not close this tab until it stops warning.")),
       WRITE_LOCK_TIMEOUT_MS,
     )),
   ]);
-  const next = writeChain.then(guarded, guarded);
-  writeChain = next.then(() => {}, () => {});
-  return next;
 }
 
 async function persist() {

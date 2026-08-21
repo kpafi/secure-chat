@@ -2794,14 +2794,29 @@ async function handleMessage(room, raw) {
       }
       try {
         const text = await cipher.decrypt(m.payload);
-        addLine("peer", "peer", text);
         // P-04: recvHighWater must reach disk too — an unpersisted receive
         // watermark lets an already-delivered frame be replayed after a reload.
+        //
+        // ROUND-3 F-2 (pentest 2026-08-21): persist BEFORE displaying, mirroring
+        // the send path, which persists before it transmits. The old order left a
+        // window where a frame had been accepted and shown while nothing durable
+        // recorded that its keystream was consumed — and on the FIRST frame a pad
+        // ever receives that window has the floors still at the probe-only
+        // (0,0,0), which since F-A1-R1 is deliberately not evidence of use. A
+        // crash there plus H-3's marker deletion made the pad re-importable, which
+        // rewinds recvHighWater and re-authenticates every already-delivered frame
+        // as fresh (the M-7 class). Persisting first makes "shown to the user"
+        // imply "durably recorded as spent".
+        //
+        // A failure still SHOWS the message rather than dropping it: the keystream
+        // is already spent in memory, so dropping would lose content the pad paid
+        // for while making nothing safer. `otpPersistFailed` is the loud part.
         try {
           await persistOtpProgress();
         } catch (err) {
           otpPersistFailed(err);
         }
+        addLine("peer", "peer", text);
       } catch {
         addLine("sys", "", "[undecryptable message — wrong key or tampered]");
       }

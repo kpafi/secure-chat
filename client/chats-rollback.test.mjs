@@ -316,7 +316,7 @@ async function testStuckWriteLockSurfaces() {
       configurable: true, writable: true,
     });
     await assert.rejects(() => chats.ensure("bob"),
-      /write lock did not become available/,
+      /taking too long/,
       "item 11: a write lock nobody releases must REJECT, not hang forever — a silently dropped " +
       "write is indistinguishable from a saved one to the user, and quiet history loss is the " +
       "exact failure this store exists to prevent");
@@ -331,4 +331,67 @@ async function testStuckWriteLockSurfaces() {
 }
 
 await testStuckWriteLockSurfaces();
+
+// ---------------------------------------------------------------------------
+// ROUND-3 F-6 (pentest of the timeout above): the timeout must REPORT, never
+// release. `Promise.race` does not cancel `run()`, so chaining the next write on
+// the RACE let a slow write be abandoned rather than cancelled — the next
+// persistLocked started while the first was still in flight. The loser then wrote
+// store `gen N+1` over the winner's `N+2` while writeWitness() read the
+// module-level generation, leaving store older than witness, which
+// assertNotRolledBack refuses PERMANENTLY: the unrecoverable lockout the CAS
+// exists to prevent, manufactured by the guard meant to prevent a hang.
+//
+// Two assertions, because each alone is satisfiable by the bug:
+//   1. a REPLICA of the shipped chaining logic must never run two callbacks at
+//      once, even when one exceeds the timeout;
+//   2. a source anchor that the shipped chain is built from the WORK promise
+//      rather than from the race — the replica cannot prove that by itself.
+async function testTimeoutDoesNotReleaseTheLock() {
+  const TIMEOUT = 20;
+  let inFlight = 0;
+  let overlapped = false;
+  let writeChain = Promise.resolve();
+
+  // Replica of chats.js withWriteLock's chaining, deliberately verbatim in shape.
+  const withWriteLock = (run) => {
+    const started = writeChain.then(run, run);
+    writeChain = started.then(() => {}, () => {});
+    return Promise.race([
+      started,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("taking too long")), TIMEOUT)),
+    ]);
+  };
+
+  const slow = (ms) => async () => {
+    inFlight++;
+    if (inFlight > 1) overlapped = true;
+    await new Promise((r) => setTimeout(r, ms));
+    inFlight--;
+  };
+
+  const a = withWriteLock(slow(TIMEOUT * 4)).catch(() => "reported");
+  const b = withWriteLock(slow(1)).catch(() => "reported");
+  assert.strictEqual(await a, "reported",
+    "F-6: the caller of a slow write must still be TOLD — visibility is why the timeout exists");
+  await b;
+  await writeChain;
+  assert.strictEqual(overlapped, false,
+    "ROUND-3 F-6: two store writes must never be in flight at once. The timeout may report a " +
+    "slow write; it may not let the next one start on top of it, because the loser's generation " +
+    "then lands after the winner's and assertNotRolledBack locks the store out forever.");
+  console.log("OK  F-6: a timed-out write is reported, not released — no concurrent persists");
+
+  const { readFile } = await import("node:fs/promises");
+  const { stripComments } = await import("./test-source.mjs");
+  const src = stripComments(await readFile(new URL("./chats.js", import.meta.url), "utf8"));
+  assert.match(src, /const started = writeChain\.then\(run, run\);/,
+    "F-6: the write chain must be built from the WORK promise...");
+  assert.match(src, /writeChain = started\.then\(/,
+    "...and must advance on that promise, not on the timeout race — chaining on the race is " +
+    "exactly what let an abandoned write run concurrently with the next one");
+  console.log("OK  F-6: the shipped chain follows the real completion, not the race");
+}
+
+await testTimeoutDoesNotReleaseTheLock();
 console.log("All chat-store concurrency checks passed.");

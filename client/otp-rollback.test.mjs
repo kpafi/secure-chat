@@ -1556,6 +1556,25 @@ await testUnarmableFloorIsNotSealedAsAbsent();
     "F-A1: app.js must await markExported BEFORE downloadText hands the pad file over — " +
     "the other order can release a pad file that nothing on this device records as exported");
   console.log("OK  F-A1: app.js latches the export before releasing the pad file");
+
+  // ROUND-3 F-2: the RECEIVE path must persist before it displays, mirroring the
+  // send path's persist-before-transmit. Shown-but-not-persisted is a frame whose
+  // keystream is spent with nothing durable saying so — and on a pad's first
+  // received frame the floors are still the probe-only (0,0,0), which since
+  // F-A1-R1 is not evidence of use, so a crash there plus H-3's marker deletion
+  // rewinds recvHighWater and replays every delivered frame.
+  const recvCase = code.indexOf('case "msg": {');
+  assert.notStrictEqual(recvCase, -1, "the msg case must still exist in app.js");
+  const recvBody = code.slice(recvCase, recvCase + 1400);
+  const persistAt = recvBody.indexOf("await persistOtpProgress();");
+  const showAt = recvBody.indexOf('addLine("peer", "peer", text);');
+  assert.notStrictEqual(persistAt, -1, "the msg case must still persist OTP progress");
+  assert.notStrictEqual(showAt, -1, "the msg case must still display the decrypted line");
+  assert.ok(persistAt < showAt,
+    "ROUND-3 F-2: app.js must await persistOtpProgress BEFORE addLine displays the frame — " +
+    "the other order shows the user a message whose keystream nothing on this device records " +
+    "as spent");
+  console.log("OK  F-2: app.js persists the receive watermark before displaying the frame");
 }
 
 // ---------------------------------------------------------------------------
