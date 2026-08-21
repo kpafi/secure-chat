@@ -83,6 +83,21 @@ const ok = (m) => { n++; console.log("ok", m); };
   ok("liftFunction ignores a block-comment decoy of the same function");
 }
 
+// --- ROUND-4: a `{}` in the PARAMETER LIST must not be taken as the body -----
+{
+  // `function f(a, opts = {}) { ... }` — taking the first `{` after the name lands
+  // inside the default parameter, brace-matching closes on its `}`, and the lift
+  // returns the signature only. Every assertion over that body then passes
+  // vacuously. Found in the field: an allow-list over makeCipher's `case` labels
+  // reported ZERO cases against a file that plainly has four.
+  const src = 'function target(a, opts = {}) {\n  switch (a) {\n    case "X": return 1;\n  }\n}';
+  const body = liftFunction(stripComments(src), "target", assert);
+  assert.match(body, /case "X"/,
+    "the lifted body must contain the real body, not stop at a default-parameter brace");
+  assert.ok(body.trim().endsWith("}"), "and it must be brace-balanced through the real body");
+  ok("liftFunction skips a `{}` default parameter and lifts the real body");
+}
+
 // --- liftFunction: two REAL definitions are rejected, not silently first-won -
 {
   const src = [

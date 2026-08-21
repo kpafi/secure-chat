@@ -1,6 +1,6 @@
 // Full-stack integration test: two real WebSocket clients talk through the
 // running relay using the SAME handshake protocol as app.js. Verifies the
-// server relays opaque ciphertext and that DHKE/RSA handshakes converge.
+// server relays opaque ciphertext and that DHKE/PQKEM handshakes converge.
 //
 // Requires the server running:  cd backend && ./run.sh
 // Run:                          node client/integration.test.mjs
@@ -124,7 +124,6 @@ async function testAlg(alg) {
 
 await testAlg("DHKE");
 await testAlg("AES256");
-await testAlg("RSA");
 await testAlg("PQKEM");
 console.log("\nAll integration checks passed.");
 process.exit(0);

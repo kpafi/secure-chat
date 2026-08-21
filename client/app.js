@@ -6,7 +6,7 @@
 // interpreted as markup.
 //
 // SECURITY — authenticated key exchange (closes the MITM gap):
-//   For the handshake modes (DHKE / RSA) the ephemeral/public key is signed by
+//   For the handshake modes (DHKE / PQKEM) the ephemeral/public key is signed by
 //   a long-term IDENTITY (Ed25519 + ML-DSA-65, see identity.js). The peer
 //   verifies that dual signature against the identity bundle that arrived, then
 //   the user confirms a SAFETY NUMBER in person. A relay that swaps the
@@ -18,7 +18,7 @@
 //   up by username and pre-pin their bundle. It is a convenience, not a trust
 //   root (it shares the relay's origin), so the in-person check still governs.
 
-import { makeCipher, isAscii, bufToB64, b64ToBuf } from "./crypto.js";
+import { makeCipher, isAscii, bufToB64, b64ToBuf, DEPRECATED_ALGS } from "./crypto.js";
 import { Identity } from "./identity.js";
 import {
   signHandshake, verifyHandshake, freshNonce, isValidNonce, signKnock, verifyKnock,
@@ -494,13 +494,24 @@ function wsUrl() {
 }
 
 function algNeedsIdentity(alg) {
-  return alg === "DHKE" || alg === "RSA" || alg === "PQKEM";
+  // RSA was here until 2026-08-21 (F-CRYPTO-009, see the tombstone in
+  // crypto.js). It is not merely unlisted: index.html no longer offers it and
+  // makeCipher refuses it outright.
+  return alg === "DHKE" || alg === "PQKEM";
 }
 
 // The encryption picker is a radio-card group (one input per mode); exactly one
 // is always checked (DHKE by default in the markup).
+//
+// The `.value` read used to be unguarded, so a markup change that dropped the
+// `checked` attribute (e.g. while removing a mode card) would surface as a bare
+// TypeError on null deep inside connect(). Name the failure instead: connect()
+// turns a throw here into a red hint, which is the loud refusal this project
+// wants in place of an unexplained crash.
 function algValue() {
-  return els.algCards.querySelector('input[name="alg"]:checked').value;
+  const picked = els.algCards.querySelector('input[name="alg"]:checked');
+  if (!picked) throw new Error("no encryption mode is selected");
+  return picked.value;
 }
 
 // ---- identity management --------------------------------------------------
@@ -1803,7 +1814,7 @@ function stopMailboxPolling() {
 // ---- connection lifecycle -------------------------------------------------
 
 // Pentest 2026-07-26 P-19: connect() awaits a directory fetch, a pad unlock
-// (600k PBKDF2) and RSA keygen before it disabled the button, so a double-click
+// (600k PBKDF2) and a keypair generation before it disabled the button, so a double-click
 // ran two overlapping connects that fought over ws/cipher/otpRecord/
 // otpLockRelease — the second call's releaseOtpLock() dropped the lock the first
 // had just taken, and both opened sockets into a room capped at two members,
@@ -1816,6 +1827,16 @@ async function connect() {
   els.connect.disabled = true;
   try {
     await connectInner();
+  } catch (e) {
+    // ROUND-4 (pentest of the RSA removal): `connectInner` can throw before it
+    // reaches its own try — `algValue()` is called on its first line, outside it.
+    // The click handler discards this promise and the client installs no
+    // `unhandledrejection` handler, so without this catch a named error reaches
+    // the console and the user sees an unexplained dead button. A refusal the
+    // user cannot see is not a refusal; that is the property this codebase keeps
+    // insisting on, so it has to be true here too.
+    hint(e.message, true);
+    setStatus("disconnected", "err");
   } finally {
     connecting = false;
     // connectInner keeps the button disabled for the life of a live socket (the
@@ -2323,8 +2344,8 @@ function admittedSomeone() {
 }
 
 // Produce + sign the next handshake payload. Computed fresh each call (not
-// cached): for PQKEM and RSA the initial "offer" and the "answer" are different
-// payloads (RSA's answer transports the wrapped root secret), and each must
+// cached): for PQKEM the initial "offer" and the "answer" are different
+// payloads (the answer carries the encapsulation to the peer's key), and each must
 // carry its own signature. For DHKE the payload is idempotent, so re-signing
 // the reply is just a negligible extra signature. The signature covers both
 // per-connection nonces, so it is only meaningful once the hello exchange
@@ -2374,7 +2395,7 @@ function sendSignedKey(room, reply) {
 // Pentest 2026-07-29 M-5. The exchange above was right, but it assumed the
 // chains it confirms never change afterwards. They can: `_derive` REPLACES
 // `this.chan` (and so both confirmation tags) whenever its input signature
-// changes, in PQKEM and RSA alike. Two consequences, both of which this block
+// changes (PQKEM). Two consequences, both of which this block
 // now handles explicitly:
 //
 //  1. THE ATTACK. A relay replays one genuine hello and delays one genuine
@@ -2465,6 +2486,25 @@ async function handleMessage(room, raw) {
   try {
     m = JSON.parse(raw);
   } catch {
+    return;
+  }
+
+  // Deprecation backstop (F-CRYPTO-009, 2026-08-21). The live-room mode is
+  // chosen ENTIRELY LOCALLY — from this page's own radio, frozen into
+  // `sessionAlg` at connect time — and no inbound frame has ever selected a
+  // cipher: `alg` on the wire is an advisory tag that neither this dispatch nor
+  // the relay reads. So a peer or relay claiming alg:"RSA" cannot downgrade us.
+  // What it CAN mean is that the other end is an old build still running the
+  // removed mode, in which case nothing it sends is decryptable here. Say that
+  // out loud rather than letting it arrive as a generic "undecryptable message":
+  // an unexplained mismatch is exactly what a downgrade would look like if the
+  // local-only property ever broke, and this codebase treats a quiet mode
+  // discrepancy as a finding. Drop the frame only — never throw (an unhandled
+  // throw here would stall every later frame in the pump) and never adopt the
+  // peer's mode.
+  if (typeof m.alg === "string" && Object.prototype.hasOwnProperty.call(DEPRECATED_ALGS, m.alg)) {
+    addLine("sys", "", `[frame refused — the other end is using ${m.alg}, which this version has removed]`);
+    hint(`${m.alg} is no longer supported — ${DEPRECATED_ALGS[m.alg]}`, true);
     return;
   }
 
@@ -3496,14 +3536,24 @@ els.copyCode.addEventListener("click", async () => {
 const ALG_LABELS = {
   DHKE: "DHKE (recommended)",
   AES256: "AES-256 with a shared passphrase",
-  RSA: "RSA",
   PQKEM: "post-quantum (ML-KEM-768)",
   OTP: "one-time pad",
 };
 function syncAlgUI() {
-  const alg = algValue();
+  // ROUND-4: this runs at module scope during init, so an `algValue()` throw here
+  // would abort the REST of app.js's setup (identity UI, the default room code,
+  // invite-link handling) with nothing shown — a blank, half-built page. Report it
+  // and leave the rest of init to run; `connect()` still refuses loudly, which is
+  // where the refusal actually has to bite.
+  let alg;
+  try {
+    alg = algValue();
+  } catch (e) {
+    els.algSummary.textContent = "Security options — " + e.message;
+    return;
+  }
   els.passRow.hidden = alg !== "AES256";
-  els.contactRow.hidden = !algNeedsIdentity(alg); // lookup only aids DHKE/RSA
+  els.contactRow.hidden = !algNeedsIdentity(alg); // lookup only aids DHKE/PQKEM
   els.otpPanel.hidden = alg !== "OTP";
   els.algSummary.textContent = "Security options — currently: " + (ALG_LABELS[alg] || alg);
   // A non-default choice needs the panel to stay open, or the setting becomes

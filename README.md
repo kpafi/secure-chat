@@ -6,8 +6,8 @@ forwards opaque ciphertext between two parties in a room. The server never
 holds keys, never decrypts, and never stores or logs message content.
 
 > Status: **backend relay + web client working locally and deployed**, five
-> encryption modes verified end-to-end in real browsers (DHKE, AES-256, RSA,
-> PQKEM, OTP; `e2e/all-modes.mjs`), all forward-secret ratchets. The DHKE/RSA/PQKEM key exchange is **authenticated in
+> encryption modes verified end-to-end in real browsers (DHKE, AES-256, PQKEM,
+> OTP; `e2e/all-modes.mjs`), all forward-secret ratchets. The DHKE/PQKEM key exchange is **authenticated in
 > the browser client** with long-term identity keys (Ed25519 + ML-DSA-65) and an
 > in-person safety-number check, closing the relay-MITM gap. The relay is
 > reachable over a **Tor v3 onion service** as well as clearnet — see
@@ -75,7 +75,7 @@ Client A --[ciphertext]--> Relay server --[ciphertext]--> Client B
   key material, and a hostile directory could switch the approval off for exactly
   the flow it was meant to protect. Restoring it needs signed directory answers.
 - Wire format: strict JSON envelope, printable ASCII only, validated by pydantic.
-- The encryption menu (RSA / AES-256 / DHKE / post-quantum KEM / OTP) is a
+- The encryption menu (AES-256 / DHKE / post-quantum KEM / OTP) is a
   **client** concern; the `alg` field is just an advisory tag the server relays.
 
 ## Run locally
@@ -121,7 +121,6 @@ Two rules that are easy to get wrong and expensive to get wrong:
 |---------|-------------------------------------|---------------------|---------------------------------------------|
 | DHKE    | ephemeral ECDH P-256                | ratcheted AES-256-GCM (one-time keys) | **identity-authenticated**, **forward-secret** |
 | AES256  | PBKDF2 from shared passphrase + session nonces | ratcheted AES-256-GCM (one-time keys) | no key swap → not relay-MITM-able |
-| RSA     | RSA-OAEP-2048 key transport         | ratcheted AES-256-GCM (one-time keys) | **identity-authenticated**, **forward-secret** |
 | PQKEM   | **hybrid ECDH P-256 + ML-KEM-768**  | ratcheted AES-256-GCM (one-time keys) | post-quantum; **identity-authenticated**, **forward-secret** |
 | OTP     | pre-shared pad, exchanged in person | **true XOR one-time pad** + one-time HMAC-SHA-256 tag | information-theoretic *confidentiality* (see caveats); no network key swap → not relay-MITM-able |
 
@@ -135,14 +134,14 @@ secret *and* an ML-KEM-768 (FIPS-203) secret, so the session stays
 confidential unless an attacker breaks **both** — defeating "harvest now,
 decrypt later" while remaining no weaker than DHKE if ML-KEM were faulted. It is
 authenticated by the same dual (Ed25519 + ML-DSA-65) identity handshake, so the
-*authentication* is also one-classical-one-post-quantum. Like RSA, it erases
-its handshake material (ECDH private key, KEM secret key, raw shared secrets)
+*authentication* is also one-classical-one-post-quantum. It erases its
+handshake material (ECDH private key, KEM secret key, raw shared secrets)
 the moment real traffic starts; **DHKE** drops its private key even earlier, as
-soon as the chains are derived. So all three handshake modes have in-session
+soon as the chains are derived. So both handshake modes have in-session
 *and* cross-session forward secrecy: state captured at time T decrypts nothing
 from before T, and never another session.
 
-DHKE and RSA handshakes are signed by a long-term identity (Ed25519 + ML-DSA-65)
+DHKE and PQKEM handshakes are signed by a long-term identity (Ed25519 + ML-DSA-65)
 that each user generates locally and the other verifies **in person** by
 comparing a safety number. A hostile relay that swaps the ephemeral key cannot
 forge the signature; one that swaps the whole identity is caught because the two
@@ -154,20 +153,20 @@ new one — it can never cover the nonce the victim just generated. Identity
 private keys are passphrase-encrypted on the device and never sent to the
 server.
 
-**RSA mode** is RSA *key transport* plus a forward-secret symmetric ratchet.
-The handshake answer transports an RSA-OAEP-wrapped 32-byte root secret; both
-sides HKDF it into two direction-separated HMAC-SHA-256 *chain* keys, and every
-message is encrypted with a **one-time AES-256-GCM key** drawn from the
-sender's chain (`msgKey = HMAC(chain, 0x01)`, `chain' = HMAC(chain, 0x02)`).
-The chain only steps forward and consumed keys are deleted, and the moment real
-traffic starts the client erases the root secret *and* the per-session RSA
-private key — so compromising a device mid-conversation reveals nothing about
-earlier messages (**forward secrecy**), and past sessions are never affected.
-Authenticity comes with it: the relay never learns the wrapped root, so forged
-frames fail AEAD authentication; direction-separated chains reject reflection;
-strictly increasing sequence numbers plus one-time keys reject replay. (The
-other modes get forgery protection implicitly: their AES-GCM key is a shared
-secret the relay never learns.)
+**RSA mode was removed on 2026-08-21** (pentest finding F-CRYPTO-009) and this
+build refuses it: it is not offered in the menu, and `makeCipher` throws with
+the reason if anything asks for it. RSA *key transport* lets one side choose the
+modulus that the other side's root secret is encrypted to, and a counterparty
+who offers `e = 65537` with `n = <small factor> x <large prime>` hands the whole
+session — both directions, past and future — to any passive observer of the
+handshake. No cheap validation can detect that (nothing certifies a modulus is
+the product of two large primes), and the alternative fix, making the root
+contributory, needs a third handshake frame the protocol has no room for. DHKE
+and PQKEM have no analogue: their peer material is a P-256 point (on-curve and
+non-identity enforced by WebCrypto, prime order) plus an ML-KEM encapsulation
+key, and the secret is contributory. Use those.
+(The remaining modes get forgery protection implicitly: their AES-GCM key is a
+shared secret the relay never learns.)
 
 **AES256 mode** runs the same ratchet, rooted in the PBKDF2-derived passphrase
 secret **plus a fresh random session nonce from each peer** (exchanged in a
@@ -178,7 +177,7 @@ replay residual. Honest limit: the passphrase is a long-term secret that lives
 outside the code (your head, the input field), so an attacker who learns *it*
 and recorded the ciphertext can still derive every session's keys — the
 ratchet's forward secrecy protects only against captured ratchet *state*. For
-real forward secrecy use DHKE, PQKEM, or RSA.
+real forward secrecy use DHKE or PQKEM.
 
 **OTP mode** is a genuine **one-time pad**: a large random pad is generated on
 one device and carried to the other **in person** (exported as a
@@ -272,7 +271,7 @@ Client -> server JSON envelope (`backend/validation.py`, `extra="forbid"`):
 | type    | enum   | `join` \| `leave` \| `key` \| `msg` \| `knock` \| `admit` \| `deny` |
 | room    | string | exactly 64 lowercase hex chars (256-bit id)                  |
 | payload | string | base64; ciphertext / key material / the knocker's opaque self-introduction |
-| alg     | enum?  | advisory: `RSA`,`AES256`,`DHKE`,`PQKEM`,`OTP` (server ignores)|
+| alg     | enum?  | advisory: `AES256`,`DHKE`,`PQKEM`,`OTP` (server ignores; the `RSA` member is kept for wire compat with old clients, which this client refuses) |
 | jid     | string?| only on `admit`/`deny`: the server-issued join id of the waiting socket |
 
 Server -> client: `{"type":"joined","role":"owner"|"guest"}`,
@@ -302,7 +301,7 @@ A room id is therefore a secret: anyone who learns one can take a slot in that
 include confidentiality or impersonation:
 - **No plaintext.** Everything the relay forwards is opaque ciphertext; a
   squatter reads nothing.
-- **No impersonation.** For DHKE/RSA/PQKEM the key exchange is signed by a
+- **No impersonation.** For DHKE/PQKEM the key exchange is signed by a
   long-term identity and gated by an in-person safety number, so a squatter
   cannot pose as the real contact — the handshake fails and the UI says so. For
   AES256 the passphrase (never sent) is the gate.

@@ -59,6 +59,10 @@ class Algorithm(str, Enum):
     never branch on this for any crypto decision because it does no crypto.
     """
 
+    # Kept for wire compatibility with clients predating 2026-08-21 only. The
+    # current client neither emits nor accepts RSA (pentest F-CRYPTO-009: peer-
+    # chosen RSA key transport was removed); it refuses a frame tagged with it.
+    # Dropping the member here would buy nothing — the relay never reads `alg`.
     rsa = "RSA"
     aes256 = "AES256"
     dhke = "DHKE"

@@ -87,10 +87,18 @@ user on 2026-08-21 and are now settled:
    the M-1 test opens with `reset()` so it only ever exercises the fresh state and
    passes while the bug it names is live; add `Date.now` stubs (no test stubs the
    clock today, in the lane whose whole subject is clock skew).
-4. **⬜ Phase 4 — deprecate RSA** via the existing `UNAVAILABLE` mechanism in
-   `crypto.js:1132`; `makeCipher` refuses; the mode picker disables it with the
-   reason; an inbound mode-change to RSA is refused loudly; `all-modes.mjs`
-   expects 4 modes + a refusal.
+4. **✅ Phase 4 — RSA key transport REMOVED** (2026-08-21, F-CRYPTO-009). Two
+   premises of the original plan were wrong and were dropped: `UNAVAILABLE` was
+   not a mechanism (dead export, read nowhere, comment claiming a UI-disable that
+   did not exist) — it is deleted and replaced by `DEPRECATED_ALGS`, which
+   `makeCipher` actually consumes; and there is no inbound live-room "mode
+   change" to refuse — the mode is chosen 100% locally and `alg` on the wire is
+   advisory, never read to pick a cipher (a visible refusal for a frame TAGGED
+   `alg:"RSA"` was added anyway, as a backstop). The `Rsa` class,
+   `assertRsaPublicKeyUsable`, the `RSA_*` constants and the prime sieve are
+   deleted (with a tombstone recording the finding); the UI card is gone;
+   `all-modes.mjs` exercises 4 modes and asserts the deprecation + an exhaustive
+   mode inventory; `rsa-keyvalidation.test.mjs` → `rsa-deprecation.test.mjs`.
 5. **⬜ Phase 5 — the rest of the test debt** (item 7 and §C9).
 6. **⬜ F-ATREST-008** — the identity blob has no anti-rollback control, and the
    contacts anchor is load-bearing on it: the anchor is defeated by ROLLING BACK

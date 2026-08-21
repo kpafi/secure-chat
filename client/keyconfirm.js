@@ -25,8 +25,9 @@
 // until one stuck. Keeping a set for the race (below) must not throw that away,
 // so the set is hard-capped at the maximum a legitimate peer can produce: each
 // side derives once in the staggered case and twice in the simultaneous-connect
-// race (its own offer secret, then the answer), never more, in PQKEM and RSA
-// alike. A third distinct tag is not a peer with bad luck; it is someone
+// race (its own offer secret, then the answer), never more — PQKEM is the mode
+// that can do it (RSA could too, until it was removed on 2026-08-21,
+// F-CRYPTO-009). A third distinct tag is not a peer with bad luck; it is someone
 // guessing.
 export const MAX_PEER_CONFIRMS = 2;
 

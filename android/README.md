@@ -88,7 +88,7 @@ The bundled web client is **generated at build time** from `../client` by the
   project defect. The password `prompt` dialog now sets its own `FLAG_SECURE`
   (see below).
 - Not recorded as driven end-to-end on a device: the identity + safety-number
-  gate for DHKE/RSA/PQKEM (those modes are covered in-browser by `e2e/all-modes.mjs`).
+  gate for DHKE/PQKEM (those modes are covered in-browser by `e2e/all-modes.mjs`).
 - **Still needs a physical device** (no device was attached when this was
   written): that the recents snapshot is blank, that the password prompt cannot
   be screen-captured, and the `PadFloor` native-floor proof.

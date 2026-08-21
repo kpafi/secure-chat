@@ -181,8 +181,22 @@ export function liftFunction(stripped, name, assertFn) {
     `${name}: expected exactly one \`${needle}\` in app.js source, found ${starts.length}. ` +
     "A second definition (or a decoy) is how a source anchor gets pointed at the wrong body.");
   const start = starts[0];
+  // ROUND-4: find the brace that opens the BODY, not merely the first `{` after
+  // the name. `function makeCipher(alg, roomId, opts = {}) {` has a `{` inside its
+  // PARAMETER LIST, and taking that one made brace-matching close immediately —
+  // the "lifted function" was 42 characters of signature, and every assertion over
+  // it passed vacuously (an allow-list over its `case` labels found none at all,
+  // which is how this was caught). So walk the parameter list to its matching `)`
+  // first, then take the next `{`.
+  let p = stripped.indexOf("(", start);
+  let paren = 0;
+  for (; p < stripped.length; p++) {
+    if (stripped[p] === "(") paren++;
+    else if (stripped[p] === ")" && --paren === 0) { p++; break; }
+  }
   let depth = 0;
-  let i = stripped.indexOf("{", start);
+  let i = stripped.indexOf("{", p);
+  assertFn.notStrictEqual(i, -1, `${name}: no function body found after its parameter list`);
   for (; i < stripped.length; i++) {
     if (stripped[i] === "{") depth++;
     else if (stripped[i] === "}" && --depth === 0) return stripped.slice(start, i + 1);

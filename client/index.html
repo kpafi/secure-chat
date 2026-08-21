@@ -125,11 +125,11 @@
               <span class="alg-name">AES-256</span>
               <span class="alg-desc">Shared passphrase → AES-256-GCM</span>
             </label>
-            <label class="alg-card">
-              <input type="radio" name="alg" value="RSA" />
-              <span class="alg-name">RSA</span>
-              <span class="alg-desc">RSA-2048-OAEP hybrid — per-message AES-256</span>
-            </label>
+            <!-- The RSA card was removed on 2026-08-21 (pentest F-CRYPTO-009): a
+                 counterparty-chosen modulus can hand the session to a passive
+                 observer and no validation catches it. Do not re-add it — the
+                 implementation is gone and crypto.js's makeCipher refuses the
+                 mode by name. Use DHKE or PQKEM. -->
             <label class="alg-card">
               <input type="radio" name="alg" value="PQKEM" />
               <span class="alg-name">Post-quantum <em class="badge pq">ML-KEM-768</em></span>
