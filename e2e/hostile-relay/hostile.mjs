@@ -31,7 +31,14 @@ import { extname, normalize, join } from "node:path";
 import ws_ from "../node_modules/ws/index.js";
 const { WebSocketServer } = ws_;
 
-const ROOT = new URL("../../client/", import.meta.url).pathname.replace(/\/$/, "");
+// Which client tree to serve. Overridable so the harness can be pointed at a
+// MUTATED copy of the client — which is how you show that a scenario here binds
+// (i.e. that reintroducing the bug turns it red) without dirtying the working
+// tree. A harness whose scenarios have never been shown to fail is decoration;
+// this project has produced three rounds of green-but-vacuous controls already.
+const ROOT = (process.env.CLIENT_ROOT
+  ? process.env.CLIENT_ROOT
+  : new URL("../../client/", import.meta.url).pathname).replace(/\/$/, "");
 const PORT = Number(process.env.PORT || 8099);
 const POLICY = process.env.POLICY || "demote";
 const HS_DELAY_MS = Number(process.env.HS_DELAY_MS || 0);
