@@ -235,13 +235,32 @@ class MainActivity : AppCompatActivity() {
                     }
                     setText(defaultValue ?: "")
                 }
-                AlertDialog.Builder(this@MainActivity)
+                val dialog = AlertDialog.Builder(this@MainActivity)
                     .setMessage(shown)
                     .setView(input)
                     .setCancelable(false)
                     .setPositiveButton(android.R.string.ok) { _, _ -> result.confirm(input.text.toString()) }
                     .setNegativeButton(android.R.string.cancel) { _, _ -> result.cancel() }
-                    .show()
+                    .create()
+                // Pentest 2026-08-07 F-ANDROID-003, the open question from the fix
+                // review (§C10), answered: a Dialog gets its OWN Window, and
+                // FLAG_SECURE marks a SURFACE, not a task. The flag set on the
+                // Activity in onCreate therefore does not cover this dialog — a
+                // screen capture taken while it is open blacks out the activity
+                // behind it and renders the dialog, passphrase field and all,
+                // perfectly legibly. Which is to say the one window in the app that
+                // is guaranteed to hold a secret was the one window not covered.
+                //
+                // Gated on `secret` to match the masking decision directly above,
+                // including its fail-SECURE fallback: whenever we decide the input
+                // must be masked, we also decide it must not be capturable.
+                if (secret) {
+                    dialog.window?.setFlags(
+                        WindowManager.LayoutParams.FLAG_SECURE,
+                        WindowManager.LayoutParams.FLAG_SECURE,
+                    )
+                }
+                dialog.show()
                 return true
             }
         }

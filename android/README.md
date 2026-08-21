@@ -53,7 +53,18 @@ with `SECURE_CHAT_EXTRA_ORIGINS="https://…"` — no code edit needed.
 # Needs a full JDK 21 (with jlink) and the Android SDK (platform 34, build-tools 34).
 export ANDROID_HOME=$HOME/android-sdk
 ./gradlew assembleDebug        # -> app/build/outputs/apk/debug/app-debug.apk
+
+# If `java -version` is not 21, point Gradle at a 21 explicitly. On this box the
+# system default is a JDK 25 EA, which fails with a Gradle/AGP incompatibility
+# that reads like a project error but is not (it fails identically on unmodified
+# master). This is the invocation that works:
+./gradlew assembleDebug -Dorg.gradle.java.home=/usr/lib/jvm/java-21-openjdk-amd64
 ```
+Dependency verification is on (`gradle/verification-metadata.xml`), so artifacts
+are hash-pinned. A first run after a Gradle-cache change can report a transient
+verification failure for test-only artifacts; re-running resolves it. A failure
+that PERSISTS is a real one — do not add hashes to make it quiet without knowing
+what changed.
 The bundled web client is **generated at build time** from `../client` by the
 `syncWebClient` Gradle task (so it can never drift from the reviewed source);
 `assets/web/` is gitignored.
@@ -72,5 +83,12 @@ The bundled web client is **generated at build time** from `../client` by the
 - Release signing is configured via a gitignored `keystore.properties` (copy
   `keystore.properties.example`); `assembleRelease` without it produces an
   unsigned APK. A launcher icon ships.
+- 2026-08-21: `assembleDebug` **builds clean** here with JDK 21 (see above) —
+  the JDK-25 breakage recorded in earlier notes was a toolchain mismatch, not a
+  project defect. The password `prompt` dialog now sets its own `FLAG_SECURE`
+  (see below).
 - Not recorded as driven end-to-end on a device: the identity + safety-number
   gate for DHKE/RSA/PQKEM (those modes are covered in-browser by `e2e/all-modes.mjs`).
+- **Still needs a physical device** (no device was attached when this was
+  written): that the recents snapshot is blank, that the password prompt cannot
+  be screen-captured, and the `PadFloor` native-floor proof.
