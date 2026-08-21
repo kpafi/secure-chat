@@ -167,11 +167,48 @@ function nextRegSeq() {
   return next;
 }
 
+// Parse a FastAPI error body into a stable shape, tolerant of BOTH the new
+// structured 409 (`detail` is an object: {error, message, stored_seq?}) and the
+// older/other paths where `detail` is a plain string. Returns
+// { code, storedSeq, message } — code/storedSeq are null when absent. Never
+// throws: a hostile relay controls this body, so every field is treated as
+// untrusted and only shape-checked here, never trusted for its value.
+function parseErrorDetail(detail) {
+  if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+    const code = typeof detail.error === "string" ? detail.error : null;
+    // stored_seq is disclosed only on the stale_counter branch and only to the
+    // verified owner; carry it through raw (unvalidated) — register() is the one
+    // place that decides whether it is a usable integer before signing it.
+    const storedSeq = Object.prototype.hasOwnProperty.call(detail, "stored_seq")
+      ? detail.stored_seq
+      : null;
+    // Clamped (pentest ROUND-4 L-2): this string is relay-chosen and ends up in
+    // the client's own status banner, which is trusted chrome. It is rendered with
+    // textContent so there is no XSS, but an unbounded value is still a rendering
+    // DoS and — worse — room for the relay to write a convincing instruction
+    // ("export your identity to…") into UI the user reads as ours.
+    const message = typeof detail.message === "string" ? detail.message.slice(0, 200) : null;
+    return { code, storedSeq, message };
+  }
+  // Plain-string detail (older errors, non-409 paths): no machine-readable code.
+  return {
+    code: null,
+    storedSeq: null,
+    message: typeof detail === "string" ? detail.slice(0, 200) : null,
+  };
+}
+
 async function asError(res) {
   let detail = res.status + "";
   try {
     const body = await res.json();
-    if (body && body.detail) detail = body.detail;
+    // The new structured detail is an OBJECT; rendering it straight into an
+    // Error used to produce "[object Object]" and swallow the server's message.
+    // Pull the human-readable message out of either shape.
+    if (body && body.detail) {
+      const parsed = parseErrorDetail(body.detail);
+      detail = parsed.message || (parsed.code ? parsed.code : detail);
+    }
   } catch {
     /* non-JSON error body */
   }
@@ -212,27 +249,78 @@ export async function register(base, identity, username) {
   // from a counter that is definitely ahead. The retry is bounded to one and
   // still has to carry a valid signature, so it grants an attacker nothing:
   // they cannot sign the retry.
+  //
+  // The backend now echoes its stored counter in the stale_counter 409 body
+  // (commit ea4afe9). That closes the wrong-clock residual documented above: a
+  // device with a skewed or backward clock no longer has to GUESS a value ahead
+  // of the server from its own lying clock — it resynchronises to stored_seq+1.
+  // But stored_seq arrives over an UNTRUSTED relay, so it is verified and clamped
+  // before it is ever signed or persisted; a hostile value falls back to the
+  // ceiling jump rather than being trusted.
   if (!res.ok && res.status === 409 && Number.isInteger(seq)) {
-    const detail = await res.clone().text();
-    if (detail.includes("counter")) {
-      // Item 18, second pass (M-1): this used to be
-      // `clampRegSeq(Math.max(seq, Date.now()))`, which recomputed EXACTLY the
-      // value that had just been refused — the first attempt already signs
-      // `max(cur + 1, Date.now())`, so `seq >= Date.now()` always held. Every
-      // counter 409 therefore cost a second ML-DSA signature and a second round
-      // trip for an outcome identical by construction, while the comment claimed
-      // it was a recovery. It is a real recovery now: jump to the ceiling, which
-      // is the furthest-ahead value this device may legitimately sign, so it
-      // overtakes anything the server can be holding within the slack window.
-      seq = regSeqCeiling();
+    let rawBody = "";
+    try { rawBody = await res.clone().text(); } catch { /* unreadable body */ }
+    let detailBody = null;
+    try { detailBody = JSON.parse(rawBody).detail; } catch { /* non-JSON */ }
+    const { code, storedSeq } = parseErrorDetail(detailBody);
+    // ROUND-4 L-1: keep the legacy sniff as a FALLBACK. A pre-ea4afe9 relay sends
+    // `detail` as a plain string, so `code` is null and a code-only test would
+    // silently drop the retry — and client and relay do NOT ship together on every
+    // path: the Android APK bundles its own copy of this file and updates
+    // independently of the relay it points at. Safe to keep: a legacy body carries
+    // no stored_seq, so this can only ever reach the already-untrusted ceiling jump.
+    const legacyCounter409 = code === null && /counter/i.test(rawBody);
+    if (code === "stale_counter" || legacyCounter409) {
+      // Resync target: one past what the server actually holds. This is the real
+      // recovery the ceiling-guess used to stand in for — it overtakes the server
+      // by exactly one regardless of how wrong this device's clock is.
+      const ceiling = regSeqCeiling();
+      let retrySeq = null;
+      if (Number.isInteger(storedSeq) && storedSeq >= 1 && storedSeq < ceiling && storedSeq + 1 > seq) {
+        // Clamp to the ceiling so a hostile relay cannot echo a giant stored_seq
+        // and walk us to the server's Pydantic cap (the freeze class this file's
+        // comments describe). storedSeq < ceiling guarantees storedSeq+1 <= ceiling
+        // stays a legitimately signable, positive integer, and storedSeq+1 > seq
+        // guarantees it overtakes the value just refused — a relay that echoes a
+        // tiny stored_seq to force a non-advancing retry gets the ceiling instead.
+        retrySeq = storedSeq + 1;
+      }
+      // Fall back to the ceiling jump when stored_seq is missing, non-integer,
+      // negative, zero, fractional, beyond the ceiling, or would not advance — i.e.
+      // anything we cannot safely trust. regSeqCeiling() is the furthest-ahead
+      // value this device may legitimately sign.
+      if (!Number.isInteger(retrySeq)) retrySeq = ceiling;
+      // The retry MUST advance past the value just refused, and MUST be a positive
+      // integer that attempt() will send as body.seq. Never re-send the refused
+      // value (an inert round trip, the old M-1 bug) and never let a non-integer
+      // slip through — a non-integer seq makes attempt() drop body.seq and
+      // registerMessageBytes() sign the counter-free v2 message, a silent replayable
+      // downgrade (F-5). If even the ceiling cannot overtake the refused value the
+      // device is signing at its maximum and is genuinely stuck (a wall clock far
+      // into the future); refuse loudly rather than resend or downgrade.
+      if (!Number.isInteger(retrySeq) || retrySeq <= seq) {
+        const err = new Error(
+          "the directory's stored registration counter is not one this device can overtake — " +
+          "registration refused rather than resent without moving the counter forward",
+        );
+        err.status = 409;
+        err.code = "stale_counter";
+        throw err;
+      }
+      seq = retrySeq;
       localStorage.setItem(LS_REG_SEQ, String(seq));
       res = await attempt(seq);
     }
   }
 
   if (!res.ok) {
+    const body = await res.clone().json().catch(() => null);
     const err = new Error(await asError(res));
     err.status = res.status;
+    // Surface the machine-readable code so callers can tell the three 409s apart
+    // (username_taken vs. a counter still stuck after the retry vs. keys_locked)
+    // instead of branching on status alone.
+    err.code = parseErrorDetail(body && body.detail).code;
     throw err;
   }
   return res.json();

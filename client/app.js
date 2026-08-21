@@ -534,7 +534,17 @@ async function showIdentityUnlocked() {
   // treats a same-identity re-registration as a bundle refresh; failures
   // (offline, foreign name) are non-fatal.
   if (savedName && savedToken && myBundle.ecdh) {
-    account.register(API_BASE, identity, savedName).catch(() => {});
+    account.register(API_BASE, identity, savedName).catch((e) => {
+      // Benign failures — offline, or a name now owned by a different identity —
+      // stay quiet: this is a background refresh, not an action the user asked for.
+      // But a keys_locked, or a stale_counter that survived the resync retry, means
+      // the directory still holds a SUPERSEDED encryption bundle: contacts sealing
+      // mail will encrypt to a key this identity may no longer control. That is not
+      // benign and must be visible, though it stays non-fatal.
+      if (e && (e.code === "keys_locked" || e.code === "stale_counter")) {
+        accountStatus("Your published encryption keys could not be updated — a contact's sealed mail may be going to a superseded key. " + e.message, "err");
+      }
+    });
   }
   if (savedName && savedToken) {
     els.username.value = savedName;
@@ -738,8 +748,34 @@ async function registerAccount() {
     // happened to press "Log in".
     await autoLogin(username);
   } catch (e) {
-    if (e.status === 409) {
-      accountStatus(`"${username}" is already taken. Pick another (or log in if it is yours).`, "err");
+    // Branch on the machine-readable code (account.js surfaces err.code), not on
+    // the 409 status alone. A counter/keys 409 is an EXISTING owner re-registering,
+    // not a name collision — telling them to "pick another" would throw away their
+    // handle and every contact's pin. The three 409s mean three different things.
+    if (e.code === "username_taken") {
+      // ROUND-4 M-3. `e.code` is a string the RELAY chose, and the advice it drives
+      // — rename — is the one action that loses the handle and every contact's pin.
+      // A hostile relay answering "taken" for a name this device provably holds was
+      // reproduced end to end. We cannot authenticate the relay here, but we do not
+      // have to: if this identity already registered THIS name successfully, we hold
+      // the ground truth locally, and "taken by someone else" is then simply false.
+      // Degrade to the conservative wording rather than repeating the relay's claim.
+      const ownsIt = localStorage.getItem(LS_USERNAME) === username
+        && localStorage.getItem(LS_LOOKUP_TOKEN);
+      accountStatus(ownsIt
+        ? `The directory says "${username}" is taken, but this device already registered that name — so this is your own account, not a collision. Do NOT pick another name (that would lose your handle and every contact's saved pin). Try again; if it persists, the directory you are talking to may not be the one you registered with.`
+        : `"${username}" is already taken. Pick another (or log in if it is yours).`, "err");
+    } else if (e.code === "stale_counter") {
+      // Survived the one-shot resync retry: the directory holds a counter this
+      // device cannot overtake (most often a wrong wall clock). Renaming does NOT
+      // help and loses the handle, so do not suggest it.
+      accountStatus("Your registration counter is behind the directory's and could not be resynced — check this device's clock (it may be set into the future), then try again. Do not rename; this is your account.", "err");
+    } else if (e.code === "keys_locked") {
+      accountStatus("The directory has your encryption keys locked and will not accept this update. A fresh counter-bearing registration from the device that owns them is required.", "err");
+    } else if (e.status === 409) {
+      // A 409 whose code we do not recognise: stay conservative and do not claim
+      // the name is taken (that was the old M-3 misfire).
+      accountStatus("Registration was refused by the directory: " + e.message, "err");
     } else {
       accountStatus("Registration failed: " + e.message, "err");
     }
