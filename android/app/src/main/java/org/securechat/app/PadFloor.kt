@@ -68,6 +68,18 @@ object PadFloor {
     /** Present but the MAC did not verify: forged or corrupted. Fails closed. */
     const val TAMPERED = -2L
 
+    /**
+     * ROUND-3 F-4. A bump whose `SharedPreferences.commit()` returned false —
+     * the in-memory map moved, but the durable write did NOT land (unwritable
+     * file, full disk). A BUMP-ONLY signal: [read] never returns this, because
+     * `read` is backed by the same in-memory map that `commit()` already
+     * mutated, so a read-back cannot tell a failed commit from a healthy one.
+     * Only the discarded boolean from `commit()` carries that fact, and this is
+     * how it now crosses to the JS side (which reacts by failing the save, so
+     * `app.js` — persist-before-transmit, P-04 — never releases the keystream).
+     */
+    const val COMMIT_FAILED = -3L
+
     private fun prefs(ctx: Context) = ctx.getSharedPreferences(FILE, Context.MODE_PRIVATE)
 
     /**
@@ -119,7 +131,8 @@ object PadFloor {
      * Raise the floor to [value] if it is higher. Never lowers. Returns the floor
      * in force afterwards, or [TAMPERED] if the stored one did not verify (in
      * which case nothing is written — a forged record must not be healed into a
-     * valid one by the next legitimate save).
+     * valid one by the next legitimate save), or [COMMIT_FAILED] if the durable
+     * write did not land (see below).
      */
     fun bump(ctx: Context, padId: String, value: Long): Long {
         if (value < 0) return read(ctx, padId)
@@ -127,8 +140,24 @@ object PadFloor {
         if (current == TAMPERED) return TAMPERED
         val next = if (current == ABSENT) value else maxOf(current, value)
         if (next == current) return current
-        prefs(ctx).edit().putString(padId, "$next:${tag(padId, next)}").commit()
-        return next
+        // ROUND-3 F-4. `commit()`'s boolean used to be DISCARDED here, and `next`
+        // was returned unconditionally. `commit()` writes the in-memory map
+        // synchronously and does NOT roll it back when the disk write fails, and
+        // [read] is backed by that very map — so a frozen/unwritable prefs file
+        // let a caller `bump` a floor, `read` it back HEALTHY in the same process,
+        // and never learn that nothing reached disk. On the JS side that defeated
+        // armFloors' read-back guard (the floor "moved"), the save reported
+        // success, `app.js` transmitted (P-04), and after a restart the durable
+        // floor was 0 — re-importing the pristine pad respent the same keystream:
+        // a two-time pad, the one failure OTP cannot survive.
+        //
+        // The boolean is the ONLY place that failure is observable, so it is
+        // surfaced now rather than swallowed. We do NOT throw across JNI (a
+        // JavascriptInterface exception is delivered to JS opaquely); a distinct
+        // sentinel the JS side inspects is the reliable channel. `read` is
+        // untouched, so it still only yields ABSENT / TAMPERED / value ≥ 0.
+        val committed = prefs(ctx).edit().putString(padId, "$next:${tag(padId, next)}").commit()
+        return if (committed) next else COMMIT_FAILED
     }
 
     // Pentest 2026-07-29 H-1: there is deliberately NO clear/remove/reset here.

@@ -105,6 +105,14 @@ const WM_DOMAIN = "secure-chat/otp-watermark/v1";
 // device to device).
 const NATIVE_ABSENT = -1;
 const NATIVE_TAMPERED = -2;
+// ROUND-3 F-4. A BUMP-ONLY signal from the native floor: the in-memory map moved
+// but `SharedPreferences.commit()` returned false, so nothing reached disk (see
+// PadFloor.bump). It is deliberately distinct from NATIVE_TAMPERED so `num()` does
+// not fold it away — a commit failure is not a forged record, and the two are
+// handled differently (a failed save vs. a hard refusal). `read()` never returns
+// it, because a read-back cannot observe a failed commit; only the bump's own
+// return can, which is exactly why the discarded boolean was the whole hole.
+const NATIVE_COMMIT_FAILED = -3;
 
 // Pentest 2026-08-07 F-ATREST-001 / F-ATREST-002. The native floor covered the
 // SEND offset only — F-ATREST-009 counted it as 1 of ~5 rollback-sensitive
@@ -270,11 +278,15 @@ async function readWatermark(id, key) {
 // makes about itself. Item 13, second pass — see writePadBlob for why the answer
 // has to be measured rather than assumed.
 //
-// Measured by READING THE SLOTS BACK, not by trusting the bump. Neither layer
-// reports failure usefully: the JS wrapper swallows any bridge exception into
-// NATIVE_TAMPERED, and `PadFloor.bump` ignores the boolean from
-// `SharedPreferences.commit()`, so a full disk writes nothing and says nothing.
-// A read-back is the only statement about a slot that is actually evidence.
+// Measured by READING THE SLOTS BACK, not by trusting the bump. The JS wrapper
+// swallows any bridge exception into NATIVE_TAMPERED, so an EXCEPTIONAL failure
+// says nothing useful. A read-back is a statement about a slot that is actually
+// evidence — for every failure mode EXCEPT one: a `commit()` that returns false
+// leaves the in-memory map (which `read` is backed by) already advanced, so the
+// read-back looks healthy while nothing reached disk. `PadFloor.bump` used to
+// discard that boolean; since ROUND-3 F-4 it returns NATIVE_COMMIT_FAILED, and
+// probeFloors/armFloors inspect the bump RETURN for exactly that case, because a
+// read-back structurally cannot see it.
 //
 // The SEND slot is included because `nativeFloor: !!nativeFloor` has exactly the
 // same defect the item 13 fix was written to repair, one level up: the 2026-07-29
@@ -299,7 +311,12 @@ function readFloorClaims(id) {
   // already-delivered frames (M-7), where the previous cut had refused outright.
   //
   // Tampering is evidence, so it is a hard refusal — never a quiet `false`.
-  if (s === NATIVE_TAMPERED || r === NATIVE_TAMPERED || e === NATIVE_TAMPERED) {
+  // NATIVE_COMMIT_FAILED is folded in defensively: `read` does not return it today
+  // (only bump does — see NATIVE_COMMIT_FAILED), but if a future bridge change ever
+  // surfaced it through `read`, "the slot's durable write failed" must fail CLOSED
+  // like a forged record, never slip past `s >= 0` below and read as "not armed".
+  if (s === NATIVE_TAMPERED || r === NATIVE_TAMPERED || e === NATIVE_TAMPERED
+    || s === NATIVE_COMMIT_FAILED || r === NATIVE_COMMIT_FAILED || e === NATIVE_COMMIT_FAILED) {
     throw new Error(
       "this pad's device-protected rollback record is damaged or forged — refusing to use the pad; exchange a fresh one",
     );
@@ -347,34 +364,49 @@ function readFloorClaims(id) {
 // The three claim values, and why "arming failed" may not collapse into "never
 // armed" (A4/F-A3). `nativeFloor: false` is what a plain browser legitimately
 // writes on every save; if a bridge IS present but its prefs write silently does
-// not take (unwritable file, full disk — `PadFloor.bump` discards `commit()`'s
-// boolean), the old code recorded that same `false`. Both unlock guards are keyed
-// on the claim being `true`, so they could never fire for that blob — and because
-// the claim is AEAD-sealed, a later save that succeeds cannot repair a snapshot
-// taken during the degraded window. It stayed exploitable forever, into keystream
-// reuse. UNCONFIRMED keeps the two cases apart, and routes such a blob through the
-// existing adoption consent gate instead of opening it silently.
+// not take (unwritable file, full disk), the old code recorded that same `false`.
+// Both unlock guards are keyed on the claim being `true`, so they could never fire
+// for that blob — and because the claim is AEAD-sealed, a later save that succeeds
+// cannot repair a snapshot taken during the degraded window. It stayed exploitable
+// forever, into keystream reuse. UNCONFIRMED keeps the two cases apart, and routes
+// such a blob through the existing adoption consent gate instead of opening it
+// silently. Since ROUND-3 F-4 the "silently does not take" case is no longer
+// silent: `PadFloor.bump` returns NATIVE_COMMIT_FAILED, and probeFloors maps a
+// failed CREATE to CLAIM_UNCONFIRMED directly from that return rather than relying
+// on a read-back the failed commit leaves looking healthy.
 const CLAIM_ARMED = true;          // slot existed and was read back
 const CLAIM_NONE = false;          // no bridge on this device (a plain browser)
 const CLAIM_UNCONFIRMED = "unconfirmed"; // bridge present, slot could not be created
 
 function probeFloors(id) {
   if (!nativeFloor) return { send: CLAIM_NONE, derived: CLAIM_NONE };
-  nativeFloor.bump(floorKeySend(id), 0);
+  const sendBump = nativeFloor.bump(floorKeySend(id), 0);
   // F-ATREST-001: the recv high-water mark, which used to be AEAD-mirrored only
   // — and an AEAD record can be restored wholesale from a snapshot.
-  nativeFloor.bump(floorKeyRecv(id), 0);
+  const recvBump = nativeFloor.bump(floorKeyRecv(id), 0);
   // F-ATREST-002: monotone one-way latch. Created at 0 on a pad's first save, so
   // the slot exists from then on and its ABSENCE is unambiguous evidence of
   // deletion rather than of a pad that was simply never exported.
-  nativeFloor.bump(floorKeyExported(id), 0);
+  const exportedBump = nativeFloor.bump(floorKeyExported(id), 0);
   const claims = readFloorClaims(id);
-  // A bridge is present, so a slot that is STILL absent after the bump above
-  // means the write did not take. That is not "this device has no floor" — say so
-  // (F-A3), and let unlockPad ask the user rather than sealing a false negative.
+  // ROUND-3 F-4. On a pad's FIRST save the bump that creates a slot is the only
+  // thing that can prove the slot is durable. A `commit()` that fails still moves
+  // the in-memory map, so `readFloorClaims` (a read-back) reports the slot armed
+  // while nothing reached disk — and a false CLAIM_ARMED sealed into the blob
+  // becomes a guard that a restart silently erases. So trust the bump's OWN return
+  // over the read-back: a NATIVE_COMMIT_FAILED create forces CLAIM_UNCONFIRMED,
+  // which routes the pad through unlockPad's adoption consent gate (F-A3) rather
+  // than promising a floor that is not durably in force. This is the create-side
+  // half; armFloors is the advance-side half that fails the save outright.
+  const sendUnconfirmed = sendBump === NATIVE_COMMIT_FAILED;
+  const derivedUnconfirmed = recvBump === NATIVE_COMMIT_FAILED || exportedBump === NATIVE_COMMIT_FAILED;
+  // A bridge is present, so a slot that is STILL absent after the bump above (or a
+  // create whose commit did not take) means the write did not durably land. That
+  // is not "this device has no floor" — say so (F-A3), and let unlockPad ask the
+  // user rather than sealing a false negative.
   return {
-    send: claims.send ? CLAIM_ARMED : CLAIM_UNCONFIRMED,
-    derived: claims.derived ? CLAIM_ARMED : CLAIM_UNCONFIRMED,
+    send: (claims.send && !sendUnconfirmed) ? CLAIM_ARMED : CLAIM_UNCONFIRMED,
+    derived: (claims.derived && !derivedUnconfirmed) ? CLAIM_ARMED : CLAIM_UNCONFIRMED,
   };
 }
 
@@ -399,21 +431,24 @@ function probeFloors(id) {
 // So the ordering is split by what each half is for: the CLAIM is measured
 // before the write (probeFloors, which cannot advance anything), the VALUE is
 // raised after it (here). A floor is never above the blob it is meant to protect.
-function armFloors(id, wm, exportedNow) {
+function armFloors(id, wm, exportedNow, armed) {
   if (!nativeFloor) return { send: false, derived: false };
   const wantExported = exportedNow ? 1 : 0;
-  nativeFloor.bump(floorKeySend(id), wm.send);
-  nativeFloor.bump(floorKeyRecv(id), wm.recv);
+  const sendBump = nativeFloor.bump(floorKeySend(id), wm.send);
+  const recvBump = nativeFloor.bump(floorKeyRecv(id), wm.recv);
   // Bumped with 0 when the pad has not been exported, so an ordinary save keeps
   // the slot alive without lowering the latch (`bump` never lowers).
-  nativeFloor.bump(floorKeyExported(id), wantExported);
+  const exportedBump = nativeFloor.bump(floorKeyExported(id), wantExported);
   const claims = readFloorClaims(id);   // throws on TAMPERED
 
-  // ROUND-3 F-1 (pentest of the F-A1-R1 fix, 2026-08-21). This return value used
-  // to be DISCARDED, and "a slot exists" was the only thing anyone checked — so a
-  // floor FROZEN at its current value (an unwritable prefs file; on Android
-  // `SharedPreferences.commit()`'s boolean is dropped too) let this function
-  // report success while the durable floor did not move at all.
+  // ROUND-3 F-1 (pentest of the F-A1-R1 fix, 2026-08-21). The claim used to be
+  // DISCARDED, and "a slot exists" was the only thing anyone checked — so a floor
+  // FROZEN at its current value let this function report success while the durable
+  // floor did not move at all. The read-back below is the F-1 repair: it catches a
+  // floor that a read genuinely reports STALE. It does NOT catch the Android
+  // residual (ROUND-3 F-4, handled just after it): a failed `commit()` leaves the
+  // in-memory map — which `read` is backed by — already advanced, so the read-back
+  // looks healthy. That case needs the bump's own return, not a read.
   //
   // Why that was catastrophic rather than untidy: `app.js` persists BEFORE it
   // transmits (P-04), so "the save succeeded" is precisely the signal that
@@ -443,7 +478,38 @@ function armFloors(id, wm, exportedNow) {
   const stuck = (claims.send === CLAIM_ARMED && readBack.send < wm.send)
     || (claims.derived === CLAIM_ARMED
       && (readBack.recv < wm.recv || readBack.exported < wantExported));
-  if (stuck) {
+
+  // ROUND-3 F-4 (pentest of the F-1 fix, 2026-08-21). The read-back `stuck` check
+  // above catches a floor frozen at its OLD value — but NOT the Android residual
+  // it was written for. `SharedPreferences.commit()` writes the in-memory map
+  // synchronously and does not roll it back on a failed disk write, and
+  // `PadFloor.read` is backed by that map, so after a failed commit the read-back
+  // reports the NEW value (`readBack.send >= wm.send`, `stuck` false) while the
+  // durable floor is still 0. armFloors then returned success, `app.js` transmitted
+  // (persist-before-transmit, P-04), and a restart plus a pristine re-import
+  // respent the keystream — a two-time pad, the exact hole H-3 closed.
+  //
+  // The only witness to that failure is the BUMP's return, which `PadFloor.bump`
+  // used to discard and now surfaces as NATIVE_COMMIT_FAILED. So inspect it, and
+  // fail the save when a slot the blob CLAIMS ARMED did not durably record its
+  // advance. `app.js` persists before it transmits, so a throw here means the
+  // keystream never goes on the wire — which is the only repair that holds when
+  // every read-back on this device lies healthy.
+  //
+  // Scoped to `armed` (the verdict probeFloors sealed into the blob), NOT to the
+  // local `claims` read-back: a slot probeFloors could not even CREATE is recorded
+  // CLAIM_UNCONFIRMED and routed through the adoption gate rather than failing the
+  // save (a permanent brick of an in-person exchange is the worse outcome there).
+  // This throw is for a slot the blob promises is armed while the bump says its
+  // durable write just failed — i.e. an ESTABLISHED pad advancing onto a frozen
+  // disk, which is the keystream-reuse case and not the first-save one.
+  const scope = armed || { send: claims.send, derived: claims.derived };
+  const commitFailed =
+    (scope.send === CLAIM_ARMED && sendBump === NATIVE_COMMIT_FAILED)
+    || (scope.derived === CLAIM_ARMED
+      && (recvBump === NATIVE_COMMIT_FAILED || exportedBump === NATIVE_COMMIT_FAILED));
+
+  if (stuck || commitFailed) {
     throw new Error(
       "this device's rollback guard did not record this pad's progress (the protected floor " +
       `did not move: send ${readBack.send}/${wm.send}, recv ${readBack.recv}/${wm.recv}). ` +
@@ -868,8 +934,11 @@ async function writePadBlob(record, key, salt, iters) {
   // legacy-adoption gate in unlockPad.
   localStorage.setItem(EPOCH_KEY, "1");
   // F-1: mirror the floors into the native store, where they cannot be deleted
-  // from the JS context and cannot be lowered at all.
-  armFloors(record.padId, wm, !!record.exported);
+  // from the JS context and cannot be lowered at all. `armed` is passed so the
+  // ROUND-3 F-4 commit-failure throw fires only for a slot this blob CLAIMS ARMED
+  // — never for one probeFloors recorded CLAIM_UNCONFIRMED, which the adoption
+  // gate already covers without failing the save.
+  armFloors(record.padId, wm, !!record.exported, armed);
   wmCache.set(record.padId, { send: wm.send, recv: wm.recv });
 }
 
@@ -1286,7 +1355,12 @@ export function padWasUsed(padId) {
     const exported = nativeFloor.read(floorKeyExported(padId));
     // TAMPERED (a forged record, or a marker with no working bridge) counts as
     // used: an import must never be the way to escape a damaged floor.
-    if (send === NATIVE_TAMPERED || recv === NATIVE_TAMPERED || exported === NATIVE_TAMPERED) return true;
+    // NATIVE_COMMIT_FAILED is folded in for the same reason and defensively:
+    // `read` does not return it today (only bump does), but a floor whose durable
+    // write failed must never become the crack an import escapes through — fail
+    // CLOSED, exactly like TAMPERED.
+    if (send === NATIVE_TAMPERED || recv === NATIVE_TAMPERED || exported === NATIVE_TAMPERED
+      || send === NATIVE_COMMIT_FAILED || recv === NATIVE_COMMIT_FAILED || exported === NATIVE_COMMIT_FAILED) return true;
     // F-A1-R1 (pentest of the F-A1 fix): "a slot exists" is NOT "the pad ran".
     // `probeFloors` creates all three slots at exactly 0 BEFORE the blob is
     // written, so a first save interrupted before the blob lands — a failed

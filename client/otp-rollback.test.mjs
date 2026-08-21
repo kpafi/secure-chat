@@ -1118,6 +1118,165 @@ async function testFailedBumpDoesNotBrickAPad() {
 
 await testFailedBumpDoesNotBrickAPad();
 
+// --- ROUND-3 F-4: a bump whose commit() FAILED must fail the save ----------
+// The Android residual the F-1 read-back cannot reach. `SharedPreferences.commit()`
+// writes the in-memory map synchronously and does NOT roll it back on a failed disk
+// write, and `PadFloor.read` is backed by that map — so after a failed commit a
+// read-back reports the NEW value while the DURABLE floor is unchanged. The F-1
+// stuck-check is a read-back, so it passes; armFloors used to report success,
+// app.js transmitted (persist-before-transmit, P-04), and a restart + a pristine
+// re-import respent the keystream: a two-time pad, the one failure OTP cannot
+// survive.
+//
+// The ONLY witness is the bump's OWN return, which PadFloor.bump now surfaces as
+// NATIVE_COMMIT_FAILED (-3) instead of discarding commit()'s boolean. This mock
+// models that faithfully: `mem` is the in-memory SharedPreferences map (read() is
+// backed by it and always looks healthy after a bump); `disk` is what a process
+// restart would actually read; a failing slot's bump advances `mem` AND returns
+// -3, and NEVER writes `disk`. The item-13 mock (which returns the OLD value and
+// writes neither) is NOT a valid model here — a real device's read-back is healthy
+// — so it is deliberately not reused; that is the whole point of a separate test.
+const NATIVE_COMMIT_FAILED = -3;
+function makePrefsFloor(failingSlot) {
+  const mem = new Map();   // SharedPreferencesImpl's in-memory map — read() reads THIS
+  const disk = new Map();  // what survives a process restart
+  // failingSlot: null = every slot healthy; "" = the SEND slot (no '#'); "#recv" /
+  // "#exported" = that derived slot. Matches the item-13 mock's slot selector.
+  const isFailing = (k) => (failingSlot === "" ? !k.includes("#") : k.endsWith(failingSlot));
+  const floor = {
+    mem, disk,
+    read: (k) => (mem.has(k) ? mem.get(k) : -1),
+    bump: (k, v) => {
+      if (v < 0) return mem.has(k) ? mem.get(k) : -1;
+      const cur = mem.has(k) ? mem.get(k) : -1;
+      const next = cur === -1 ? v : Math.max(cur, v);
+      if (next === cur) return cur;              // monotone no-op: no commit() at all
+      mem.set(k, next);                           // commitToMemory ALWAYS runs first
+      if (failingSlot !== null && isFailing(k)) return NATIVE_COMMIT_FAILED; // disk failed
+      disk.set(k, next);                          // healthy: the durable write lands
+      return next;
+    },
+  };
+  return floor;
+}
+
+async function testCommitFailureFailsTheSave() {
+  for (const failing of ["", "#recv", "#exported"]) {
+    const which = failing === "" ? "the SEND slot" : `the ${failing} slot`;
+    // Phase 1: ESTABLISH the pad with a fully healthy floor, so all three slots
+    // exist and are DURABLE. F-4 is an established pad advancing onto a frozen disk
+    // — distinct from a first save whose slot could not be created at all (that is
+    // probeFloors' CLAIM_UNCONFIRMED path, covered by testFailedBumpDoesNotBrickAPad).
+    const healthy = makePrefsFloor(null);
+    const store = new Map();
+    globalThis.localStorage = {
+      getItem: (k) => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => store.set(k, String(v)),
+      removeItem: (k) => store.delete(k),
+    };
+    Object.defineProperty(globalThis, "__SECURE_CHAT_NATIVE_FLOOR__", { value: true, configurable: true });
+    Object.defineProperty(globalThis, "__SECURE_CHAT_PAD_FLOOR__", { value: Object.freeze(healthy), configurable: true });
+    const mod1 = await import(`./otp.js?f4est=${failing}&t=${Date.now()}`);
+    const PASS = "pad passphrase";
+    const pad = await mod1.generatePad({ label: "f4", totalBytes: 64 * 1024 });
+    await mod1.saveNewPad(pad, PASS);           // establishes durable slots at 0
+
+    // Phase 2: swap in a floor that FAILS the target slot's disk commit, carrying
+    // the SAME mem+disk state forward (a process that keeps running — the healthy
+    // slots stay durable). `nativeFloor` is captured at module load, so re-import.
+    const failer = makePrefsFloor(failing);
+    for (const [k, v] of healthy.mem) failer.mem.set(k, v);
+    for (const [k, v] of healthy.disk) failer.disk.set(k, v);
+    Object.defineProperty(globalThis, "__SECURE_CHAT_PAD_FLOOR__", { value: Object.freeze(failer), configurable: true });
+    const mod2 = await import(`./otp.js?f4fail=${failing}&t=${Date.now()}`);
+    const r = await mod2.unlockPad(pad.padId, PASS);
+
+    // Advance the counter that the target slot backs, then try to persist.
+    if (failing === "") r.record.sendOffset = 900;
+    else if (failing === "#recv") r.record.recvHighWater = 4096;
+    else r.record.exported = true;
+    const target = failing === "" ? pad.padId : pad.padId + failing;
+    const durableBefore = failer.disk.has(target) ? failer.disk.get(target) : -1;
+
+    // (a) the save REJECTS. armFloors sees the bump's NATIVE_COMMIT_FAILED for a
+    // slot the blob CLAIMS ARMED, so it throws before app.js can transmit (P-04).
+    await assert.rejects(
+      () => mod2.savePadProgress(r.record, r.atRest),
+      /did not record this pad's progress|Nothing was sent/,
+      `F-4: a save whose commit() failed for ${which} must REJECT — the durable floor did not ` +
+      "move, and app.js persists before it transmits, so the keystream must not go on the wire");
+    console.log(`OK  F-4: a save whose commit() fails for ${which} is rejected (nothing transmitted)`);
+
+    // (b) H-3 stays closed. The DURABLE floor genuinely did NOT advance (commit
+    // failed) — a real restart would read the old value — even though a bare read()
+    // looks healthy because the in-memory map moved. Because (a) refused the save,
+    // the offset the target slot backs was never released onto the wire, so no
+    // keystream was spent; re-importing the pristine pad at offset 0 later would be
+    // a FIRST use, not a reuse. The rejection is the ONLY thing standing between
+    // here and a two-time pad, which is exactly why the durable floor being frozen
+    // must fail the save rather than be papered over by a healthy-looking read-back.
+    const durableAfter = failer.disk.has(target) ? failer.disk.get(target) : -1;
+    assert.strictEqual(durableAfter, durableBefore,
+      `F-4: the durable ${which} floor must be UNCHANGED after a failed commit — a restart would ` +
+      "read the old value, so it is the refused save (not the floor) that keeps H-3 closed");
+    assert.ok(failer.read(target) > durableAfter,
+      `F-4: the in-memory read of ${which} DID advance and looks healthy — proving a read-back ` +
+      "cannot see the failure and the bump's return is the only witness the fix can react to");
+
+    delete globalThis.__SECURE_CHAT_NATIVE_FLOOR__;
+    delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+  }
+
+  // (c) CONTROL: a healthy commit still saves normally and the durable floor moves.
+  const healthy = makePrefsFloor(null);
+  const store = new Map();
+  globalThis.localStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k),
+  };
+  Object.defineProperty(globalThis, "__SECURE_CHAT_NATIVE_FLOOR__", { value: true, configurable: true });
+  Object.defineProperty(globalThis, "__SECURE_CHAT_PAD_FLOOR__", { value: Object.freeze(healthy), configurable: true });
+  const mod = await import(`./otp.js?f4ok=${Date.now()}`);
+  const PASS = "pad passphrase";
+  const pad = await mod.generatePad({ label: "f4-ok", totalBytes: 64 * 1024 });
+  const at = await mod.saveNewPad(pad, PASS);
+  pad.sendOffset = 900;
+  await mod.savePadProgress(pad, at);           // must NOT throw
+  assert.strictEqual(healthy.disk.get(pad.padId), 900,
+    "F-4 control: a healthy commit advances the DURABLE send floor and the save succeeds");
+  const reopened = await mod.unlockPad(pad.padId, PASS);
+  assert.strictEqual(reopened.record.sendOffset, 900, "F-4 control: the pad reopens at its true offset");
+  console.log("OK  F-4 control: a healthy commit still saves normally and the durable floor advances");
+  delete globalThis.__SECURE_CHAT_NATIVE_FLOOR__;
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+}
+await testCommitFailureFailsTheSave();
+
+// Kotlin SOURCE anchor (Kotlin cannot run in this suite). The entire JS-side
+// reaction above is worthless unless PadFloor.bump actually SURFACES commit()'s
+// boolean as a distinct sentinel instead of discarding it and returning the
+// intended value — the F-4 residual in one line. Pin that at the source so a
+// revert to `.commit(); return next` cannot slip past this suite unnoticed.
+{
+  const kt = await readFile(
+    new URL("../android/app/src/main/java/org/securechat/app/PadFloor.kt", import.meta.url),
+    "utf8",
+  );
+  assert.match(kt, /const val COMMIT_FAILED = -3L/,
+    "F-4: PadFloor must define COMMIT_FAILED = -3L beside ABSENT/TAMPERED");
+  const bumpBody = kt.slice(
+    kt.indexOf("fun bump("),
+    kt.indexOf("// Pentest 2026-07-29 H-1: there is deliberately NO clear"),
+  );
+  assert.match(bumpBody, /\.commit\(\)/, "F-4: bump must call commit()");
+  assert.match(bumpBody, /if\s*\(\s*committed\s*\)\s*next\s+else\s+COMMIT_FAILED/,
+    "F-4: bump must return COMMIT_FAILED when commit() returns false, not discard the boolean");
+  assert.doesNotMatch(bumpBody, /\.commit\(\)\s*\n\s*return next/,
+    "F-4: bump must NOT discard commit()'s boolean and return the intended value unconditionally");
+  console.log("OK  F-4 (Kotlin source): PadFloor.bump surfaces commit()'s boolean as COMMIT_FAILED");
+}
+
 // A CORRUPTED slot is not the same as an absent one, and must not be handled the
 // same way. NATIVE_ABSENT (-1) is benign — nothing was ever written. TAMPERED
 // (-2) means something IS there and its Keystore MAC did not verify, which costs
