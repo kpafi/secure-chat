@@ -5,6 +5,45 @@ import assert from "node:assert";
 import { readFile } from "node:fs/promises";
 import { stripComments, codeLines } from "./test-source.mjs";
 
+// ROUND-5 (cold reviewer). The two `Object.defineProperty` injections that
+// publish `__SECURE_CHAT_NATIVE_FLOOR__` and `__SECURE_CHAT_PAD_FLOOR__` sit a
+// few lines apart in MainActivity.kt, and both anchors below used to slice from
+// `indexOf(<name>)` to the END OF THE FILE. Each slice therefore contained the
+// OTHER block, so each was satisfied by the other's attribute list and neither
+// pinned its own target: flipping one to `configurable: true` — which makes the
+// protected name deletable from a document-start script, the exact downgrade H-1
+// and H-A exist to stop — left the suite green.
+//
+// Two things are needed. Bound each block to ITS OWN call by paren matching, and
+// strip comments from the injected JS so a comment cannot satisfy it. The
+// injection lives inside a Kotlin RAW STRING, which the JS scanner cannot parse
+// (see android-source.test.mjs), so pull the raw string out first and strip
+// THAT — it is JavaScript, which is exactly what the scanner is for.
+function injectedJs(kotlinSrc) {
+  const open = kotlinSrc.indexOf('"""');
+  if (open === -1) return null;
+  const close = kotlinSrc.indexOf('"""', open + 3);
+  if (close === -1) return null;
+  return stripComments(kotlinSrc.slice(open + 3, close));
+}
+
+// The single `Object.defineProperty(...)` call whose arguments name `global`,
+// bounded by paren matching so the NEXT call cannot stand in for it.
+function definePropertyFor(js, global) {
+  const re = /Object\.defineProperty\s*\(/g;
+  for (let m = re.exec(js); m; m = re.exec(js)) {
+    let i = js.indexOf("(", m.index);
+    let depth = 0;
+    for (; i < js.length; i++) {
+      if (js[i] === "(") depth++;
+      else if (js[i] === ")" && --depth === 0) { i++; break; }
+    }
+    const block = js.slice(m.index, i);
+    if (block.includes(global)) return block;
+  }
+  return null;
+}
+
 const mem = new Map();
 globalThis.localStorage = {
   getItem: (k) => (mem.has(k) ? mem.get(k) : null),
@@ -568,11 +607,15 @@ console.log("OK  F-1: v2 two-time-pad PoC is loud in the browser, refused outrig
     "utf8",
   );
   assert.match(activity, /__SECURE_CHAT_NATIVE_FLOOR__/, "the app must inject the marker");
-  assert.match(
-    activity.slice(activity.indexOf("__SECURE_CHAT_NATIVE_FLOOR__")),
-    /configurable:\s*false/,
-    "H-1: the marker must be non-configurable or `delete` hides the downgrade",
-  );
+  const injected = injectedJs(activity);
+  assert.ok(injected, "MainActivity.kt must still carry the injected document-start script");
+  const markerDef = definePropertyFor(injected, "__SECURE_CHAT_NATIVE_FLOOR__");
+  assert.ok(markerDef,
+    "H-1: the marker must be published with Object.defineProperty, not a plain assignment");
+  assert.match(markerDef, /configurable:\s*false/,
+    "H-1: the marker must be non-configurable or `delete` hides the downgrade. Bounded to its " +
+    "OWN defineProperty call (ROUND-5): slicing to end-of-file let the OTHER injection's " +
+    `attribute list satisfy this. Found: ${markerDef}`);
 
   // A genuine browser — NEITHER global — is unaffected: no floor, and the
   // documented residual stands. Without this the fix could be "fail closed
@@ -670,11 +713,17 @@ console.log("OK  H-1: the native floor cannot be cleared or feature-detected awa
     new URL("../android/app/src/main/java/org/securechat/app/MainActivity.kt", import.meta.url),
     "utf8",
   );
-  const inject = activity.slice(activity.indexOf("__SECURE_CHAT_PAD_FLOOR__"));
+  const injectedA = injectedJs(activity);
+  assert.ok(injectedA, "MainActivity.kt must still carry the injected document-start script");
+  const inject = definePropertyFor(injectedA, "__SECURE_CHAT_PAD_FLOOR__");
+  assert.ok(inject,
+    "H-A: the bridge must be published with Object.defineProperty, not a plain assignment");
   assert.match(inject, /Object\.freeze/, "H-A: the published bridge must be frozen");
   assert.match(inject, /\.bind\(b\)/,
     "H-A: methods must be BOUND, or a later `b.read = fake` is still obeyed");
-  assert.match(inject, /configurable:\s*false/, "H-A: the published name must be non-configurable");
+  assert.match(inject, /configurable:\s*false/,
+    "H-A: the published name must be non-configurable. Bounded to its OWN defineProperty call " +
+    `(ROUND-5) so the marker's block cannot satisfy it. Found: ${inject}`);
   // otp.js must not read the writable global at all any more.
   const otpSrc = await readFile(new URL("./otp.js", import.meta.url), "utf8");
   const code = stripComments(otpSrc);
@@ -1836,5 +1885,99 @@ async function testFrozenFloorFailsTheSaveBeforeSending() {
 }
 
 await testFrozenFloorFailsTheSaveBeforeSending();
+
+// --- item 13, third pass: the two writers that had no broken-bridge gate -----
+// Test-debt item 7. `unlockPad`, `saveNewPad` and `importPad` each refuse when
+// the bridge is BROKEN — `__SECURE_CHAT_NATIVE_FLOOR__` says a hardware floor is
+// supposed to exist but `__SECURE_CHAT_PAD_FLOOR__` is missing or malformed, so
+// every floor read and every bump answers NATIVE_TAMPERED. `savePadProgress` and
+// `markExported` did not, and they are the two writers that run WITHOUT a fresh
+// unlock: app.js caches {record, atRest} per pad for the whole session. So every
+// per-message save, and the write that latches the one-way `exported` flag,
+// reached `writePadBlob` with no floor check at all. `markExported` is the worse
+// of the two — that flag is the only thing standing between one pristine export
+// file and a two-time pad by construction.
+//
+// HONESTY NOTE, because a test that overstates what it proves is worse than no
+// test. This state is NOT producible in production, and PROGRESS.md item 9 (A4)
+// already records that: the bridge is republished non-configurable at
+// document-start, and `nativeFloor` is captured once in a module-scope IIFE, so
+// within one page load it cannot "break mid-session" the way the code comment
+// above savePadProgress claims; across a page load, every producer of
+// {record, atRest} refuses first. This is therefore a MUTATION-BINDING test for a
+// defence-in-depth line, not a regression test for a live hole. It exists so the
+// line cannot be deleted as dead weight without something going red, which is
+// exactly what the debt entry asked for.
+//
+// Reaching it needs no hook in otp.js: `nativeFloor` is decided at IMPORT time,
+// so the pad is created by one module instance with a working bridge and then
+// handed to a SECOND instance imported after the bridge global was removed.
+// `record`/`atRest` are plain objects and cross instances freely.
+async function testBrokenBridgeBlocksTheCachedWriters() {
+  const slots = new Map();
+  const floor = {
+    read: (k) => (slots.has(k) ? slots.get(k) : -1),
+    bump: (k, v) => { if (v < 0) return floor.read(k); const n = Math.max(floor.read(k), v); slots.set(k, n); return n; },
+  };
+  Object.defineProperty(globalThis, "__SECURE_CHAT_NATIVE_FLOOR__", { value: true, configurable: true });
+  Object.defineProperty(globalThis, "__SECURE_CHAT_PAD_FLOOR__", { value: Object.freeze(floor), configurable: true });
+  const store = new Map();
+  globalThis.localStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k),
+  };
+
+  const PASS = "pad passphrase";
+  const healthy = await import(`./otp.js?broken=a&t=${Date.now()}`);
+  const record = await healthy.generatePad({ label: "broken bridge", totalBytes: 64 * 1024 });
+  const atRest = await healthy.saveNewPad(record, PASS);
+  const padKey = "sc.otp.pad.v1." + record.padId;
+  const sealed = localStorage.getItem(padKey);
+  assert.ok(sealed, "fixture: the pad must be on disk before the bridge is taken away");
+
+  // The marker STAYS (this device claims a hardware floor); only the bridge goes.
+  // That is precisely the "expected but not securable" state, and it is what
+  // makes a plain browser distinguishable from a device whose floor was removed.
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+  const broken = await import(`./otp.js?broken=b&t=${Date.now()}`);
+
+  record.sendOffset = 4096;
+  await assert.rejects(() => broken.savePadProgress(record, atRest),
+    /hardware rollback protection/,
+    "item 13: a per-message save must refuse once the floor cannot be reached — app.js caches " +
+    "{record, atRest} for the session, so without this gate every save after the first unlock " +
+    "sealed a blob whose floor claim nothing on the device can check");
+  assert.strictEqual(localStorage.getItem(padKey), sealed,
+    "...and it must refuse BEFORE writing: a rejected save that already rewrote the blob would " +
+    "advance the recorded offset with no floor behind it, which is the H-3 shape");
+
+  record.exported = false;
+  await assert.rejects(() => broken.markExported(record, atRest),
+    /hardware rollback protection/,
+    "item 13: latching the one-way `exported` flag must refuse too — that flag is the only " +
+    "warning between one pristine export file and the same pad handed to two importers, i.e. a " +
+    "two-time pad by construction, so it is the last write that may happen unverifiably");
+  assert.strictEqual(localStorage.getItem(padKey), sealed,
+    "...and markExported must not have touched the blob either");
+  console.log("OK  item 13: savePadProgress and markExported refuse on a broken floor bridge");
+
+  // Control: the SAME calls on the SAME record succeed against a working bridge,
+  // so the assertions above are pinned to the broken state and not to something
+  // incidental about a re-imported module instance.
+  Object.defineProperty(globalThis, "__SECURE_CHAT_PAD_FLOOR__", { value: Object.freeze(floor), configurable: true });
+  const again = await import(`./otp.js?broken=c&t=${Date.now()}`);
+  await again.savePadProgress(record, atRest);
+  await again.markExported(record, atRest);
+  assert.notStrictEqual(localStorage.getItem(padKey), sealed,
+    "control: with the bridge back, the very same writes must go through — otherwise the test " +
+    "above would pass with the gate deleted and something else doing the refusing");
+  console.log("OK  item 13: control — the same writes succeed once the bridge is back");
+
+  delete globalThis.__SECURE_CHAT_NATIVE_FLOOR__;
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+}
+
+await testBrokenBridgeBlocksTheCachedWriters();
 
 console.log("All OTP native-floor scope checks passed.");

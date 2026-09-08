@@ -431,4 +431,282 @@ const ok = (name) => { n++; console.log("OK  " + name); };
   ok(`item 14: all ${seen.size} expectedPeerBundle sites in app.js are on the allow-list`);
 }
 
+// ===========================================================================
+// §C9 — the guest-side half of F-PROTO-001, which nothing anchored.
+//
+// The debt entry said "no regression test at all for F-PROTO-001". That is not
+// quite right and the correction matters: the OWNER side is covered three times
+// over — `peerAlreadyTrusted` runs for real above, the key-frame window pins
+// `roomRole === "owner" && !admittedSomeone()`, and e2e/hostile-relay/proto001.mjs
+// drives POLICY=demote against a live hostile relay. What has NO anchor anywhere
+// is the GUEST side, and it is the half the finding is actually about: a relay
+// answering `join` with `pending` demotes the creator to guest, so nobody is
+// asked to approve and an unapproved identity completes the handshake.
+//
+// Two gates carry that, both in the `joined` arm of handleMessage:
+//
+//   * role WRITE-ONCE. A guest told mid-session that it is the owner would start
+//     approving people into a room it does not control; an owner told it is a
+//     guest stops being asked at all. The relay picks. Neither is recoverable
+//     from, so a role that CHANGES is a refusal.
+//
+//   * `roomRole === "guest" && !wasPending`. The only legitimate route to a guest
+//     seat is pending -> knock -> joined:guest, so a seat handed over without
+//     ever passing through the queue means no owner approved it. This is what
+//     stops the relay telling BOTH parties they are guests — the state in which
+//     the owner-side gate above is never reached by anybody.
+//
+// `app.js` cannot be imported (it touches `document` at module scope) and
+// `handleMessage` closes over ~20 module-scope bindings, so this is a source
+// anchor: an exact allow-list of the executable lines from the top of the arm
+// through the end of the second gate. Everything in that window must be a
+// refusal or the write-once assignment; nothing may be added, in any spelling.
+{
+  const body = liftFunction(src, "handleMessage", assert);
+  const armAt = body.indexOf('case "joined": {');
+  assert.notStrictEqual(armAt, -1, "F-PROTO-001: handleMessage must still have a `joined` arm");
+  // Brace-match to the end of the guest-seat gate, so the window covers the whole
+  // of both gates' BODIES (the ROUND-3 F-1 lesson: a window that stops at a gate
+  // line leaves the branch it guards pinned by nothing).
+  const gateAt = body.indexOf('if (roomRole === "guest" && !wasPending) {', armAt);
+  assert.notStrictEqual(gateAt, -1,
+    "F-PROTO-001: the guest half of M-2 must still exist — without it the relay can seat us " +
+    "without anybody approving us, and the owner-side gate never runs at all");
+  let depth = 0, gateEnd = -1;
+  for (let k = body.indexOf("{", gateAt); k < body.length; k++) {
+    if (body[k] === "{") depth++;
+    else if (body[k] === "}" && --depth === 0) { gateEnd = k + 1; break; }
+  }
+  assert.notStrictEqual(gateEnd, -1, "the guest-seat gate must be brace-balanced");
+  const window = codeOnly(body.slice(armAt, gateEnd));
+
+  // The H-1 meta-check: prove the slice is CODE before trusting what it says
+  // about the code. A comment-anchored slice collapses here.
+  assert.ok(window.length >= 15,
+    `H-1: the joined-arm window holds only ${window.length} executable lines — that is a slice ` +
+    "over comments, not over code, which is exactly how a previous anchor in this file passed " +
+    "while the branch it named was deleted");
+
+  assert.deepStrictEqual(window, [
+    'case "joined": {',
+    "joined = true;",
+    // An older relay's bare {"joined"} is refused rather than silently running
+    // the first-come-first-served protocol this fix removed.
+    'if (m.role !== "owner" && m.role !== "guest") {',
+    'addLine("sys", "", "[this relay does not support join approval — refusing]");',
+    'hint("This relay is running an older protocol without the join-approval step. Update the relay (or your app) before using it.", true);',
+    "if (ws) ws.close();",
+    "return;",
+    "}",
+    // Write-once. `roomRole` may be ASSIGNED here only when it is still null;
+    // any other value from the relay is a re-cast and a refusal.
+    "if (roomRole === null) {",
+    "roomRole = m.role;",
+    "} else if (roomRole !== m.role) {",
+    'addLine("sys", "", "[the relay changed our role mid-session — refusing]");',
+    'hint("The relay tried to change your role in this room. Disconnecting.", true);',
+    "if (ws) ws.close();",
+    "return;",
+    "}",
+    // A seat that never went through the queue.
+    'if (roomRole === "guest" && !wasPending) {',
+    'addLine("sys", "", "[we were seated in this room without ever asking to be let in — refusing]");',
+    'hint("This relay put you in the room without the owner approving you. Disconnecting.", true);',
+    "if (ws) ws.close();",
+    "return;",
+    "}",
+  ],
+    "F-PROTO-001 (guest side): the joined arm through both role gates is pinned EXACTLY. Nothing " +
+    "may run before them, and `roomRole` may be written only on the null->role transition. If " +
+    "you are changing this deliberately, update this list and say why in the commit.");
+  ok("F-PROTO-001: the guest-side role gates in the `joined` arm are pinned exactly");
+
+  // `wasPending` is the whole evidence base for the second gate, so pin its
+  // producer too: it may become true in exactly ONE place, the `pending` arm.
+  // A second writer — or one moved into the `joined` arm — would make the gate
+  // self-satisfying, i.e. decorative, while every line above still matched.
+  // ROUND-5 (pentest): this regex was `/\bwasPending\s*=/`, which does not match
+  // the COMPOUND assignments `||=`, `&&=`, `??=`. `wasPending ||= true;` inserted
+  // at the top of handleMessage manufactures exactly the evidence the guest-side
+  // gate consults, and the allow-list never saw it. Match any assignment form,
+  // and exclude comparisons (`==`, `===`, `!=`, `>=` …) rather than only `=`.
+  const setters = codeOnly(src).filter((l) =>
+    /\bwasPending\s*(?:\|\||&&|\?\?)?=(?!=)/.test(l) || /\bwasPending\s*[-+*/%]=/.test(l));
+  assert.deepStrictEqual(setters.sort(),
+    ["let wasPending = false;", "wasPending = false;", "wasPending = false;", "wasPending = true;"],
+    "F-PROTO-001: `wasPending` may be set true exactly once (in the `pending` arm, which is the " +
+    "proof we sat in the approval queue) and otherwise only reset to false on connect/disconnect. " +
+    "A second `= true` anywhere lets the relay manufacture the evidence the guest gate checks.");
+
+  // ROUND-5 (pentest): the block above claims "`roomRole` may be written only on
+  // the null->role transition", but that was asserted ONLY inside the joined-arm
+  // window slice — so an assignment placed anywhere else in app.js (e.g.
+  // `if (m && m.hint === "promote") roomRole = "owner";` at the top of
+  // handleMessage) satisfied the whole test while granting the relay the role it
+  // wants. A claim about "only" needs a writer allow-list over the WHOLE file,
+  // exactly as `wasPending` has.
+  const roleSetters = codeOnly(src).filter((l) =>
+    /\broomRole\s*(?:\|\||&&|\?\?)?=(?!=)/.test(l) || /\broomRole\s*[-+*/%]=/.test(l));
+  assert.deepStrictEqual(
+    roleSetters,
+    ["let roomRole = null;", "roomRole = null;", "roomRole = null;",
+      'roomRole = "guest";', "roomRole = m.role;"],
+    "item 20 / F-PROTO-001: `roomRole` is the relay's word about who owns the room, and the " +
+    "guest-side approval gate reads it. Every assignment in app.js must be one of: the " +
+    "declaration, the per-connection reset, and the single null->role transition inside the " +
+    "`joined` arm. A new writer anywhere else lets the relay re-assert a role mid-session, " +
+    `which is M-2's shape. Found: ${roleSetters.join(" | ")}`);
+  // Both role-setting arms are write-once GUARDED; the allow-list above pins who
+  // may write, this pins that neither can be re-driven mid-session by a relay
+  // that simply repeats the frame.
+  const pendingArmSlice = src.slice(src.indexOf('case "pending": {'));
+  assert.match(pendingArmSlice.slice(0, 400), /if \(roomRole !== null\) break;[\s\S]{0,80}roomRole = "guest";/,
+    "item 20: the `pending` arm must refuse to re-cast a role that is already set — a relay " +
+    "that re-sends `pending` to an OWNER would otherwise stop that owner being asked to " +
+    "approve anyone, which is M-2's shape");
+  ok("item 20: `roomRole` has exactly five writers file-wide, and both setters are write-once");
+  const pendingArm = src.indexOf('case "pending": {');
+  const trueAt = src.indexOf("wasPending = true", pendingArm);
+  const joinedArm = src.indexOf('case "joined": {');
+  assert.ok(pendingArm !== -1 && trueAt !== -1 && trueAt < joinedArm,
+    "F-PROTO-001: the single `wasPending = true` must live in the `pending` arm — setting it " +
+    "anywhere reachable from `joined` would make the gate approve the thing it is checking");
+  ok("F-PROTO-001: `wasPending` is written true only where we actually queued");
+}
+
+// ===========================================================================
+// §C9 — F-PROTO-002: the readyState gate must be the FIRST statement.
+//
+// Every authentication refusal in app.js ends in a bare `ws.close()`, which
+// stops nothing already in flight: `msgChain` is a FIFO promise chain, so frames
+// the relay batched with the refused one stayed queued and kept driving the state
+// machine after the decision to refuse. Demonstrated end state, after the client
+// had printed "[a SECOND identity tried to complete the key exchange — refusing]":
+// the channel was still derived, the receive gate still opened, relayed
+// ciphertext was still rendered as trusted peer content, and the user was left
+// reading "Verified. Messages are end-to-end encrypted."
+//
+// The property is POSITIONAL, which is why `includes` would not do: `close()`
+// moves readyState to CLOSING synchronously, so anything ABOVE this line still
+// runs on a socket that is going away. Note there is a SECOND, different
+// occurrence of the same line (the re-check after `await requestPeerApproval`,
+// pinned in EXPECTED_WINDOW above), so this anchors on position within the
+// lifted body rather than on the string appearing somewhere.
+//
+// Recorded honestly: PROGRESS.md notes the original burst could not be
+// reproduced in Chromium, whose own readyState handling already drops it. This
+// is defence in depth against a runtime that does not, and against the same
+// class arriving through a non-WebSocket transport later.
+{
+  const body = liftFunction(src, "handleMessage", assert);
+  const lines = codeOnly(body);
+  assert.ok(/^async function handleMessage\(|^function handleMessage\(/.test(lines[0]),
+    "the lift must start at the signature");
+  assert.strictEqual(lines[1], "if (!ws || ws.readyState !== WebSocket.OPEN) return;",
+    "F-PROTO-002: the readyState gate must be the FIRST statement in handleMessage. A refusal " +
+    "ends in ws.close(), which moves readyState to CLOSING synchronously but cancels nothing " +
+    "already queued on msgChain — so every line placed above this one runs on a socket that is " +
+    "going away, on frames the relay batched with the one we just refused.");
+  ok("F-PROTO-002: the readyState gate is the first statement of handleMessage");
+}
+
+// ===========================================================================
+// §C9 — F-CRYPTO-014: no Web Locks, no OTP.
+//
+// OTP's entire information-theoretic claim rests on no pad byte ever encrypting
+// twice, and ACROSS tabs the pad lock is the only thing enforcing that. The
+// fallback used to be a hand-rolled localStorage lease, which is not an exclusion
+// primitive: getItem/setItem have no cross-tab atomicity, so two tabs that both
+// read "free" both acquired, and a backgrounded tab whose heartbeat was throttled
+// lost its lease and kept sending anyway — the same decrypted pad at the same
+// sendOffset in two tabs, i.e. a genuine two-time pad plus a reused one-time MAC
+// key, recoverable by crib-dragging. The lease is gone; the stance is fail-closed.
+//
+// `acquirePadLock` closes over exactly two things — the `navigator` global and
+// the module constant PAD_LOCK_UNSUPPORTED — so unlike handleMessage it lifts and
+// RUNS. The distinction under test is not "it refused" but WHICH refusal: a
+// `null` return renders as "this pad is open in another tab", which is a
+// different (and wrong) sentence and reopens exactly the ambiguity the sentinel
+// was introduced to remove.
+{
+  const fnSrc = liftFunction(src, "acquirePadLock", assert);
+  const make = (PAD_LOCK_UNSUPPORTED) => new Function(
+    "PAD_LOCK_UNSUPPORTED", `${fnSrc}; return acquirePadLock;`,
+  )(PAD_LOCK_UNSUPPORTED);
+  const SENTINEL = "unsupported";
+  const prevNav = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  const setNav = (v) => Object.defineProperty(globalThis, "navigator", {
+    value: v, configurable: true, writable: true,
+  });
+  try {
+    // (1) An engine with no Web Locks API — Chrome / Android System WebView < 69,
+    // Firefox < 96, Safari 15.0-15.3. Must be the SENTINEL.
+    setNav({});
+    const got = await make(SENTINEL)("pad-1");
+    assert.strictEqual(got, SENTINEL,
+      "F-CRYPTO-014: with no Web Locks API, acquirePadLock must return the UNSUPPORTED sentinel. " +
+      "Returning a release function would be a fabricated lease (the removed localStorage lock, " +
+      "which is what let two tabs hold one pad at one offset); returning null would be correct " +
+      "in effect but tells the user 'the pad is open in another tab', which is not what happened " +
+      "and sends them looking for a tab that does not exist.");
+    assert.notStrictEqual(got, null, "...distinct from null, which means 'held elsewhere'");
+    assert.notStrictEqual(typeof got, "function", "...and emphatically not a usable lock");
+
+    // (2) With a real-enough Web Locks (`ifAvailable` honoured, exclusive by
+    // name, held for the life of the callback promise): the first caller gets a
+    // release function, a second caller for the SAME pad gets null.
+    const held = new Set();
+    setNav({
+      locks: {
+        request(name, opts, fn) {
+          if (opts && opts.ifAvailable && held.has(name)) return Promise.resolve(fn(null));
+          held.add(name);
+          return Promise.resolve(fn({ name })).then(() => { held.delete(name); });
+        },
+      },
+    });
+    const lock = make(SENTINEL);
+    const first = await lock("pad-2");
+    assert.strictEqual(typeof first, "function",
+      "control: the supported path must hand back a release function, or OTP is unusable on " +
+      "every current browser and the fail-closed stance becomes a total outage");
+    const second = await lock("pad-2");
+    assert.strictEqual(second, null,
+      "F-CRYPTO-014: a pad already held must come back as null — 'open in another tab', the one " +
+      "case where that sentence is the right one");
+    const other = await lock("pad-3");
+    assert.strictEqual(typeof other, "function", "...and a DIFFERENT pad is unaffected");
+    ok("F-CRYPTO-014: acquirePadLock fails closed with a distinct sentinel when Web Locks is absent");
+  } finally {
+    if (prevNav) Object.defineProperty(globalThis, "navigator", prevNav);
+    else delete globalThis.navigator;
+  }
+
+  // The call site is the other half: a sentinel nobody acts on is decoration.
+  // Pinned as an exact window so the `return` cannot be dropped (which would let
+  // OTP proceed with `otpLockRelease` set to the string "unsupported") and so the
+  // sentinel branch cannot be reordered below the `!padLock` branch, where the
+  // truthy string would fall straight through to a session with no lock at all.
+  const site = src.indexOf("const padLock = await acquirePadLock(padId);");
+  assert.notStrictEqual(site, -1, "F-CRYPTO-014: the pad lock must still be acquired before a session");
+  const after = codeOnly(src.slice(site)).slice(0, 12);
+  assert.deepStrictEqual(after.slice(0, 8), [
+    "const padLock = await acquirePadLock(padId);",
+    "if (padLock === PAD_LOCK_UNSUPPORTED) {",
+    'hint("This browser is too old to guarantee a one-time pad is open only once (it has no Web Locks API), and using a pad twice would destroy its security. Use a current browser for one-time-pad mode, or pick another encryption mode.", true);',
+    "return;",
+    "}",
+    "if (!padLock) {",
+    // Spelled with the source's own — escape: this is an EXACT line match
+    // against app.js, not a rendering of it.
+    'hint("This one-time pad is open in another tab or window. Close it there first \\u2014 using a pad twice at once would break its security.", true);',
+    "return;",
+    ],
+    "F-CRYPTO-014: the UNSUPPORTED branch must come FIRST and must RETURN. The sentinel is a " +
+    "truthy string, so if the `!padLock` test were reached first — or if this branch merely " +
+    "warned and fell through — the session would continue with no pad lock at all and " +
+    "`otpLockRelease` set to a string, which is the two-time pad this finding is about.");
+  ok("F-CRYPTO-014: the call site refuses on the UNSUPPORTED sentinel before anything else");
+}
+
 console.log(`\nAll ${n} peer-approval checks passed.`);

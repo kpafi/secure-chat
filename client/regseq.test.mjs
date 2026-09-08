@@ -569,4 +569,129 @@ globalThis.fetch = async (_url, opts) => {
   ok("M-3: the republish warning is anchored in its own function");
 }
 
+// --- test-debt item 7: keys_locked, driven through the REAL register() -------
+// The backend distinguishes three 409s (`username_taken`, `stale_counter`,
+// `keys_locked` — commit ea4afe9) and app.js branches on all three. Until now
+// `keys_locked` appeared in this file only inside the `accountMessageFor`
+// REPLICA and in the source anchors over app.js: nothing ever put one on the
+// wire and checked what `register()` actually produces from it. A replica plus a
+// source anchor prove the caller handles a code it is GIVEN; neither proves the
+// code is ever handed over.
+{
+  reset();
+  useScript();
+  replies = [{ ok: false, status: 409, body: { detail: { error: "keys_locked", message: "encryption keys are locked" } } }];
+  let err = null;
+  try { await account.register("http://x", identity, "victim"); } catch (e) { err = e; }
+
+  assert.ok(err, "a keys_locked 409 must throw, not resolve");
+  assert.strictEqual(err.status, 409);
+  assert.strictEqual(err.code, "keys_locked",
+    "item 7: the third 409 must reach the caller as its own machine-readable code. Without it, " +
+    "app.js falls through to the bare `e.status === 409` branch and the user is told to pick " +
+    "another username — which throws away a handle that is theirs and every pin their contacts " +
+    "hold for it, while the actual problem (the directory will not accept this key update) goes " +
+    "unsaid.");
+  assert.strictEqual(err.message, "encryption keys are locked",
+    "...carrying the server's own sentence, not '[object Object]' from the structured detail");
+
+  // The load-bearing one. `keys_locked` must NOT fall into the stale_counter
+  // retry: that branch re-signs and re-sends at a bumped counter, which cannot
+  // help (the keys are locked, not the counter) and burns a counter value that
+  // this device then has to overtake for the rest of the account's life.
+  assert.strictEqual(sent.length, 1,
+    "item 7: a keys_locked 409 must not trigger the counter retry — the retry is gated on " +
+    "stale_counter (or the legacy string sniff), and widening it to 'any 409 with a code' would " +
+    "silently burn a counter value on a refusal that a new counter cannot fix");
+  ok("item 7: a keys_locked 409 surfaces as its own code, with no counter retry");
+}
+
+// --- test-debt item 7: the same paths against a SPEC-FAITHFUL Response -------
+// Every `fetch` stub in this file returns a hand-rolled object whose `clone()` is
+// `() => res` — infinitely re-readable. A real `Response` body may be read ONCE:
+// `clone()` before disturbing it, or the next read throws "Body is unusable".
+//
+// `register()` reads the body up to three times on the 409 path
+// (`res.clone().text()` for the legacy sniff, `res.clone().json()` for the code,
+// then `res.json()` inside `asError`), and against the stub all three succeed
+// unconditionally — so dropping a `.clone()` is INVISIBLE to every existing test
+// here while breaking the real browser path outright: the TypeError escapes as an
+// unhandled rejection instead of a coded 409, and the user gets no message at all
+// on the one failure that most needs explaining.
+//
+// Node ships the WHATWG `Response` (undici) as a global, so this needs no stub
+// and no import — just the real class.
+{
+  const realResponseFetch = (log) => async (_url, opts) => {
+    log.push(JSON.parse(opts.body));
+    const r = replies.shift() || { ok: true, status: 200, body: { status: "ok" } };
+    // A genuine Response: single-use body, real clone(), real json()/text().
+    return new Response(JSON.stringify(r.body), {
+      status: r.status,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  // Sanity: prove the harness really is stricter than the stub it replaces, so
+  // this block cannot quietly degrade into another re-readable double.
+  {
+    const probe = new Response(JSON.stringify({ detail: { error: "x" } }), { status: 409 });
+    assert.notStrictEqual(probe.clone(), probe, "a real Response.clone() is a NEW object");
+    await probe.json();
+    await assert.rejects(() => probe.json(), /unusable|already (been )?read/i,
+      "a real Response body may be read exactly once — that constraint is the whole point of " +
+      "this block, and if a runtime ever relaxes it this test stops proving anything");
+  }
+
+  // (1) the three-read path: a stale_counter 409, the retry, then a 409 that
+  //     survives it. This exercises clone().text(), clone().json() and asError's
+  //     res.json() on one and the same Response.
+  reset();
+  const log1 = [];
+  globalThis.fetch = realResponseFetch(log1);
+  const stored = Date.now() + 60_000;
+  replies = [
+    { ok: false, status: 409, body: { detail: { error: "stale_counter", stored_seq: stored, message: "counter not newer" } } },
+    { ok: false, status: 409, body: { detail: { error: "stale_counter", stored_seq: stored, message: "still not newer" } } },
+  ];
+  let e1 = null;
+  try { await account.register("http://x", identity, "alice"); } catch (e) { e1 = e; }
+  assert.ok(e1, "a 409 that survives the retry must throw");
+  assert.strictEqual(log1.length, 2, "the retry must still happen against a real Response");
+  assert.strictEqual(log1[1].seq, stored + 1, "...and still resync to the echoed stored_seq + 1");
+  assert.strictEqual(e1.code, "stale_counter",
+    "item 7: with a single-use body, register() must still produce a coded error. It reads the " +
+    "body three times on this path, so every read but the last has to go through clone() — drop " +
+    "one and the second read throws TypeError('Body is unusable') from inside asError, which " +
+    "escapes as an unhandled rejection rather than a 409 the UI can explain.");
+  assert.strictEqual(e1.message, "still not newer",
+    "...with the server's message, which is the read that happens LAST and therefore first to " +
+    "break when an earlier read consumed the body");
+  ok("item 7: the 409 retry path works against a spec-faithful single-use Response body");
+
+  // (2) keys_locked again, over a real Response: no retry, code and message intact.
+  reset();
+  const log2 = [];
+  globalThis.fetch = realResponseFetch(log2);
+  replies = [{ ok: false, status: 409, body: { detail: { error: "keys_locked", message: "encryption keys are locked" } } }];
+  let e2 = null;
+  try { await account.register("http://x", identity, "victim"); } catch (e) { e2 = e; }
+  assert.strictEqual(e2 && e2.code, "keys_locked", "keys_locked survives a single-use body");
+  assert.strictEqual(e2.message, "encryption keys are locked");
+  assert.strictEqual(log2.length, 1, "...and still does not retry");
+
+  // (3) control: the ordinary success path must not have been broken by any of
+  //     this — `register()` returns the parsed body, which is itself a body read.
+  reset();
+  const log3 = [];
+  globalThis.fetch = realResponseFetch(log3);
+  replies = [{ ok: true, status: 200, body: { username: "alice", lookup_token: "tok" } }];
+  const out = await account.register("http://x", identity, "alice");
+  assert.deepStrictEqual(out, { username: "alice", lookup_token: "tok" },
+    "control: a 200 must still be parsed and returned from a real Response");
+  ok("item 7: keys_locked and the success path also hold against a real Response");
+
+  useScript();   // ROUND-4 M-1: never leave another block talking to this stub
+}
+
 console.log(`\nAll ${n} registration-counter checks passed.`);

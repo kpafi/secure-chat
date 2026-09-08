@@ -495,9 +495,19 @@ export async function savePin(key, bundle) {
   // key. Without this the marker would outlive the re-verification it asks for on
   // the room-pin path, where `onVerifyOk` has no handle to upsert against.
   //
-  // Keyed on the pin key, so re-verifying one key does NOT silence the alarm for
-  // a different key that was swept in the same revocation.
-  if (swept) delete swept[key];
+  // Keyed on the pin key AND on the identity (ROUND-5). Saving a pin is an
+  // in-person check of a PERSON, so it may only clear the tombstone raised for
+  // that same person. Clearing on the key alone let a LATER, unrelated
+  // verification under the same key — a recycled `room:<id>` with somebody else —
+  // delete the victim's tombstone. That is worse than losing one alarm: since
+  // ROUND-3 F-3 made `pinWasSwept` fall through to an identity scan across
+  // tombstones, deleting the wrong one silences that peer's alarm in EVERY room,
+  // which is M-2's inverted alarm restored through a side door.
+  //
+  // Still per-key, so re-verifying one key does NOT silence the alarm for a
+  // different key swept in the same revocation.
+  const tomb = swept ? swept[key] : null;
+  if (tomb && tomb.ed === bundle.ed && tomb.mldsa === bundle.mldsa) delete swept[key];
   await persist();
 }
 

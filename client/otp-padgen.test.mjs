@@ -60,4 +60,57 @@ for (const size of PAD_SIZES) {
   console.log("OK  1 MiB pad with drawn entropy folded in");
 }
 
+// --- the PARTIAL TAIL, which PAD_SIZES cannot reach -------------------------
+// Test-debt item 7. Every entry in PAD_SIZES is an exact multiple of
+// CSPRNG_MAX_BYTES (65536, 262144, 1048576), so the loop above only ever walks
+// whole chunks: `fillRandom`'s final short chunk — the `Math.min(...)` end of the
+// last `subarray` — has never been executed by this suite at all. A fill loop
+// that stopped one chunk early (`off + CSPRNG_MAX_BYTES <= buf.length`) still
+// passes all three advertised sizes and leaves the tail of any other size as
+// ZEROS, which is not "a weaker pad": XOR against zeros is the identity, so those
+// bytes are the user's plaintext on the wire.
+//
+// The sizes are a UI menu, not a law — `generatePad` accepts any even integer
+// >= 128 — so this must be pinned independently of what the menu happens to
+// offer today. 100000 = 65536 + 34464, i.e. one whole chunk plus a partial one.
+{
+  const ODD = 100_000;
+  const TAIL_START = CSPRNG_MAX_BYTES;
+  assert.ok(PAD_SIZES.every((s) => s.bytes % CSPRNG_MAX_BYTES === 0),
+    "premise of this block: every advertised size is a whole number of chunks, which is exactly " +
+    "why the loop above cannot reach the partial-tail branch — if a non-multiple size is ever " +
+    "added to the menu, say so here rather than letting this block quietly become redundant");
+
+  const tail = await generatePad({ label: "partial tail", totalBytes: ODD });
+  assert.strictEqual(tail.bytes.length, ODD, "a non-multiple size must still generate in full");
+  assert.ok(tail.bytes.subarray(TAIL_START).some((b) => b !== 0),
+    "F-CRYPTO-012: the final SHORT chunk must be filled — an unwritten tail is a run of zeros, " +
+    "and XOR-OTP against zeros transmits the plaintext verbatim");
+  // The very end specifically: a loop that wrote the tail but computed its length
+  // wrong would leave only the last handful of bytes untouched, which is still a
+  // plaintext leak and is invisible to a whole-tail "some non-zero" check.
+  assert.ok(tail.bytes.subarray(ODD - 64).some((b) => b !== 0),
+    "F-CRYPTO-012: ...including the final bytes of the pad, not merely most of the tail");
+  // ...and the tail must be its own randomness, not a copy of chunk 0 (the
+  // two-time-pad shape the whole-chunk loop above also guards against).
+  {
+    const first = Buffer.from(tail.bytes.subarray(0, 64));
+    const last = Buffer.from(tail.bytes.subarray(TAIL_START, TAIL_START + 64));
+    assert.ok(!first.equals(last), "the partial tail must not repeat the first chunk");
+  }
+  console.log(`OK  item 7: a non-multiple size (${ODD}) fills its partial final chunk`);
+
+  // The drawn-entropy path XORs a full-length AES-CTR keystream over the base,
+  // so it can mask a zero tail with keystream and LOOK filled while the CSPRNG
+  // contributed nothing there. Assert the size works at all; the base-fill claim
+  // is carried by the plain case above, which is why both are kept.
+  const drawn = await generatePad({
+    label: "partial tail, drawn", totalBytes: ODD, fingerBytes: new Uint8Array(4096).fill(7),
+  });
+  assert.strictEqual(drawn.bytes.length, ODD);
+  assert.ok(drawn.bytes.subarray(ODD - 64).some((b) => b !== 0),
+    "tail unwritten with drawn entropy at a non-multiple size");
+  console.log(`OK  item 7: ...and with drawn entropy folded in at ${ODD} bytes`);
+}
+
 console.log("\nAll OTP pad generation checks passed.");

@@ -394,4 +394,238 @@ async function testTimeoutDoesNotReleaseTheLock() {
 }
 
 await testTimeoutDoesNotReleaseTheLock();
+
+// ---------------------------------------------------------------------------
+// TEST-DEBT ITEM 7. Three guards in `withWriteLock`/`persistLocked` were "green
+// against deletion": delete them and the suite still passed, so they proved
+// nothing. Each is reached here by stubbing the ENVIRONMENT — never by adding a
+// hook to chats.js, because a knob a same-origin script could turn is precisely
+// what this project does not want (see testStuckWriteLockSurfaces above, which
+// stubs `setTimeout` for exactly the same reason).
+//
+// A CORRECTION FIRST, since it is the reason two of the three were dead. The
+// comment at the head of installWebLocksShim says "Node has no navigator.locks".
+// That was true when it was written and is not true now: Node 21 grew a global
+// `navigator`, and on this runtime `locks` sits on `Navigator.prototype`
+// (`Object.keys(navigator.__proto__)` lists it). So `hasWebLocks` has been TRUE
+// in every test in this file whether or not the shim was installed, and the
+// `: fn()` fallback branch had never once executed. Note also that
+// `delete globalThis.navigator.locks` does NOT work for the same reason — the
+// property is on the prototype, not on the instance — so the global itself has
+// to be replaced or removed.
+
+// --- item 7 (a): the no-Web-Locks fallback still serialises writes -----------
+// On Chrome/Android WebView < 69, Firefox < 96 and Safari 15.0-15.3 there is no
+// Web Locks API at all, and chats.js deliberately does NOT fail closed there —
+// refusing would lock those users out of their own history, which is a worse
+// outcome than the cross-tab race it would prevent (the comment in withWriteLock
+// argues this at length). What carries the load on those engines is the intra-tab
+// `writeChain`, and NOTHING has ever tested it, because the branch was
+// unreachable in this suite.
+//
+// If the chain is dropped, two `persist()` calls on those engines interleave
+// read-witness / bump-generation / write, and the loser lands generation N+1 on
+// top of the winner's N+2 while the witness says N+2 — store older than witness,
+// which `assertNotRolledBack` refuses PERMANENTLY. A browser-version-dependent,
+// unrecoverable lockout.
+async function testWritesSerialiseWithoutWebLocks() {
+  const prevNav = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  const realEncrypt = crypto.subtle.encrypt.bind(crypto.subtle);
+  let inFlight = 0;
+  let overlapped = false;
+  try {
+    // An empty object, not `delete`: this pins the fallback specifically (the
+    // binding exists, `locks` does not), which is a DIFFERENT guard from the
+    // `typeof navigator` one tested below. They die to different mutants, so
+    // they are two tests rather than one.
+    Object.defineProperty(globalThis, "navigator", { value: {}, configurable: true, writable: true });
+    assert.strictEqual(typeof navigator, "object", "fixture: the binding must still exist");
+    assert.strictEqual(navigator.locks, undefined,
+      "fixture: ...but with no Web Locks — this is the branch PAD_SIZES of browsers actually run");
+
+    globalThis.localStorage = fakeLocalStorage();
+    const store = await import(`./chats.js?nolocks=${Date.now()}`);
+    store.setStoreAnchor(anchorFor({}));
+    await store.unlock(PASS);
+
+    // Detect overlap in the middle of the real persist, where the read-modify-
+    // write window actually is. `encrypt` is the awaited call inside
+    // persistLocked, so two persists in flight at once show up here.
+    crypto.subtle.encrypt = async (...args) => {
+      inFlight++;
+      if (inFlight > 1) overlapped = true;
+      try {
+        await new Promise((r) => setTimeout(r, 20));
+        return await realEncrypt(...args);
+      } finally { inFlight--; }
+    };
+
+    // Three writes fired WITHOUT awaiting, which is what an ordinary burst of
+    // chat activity looks like (ensure/append/markSeen all persist).
+    const results = await Promise.allSettled([
+      store.ensure("alice"), store.ensure("bob"), store.ensure("carol"),
+    ]);
+    crypto.subtle.encrypt = realEncrypt;
+    const failed = results.filter((r) => r.status === "rejected");
+    assert.deepStrictEqual(failed.map((r) => String(r.reason)), [],
+      "control: with no Web Locks the writes must still SUCCEED — chats.js deliberately does not " +
+      "fail closed here, because locking a user out of their own history is worse than the race");
+    assert.strictEqual(overlapped, false,
+      "item 7: with no Web Locks API, `writeChain` is the ONLY thing serialising writes in the " +
+      "tab. Two persists overlapping means the loser writes generation N+1 over the winner's " +
+      "N+2 while the witness holds N+2 — store older than witness, which assertNotRolledBack " +
+      "refuses permanently. That is an unrecoverable lockout on Chrome/WebView<69, FF<96 and " +
+      "Safari 15.0-15.3, and this suite never executed that branch at all until now.");
+
+    // ...and all three writes must actually be on disk, so "serialised" does not
+    // quietly mean "one of them was dropped".
+    for (const who of ["alice", "bob", "carol"]) {
+      assert.ok(store.get(who), `every serialised write must survive (${who} is missing)`);
+    }
+    console.log("OK  item 7: with no Web Locks API, writeChain still serialises every write");
+  } finally {
+    crypto.subtle.encrypt = realEncrypt;
+    if (prevNav) Object.defineProperty(globalThis, "navigator", prevNav);
+    else delete globalThis.navigator;
+  }
+}
+
+await testWritesSerialiseWithoutWebLocks();
+
+// --- item 7 (b): no `navigator` BINDING at all ------------------------------
+// The guard is `typeof navigator !== "undefined"`, not merely `navigator.locks`,
+// and the difference is not cosmetic: with no binding, a bare `navigator.locks`
+// is a ReferenceError, which is thrown out of `unlock()` and every subsequent
+// write. Node only grew a global `navigator` in 21.0.0 and the repo's brief still
+// targets Node 20; the same holds for any embedding that does not install one.
+// The failure mode is the one this project cares about most — it reads as a bug
+// in the chat store rather than as a missing global, so it gets debugged in the
+// wrong place while history is inaccessible. Pentest 2026-08-10 (L-2).
+async function testNoNavigatorBindingAtAll() {
+  const prevNav = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  try {
+    delete globalThis.navigator;
+    assert.strictEqual(typeof navigator, "undefined", "fixture: the binding must be gone");
+    assert.throws(() => navigator.locks, ReferenceError,
+      "fixture: an UNGUARDED read must be a ReferenceError — that is what this guard exists for, " +
+      "and it is why `navigator.locks &&` alone would not have been enough");
+
+    globalThis.localStorage = fakeLocalStorage();
+    const store = await import(`./chats.js?nonav=${Date.now()}`);
+    store.setStoreAnchor(anchorFor({}));
+    await store.unlock(PASS);          // this is what threw on Node 20
+    await store.ensure("alice", "SEALED");
+    await store.append("alice", { dir: "in", text: "hi", ts: Date.now(), id: "env-1" });
+    assert.ok(store.get("alice"), "a runtime with no `navigator` must still be able to write");
+    assert.ok(localStorage.getItem(LS_GEN), "...including the rollback witness beside the store");
+    console.log("OK  item 7 / L-2: a runtime with no `navigator` binding can still open and write");
+  } finally {
+    if (prevNav) Object.defineProperty(globalThis, "navigator", prevNav);
+    else delete globalThis.navigator;
+  }
+}
+
+await testNoNavigatorBindingAtAll();
+
+// --- item 7 (c): `persistLocked` re-checks `chats`, not only `dataKey` -------
+// `unlock()` sets `dataKey` (line ~148) and only later assigns `chats` (~197),
+// with a `crypto.subtle.decrypt` and a `JSON.parse` in between. A write that was
+// already queued on the write lock and dispatches inside that window sees
+// `dataKey` set and `chats === null`. Without the `!chats` half of the guard it
+// serialises `chats: null` AND writes an agreeing witness beside it — so the
+// rollback check then calls the empty store healthy. Silent, total history loss,
+// certified as fine by the machinery built to detect exactly that.
+//
+// The window is opened here with three environment stubs and no product change:
+// a controlled Web Locks shim whose grant waits on a gate the test holds, so two
+// writes can be parked; and a `crypto.subtle.decrypt` stub that opens the gate
+// and then stalls, so the parked writes dispatch while `unlock()` is between its
+// two assignments. Same move as testStuckWriteLockSurfaces' `setTimeout` stub.
+async function testQueuedWriteInsideTheUnlockWindowIsRefused() {
+  const prevNav = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  const realDecrypt = crypto.subtle.decrypt.bind(crypto.subtle);
+  let openGate = () => {};
+  const gate = new Promise((r) => { openGate = r; });
+  let gated = false;
+  try {
+    globalThis.localStorage = fakeLocalStorage();
+    // A faithful minimal Web Locks (exclusive by name, FIFO, held for the life of
+    // the callback promise) with one addition: while `gated`, a grant waits on
+    // the test's gate. That is what parks the writes without touching chats.js.
+    const held = new Map();
+    Object.defineProperty(globalThis, "navigator", {
+      value: {
+        locks: {
+          request(name, fn) {
+            const tail = held.get(name) || Promise.resolve();
+            const run = async () => { if (gated) await gate; return fn(); };
+            const next = tail.then(run, run);
+            held.set(name, next.then(() => {}, () => {}));
+            return next;
+          },
+        },
+      },
+      configurable: true, writable: true,
+    });
+
+    const store = await import(`./chats.js?window=${Date.now()}`);
+    store.setStoreAnchor(anchorFor({}));   // genuine first run: nothing to roll back yet
+    await store.unlock(PASS);
+    await store.ensure("alice", "SEALED");
+    await store.append("alice", { dir: "in", text: "keep me", ts: Date.now(), id: "env-1" });
+    const onDisk = localStorage.getItem(LS_CHATS);
+
+    // Park two writes behind the gate, then lock. They are now queued against a
+    // store that is about to be re-opened.
+    gated = true;
+    // Settled outcomes captured EAGERLY. A rejection with no handler attached at
+    // the moment it happens is an unhandled rejection that tears the process
+    // down before any assertion runs — and the whole point is that these two
+    // reject, so the handler has to be on them from the start.
+    const settle = (p) => p.then(() => "RESOLVED — the write went through", (e) => String(e && e.message));
+    const w1 = settle(store.ensure("bob"));
+    const w2 = settle(store.ensure("carol"));
+    await new Promise((r) => setTimeout(r, 5));   // let both reach the lock
+    store.lock();
+
+    // The stub fires INSIDE unlock(), after `dataKey` is assigned and before
+    // `chats` is: it releases the parked writes and then stalls long enough for
+    // them to dispatch into the window.
+    crypto.subtle.decrypt = async (...args) => {
+      gated = false;
+      openGate();
+      await new Promise((r) => setTimeout(r, 120));
+      return realDecrypt(...args);
+    };
+    await store.unlock(PASS);
+    crypto.subtle.decrypt = realDecrypt;
+
+    assert.match(await w1, /chat store is locked/,
+      "item 7: a write that dispatches between `dataKey = ...` and `chats = ...` must be REFUSED. " +
+      "Without the `!chats` half of the guard it serialises a null store and writes an AGREEING " +
+      "witness beside it, so assertNotRolledBack reports the empty store as healthy — silent, " +
+      "total history loss certified as fine by the check built to catch exactly that.");
+    assert.match(await w2, /chat store is locked/,
+      "...and every queued write in the window, not merely the first one");
+
+    // The history itself must be intact: proven by re-reading from storage with a
+    // fresh module instance, so nothing in memory can mask a null-store write.
+    const reader = await import(`./chats.js?windowread=${Date.now()}`);
+    reader.setStoreAnchor(anchorFor({ chatsEstablished: true }));
+    await reader.unlock(PASS);
+    assert.ok(reader.get("alice"), "the pre-existing chat must survive the refused writes");
+    assert.ok(reader.get("alice").messages.some((m) => m.id === "env-1"),
+      "...with its messages, which is what a serialised null store would have erased");
+    assert.strictEqual(localStorage.getItem(LS_CHATS), onDisk,
+      "...and the blob must be byte-identical: a refused write may not have persisted anything");
+    console.log("OK  item 7: a write queued into the unlock window is refused, not serialised as null");
+  } finally {
+    crypto.subtle.decrypt = realDecrypt;
+    if (prevNav) Object.defineProperty(globalThis, "navigator", prevNav);
+    else delete globalThis.navigator;
+  }
+}
+
+await testQueuedWriteInsideTheUnlockWindowIsRefused();
+
 console.log("All chat-store concurrency checks passed.");

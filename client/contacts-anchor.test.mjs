@@ -456,6 +456,36 @@ async function testPinHistoryFindings() {
     "F-A2-R1: clearing one tombstone must not clear another — they are per pin key");
   console.log("OK  F-A2-R1: tombstones are per pin key, not global");
 
+  // ROUND-5: the savePin NEGATIVE case, which the recorded debt asked for and
+  // which turned out to hide a live bug. `savePin` clears the tombstone because
+  // saving a pin IS the in-person confirmation the alarm demands — but it is a
+  // confirmation of a PERSON. Clearing on the pin KEY alone means verifying
+  // SOMEBODY ELSE under that key silences the alarm that was raised for the peer
+  // whose pin was actually swept. Since ROUND-3 F-3 made pinWasSwept fall through
+  // to an identity scan over the tombstones, deleting the wrong one does not just
+  // lose the alarm for that key — it loses it for that PEER everywhere.
+  await freshDevice();
+  const VICTIM = { ed: "VklDVElN", mldsa: "VklDVElNTQ" };
+  const STRANGER = { ed: "U1RSQU5HRVI", mldsa: "U1RSQU5HRVJN" };
+  await contacts.savePin("room:shared", VICTIM);
+  await contacts.upsert({ username: "mallory", ...VICTIM });
+  await contacts.upsert({ username: "mallory", ed: "TUFM", mldsa: "TUFMTQ" });
+  await contacts.remove("mallory");                     // sweeps VICTIM's pin, tombstones it
+  assert.ok(contacts.pinWasSwept("room:shared", VICTIM), "fixture: the victim is tombstoned");
+
+  // A LATER, unrelated verification under the SAME room key — a new session in a
+  // recycled room, with a different person.
+  await contacts.savePin("room:shared", STRANGER);
+
+  assert.ok(contacts.pinWasSwept("room:elsewhere", VICTIM),
+    "ROUND-5: verifying a DIFFERENT identity must not clear the victim's tombstone — the pin " +
+    "save is an in-person check of the STRANGER, and it says nothing about the peer whose pin " +
+    "was swept. Clearing it silences that peer's alarm in every room (ROUND-3 F-3's identity " +
+    "scan has nothing left to find), which is M-2's inverted alarm restored by a side door.");
+  assert.ok(!contacts.pinWasSwept("room:anywhere", STRANGER),
+    "ROUND-5: ...and the stranger, who was never swept, must not inherit an alarm");
+  console.log("OK  ROUND-5: savePin for a different identity leaves the victim's tombstone");
+
   // ROUND-3 F-3 (pentest of the F-A2-R1 fix): the alarm must follow the PEER, not
   // just the label. `room:<id>` pin keys are per chat code, so a lookup keyed only
   // on the pin key loses the alarm the moment the same person appears in a
@@ -502,7 +532,23 @@ async function testPinHistoryFindings() {
   assert.strictEqual(contacts.getPin("room:bob-room"), null,
     "F-A2: an unverified auto-created contact must not be able to retain a pin that " +
     "revocation is meant to kill — the attacker chooses whether that record exists");
-  console.log("OK  F-A2: an auto-created record cannot preserve a revoked pin");
+  // Test-debt item 7: the DELETION half was covered here; the TOMBSTONE half was
+  // not, in the one shape where an attacker-made record is present. Both halves
+  // matter and they fail separately: deleting the pin without filing the marker
+  // is not "revocation worked", it is the pin silently vanishing, and bob's next
+  // session then renders as a benign FIRST CONTACT — M-2's inverted alarm, which
+  // is the failure mode this whole item exists to prevent. The sweep is
+  // deliberately NOT conditioned on any other record being verified or
+  // user-created (contacts.js), and that has to hold for what it ANNOUNCES too,
+  // not merely for what it deletes.
+  assert.ok(contacts.pinWasSwept("room:bob-room", BOB),
+    "F-A2: an auto-created claimant must not suppress the TOMBSTONE either. One sealed envelope " +
+    "creates such a record with no user action at all, so if its presence could silence the " +
+    "marker, the attacker would choose whether the bystander's next session looks alarming or " +
+    "ordinary — which is exactly the fail-open the withdrawn first repair had.");
+  assert.ok(contacts.pinWasSwept("room:some-other-room", BOB),
+    "...and the marker follows the PEER across rooms (ROUND-3 F-3), including in this shape");
+  console.log("OK  F-A2: an auto-created record cannot preserve a revoked pin, nor silence its tombstone");
 
   // Control: a superseded key that no other contact claims is still swept.
   await freshDevice();
@@ -617,3 +663,140 @@ async function testVouchWriteIsBoundToTheVerifiedBundle() {
 
 await testVouchWriteIsBoundToTheVerifiedBundle();
 console.log("All F-PROTO-005 checks passed.");
+
+// ---------------------------------------------------------------------------
+// TEST-DEBT ITEM 7: `dropPinsFor`'s shape guard on `pinKeys`.
+//
+//   if (!k || typeof k.ed !== "string" || typeof k.mldsa !== "string") continue;
+//
+// Delete it and the whole suite still passed, because nothing has ever put a
+// malformed entry into `pinKeys`. The in-memory writer (`rememberSupersededKeys`)
+// only ever pushes string pairs, so the reachable route is the one this file is
+// written against anyway: the AT-REST BLOB. `unlock()` validates the contacts
+// ARRAY and the PIN MAP, but it never walks a contact's `pinKeys`, so whatever is
+// in there on disk is what the sweep runs over.
+//
+// Two distinct harms, and they need two scenarios because the first mask the
+// second — a `null` entry throws before any later entry is examined.
+//
+//   (a) `!k`: `k.ed` on null is a TypeError, thrown out of `dropPinsFor` ->
+//       `remove()`/`setVerified(false)` BEFORE `delete pins[...]` and before
+//       `persist()`. Revocation then fails OPEN: the user clicks Remove, sees an
+//       error, and the pin that auto-unlocks messaging (app.js: sameBundle(pin,
+//       bundle) -> unlockMessaging()) is still sitting there. Post-compromise
+//       revocation defeated by one malformed array element.
+//
+//   (b) the `typeof` half: an entry like `{ed: null, mldsa: null}` lands in
+//       `owned`, and `owned.find((k) => pin.ed === k.ed && pin.mldsa === k.mldsa)`
+//       then MATCHES any pin with the same non-string shape — so revoking one
+//       contact deletes a pin that contact never owned, and files a tombstone
+//       claiming it did. The alarm points at the wrong peer, which is the M-2
+//       inverted-alarm class again.
+//
+// Re-encrypting the blob here is deliberate and is NOT a hook: it is the attacker
+// model. `sc.contacts.v1` is a device-local file; the generation counter is kept
+// as-is so the witness still agrees and the store opens normally.
+async function poisonPinKeysOnDisk(mutate) {
+  contacts.lock();
+  const blob = JSON.parse(localStorage.getItem(LS_CONTACTS));
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+  const b64 = (u8) => Buffer.from(u8).toString("base64");
+  const base = await crypto.subtle.importKey("raw", enc.encode(PASS), "PBKDF2", false, ["deriveKey"]);
+  const key = await crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt: unb64(blob.salt), iterations: blob.iters, hash: "SHA-256" },
+    base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"],
+  );
+  const plain = JSON.parse(dec.decode(await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: unb64(blob.iv) }, key, unb64(blob.ct),
+  )));
+  mutate(plain);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv }, key, enc.encode(JSON.stringify(plain)),
+  ));
+  localStorage.setItem(LS_CONTACTS, JSON.stringify({ ...blob, iv: b64(iv), ct: b64(ct) }));
+  await contacts.unlock(PASS);
+}
+
+async function testMalformedPinKeysCannotBreakRevocation() {
+  const ALICE = { ed: "QUxJQ0U", mldsa: "QUxJQ0VN" };
+  const MAL1 = { ed: "TUFMMQ", mldsa: "TUFMMU0" };
+  const MAL2 = { ed: "TUFMMg", mldsa: "TUFMMk0" };
+
+  // (a) a null entry must not abort the sweep.
+  await freshDevice();
+  await contacts.savePin("user:alice", ALICE);
+  await contacts.upsert({ username: "mallory", ...MAL1 });
+  await contacts.upsert({ username: "mallory", ...MAL2 });   // MAL1 goes into pinKeys
+  await poisonPinKeysOnDisk((store) => {
+    const m = store.contacts.find((c) => c.username === "mallory");
+    assert.ok(Array.isArray(m.pinKeys) && m.pinKeys.length === 1,
+      "fixture: mallory must have a real superseded-key history to poison");
+    // The valid ALICE pair is placed LAST, behind the malformed entries, so a
+    // sweep that aborts on the first bad element never reaches the pin that
+    // revocation is actually supposed to delete.
+    m.pinKeys = [null, {}, { ed: 5, mldsa: 7 }, { ed: ALICE.ed, mldsa: ALICE.mldsa }];
+  });
+
+  await contacts.remove("mallory");   // must not throw
+  assert.strictEqual(contacts.getPin("user:alice"), null,
+    "item 7: a malformed entry in a contact's on-disk `pinKeys` must not stop revocation from " +
+    "deleting the pins it is supposed to delete. Without the `!k` guard, `k.ed` on null is a " +
+    "TypeError thrown out of remove() BEFORE `delete pins[...]` and before persist() — so the " +
+    "user clicks Remove, sees an error, and the pin that silently auto-unlocks messaging is " +
+    "still there. Revocation failing OPEN is the worst way for revocation to fail.");
+  assert.ok(contacts.pinWasSwept("user:alice", ALICE),
+    "...and the tombstone must be filed as usual, or alice's next session renders as a benign " +
+    "first contact");
+  assert.strictEqual(contacts.get("mallory"), null, "...and the contact really is removed");
+  console.log("OK  item 7: a null entry in on-disk pinKeys cannot abort revocation");
+
+  // (b) a non-string entry must not MATCH anything.
+  await freshDevice();
+  await contacts.upsert({ username: "mallory", ...MAL1 });
+  await contacts.upsert({ username: "mallory", ...MAL2 });
+  await poisonPinKeysOnDisk((store) => {
+    const m = store.contacts.find((c) => c.username === "mallory");
+    // ROUND-5 (hot reviewer): this fixture used `{ed: null, mldsa: null}`, so
+    // dropping ONLY the `typeof k.mldsa` half of the guard left the suite green —
+    // the `ed` half alone already rejected the entry. Each half must be
+    // independently load-bearing, so the entry is now well-formed in `ed` and
+    // malformed only in `mldsa`. The victim pin below matches it under a guard
+    // that checks just `ed`.
+    // BOTH malformed shapes, so each half of the guard is independently
+    // load-bearing: one entry is well-formed in `ed` and broken in `mldsa`, the
+    // other the reverse. With only the first shape present, dropping the `ed`
+    // half of the guard still passed.
+    m.pinKeys = [
+      { ed: "QllTVEFOREVS", mldsa: null },
+      { ed: null, mldsa: "QllTVEFOREVSTQ" },
+    ];
+    // Pins of the same malformed shapes, belonging to somebody else entirely.
+    // `unlock()` validates the pin map only on the UNTAGGED legacy path, so a
+    // tagged store's pins are whatever the blob says — the same reachability
+    // this whole scenario rests on.
+    store.pins["room:bystander"] = { ed: "QllTVEFOREVS", mldsa: null, ecdh: null, mlkem: null };
+    store.pins["room:bystander2"] = { ed: null, mldsa: "QllTVEFOREVSTQ", ecdh: null, mlkem: null };
+  });
+  assert.ok(contacts.getPin("room:bystander"), "fixture: the bystander's pin is present");
+  assert.ok(contacts.getPin("room:bystander2"), "fixture: the second bystander's pin is present");
+
+  await contacts.remove("mallory");
+  assert.ok(contacts.getPin("room:bystander"),
+    "item 7: `owned` may only ever contain STRING key pairs. Without the typeof half of the " +
+    "guard, `{ed: null, mldsa: null}` in mallory's history compares equal to any pin of the " +
+    "same shape, so revoking mallory deletes a pin she never owned and files a tombstone " +
+    "naming her for it — the alarm pointed at the wrong peer, which is M-2 all over again.");
+  assert.ok(contacts.getPin("room:bystander2"),
+    "item 7: ...and the mirror shape too — each half of the `typeof` guard must be independently " +
+    "load-bearing, or half of it can be deleted while the suite stays green");
+  assert.ok(!contacts.pinWasSwept("room:bystander"),
+    "...and no tombstone may be filed for a pin that was never swept");
+  assert.ok(!contacts.pinWasSwept("room:bystander2"), "...for either shape");
+  console.log("OK  item 7: a non-string entry in pinKeys cannot match an unrelated pin");
+}
+
+await testMalformedPinKeysCannotBreakRevocation();
+console.log("All pinKeys shape checks passed.");

@@ -14,6 +14,7 @@
 // behaviour (the modules throw with crypto.subtle absent) and by source (the
 // specific shapes a fallback would take are absent from the code).
 import assert from "node:assert";
+import { stripComments } from "./test-source.mjs";
 import { readFile, readdir } from "node:fs/promises";
 
 const HERE = new URL("./", import.meta.url);
@@ -115,10 +116,19 @@ console.log("OK  crypto.subtle absent: identity, every cipher mode, and the stor
     // security relevance lives somewhere else, so it is now unconditional.
     // If UI jitter ever genuinely needs it, add a named allowlist here rather
     // than reopening the keyword heuristic.
-    for (const [i, line] of src.split("\n").entries()) {
-      // Skip comment lines only: `//`, a block-comment opener, or a
-      // continuation `*`. (The `/*` case was missing in the first cut.)
-      if (!/Math\.random/.test(line) || /^\s*(\/\/|\/\*|\*)/.test(line)) continue;
+    // ROUND-5 (cold reviewer). The comment skip was a LINE-PREFIX regex —
+    // `/^\s*(\/\/|\/\*|\*)/` — which is the exact bypassable pattern
+    // test-source.mjs's stripComments() was written to replace, and which this
+    // repo has already documented as defeated three separate ways (`/**/ stmt;`
+    // executes while reading as a comment; `/* code */ realCode;` keeps the code
+    // on a "comment" line). The reviewer walked straight through it:
+    //   /* legacy engines */ if (!crypto.getRandomValues) return String(Math.random()).slice(2);
+    // as the first line of otp.js's randomId() — the pad-id generator — passed
+    // green. Every other source anchor in this suite already uses the scanner;
+    // this one was the last holdout.
+    const stripped = stripComments(src);
+    for (const [i, line] of stripped.split("\n").entries()) {
+      if (!/Math\.random/.test(line)) continue;
       assert.fail(`${f}:${i + 1}: Math.random in a client module: ${line.trim()}`);
     }
   }
