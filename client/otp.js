@@ -1251,8 +1251,18 @@ export async function unlockPad(padId, passphrase, opts = {}) {
   // turn the gate off.
   const floorUnconfirmed = inner.nativeFloor === CLAIM_UNCONFIRMED ||
     inner.derivedFloors === CLAIM_UNCONFIRMED;
-  const needsAdoption = floorUnconfirmed ||
-    ((legacy || (o.v || 1) < PAD_BLOB_V) && outerWm === null);
+  // Phase-7 pentest 2026-09-16, F-P7-5. This used to read `(o.v || 1) <
+  // PAD_BLOB_V` — the OUTER version byte, which sits outside the AEAD and is
+  // exactly the downgrade trap the comment forty lines up warns against. A v2
+  // blob has `inner.padId`, so `legacy` is false and the outer byte was the ONLY
+  // thing routing it to this gate: editing `"v":2` to `"v":3` (one byte, the
+  // ciphertext untouched, still opening under the real passphrase) removed the
+  // gate and suppressed the migration rewrite below, so the pad opened silently
+  // at offset 0 after the three deletable markers were removed — a two-time
+  // pad in the browser, repeatable. `hwSend` exists only inside a v3 plaintext,
+  // so "is this pre-v3?" is asked of the authenticated bytes, as `legacy` is.
+  const preV3 = legacy || !Number.isInteger(inner.hwSend);
+  const needsAdoption = floorUnconfirmed || (preV3 && outerWm === null);
   if (needsAdoption && !opts.adoptLegacy) {
     const err = new Error(floorUnconfirmed
       ? "this pad was saved while this device could not write its tamper-proof usage record, so nothing here can prove whether the pad has been rewound. If it has ever sent a message, it is NOT safe to use — exchange a fresh one."
@@ -1329,7 +1339,7 @@ export async function unlockPad(padId, passphrase, opts = {}) {
   // A v2 blob is rewritten for the same reason one version later: it carries no
   // authenticated watermark and no authenticated `exported` flag, and the sooner
   // it does the sooner H-3/M-7/L-3 apply to it.
-  if (legacy || (o.v || 1) < PAD_BLOB_V) await writePadBlob(record, key, salt, iters);
+  if (preV3) await writePadBlob(record, key, salt, iters); // F-P7-5: decided by the AEAD, not the outer byte
   return { record, atRest };
 }
 

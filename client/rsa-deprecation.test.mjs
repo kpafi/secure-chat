@@ -198,3 +198,31 @@ const html = read("./index.html");
 }
 
 console.log(`\nAll RSA deprecation checks passed (${n}).`);
+
+
+// Phase-7 pentest 2026-09-16, F-P7-7. The refusal above runs BEFORE the type
+// dispatch, so `{"alg":"RSA"}` (14 bytes, no room state) reached addLine +
+// hint on every frame: 10 000 of them (~140 KB of relay traffic) wedged the
+// renderer for minutes and scrolled every genuine warning out of reach. The
+// refusal is now said once per connection, and the transcript is bounded.
+{
+  const appSrc = stripComments(readFileSync(new URL("./app.js", import.meta.url), "utf8"));
+  const handle = liftFunction(appSrc, "handleMessage", assert);
+  assert.match(handle, /if \(!saidDeprecatedAlg\) \{\s*saidDeprecatedAlg = true;\s*addLine\("sys", "", `\[frame refused — the other end is using \$\{m\.alg\}/,
+    "F-P7-7: the deprecated-alg refusal is latched — addLine/hint run only the first time per connection");
+  const latchWrites = appSrc.split("\n").map((l) => l.trim()).filter((l) => /^saidDeprecatedAlg = /.test(l)).sort();
+  assert.deepStrictEqual(latchWrites, ["saidDeprecatedAlg = false;", "saidDeprecatedAlg = false;", "saidDeprecatedAlg = true;"],
+    "F-P7-7: the latch is reset exactly where wasPending is (the two per-connection resets) and set in exactly one place");
+  const resets = appSrc.split("\n").map((l) => l.trim());
+  for (let i = 0; i < resets.length; i++) {
+    if (resets[i] === "wasPending = false;") {
+      assert.strictEqual(resets[i + 1], "saidDeprecatedAlg = false;", "the latch reset sits next to each wasPending reset");
+    }
+  }
+  const addLine = liftFunction(appSrc, "addLine", assert);
+  assert.match(appSrc, /^const LOG_MAX_LINES = 500;\s*$/m, "F-P7-7: the transcript bound is the literal 500");
+  assert.match(addLine, /while \(els\.log\.childElementCount > LOG_MAX_LINES\) els\.log\.removeChild\(els\.log\.firstChild\);/,
+    "F-P7-7: addLine evicts the oldest lines past the bound, before the synchronous scroll");
+  assert.ok(addLine.indexOf("LOG_MAX_LINES") < addLine.indexOf("scrollTop"), "...eviction happens before the layout-forcing scroll");
+  console.log("OK  F-P7-7: the deprecated-alg refusal is said once per connection and the transcript is bounded");
+}

@@ -2103,6 +2103,38 @@ async function testFirstSaveWithFailedCreateCommitIsUnconfirmed() {
   console.log("OK  F-P7-A3: a failed create-commit on a first save is sealed as unconfirmed, not armed");
 }
 
+// Phase-7 pentest 2026-09-16, F-P7-5: the legacy-adoption gate was keyed on
+// the OUTER `v` byte. Plain-browser device, a v2-shaped blob (what the
+// 2026-07-26 build wrote), the three deletable markers removed: with "v":2 the
+// gate fired; with the one unauthenticated byte edited to "v":3 the same
+// ciphertext opened SILENTLY at sendOffset 0 — a browser two-time pad, and
+// repeatable because the migration rewrite was suppressed by the same byte.
+async function testAdoptionGateIgnoresTheOuterVersionByte() {
+  const pad = await otp.generatePad({ label: "vbyte", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const atRest = await otp.saveNewPad(pad, PASS);
+  pad.sendOffset = 3000;
+  await otp.savePadProgress(pad, atRest);
+  await makeV2Blob(pad.padId, atRest.key, (inner) => { inner.sendOffset = 0; });
+  for (const k of ["sc.otp.wm.v1.", "sc.otp.used.v1.", "sc.otp.hw.v1."]) localStorage.removeItem(k + pad.padId);
+  await assert.rejects(() => otp.unlockPad(pad.padId, PASS), (e) => e.code === "LEGACY_PAD_ADOPTION",
+    "fixture: with the outer byte honest, the v2 blob is routed to the adoption gate");
+  const key = "sc.otp.pad.v1." + pad.padId;
+  const raw = JSON.parse(localStorage.getItem(key));
+  assert.strictEqual(raw.v, 2, "fixture: the blob says v2 outside the AEAD");
+  raw.v = 3; // one byte, no MAC to satisfy, ciphertext untouched
+  localStorage.setItem(key, JSON.stringify(raw));
+  await assert.rejects(() => otp.unlockPad(pad.padId, PASS), (e) => e.code === "LEGACY_PAD_ADOPTION",
+    "F-P7-5: the outer version byte is attacker-writable and must not decide the gate — a pre-v3 plaintext " +
+    "(no hwSend inside the AEAD) is routed to the adoption gate whatever the outer byte says");
+  // ...and the migration rewrite is decided the same way: adopting it writes a v3 blob.
+  const { record } = await otp.unlockPad(pad.padId, PASS, { adoptLegacy: true });
+  assert.strictEqual(record.sendOffset, 0);
+  const rewritten = JSON.parse(localStorage.getItem(key));
+  assert.strictEqual(rewritten.v, 3, "adoption migrates the blob to v3 regardless of what the outer byte claimed");
+  console.log("OK  F-P7-5: the OTP adoption gate is keyed on the AEAD, not the outer v byte");
+}
+
+await testAdoptionGateIgnoresTheOuterVersionByte();
 await testFloorVerdictSurvivesPoisonedMathMax();
 await testPadWasUsedHonoursRecvAndExportedEvidence();
 await testFirstSaveWithFailedCreateCommitIsUnconfirmed();

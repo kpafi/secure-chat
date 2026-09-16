@@ -226,6 +226,11 @@ let roomRole = null;       // "owner" | "guest" for this connection
 let admittedBundle = null; // the identity WE let in (owner side), or null
 let admittedAnon = false;  // we let in someone with no identity at all
 let wasPending = false;    // we sat in the approval queue (M-2, guest side)
+// Phase-7 pentest 2026-09-16, F-P7-7: the deprecated-alg refusal is said ONCE
+// per connection. It runs before the type dispatch, so a 14-byte {"alg":"RSA"}
+// needed no room state to reach addLine + hint — and 10 000 of them (~140 KB)
+// wedged the renderer for minutes while burying every real transcript line.
+let saidDeprecatedAlg = false;
 let knockQueue = [];       // [{jid, bundle, anon}] waiting for our verdict
 // The identity a human on THIS device approved for this session, by either
 // route. This is the whole admission control: it is written only by a click.
@@ -474,6 +479,7 @@ function accountStatus(text, cls = "") {
   els.accountStatus.className = "hint" + (cls ? " " + cls : "");
 }
 
+const LOG_MAX_LINES = 500; // F-P7-7
 function addLine(kind, who, text) {
   const li = document.createElement("li");
   li.className = kind;
@@ -485,6 +491,10 @@ function addLine(kind, who, text) {
   }
   li.appendChild(document.createTextNode(text)); // textContent path: no markup
   els.log.appendChild(li);
+  // F-P7-7: the transcript is bounded. Every frame the relay can make us
+  // narrate costs a node plus a synchronous layout (scrollTop below), so an
+  // unbounded list is O(n^2) work an attacker controls. Oldest lines go first.
+  while (els.log.childElementCount > LOG_MAX_LINES) els.log.removeChild(els.log.firstChild);
   els.log.scrollTop = els.log.scrollHeight;
 }
 
@@ -2045,6 +2055,7 @@ async function connectInner() {
   approvedBundle = null;
   resolvePeerApproval(false);
   wasPending = false;
+  saidDeprecatedAlg = false;
   keyConfirm.reset();
   knockQueue = [];
   hideAdmitPrompt();
@@ -2099,6 +2110,7 @@ async function connectInner() {
     // FIFO chain for this connection is wedged for as long as the page lives.
     resolvePeerApproval(false);
     wasPending = false;
+  saidDeprecatedAlg = false;
     keyConfirm.reset();
     knockQueue = [];
     hideAdmitPrompt();
@@ -2600,8 +2612,11 @@ async function handleMessage(room, raw) {
   // throw here would stall every later frame in the pump) and never adopt the
   // peer's mode.
   if (typeof m.alg === "string" && Object.prototype.hasOwnProperty.call(DEPRECATED_ALGS, m.alg)) {
-    addLine("sys", "", `[frame refused — the other end is using ${m.alg}, which this version has removed]`);
-    hint(`${m.alg} is no longer supported — ${DEPRECATED_ALGS[m.alg]}`, true);
+    if (!saidDeprecatedAlg) { // F-P7-7: once per connection, or the refusal is a DOM flood
+      saidDeprecatedAlg = true;
+      addLine("sys", "", `[frame refused — the other end is using ${m.alg}, which this version has removed]`);
+      hint(`${m.alg} is no longer supported — ${DEPRECATED_ALGS[m.alg]}`, true);
+    }
     return;
   }
 
