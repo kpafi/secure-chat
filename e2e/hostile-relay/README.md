@@ -130,13 +130,19 @@ hostile relay cannot read, forge, replay or undetectably tamper with a
 conversation) therefore had no end-to-end control at all (F-P7-A8). `tamper.mjs`
 is a relay with HONEST role assignment that changes exactly one thing per mode:
 `keysub`, `idbswap`, `idbstrip` (the P-03 bundle binding, live), `ctflip`,
-`msgreplay`, `confirmpre` (F-P7-19) and `algflood` (F-P7-7). `crypto-tamper.mjs`
+`msgreplay`, `confirmpre` (F-P7-19), `algflood` (F-P7-7), `msgflood` (the
+transcript must keep its security lines under a junk flood) and `confirmpost`
+(the half of F-P7-19 that cannot be fixed: an expected, loud, relay-blaming
+teardown). `crypto-tamper.mjs`
 spawns it per mode on its own port, drives two real browsers, and asserts what
 the shipped client must show — a loud `handshake signature INVALID` and no
 sending for the three key attacks, `undecryptable` and no plaintext for the
 tampered frame, exactly one render for the replayed one, an intact session and
-no blamed peer for the injected confirm tags, and a bounded transcript with one
-refusal line under the flood.
+no blamed peer for confirm tags injected BEFORE the chains exist (and a loud,
+relay-blaming teardown for tags injected after — that half is availability
+only and is asserted as expected), a bounded transcript with one refusal line
+under the alg flood, and the approval/pin lines still present under a junk
+message flood.
 
 ```bash
 node e2e/hostile-relay/crypto-tamper.mjs              # every mode, exits non-zero on failure

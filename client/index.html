@@ -336,6 +336,7 @@
           <div class="row">
             <label>Status</label>
             <div class="chips" id="profileStatus"></div>
+        <p class="hint" id="profileHint" aria-live="polite"></p>
           </div>
           <div class="row inline">
             <button id="profileExport" type="button">Copy backup</button>
@@ -387,6 +388,7 @@
             </div>
           </div>
           <p class="hint" id="usersStatus" aria-live="polite"></p>
+          <p class="hint" id="usersHint" aria-live="polite"></p>
           <ul id="userList" class="userlist"></ul>
           <div class="legend">
             <span class="legend-item">🟢 <b>verified</b> — you compared the fingerprint in person</span>
@@ -419,6 +421,7 @@
 
         <div id="chatsUnlocked" hidden>
           <p class="hint" id="chatsStatus" aria-live="polite"></p>
+          <p class="hint" id="chatsHint" aria-live="polite"></p>
 
           <div id="chatListWrap">
             <div class="row">

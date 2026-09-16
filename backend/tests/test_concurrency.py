@@ -43,6 +43,7 @@ ROUNDS = 320
 def _reset_limiters():
     accounts._api_limiter._buckets.clear()
     accounts._lookup_limiter._buckets.clear()
+    accounts._vouch_host_limiter._buckets.clear()
     accounts._challenge_limiter._buckets.clear()
     yield
 

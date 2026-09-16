@@ -42,16 +42,21 @@ _post_global_limiter = KeyedRateLimiter(
 _fetch_limiter = KeyedRateLimiter(
     config.MAILBOX_FETCH_RATE_CAPACITY, config.MAILBOX_FETCH_RATE_REFILL_PER_SEC
 )
-# The only thing charged before a gate: a generous per-host ceiling. See config.
-_host_limiter = KeyedRateLimiter(config.MAILBOX_HOST_RATE_CAPACITY, config.MAILBOX_HOST_RATE_REFILL_PER_SEC)
+# The only thing charged before a gate, and only on POST: a generous per-host
+# ceiling. See config. GET has NO pre-auth charge — a shared pre-gate bucket on
+# both verbs let a POST flood deny every authenticated GET (review of the first
+# F-P7-2 fix).
+_post_host_limiter = KeyedRateLimiter(config.MAILBOX_POST_HOST_RATE_CAPACITY, config.MAILBOX_POST_HOST_RATE_REFILL_PER_SEC)
 
-# Envelopes are JSON of base64 fields — printable ASCII by construction.
-_ASCII_RE = re.compile(r"^[\x20-\x7e]+$")
+# Envelopes are JSON of base64 fields — printable ASCII by construction. `\Z`,
+# not `$`: `$` matches before a trailing newline, and the byte budget below
+# counts on every accepted envelope being one byte per character.
+_ASCII_RE = re.compile(r"^[\x20-\x7e]+\Z")
 
 router = APIRouter(prefix="/api/mailbox", tags=["mailbox"])
 
 
-def _host_rate_limit(request: Request) -> None:
+def _post_host_rate_limit(request: Request) -> None:
     """The one charge that happens before any gate: a generous per-host ceiling.
 
     Pentest 2026-07-26 P-11 gave `GET /api/mailbox` a bucket; 2026-08-07
@@ -69,7 +74,7 @@ def _host_rate_limit(request: Request) -> None:
     the subject the gate proved: the recipient (a token holder), or the
     authenticated user.
     """
-    if not _host_limiter.allow(client_key(request)):
+    if not _post_host_limiter.allow(client_key(request)):
         raise HTTPException(status_code=429, detail="rate limited")
 
 
@@ -86,41 +91,53 @@ def init_db() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_recipient ON mailbox(recipient)")
-        # F-P7-1: who has ever fetched. Mail queued to an inbox that never has
-        # expires on the short TTL — an attacker's throwaway recipients never
-        # fetch, a real one polls within seconds of registering.
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS mailbox_fetches (
-                recipient  TEXT PRIMARY KEY,
-                last_fetch INTEGER NOT NULL
-            )
-            """
-        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_created ON mailbox(created_at)")
+        # The first F-P7-1 fix added a `mailbox_fetches` table (who has ever
+        # fetched, with a timestamp) to expire never-fetched inboxes early. Its
+        # review showed it was a per-user last-seen log at rest that nothing
+        # read (I2), that one authenticated GET per throwaway inbox bought the
+        # long TTL back, and that it deleted real mail on deploy day and on a
+        # user's first poll. Dropped; the relay keeps no read history.
+        conn.execute("DROP TABLE IF EXISTS mailbox_fetches")
 
 
 def _prune(conn) -> None:
-    now = int(time.time())
-    conn.execute("DELETE FROM mailbox WHERE created_at < ?", (now - config.MAILBOX_TTL_SEC,))
-    # F-P7-1: the short TTL for inboxes nobody has ever fetched.
-    conn.execute(
-        "DELETE FROM mailbox WHERE created_at < ? AND recipient NOT IN (SELECT recipient FROM mailbox_fetches)",
-        (now - config.MAILBOX_UNFETCHED_TTL_SEC,),
-    )
+    conn.execute("DELETE FROM mailbox WHERE created_at < ?", (int(time.time()) - config.MAILBOX_TTL_SEC,))
+
+
+def _evict_oldest_to_fit(conn, incoming: int) -> None:
+    """F-P7-1: the server-wide budget evicts the OLDEST queued mail instead of
+    refusing new mail. A 503 for everyone until the TTL ran out was the
+    finding's impact; with free registration the budget can always be filled,
+    so what a flood may cost is RETENTION (mail must be fetched sooner), never
+    delivery. Bounded loop: each pass drops at least one row."""
+    for _ in range(64):
+        rows, total = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(envelope AS BLOB))), 0) FROM mailbox"
+        ).fetchone()
+        if rows < config.MAX_MAILBOX_TOTAL and total + incoming <= config.MAX_MAILBOX_TOTAL_BYTES:
+            return
+        if rows == 0:
+            return
+        conn.execute(
+            "DELETE FROM mailbox WHERE id IN (SELECT id FROM mailbox ORDER BY id LIMIT ?)",
+            (max(1, rows // 64),),
+        )
 
 
 class PostReq(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    envelope: str = Field(min_length=1, max_length=config.MAX_ENVELOPE_BYTES)
+    # F-P7-1: a real sealed envelope is well over 1 KiB (it carries an ML-KEM
+    # ciphertext); a one-byte "envelope" only ever existed to spend budget.
+    envelope: str = Field(min_length=config.MIN_ENVELOPE_BYTES, max_length=config.MAX_ENVELOPE_BYTES)
 
 
-@router.post("/{recipient}", dependencies=[Depends(_host_rate_limit)])
+@router.post("/{recipient}", dependencies=[Depends(_post_host_rate_limit)])
 def post_mail(request: Request, recipient: str, req: PostReq, t: str = Query(default="", max_length=64)) -> dict:
     _check_username(recipient)
     if not _ASCII_RE.match(req.envelope):
         raise HTTPException(status_code=422, detail="envelope must be printable ASCII")
     with _db() as conn:
-        _prune(conn)
         row = conn.execute(
             "SELECT lookup_token FROM accounts WHERE username = ?", (recipient,)
         ).fetchone()
@@ -141,18 +158,18 @@ def post_mail(request: Request, recipient: str, req: PostReq, t: str = Query(def
         # behind Tor it is shared, but only among real senders.
         if not _post_global_limiter.allow(client_key(request)):
             raise HTTPException(status_code=429, detail="rate limited")
-        # F-P7-1: the budget is BYTES first. A row count alone let ~100 KB of
-        # one-byte envelopes fill the server-wide budget for the whole TTL.
-        total_rows, total_bytes = conn.execute(
-            "SELECT COUNT(*), COALESCE(SUM(LENGTH(envelope)), 0) FROM mailbox"
-        ).fetchone()
-        if total_rows >= config.MAX_MAILBOX_TOTAL or total_bytes + len(req.envelope) > config.MAX_MAILBOX_TOTAL_BYTES:
-            raise HTTPException(status_code=503, detail="mailbox storage full")
+        # The TTL prune runs only past the gates (review of the first fix: two
+        # full scans per unauthenticated request, rolled back on the 404 anyway).
+        _prune(conn)
+        # F-P7-1: per-inbox share first (hard — the recipient can fetch), then
+        # the server-wide budget, which evicts the oldest queued mail to fit.
         count, inbox_bytes = conn.execute(
-            "SELECT COUNT(*), COALESCE(SUM(LENGTH(envelope)), 0) FROM mailbox WHERE recipient = ?", (recipient,)
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(envelope AS BLOB))), 0) FROM mailbox WHERE recipient = ?",
+            (recipient,),
         ).fetchone()
         if count >= config.MAX_MAILBOX_PER_RECIPIENT or inbox_bytes + len(req.envelope) > config.MAX_MAILBOX_PER_RECIPIENT_BYTES:
             raise HTTPException(status_code=429, detail="recipient inbox full")
+        _evict_oldest_to_fit(conn, len(req.envelope))
         conn.execute(
             "INSERT INTO mailbox (recipient, envelope, created_at) VALUES (?,?,?)",
             (recipient, req.envelope, int(time.time())),
@@ -160,7 +177,7 @@ def post_mail(request: Request, recipient: str, req: PostReq, t: str = Query(def
     return {"status": "queued"}
 
 
-@router.get("", dependencies=[Depends(_host_rate_limit)])
+@router.get("")
 def fetch_mail(username: str = Depends(current_user)) -> dict:
     """Return AND DELETE the queued envelopes for the authenticated user.
 
@@ -176,11 +193,6 @@ def fetch_mail(username: str = Depends(current_user)) -> dict:
         raise HTTPException(status_code=429, detail="rate limited")
     with _db() as conn:
         _prune(conn)
-        conn.execute(
-            "INSERT INTO mailbox_fetches (recipient, last_fetch) VALUES (?, ?) "
-            "ON CONFLICT(recipient) DO UPDATE SET last_fetch = excluded.last_fetch",
-            (username, int(time.time())),
-        )
         # Bound the response explicitly (P-11) rather than relying on the
         # per-inbox insert cap to be the only limit. Anything beyond this stays
         # queued for the next fetch.

@@ -323,9 +323,13 @@ const ok = (name) => { n++; console.log("OK  " + name); };
   // so it cannot be pinned by exact body without pinning the UI copy. What it
   // must never do is SETTLE the promise: only `resolvePeerApproval`, driven by
   // the two buttons, may call `resolve`.
-  const render = codeOnly(liftFunction(src, "renderPeerApproval", assert));
+  // Review of the F-P7-A2 fix (M-6): `resolvePeerApproval?.(true)` slipped
+  // both the deny-list (`\bresolve\b` stops at the longer name) and the callee
+  // scan (`?.` sits between the name and the paren). Normalise optional calls
+  // to plain calls before either check, and match any `resolve…` prefix.
+  const render = codeOnly(liftFunction(src, "renderPeerApproval", assert)).map((l) => l.replace(/\?\.\s*\(/g, "("));
   for (const l of render) {
-    assert.ok(!/\bresolve\b|approvalPending\s*=/.test(l),
+    assert.ok(!/\bresolve\w*\b|approvalPending\s*=/.test(l),
       "item 14 / H-1: `renderPeerApproval` may not settle or clear the pending approval — " +
       `only the user's click may do that. Offending line:\n      ${l}`);
   }

@@ -10,7 +10,46 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
 > said it was still open). `git log --oneline -15` is the authority on what has
 > landed; this file is the authority on WHY.
 
-## ⮕ RESUME HERE (2026-09-16, evening — Phase 7's fix list items 1-4 LANDED; next: review the delta, then merge)
+## ⮕ RESUME HERE (2026-09-16, night — the delta was reviewed, its 16 findings fixed, and the branch MERGED into master locally)
+
+**HEAD:** `master` == `pentest-2026-08-07-fixes` after a local `--no-ff` merge
+(see `git log --oneline -3`). **Not pushed. Not deployed.** Tree clean.
+
+**The review of the delta (item 5 of the previous entry) found the mailbox
+commit `018652d` did NOT do what it claimed** — 8 Medium / 6 Low / 2 Info, no
+Critical/High. Every one is fixed in the last commit before the merge and
+recorded, with resolutions, as §9 of `docs/pentests/secure-chat-pentest-2026-09-16.md`.
+The short version: the first F-P7-1 fix's `mailbox_fetches` table was a
+last-seen log at rest that nothing read, was bought back with one GET per
+throwaway inbox, and deleted real mail on deploy day — it is GONE; the budget
+is now bytes-first with a minimum envelope size and evict-oldest instead of a
+relay-wide 503; the host ceiling is POST-only; `#log` eviction keeps system
+lines and collapses repeats; the callee allow-list normalises `?.(`; the
+ship-list test strips comments; the Kotlin raw string is pinned to `$config`
+only; each view has its own hint element; `/api` is no longer behind the static
+gate (closes F-P7-16 too).
+
+Verification for the merge: client suite exit 0 (279 OK), backend **177
+passed** (run with nothing on :8000), `crypto-tamper.mjs` **10 modes** green
+(`msgflood` and `confirmpost` are new), `two-user-flow` 8/8, `no-dead-ends`
+12/12, `room-admission` 13/13, `all-modes` 29/29 against a scratch relay
+running the final backend. 7 review-fix mutants RED (one e2e mutant is GREEN
+by construction: with repeats collapsed, a junk flood never reaches the cap,
+so the eviction ORDER is pinned by the unit anchor only — noted).
+
+### ⬜ NEXT — in order
+
+1. **⬜ Decide push + Phase 8 deploy.** The order is settled: APK first, then
+   relay + web client together (F-P7-8). Nothing here pushes.
+2. **⬜ Phase 9 — Android on-device** (unchanged list + F-P7-17).
+3. **⬜ 7b — floors for the contact and chat witnesses** (F-P7-6, the last
+   runtime Medium; the `deviceFloor()` primitive is ready, zero Kotlin).
+4. **⬜ 7a — a behavioural `app.js` test** against a DOM stub; wire
+   `proto001.mjs` + `crypto-tamper.mjs` + `room-admission.mjs` into an
+   automated runner (`npm run e2e:tamper` exists; the rest still needs a relay).
+5. **⬜ The Lows left from the report:** F-P7-10, 11, 12, 13, 15, 20, 21, 22.
+
+## ⮕ (2026-09-16, evening — Phase 7's fix list items 1-4 LANDED; next: review the delta, then merge)
 
 **HEAD:** see `git log --oneline -6` (this file is written before the last
 commit of the batch; the four fix commits are `1d240d0` item 1, `6695cf1`

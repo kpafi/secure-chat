@@ -81,8 +81,11 @@ def test_the_three_ship_lists_agree():
     refuses to serve still ships inside the app and onto the box. client/
     test-source.mjs matched none of the three lists."""
     root = Path(__file__).resolve().parents[2]
-    deploy = (root / "deploy" / "deploy-2026-07-30.sh").read_text()
-    gradle = (root / "android" / "app" / "build.gradle.kts").read_text()
+    # Comments are stripped first (review of the first fix, M-7: a substring
+    # check was satisfied by the exclusion moved into a comment).
+    import re
+    deploy = re.sub(r"#.*", "", (root / "deploy" / "deploy-2026-07-30.sh").read_text())
+    gradle = re.sub(r"//.*", "", (root / "android" / "app" / "build.gradle.kts").read_text())
     for pattern in ("*.test.mjs", "package*.json", "node_modules", "test-source.mjs", "README.md"):
         assert f"--exclude '{pattern}'" in deploy or f"--exclude {pattern}" in deploy, f"deploy script does not exclude {pattern}"
         assert f'"{pattern}"' in gradle, f"APK Sync task does not exclude {pattern}"
@@ -91,3 +94,14 @@ def test_the_three_ship_lists_agree():
         assert _main._is_blocked_static("/" + basename), basename
     assert _main._is_blocked_static("/vendor/README.md")
     assert not _main._is_blocked_static("/app.js")
+
+
+def test_api_paths_are_not_shadowed_by_the_static_gate():
+    """F-P7-16 (and the review's L-6): the static gate runs on the static mount
+    only. A legal username that looks like a blocked file must stay reachable."""
+    import main as _main
+    assert _main._is_blocked_static("/test-source.mjs")
+    r = client.get("/api/users/test-source.mjs", params={"t": "x"})
+    assert r.status_code == 404 and r.json()["detail"] == "no such user", r.text  # the API answered, not the gate
+    r = client.get("/api/users/.alice", params={"t": "x"})
+    assert r.status_code == 404 and r.json()["detail"] == "no such user", r.text

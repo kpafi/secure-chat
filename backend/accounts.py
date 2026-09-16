@@ -294,8 +294,25 @@ def challenge_rate_limit(request: Request) -> None:
 # without a token spends nothing, and a token holder can only exhaust the one
 # handle they hold a token for. The per-host `_api_limiter` on the router is the
 # ceiling in front of the gate.
+# ACCEPTED, stated at the acceptance level (review of the first fix, L-4): a
+# holder of a handle's lookup token can exhaust THAT handle's bucket for every
+# other holder — 10 lookups, then 0.5/s to keep it there — and nobody can add
+# that one person by handle until they stop. Same trade as `"mail:" + recipient`
+# (F-RELAY-004): the harm is bounded to one handle its own owner shared, versus
+# the previous per-host bucket, which anyone with no token could drain for
+# every handle on the relay.
 def _charge_lookup(key: str) -> None:
     if not _lookup_limiter.allow(key):
+        raise HTTPException(status_code=429, detail="rate limited")
+
+
+# POST /vouch is also bounded per HOST: accounts are free, so a per-voucher
+# bucket alone scales with throwaway accounts (review of the first fix, L-3).
+_vouch_host_limiter = KeyedRateLimiter(config.VOUCH_HOST_RATE_CAPACITY, config.VOUCH_HOST_RATE_REFILL_PER_SEC)
+
+
+def vouch_host_rate_limit(request: Request) -> None:
+    if not _vouch_host_limiter.allow(client_key(request)):
         raise HTTPException(status_code=429, detail="rate limited")
 
 
@@ -507,6 +524,11 @@ def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(config.DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    # Review of the Phase-7 fixes (L-2): under a flood, overlapping writers hit
+    # "database is locked" after sqlite's default 5 s and each one was a 500
+    # plus a traceback on disk (an I2 violation, per relay.py's own docstring).
+    # Wait longer, and main.py maps what still fails to a bare 503.
+    conn.execute("PRAGMA busy_timeout=15000")
     return conn
 
 
@@ -954,7 +976,7 @@ class VouchReq(BaseModel):
     mldsa_sig: str  # voucher's ML-DSA-65 signature over the same message
 
 
-@router.post("/vouch")
+@router.post("/vouch", dependencies=[Depends(vouch_host_rate_limit)])
 def vouch(req: VouchReq, username: str = Depends(current_user)) -> dict:
     """Publish (or refresh) a dual-signed vouch for `target`.
 

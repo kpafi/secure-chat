@@ -91,7 +91,8 @@ const els = {
   profileCopyHandle: $("profileCopyHandle"), profileCopyInvite: $("profileCopyInvite"),
   profileQrRow: $("profileQrRow"), profileQr: $("profileQr"),
   profileFingerprint: $("profileFingerprint"), profileKeys: $("profileKeys"),
-  profileStatus: $("profileStatus"),
+  profileStatus: $("profileStatus"), profileHint: $("profileHint"),
+  usersHint: $("usersHint"), chatsHint: $("chatsHint"),
   profileExport: $("profileExport"), profileForget: $("profileForget"),
   profileLogout: $("profileLogout"), profileSessionHint: $("profileSessionHint"),
   // users view
@@ -458,10 +459,14 @@ function activeHintEl() {
   // Users or Chats view on screen (where someone waiting for mail sits) the
   // "sealed messages will not arrive" warning was written into a zero-size
   // node. Pick the visible VIEW first; each has its own status line.
+  // Each view gets a hint line of its OWN (review of the first fix, L-5): the
+  // views' status elements are written and cleared by their renderers, so a
+  // warning written there was destroyed on the next render — and on Profile
+  // the "status" is a chip container that hint() would have wiped.
   if (els.viewLive.hidden) {
-    if (!els.viewUsers.hidden) return els.usersStatus;
-    if (!els.viewChats.hidden) return els.chatsStatus;
-    if (!els.viewProfile.hidden) return els.profileStatus;
+    if (!els.viewUsers.hidden) return els.usersHint;
+    if (!els.viewChats.hidden) return els.chatsHint;
+    if (!els.viewProfile.hidden) return els.profileHint;
   }
   if (!els.scrRoom.hidden) return els.roomHint;
   if (!els.scrIdentity.hidden) return els.idHint;
@@ -479,7 +484,7 @@ function hint(text, isErr = false) {
 // Clear stale feedback when moving between screens, so an old error can never
 // look like it belongs to the screen you just arrived at.
 function clearHints() {
-  for (const el of [els.idHint, els.roomHint, els.hint]) {
+  for (const el of [els.idHint, els.roomHint, els.hint, els.usersHint, els.chatsHint, els.profileHint]) {
     if (el) { el.textContent = ""; el.className = "hint"; }
   }
 }
@@ -491,8 +496,26 @@ function accountStatus(text, cls = "") {
 
 const LOG_MAX_LINES = 500; // F-P7-7
 function addLine(kind, who, text) {
+  // Review of the F-P7-7 fix (M-5): a relay that floods junk `msg` frames makes
+  // us narrate "[undecryptable message …]" once per frame, and oldest-first
+  // eviction then pushed the SECURITY lines ("you approved this peer",
+  // "handshake signature INVALID") out of the transcript entirely — the
+  // F-PROTO-002 note says those must not survive only as a scrolled-past line,
+  // and they no longer survived at all. Two rules: a system line identical to
+  // the previous one is COUNTED onto it rather than appended, so a flood of one
+  // message is one line; and eviction takes the oldest NON-system line first,
+  // touching system lines only when they alone exceed the cap.
+  const last = els.log.lastElementChild;
+  if (kind === "sys" && !who && last && last.className === "sys" && last.dataset.text === text) {
+    const n = (Number(last.dataset.repeat) || 1) + 1;
+    last.dataset.repeat = String(n);
+    last.textContent = `${text} (×${n})`;
+    els.log.scrollTop = els.log.scrollHeight;
+    return;
+  }
   const li = document.createElement("li");
   li.className = kind;
+  if (kind === "sys" && !who) li.dataset.text = text;
   if (who) {
     const w = document.createElement("span");
     w.className = "who";
@@ -503,8 +526,12 @@ function addLine(kind, who, text) {
   els.log.appendChild(li);
   // F-P7-7: the transcript is bounded. Every frame the relay can make us
   // narrate costs a node plus a synchronous layout (scrollTop below), so an
-  // unbounded list is O(n^2) work an attacker controls. Oldest lines go first.
-  while (els.log.childElementCount > LOG_MAX_LINES) els.log.removeChild(els.log.firstChild);
+  // unbounded list is O(n^2) work an attacker controls.
+  while (els.log.childElementCount > LOG_MAX_LINES) {
+    let victim = els.log.firstElementChild;
+    for (const c of els.log.children) { if (c.className !== "sys") { victim = c; break; } }
+    els.log.removeChild(victim);
+  }
   els.log.scrollTop = els.log.scrollHeight;
 }
 

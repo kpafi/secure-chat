@@ -221,8 +221,10 @@ console.log(`\nAll RSA deprecation checks passed (${n}).`);
   }
   const addLine = liftFunction(appSrc, "addLine", assert);
   assert.match(appSrc, /^const LOG_MAX_LINES = 500;\s*$/m, "F-P7-7: the transcript bound is the literal 500");
-  assert.match(addLine, /while \(els\.log\.childElementCount > LOG_MAX_LINES\) els\.log\.removeChild\(els\.log\.firstChild\);/,
-    "F-P7-7: addLine evicts the oldest lines past the bound, before the synchronous scroll");
-  assert.ok(addLine.indexOf("LOG_MAX_LINES") < addLine.indexOf("scrollTop"), "...eviction happens before the layout-forcing scroll");
+  assert.match(addLine, /while \(els\.log\.childElementCount > LOG_MAX_LINES\) \{\s*let victim = els\.log\.firstElementChild;\s*for \(const c of els\.log\.children\) \{ if \(c\.className !== "sys"\) \{ victim = c; break; \} \}\s*els\.log\.removeChild\(victim\);/,
+    "F-P7-7 / M-5: eviction takes the oldest NON-system line first, so security lines survive a flood");
+  assert.match(addLine, /last\.className === "sys" && last\.dataset\.text === text/,
+    "M-5: a system line identical to the previous one is counted onto it, not appended");
+  assert.ok(addLine.indexOf("LOG_MAX_LINES") < addLine.lastIndexOf("scrollTop"), "...eviction happens before the layout-forcing scroll");
   console.log("OK  F-P7-7: the deprecated-alg refusal is said once per connection and the transcript is bounded");
 }

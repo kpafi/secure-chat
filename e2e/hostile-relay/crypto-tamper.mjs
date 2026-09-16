@@ -132,6 +132,26 @@ const EXPECT = {
     check(r.send.a && r.send.b, "confirmpre (F-P7-19): injected pre-chain tags do not tear the session down");
     check(!has(r.logA, /more key confirmations/) && !has(r.logB, /more key confirmations/), "confirmpre: the honest peer is not blamed");
   },
+  msgflood(r) {
+    // Review of the F-P7-7 fix (M-5): oldest-first eviction let 600 junk msg
+    // frames push "you approved this peer" and "joined room" out of the
+    // transcript. Repeated system lines collapse and non-system lines go first.
+    check(r.send.a && r.send.b, "msgflood: the session completes under the flood");
+    check(has(r.logB, new RegExp(CANARY)), "msgflood: the real message still renders");
+    check(has(r.logA, /joined room/) && has(r.logB, /joined room/), "msgflood (M-5): the early system lines survive the flood");
+    check(has(r.logA, /approved this peer|let someone in|now pinned/) || has(r.logB, /approved this peer|let someone in|now pinned/), "msgflood (M-5): the approval/pin lines survive the flood");
+    check(count(r.logB, /undecryptable/) <= 2, `msgflood: the junk is counted onto one line, not narrated ${count(r.logB, /undecryptable/)} times`);
+    check(r.liA <= 500 && r.liB <= 500, "msgflood: the transcript stays bounded");
+  },
+  confirmpost(r) {
+    // The half F-P7-19 cannot fix: tags injected AFTER the chains exist do
+    // count, and two of them make the honest tag the third. A relay that can
+    // do this can also drop frames, so this is availability only — but it must
+    // be LOUD and it must blame the relay, not the peer. Asserted as expected.
+    check(!r.send.a && !r.send.b, "confirmpost: the session is torn down (expected — availability only)");
+    check(has(r.logA, /the relay is injecting them/) || has(r.logB, /the relay is injecting them/), "confirmpost: the teardown names the relay");
+    check(!has(r.logA, /the other side sent/) && !has(r.logB, /the other side sent/), "confirmpost: the honest peer is not blamed");
+  },
   algflood(r) {
     // F-P7-7: the RSA refusal is said once per connection and the log is capped,
     // so a flood of 14-byte frames neither buries the real lines nor wedges the tab.

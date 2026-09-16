@@ -34,6 +34,7 @@ client = TestClient(app)
 def _reset():
     accounts._api_limiter._buckets.clear()
     accounts._lookup_limiter._buckets.clear()
+    accounts._vouch_host_limiter._buckets.clear()
     accounts._challenge_limiter._buckets.clear()
     mailbox._post_limiter._buckets.clear()
     yield

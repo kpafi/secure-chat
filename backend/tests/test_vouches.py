@@ -33,6 +33,7 @@ client = TestClient(app)
 def _reset_api_limiter():
     accounts._api_limiter._buckets.clear()
     accounts._lookup_limiter._buckets.clear()
+    accounts._vouch_host_limiter._buckets.clear()
     accounts._challenge_limiter._buckets.clear()
     yield
 
@@ -174,6 +175,7 @@ def test_vouch_rejects_bad_signatures_and_auth():
     # which would mask the property under test rather than demonstrate it.
     for absent in ("wot-nobody", "wot-zzz", "wot-ghost2"):
         accounts._lookup_limiter._buckets.clear()
+        accounts._vouch_host_limiter._buckets.clear()
         probe = dict(_vouch_body(alice, bob), target=absent)
         rp = client.post("/api/vouch", json=probe, headers=_auth(tok))
         assert (rp.status_code, rp.json()) == (r_real.status_code, r_real.json()), (
@@ -182,6 +184,7 @@ def test_vouch_rejects_bad_signatures_and_auth():
 
     # Nothing slipped into storage.
     accounts._lookup_limiter._buckets.clear()
+    accounts._vouch_host_limiter._buckets.clear()
     r = client.get(f"/api/users/{bob['username']}/vouches", params={"t": bob["token"]})
     assert r.json()["vouches"] == []
 
@@ -199,6 +202,7 @@ def test_vouch_is_throttled_on_the_anti_enumeration_bucket():
     with no account. The bound per prober is unchanged.
     """
     accounts._lookup_limiter._buckets.clear()
+    accounts._vouch_host_limiter._buckets.clear()
     alice = _register("wot-lim-alice")
     bob = _register("wot-lim-bob")
     tok = _login(alice)

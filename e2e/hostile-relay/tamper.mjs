@@ -15,6 +15,9 @@
 //   msgreplay   deliver every msg frame three times
 //   confirmpre  inject two bogus key-confirmation tags before the honest one
 //   algflood    send ALGFLOOD_N (default 300) frames tagged alg:"RSA" per key frame
+//   msgflood    after the first real msg, send MSGFLOOD_N (default 600) junk msg frames
+//   confirmpost inject two bogus confirm tags AFTER each handshake key frame (the
+//               half F-P7-19 could not fix: an expected, loud, relay-blaming teardown)
 //
 // crypto-tamper.mjs drives two real browsers through each mode and asserts what
 // the shipped client must show. Run it, not this, unless you are debugging.
@@ -31,7 +34,8 @@ const ROOT = (process.env.CLIENT_ROOT
 const PORT = Number(process.env.PORT || 8098);
 const EVIL = process.env.EVIL || "none";
 const ALGFLOOD_N = Number(process.env.ALGFLOOD_N || 300);
-const MODES = new Set(["none", "keysub", "idbswap", "idbstrip", "ctflip", "msgreplay", "confirmpre", "algflood"]);
+const MSGFLOOD_N = Number(process.env.MSGFLOOD_N || 600);
+const MODES = new Set(["none", "keysub", "idbswap", "idbstrip", "ctflip", "msgreplay", "confirmpre", "algflood", "msgflood", "confirmpost"]);
 if (!MODES.has(EVIL)) {
   console.error(`EVIL must be one of ${[...MODES].join(", ")}; got ${EVIL}`);
   process.exit(2);
@@ -143,6 +147,25 @@ wss.on("connection", (ws) => {
       }
       if (EVIL === "msgreplay" && m.type === "msg") {
         for (const peer of peers) { send(peer, out); send(peer, out); }
+      }
+      if (EVIL === "msgflood" && m.type === "msg" && !conn.flooded) {
+        conn.flooded = true;
+        for (const peer of e.sockets) {
+          for (let i = 0; i < MSGFLOOD_N; i++) {
+            send(peer, { type: "msg", room: m.room, alg: m.alg, payload: b64json({ iv: "AAAAAAAAAAAAAAAA", ct: "AAAAAAAAAAAAAAAAAAAAAAAA", n: 100000 + i }) });
+          }
+        }
+      }
+      if (EVIL === "confirmpost" && m.type === "key") {
+        let p = null;
+        try { p = unb64json(m.payload); } catch {}
+        if (p && p.pub) { // the handshake frame: the receiver derives chains on it, so tags after it COUNT
+          for (const peer of peers) {
+            for (let i = 0; i < 2; i++) {
+              send(peer, { type: "key", room: m.room, alg: m.alg, payload: b64json({ confirm: "POST" + i }) });
+            }
+          }
+        }
       }
     }
   });

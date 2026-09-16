@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import posixpath
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -145,13 +146,26 @@ def _is_blocked_static(path: str) -> bool:
     )
 
 
+@app.exception_handler(sqlite3.OperationalError)
+async def _sqlite_busy(request: Request, exc: sqlite3.OperationalError) -> Response:
+    # Review of the Phase-7 fixes (L-2): a "database is locked" under load used
+    # to escape as a 500 with a traceback in the log (I2). A bare 503 says
+    # "try again" and writes nothing.
+    return Response(status_code=503, content="busy", media_type="text/plain")
+
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     # Audit 2026-07-18 M-01: decide on the raw ASGI path, NOT request.url.path.
     # Affected Starlette versions reconstruct `url` using the client-controlled
     # Host header, which can desync it from the routed path and bypass this
     # gate (GHSA-86qp-5c8j-p5mr). scope["path"] is what routing actually uses.
-    if _is_blocked_static(request.scope["path"]):
+    # Phase-7 pentest 2026-09-16 F-P7-16: the gate is for the static mount only.
+    # Run on every path it made legal usernames (a leading ".", a ".test.mjs"
+    # suffix, and since F-P7-18 the name "test-source.mjs") register fine and
+    # then 404 on every /api/users lookup, indistinguishably from "no such user".
+    path = request.scope["path"]
+    if not path.startswith("/api/") and _is_blocked_static(path):
         return Response(status_code=404)
     resp: Response = await call_next(request)
     resp.headers["X-Content-Type-Options"] = "nosniff"

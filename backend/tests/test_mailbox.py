@@ -33,11 +33,12 @@ client = TestClient(app)
 def _reset_limiters():
     accounts._api_limiter._buckets.clear()
     accounts._lookup_limiter._buckets.clear()
+    accounts._vouch_host_limiter._buckets.clear()
     accounts._challenge_limiter._buckets.clear()
     mailbox._post_limiter._buckets.clear()
     mailbox._post_global_limiter._buckets.clear()
     mailbox._fetch_limiter._buckets.clear()
-    mailbox._host_limiter._buckets.clear()
+    mailbox._post_host_limiter._buckets.clear()
     yield
 
 
@@ -78,30 +79,35 @@ def _auth(token):
     return {"Authorization": f"Bearer {token}"}
 
 
+def _env(n=None, fill="A"):
+    """A syntactically valid envelope of `n` bytes (default: the minimum)."""
+    return fill * (n or config.MIN_ENVELOPE_BYTES)
+
+
 def test_post_fetch_delete_roundtrip():
     bob = _register("mb-bob")
     tok = _login(bob)
 
     r = client.post(f"/api/mailbox/{bob['username']}", params={"t": bob["token"]},
-                    json={"envelope": '{"v":1,"ct":"abc"}'})
+                    json={"envelope": _env(fill="a")})
     assert r.status_code == 200
     r = client.post(f"/api/mailbox/{bob['username']}", params={"t": bob["token"]},
-                    json={"envelope": '{"v":1,"ct":"def"}'})
+                    json={"envelope": _env(fill="b")})
     assert r.status_code == 200
 
     # Fetch returns both in order and empties the box.
     r = client.get("/api/mailbox", headers=_auth(tok))
     assert r.status_code == 200
     msgs = r.json()["messages"]
-    assert [m["envelope"] for m in msgs] == ['{"v":1,"ct":"abc"}', '{"v":1,"ct":"def"}']
+    assert [m["envelope"] for m in msgs] == [_env(fill="a"), _env(fill="b")]
     assert client.get("/api/mailbox", headers=_auth(tok)).json()["messages"] == []
 
 
 def test_post_is_token_gated_and_not_an_oracle():
     bob = _register("mb-carol")
     r1 = client.post(f"/api/mailbox/{bob['username']}", params={"t": "wrong"},
-                     json={"envelope": "x"})
-    r2 = client.post("/api/mailbox/mb-ghost", params={"t": "wrong"}, json={"envelope": "x"})
+                     json={"envelope": _env(fill="x")})
+    r2 = client.post("/api/mailbox/mb-ghost", params={"t": "wrong"}, json={"envelope": _env(fill="x")})
     assert r1.status_code == r2.status_code == 404
     assert r1.json() == r2.json()
 
@@ -120,7 +126,7 @@ def test_bounds():
     assert r.status_code == 422
     # Non-printable-ASCII refused.
     r = client.post(f"/api/mailbox/{bob['username']}", params={"t": bob["token"]},
-                    json={"envelope": "abcé"})
+                    json={"envelope": _env() + "\x01"})
     assert r.status_code == 422
 
     # Per-recipient cap.
@@ -130,10 +136,10 @@ def test_bounds():
         for i in range(3):
             mailbox._post_limiter._buckets.clear()
             assert client.post(f"/api/mailbox/{bob['username']}", params={"t": bob["token"]},
-                               json={"envelope": f"m{i}"}).status_code == 200
+                               json={"envelope": _env(fill=str(i))}).status_code == 200
         mailbox._post_limiter._buckets.clear()
         r = client.post(f"/api/mailbox/{bob['username']}", params={"t": bob["token"]},
-                        json={"envelope": "overflow"})
+                        json={"envelope": _env(fill="o")})
         assert r.status_code == 429
     finally:
         config.MAX_MAILBOX_PER_RECIPIENT = old_cap
@@ -145,7 +151,7 @@ def test_ttl_prune():
     bob = _register("mb-eve")
     tok = _login(bob)
     assert client.post(f"/api/mailbox/{bob['username']}", params={"t": bob["token"]},
-                       json={"envelope": "stale"}).status_code == 200
+                       json={"envelope": _env(fill="s")}).status_code == 200
     # Age the row past the TTL directly in the DB, then any access prunes it.
     with accounts._db() as conn:
         conn.execute("UPDATE mailbox SET created_at = ?",
@@ -158,7 +164,8 @@ def test_ttl_prune():
 def test_unauthenticated_fetch_flood_cannot_deny_authenticated_polling(monkeypatch):
     """F-P7-2: the fetch bucket used to be keyed per HOST and charged BEFORE the
     token gate — behind Tor one bucket for everybody, drainable with no account.
-    It is per authenticated user now, charged after `current_user`."""
+    It is per authenticated user now, charged after `current_user`, and GET has
+    no pre-auth charge at all."""
     from relay import KeyedRateLimiter
     monkeypatch.setattr(mailbox, "_fetch_limiter", KeyedRateLimiter(2, 0.001))
     bob = _register("f2-bob")
@@ -171,6 +178,19 @@ def test_unauthenticated_fetch_flood_cannot_deny_authenticated_polling(monkeypat
     assert client.get("/api/mailbox", headers=_auth(_login(alice))).status_code == 200, "another user's bucket is separate"
 
 
+def test_post_flood_cannot_deny_authenticated_fetch(monkeypatch):
+    """Review of the first F-P7-2 fix (M-1): one pre-gate host bucket on BOTH
+    verbs let an unauthenticated POST flood deny every authenticated GET. The
+    POST ceiling is POST-only; GET is gated by auth and its per-user bucket."""
+    from relay import KeyedRateLimiter
+    monkeypatch.setattr(mailbox, "_post_host_limiter", KeyedRateLimiter(3, 0.001))
+    bob = _register("m1-bob")
+    tok = _login(bob)
+    flood = [client.post(f"/api/mailbox/nobody{i}", params={"t": "x"}, json={"envelope": _env()}).status_code for i in range(10)]
+    assert 429 in flood and 404 in flood, flood  # the POST ceiling is exhausted...
+    assert client.get("/api/mailbox", headers=_auth(tok)).status_code == 200, "...and GET does not share it"
+
+
 def test_unauthenticated_posts_cannot_spend_the_global_post_budget(monkeypatch):
     """F-P7-4: the global ceiling was charged before the 404 for a nonexistent
     recipient, so posts with a bogus token to made-up handles drained it. It is
@@ -178,46 +198,55 @@ def test_unauthenticated_posts_cannot_spend_the_global_post_budget(monkeypatch):
     from relay import KeyedRateLimiter
     monkeypatch.setattr(mailbox, "_post_global_limiter", KeyedRateLimiter(2, 0.001))
     bob = _register("f4-bob")
-    garbage = [client.post(f"/api/mailbox/nobody{i}", params={"t": "x"}, json={"envelope": "QUJD"}).status_code for i in range(20)]
+    garbage = [client.post(f"/api/mailbox/nobody{i}", params={"t": "x"}, json={"envelope": _env()}).status_code for i in range(20)]
     assert garbage == [404] * 20, garbage
-    wrong = [client.post("/api/mailbox/f4-bob", params={"t": "x"}, json={"envelope": "QUJD"}).status_code for _ in range(5)]
+    wrong = [client.post("/api/mailbox/f4-bob", params={"t": "x"}, json={"envelope": _env()}).status_code for _ in range(5)]
     assert wrong == [404] * 5, wrong
-    codes = [client.post("/api/mailbox/f4-bob", params={"t": bob["token"]}, json={"envelope": "QUJD"}).status_code for _ in range(3)]
+    codes = [client.post("/api/mailbox/f4-bob", params={"t": bob["token"]}, json={"envelope": _env()}).status_code for _ in range(3)]
     assert codes == [200, 200, 429], codes  # the ceiling still exists, for real senders
 
 
-def test_mailbox_budget_is_bytes_not_rows(monkeypatch):
-    """F-P7-1: a 100 000-ROW budget let ~100 KB of one-byte envelopes shut off
-    mail for everyone for the full TTL. Bytes, server-wide and per inbox."""
-    monkeypatch.setattr(config, "MAX_MAILBOX_TOTAL_BYTES", 100)
-    monkeypatch.setattr(config, "MAX_MAILBOX_PER_RECIPIENT_BYTES", 60)
+def test_envelopes_have_a_minimum_size():
+    """F-P7-1: a one-byte envelope only ever existed to spend budget."""
+    bob = _register("f1-min")
+    r = client.post("/api/mailbox/f1-min", params={"t": bob["token"]}, json={"envelope": "A" * (config.MIN_ENVELOPE_BYTES - 1)})
+    assert r.status_code == 422, r.text
+    assert client.post("/api/mailbox/f1-min", params={"t": bob["token"]}, json={"envelope": _env()}).status_code == 200
+
+
+def test_mailbox_budget_is_bytes_and_evicts_oldest(monkeypatch):
+    """F-P7-1: the server-wide budget is BYTES, and when it is full the OLDEST
+    queued mail is evicted instead of refusing new mail relay-wide (the review
+    of the first fix: a 503 for everyone until the TTL ran out was the harm).
+    The per-inbox share stays a hard 429 — the recipient can fetch."""
+    n = config.MIN_ENVELOPE_BYTES
+    monkeypatch.setattr(config, "MAX_MAILBOX_TOTAL_BYTES", 3 * n)
+    monkeypatch.setattr(config, "MAX_MAILBOX_PER_RECIPIENT_BYTES", 2 * n)
     bob = _register("f1-bob")
     alice = _register("f1-alice")
-    big = "A" * 40
-    assert client.post("/api/mailbox/f1-bob", params={"t": bob["token"]}, json={"envelope": big}).status_code == 200
-    r = client.post("/api/mailbox/f1-bob", params={"t": bob["token"]}, json={"envelope": big})
-    assert r.status_code == 429 and "inbox full" in r.text, r.text  # 80 > 60 for this inbox
-    assert client.post("/api/mailbox/f1-alice", params={"t": alice["token"]}, json={"envelope": big}).status_code == 200
-    r = client.post("/api/mailbox/f1-alice", params={"t": alice["token"]}, json={"envelope": "B" * 30})
-    assert r.status_code == 503 and "storage full" in r.text, r.text  # 40 + 40 + 30 > 100 server-wide
-    assert client.post("/api/mailbox/f1-alice", params={"t": alice["token"]}, json={"envelope": "C" * 10}).status_code == 200
+    post = lambda who, fill: client.post(f"/api/mailbox/{who['username']}", params={"t": who["token"]}, json={"envelope": _env(n, fill)})
+    assert post(bob, "1").status_code == 200
+    assert post(bob, "2").status_code == 200
+    r = post(bob, "3")
+    assert r.status_code == 429 and "inbox full" in r.text, r.text  # bob's share (2n) is hard
+    assert post(alice, "a").status_code == 200                      # 3n total: full
+    assert post(alice, "b").status_code == 200                      # evicts bob's oldest ("1"), never refuses
+    with accounts._db() as conn:
+        rows = [(r["recipient"], r["envelope"][0]) for r in conn.execute("SELECT recipient, envelope FROM mailbox ORDER BY id").fetchall()]
+    assert rows == [("f1-bob", "2"), ("f1-alice", "a"), ("f1-alice", "b")], rows
+    got = client.get("/api/mailbox", headers=_auth(_login(alice))).json()["messages"]
+    assert [m["envelope"][0] for m in got] == ["a", "b"], "new mail was delivered under a full budget"
 
 
-def test_mail_to_an_inbox_that_never_fetched_expires_early():
-    """F-P7-1: rows for a recipient that has NEVER fetched die on the short TTL;
-    an inbox that has fetched keeps its mail for the full TTL."""
-    bob = _register("f1-never")      # never fetches — an attacker's throwaway
-    alice = _register("f1-fetcher")
-    assert client.get("/api/mailbox", headers=_auth(_login(alice))).status_code == 200  # alice has fetched once
-    for who in (bob, alice):
-        assert client.post(f"/api/mailbox/{who['username']}", params={"t": who["token"]}, json={"envelope": "QUJD"}).status_code == 200
-    old = int(time.time()) - config.MAILBOX_UNFETCHED_TTL_SEC - 1
+def test_prune_and_no_read_history():
+    """The relay keeps no read history (the first fix added a last-fetch table;
+    its review found it was a last-seen log at rest — dropped), and the TTL
+    prune still runs."""
     with accounts._db() as conn:
-        conn.execute("UPDATE mailbox SET created_at = ? WHERE recipient IN (?, ?)", (old, "f1-never", "f1-fetcher"))
-    # Any prune trigger — here a post to a third inbox.
-    carol = _register("f1-carol")
-    assert client.post("/api/mailbox/f1-carol", params={"t": carol["token"]}, json={"envelope": "QUJD"}).status_code == 200
+        tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    assert "mailbox_fetches" not in tables
+    bob = _register("ttl-bob")
+    assert client.post("/api/mailbox/ttl-bob", params={"t": bob["token"]}, json={"envelope": _env()}).status_code == 200
     with accounts._db() as conn:
-        left = {r["recipient"] for r in conn.execute("SELECT recipient FROM mailbox").fetchall()}
-    assert "f1-never" not in left, "mail to an inbox nobody ever fetched must expire on the short TTL"
-    assert "f1-fetcher" in left, "an inbox that has fetched keeps its mail until the full TTL"
+        conn.execute("UPDATE mailbox SET created_at = ? WHERE recipient = ?", (int(time.time()) - config.MAILBOX_TTL_SEC - 1, "ttl-bob"))
+    assert client.get("/api/mailbox", headers=_auth(_login(bob))).json()["messages"] == []

@@ -343,17 +343,22 @@ TOKEN_TTL_SEC = 3600         # issued session-token lifetime
 # session token and DELETES what it returns. Everything is bounded.
 MAX_ENVELOPE_BYTES = 64 * 1024        # one sealed envelope (matches WS frame cap)
 MAX_MAILBOX_PER_RECIPIENT = 200       # queued envelopes per inbox
-MAX_MAILBOX_TOTAL = 100_000           # queued envelopes server-wide (row count)
-# Phase-7 pentest 2026-09-16 F-P7-1: the row count alone let ~100 KB of one-byte
-# envelopes to throwaway accounts fill the server-wide budget for the full TTL.
-# The budget is BYTES first (rows second), per inbox and server-wide, and mail
-# queued to a recipient that has NEVER fetched dies much sooner than the TTL —
-# an attacker's throwaway inboxes never fetch; a real one polls within seconds
-# of registering.
-MAX_MAILBOX_TOTAL_BYTES = 256 * 1024 * 1024       # queued envelope bytes server-wide
-MAX_MAILBOX_PER_RECIPIENT_BYTES = 8 * 1024 * 1024  # queued envelope bytes per inbox
+# Phase-7 pentest 2026-09-16 F-P7-1 (and the review of its first fix): a row
+# count alone let ~100 KB of one-byte envelopes to throwaway accounts fill the
+# server-wide budget, and "storage full" was a relay-wide 503 for the whole
+# 14-day TTL. Now: envelopes have a realistic MINIMUM size (a sealed envelope
+# carries an ML-KEM ciphertext, so a genuine one is well over 1 KiB), the
+# budget is BYTES first with a per-inbox share, the row cap only exists to
+# bound table size, and when the server-wide budget is full the OLDEST queued
+# mail is evicted instead of refusing new mail. Under a sustained flood
+# retention therefore degrades (mail must be fetched sooner) rather than
+# delivery stopping; with free registration that is the honest limit, and it
+# is stated in mailbox.py.
+MIN_ENVELOPE_BYTES = 256
+MAX_MAILBOX_TOTAL = 1_000_000                       # rows, bounds the table; bytes bind first
+MAX_MAILBOX_TOTAL_BYTES = 256 * 1024 * 1024        # queued envelope bytes server-wide (evict-oldest)
+MAX_MAILBOX_PER_RECIPIENT_BYTES = 4 * 1024 * 1024   # queued envelope bytes per inbox (hard)
 MAILBOX_TTL_SEC = 14 * 24 * 3600      # unfetched mail expires
-MAILBOX_UNFETCHED_TTL_SEC = 24 * 3600 # ...much sooner for an inbox that has never been fetched
 # Pentest 2026-08-07 F-RELAY-004: this bucket was keyed per host (one global
 # bucket behind Tor) and charged BEFORE the lookup-token gate, so unauthenticated
 # posts to a nonexistent recipient drained mail delivery for everyone. It is now
@@ -380,12 +385,20 @@ MAILBOX_GLOBAL_RATE_REFILL_PER_SEC = 10.0 # sustained posts/second, all recipien
 # anyone with no account). A client polls every 6 s.
 MAILBOX_FETCH_RATE_CAPACITY = 30      # burst fetches per user
 MAILBOX_FETCH_RATE_REFILL_PER_SEC = 1.0   # sustained fetches/second per user
-# The per-host ceiling on the mailbox router, charged before anything else.
-# Behind Tor this is one bucket for everybody, so it is a backstop against
-# runaway clients and nothing more: the controls that matter are per user and
-# per recipient, after the gates (F-P7-2, F-P7-4).
-MAILBOX_HOST_RATE_CAPACITY = 600
-MAILBOX_HOST_RATE_REFILL_PER_SEC = 50.0
+# The per-host ceiling on mailbox POST, charged before the token gate. Behind
+# Tor this is one bucket for everybody, so it is a backstop against runaway
+# clients and nothing more: the controls that matter are per user and per
+# recipient, after the gates (F-P7-2, F-P7-4). It is POST-only: the review of
+# the first fix showed one bucket on both verbs let a POST flood deny every
+# authenticated GET, which is F-P7-2 through the other door. GET charges
+# nothing before auth (`current_user` is a dict lookup).
+MAILBOX_POST_HOST_RATE_CAPACITY = 600
+MAILBOX_POST_HOST_RATE_REFILL_PER_SEC = 50.0
+# POST /api/vouch: per authenticated voucher (the anti-enumeration bound per
+# prober) AND a per-host ceiling, because accounts are free and a per-account
+# bound alone scales with throwaway accounts (review of the first F-P7-3 fix).
+VOUCH_HOST_RATE_CAPACITY = 30
+VOUCH_HOST_RATE_REFILL_PER_SEC = 1.0
 
 # --- Web-of-trust vouches --------------------------------------------------
 # A vouch is a dual-signed public statement "voucher has verified target's

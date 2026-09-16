@@ -267,6 +267,20 @@ function kotlinFun(sigRe, what, from = lines) {
   ok("F-P7-A5: the WebView settings, the single bridge, debug-only devtools and the CSP are pinned");
 }
 
+// --- 4b. Review of the F-P7-A5 fix (L-7): the raw string's OWN body ---------
+// Kotlin raw strings interpolate `$name` and `${ … }`, so Kotlin can hide
+// inside the injected script (`${ run { addJavascriptInterface(...); "" } }`)
+// where neither slice above looks. Pin the interpolation surface: no `${`
+// blocks at all, and the only simple interpolation is the relay config.
+{
+  const rawBody = raw.slice(rawStringAt + 3, rawStringEnd);
+  assert.ok(!/\$\{/.test(rawBody), "F-P7-A5: the injected script may contain no `${ … }` Kotlin interpolation");
+  const names = [...new Set([...rawBody.matchAll(/\$([A-Za-z_]\w*)/g)].map((m) => m[1]))];
+  assert.deepStrictEqual(names, ["config"],
+    `F-P7-A5: the only Kotlin value interpolated into the injected script is $config — found ${names.join(", ")}`);
+  ok("F-P7-A5: the raw string interpolates exactly $config and no Kotlin code");
+}
+
 // --- 5. F-P7-A5: both document-start defineProperty descriptors -------------
 // The injected script lives in the Kotlin RAW STRING the slice above excludes.
 // otp-rollback.test.mjs pins the MARKER's `configurable: false`; nothing pinned
