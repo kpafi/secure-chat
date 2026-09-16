@@ -296,6 +296,19 @@ export function judge(identity) {
         "treating every saved store as present rather than trusting the identity file on its own",
     };
   }
+  if (f >= MAX_GENERATION) {
+    // Second review of store-floor.js (H-1), applied here too: a slot the
+    // blob can never overtake is a permanent bad verdict, whatever put it
+    // there — otherwise the blob freezes EQUAL to it and later states cannot
+    // be told apart. Fail closed (anchors established), say so every unlock.
+    return {
+      ok: false,
+      arm: false,
+      reason: "exhausted",
+      message: "this device's protected record for your identity is exhausted (its counter can no longer advance), " +
+        "so a rollback could no longer be told from a save — treating every saved store as present",
+    };
+  }
   if (f === NATIVE_ABSENT) {
     if (identity.floorClaim === CLAIM_ARMED) {
       return {

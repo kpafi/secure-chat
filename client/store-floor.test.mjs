@@ -240,26 +240,82 @@ async function testChatStoreVerdicts() {
 }
 
 // ---- the review's two Highs -----------------------------------------------------
+// A slot the store can never overtake is itself a permanent bad verdict —
+// however it got there. The second review's H-1: the first ceiling fix tested
+// the MEASURED slot, so a slot parked one below the detector (MAX-1) let one
+// honest write catch up to it, after which the store was frozen EQUAL to the
+// slot and every later rollback among the frozen states read clean. Table-
+// driven over the whole boundary and BOTH stores: after the park, one honest
+// write, a re-verification and a rollback, the verdict must be loud and the
+// superseded state must not pass as current.
 async function testParkedSlotIsLoudForever() {
-  // One `bump` on the frozen bridge from the page realm parks the slot at the
-  // ceiling. The first cut's catch-up then carried the generation PAST it and
-  // armStoreFloor went silent forever — the whole control off. Now the parked
-  // slot reads as a rollback on every open: loud, permanent, never silent.
+  for (const parked of [MAX - 2, MAX - 1, MAX, MAX + 1, 0x7fffffff]) {
+    const floor = device();
+    await establishBob();
+    floor.slots.set(CSLOT, parked);
+    await contacts.upsert({ username: "carol", token: "t", ...BOB2 }); // one honest write after the park
+    const archived = localStorage._dump();
+    await contacts.savePin("user:bob", BOB2); // the re-verification
+    localStorage._restore(archived);          // the rollback
+    contacts.lock();
+    const warning = await contacts.unlock(PASS);
+    assert.ok(warning, `H-1 (contacts, parked at ${parked - MAX} from MAX): a slot the store cannot overtake must be a loud verdict on every open`);
+    assert.strictEqual(contacts.getPin("user:bob").suspect, true, `...and the superseded pin cannot auto-unlock (parked at ${parked - MAX})`);
+    assert.ok(contacts.isUnlocked(), "...and the store is still usable");
+    // chats, same boundary
+    await chats.unlock(PASS);
+    await chats.ensure("bob");
+    floor.slots.set(HSLOT, parked);
+    await chats.append("bob", { dir: "out", text: "honest write after the park" });
+    const archivedChats = localStorage._dump();
+    await chats.setMode("bob", "AES256", { secret: "S2-rotated", salt: "x" });
+    localStorage._restore(archivedChats);
+    chats.lock();
+    const w2 = await chats.unlock(PASS);
+    assert.ok(w2, `H-1 (chats, parked at ${parked - MAX} from MAX): loud on every open`);
+    assert.strictEqual(chats.get("bob").rollback, true, "...and the chat carries durable rollback evidence");
+  }
+  console.log("OK  F-P7-6 review H-1: a slot the store can never overtake is a permanent loud verdict, both stores, whole boundary");
+}
+
+// Second review, M-1: the chat store's evidence is durable and names the secret.
+async function testChatRollbackEvidenceIsDurable() {
   const floor = device();
-  await establishBob();
-  floor.slots.set(CSLOT, MAX);
-  await contacts.upsert({ username: "carol", token: "t", ...BOB2 }); // an honest write after the park
-  assert.match(contacts.lastFloorWarning(), /ceiling/, "the write warns");
-  assert.strictEqual(floor.slots.get(CSLOT), MAX, "the store never advances the parked slot");
+  await chats.unlock(PASS);
+  await chats.ensure("bob");
+  await chats.setMode("bob", "AES256", { secret: "S1-leaked", salt: "x" });
   const archived = localStorage._dump();
-  await contacts.savePin("user:bob", BOB2); // the re-verification
-  localStorage._restore(archived); // the rollback
+  await chats.setMode("bob", "AES256", { secret: "S2-rotated", salt: "y" }); // the pair rotated in person
+  localStorage._restore(archived);
+  chats.lock();
+  const w = await chats.unlock(PASS);
+  assert.match(w, /passphrase or mode you changed since may have been reverted/, "the warning names the secret");
+  assert.strictEqual(chats.get("bob").rollback, true, "the chat is marked, inside the AEAD");
+  assert.strictEqual(chats.get("bob").secret, "S1-leaked", "the reverted secret is KEPT (not deleted) but flagged");
+  chats.lock();
+  assert.strictEqual(await chats.unlock(PASS), null, "the verdict heals...");
+  assert.strictEqual(chats.get("bob").rollback, true, "...but the mark survives the heal — it is not a one-shot warning");
+  await chats.setMode("bob", "AES256", { secret: "S2-rotated", salt: "y" }); // the deliberate re-negotiation
+  assert.strictEqual(chats.get("bob").rollback, undefined, "a deliberate setMode clears the mark");
+  console.log("OK  F-P7-6 review M-1: a rolled-back chat carries durable evidence until the next deliberate mode change");
+}
+
+// Second review, test gap 2: `room:<id>` pins are the DEFAULT for Live-room use.
+async function testRoomPinsAreMarkedSuspectToo() {
+  const floor = device();
+  await contacts.unlock(PASS);
+  await contacts.savePin("room:" + "a".repeat(64), BOB);
+  const archived = localStorage._dump();
+  await contacts.savePin("room:" + "a".repeat(64), BOB2);
+  localStorage._restore(archived);
   contacts.lock();
-  const warning = await contacts.unlock(PASS);
-  assert.match(warning, /OLDER/, "F-1: with the slot parked, every open is a (loud) rollback verdict");
-  assert.strictEqual(contacts.getPin("user:bob").suspect, true, "...and the superseded pin cannot auto-unlock");
-  assert.ok(contacts.isUnlocked(), "...and the store is still usable");
-  console.log("OK  F-P7-6 review F-1: a parked floor slot is a permanent loud alarm, not a silent bypass");
+  assert.ok(await contacts.unlock(PASS));
+  assert.strictEqual(contacts.getPin("room:" + "a".repeat(64)).suspect, true, "a room pin with no contact record is marked suspect like any other");
+  // and a caller cannot launder the mark through the returned reference
+  const p = contacts.getPin("room:" + "a".repeat(64));
+  delete p.suspect;
+  assert.strictEqual(contacts.getPin("room:" + "a".repeat(64)).suspect, true, "getPin hands out a copy");
+  console.log("OK  F-P7-6: room pins are suspect too, and getPin returns a copy");
 }
 
 function testPoisonedIsIntegerCannotBlindTheFloor() {
@@ -351,9 +407,9 @@ function testAppJsHonoursSuspectPinsAndSurfacesWarnings() {
   const src = stripComments(readFileSync(new URL("./app.js", import.meta.url), "utf8"));
   const fn = liftFunction(src, "unlockContacts", assert);
   assert.match(fn, /const warning = await contacts\.unlock\(pass, \{ startFresh: freshStoreConsent\.contacts \}\);/);
-  assert.match(fn, /for \(const w of \[warning, contacts\.lastFloorWarning\(\)\]\) \{\s*if \(w\) \{ addLine\("sys", "", "\[contacts: " \+ w \+ "\]"\); hint\(w, true\); \}/,
-    "F-P7-6: the contact store's verdict and floor warnings reach the transcript and the visible hint");
-  assert.match(fn, /for \(const w of \[warning, chats\.lastFloorWarning\(\)\]\) \{\s*if \(w\) \{ addLine\("sys", "", "\[chats: " \+ w \+ "\]"\); hint\(w, true\); \}/);
+  assert.match(fn, /for \(const w of \[warning, contacts\.lastFloorWarning\(\)\]\) \{\s*if \(w\) \{ addLine\("sys", "", "\[contacts: " \+ w \+ "\]"\); storeWarnings\.push\("Contacts: " \+ w\); \}/,
+    "F-P7-6: the contact store's verdict and floor warnings reach the transcript and are collected for the hint");
+  assert.match(fn, /for \(const w of \[warning, chats\.lastFloorWarning\(\)\]\) \{\s*if \(w\) \{ addLine\("sys", "", "\[chats: " \+ w \+ "\]"\); storeWarnings\.push\("Chats: " \+ w\); \}/);
   // renderVerify: a suspect pin is refused BEFORE the auto-unlock comparison,
   // with the loud "changed" prompt, and nothing else may read `suspect`.
   const rv = liftFunction(src, "enterVerification", assert);
@@ -367,7 +423,33 @@ function testAppJsHonoursSuspectPinsAndSurfacesWarnings() {
   assert.match(branch, /return;\s*\}\s*$/, "...and returns without unlocking");
   assert.doesNotMatch(branch, /unlockMessaging\(\)/);
   assert.strictEqual((src.match(/\.suspect\b/g) || []).length, 1, "`suspect` is read in exactly one place in app.js");
-  console.log("OK  F-P7-6: app.js refuses to auto-unlock on a suspect pin and shows both stores' warnings");
+  assert.match(fn, /if \(storeWarnings\.length\) hint\(storeWarnings\.join\(" — "\), true\);/,
+    "second review M-2: all store warnings are shown as ONE hint, not four overwriting calls");
+  assert.match(src, /c\.reverifyReason === "rollback"\n\s*\? "⚠ verification reset — your saved contacts were ROLLED BACK/,
+    "second review L-1: the Users view names a rollback as a rollback, not as the H-01 migration");
+  assert.match(src, /\} else if \(chat\.rollback\) \{/, "second review M-1: the chat view shows the durable rollback mark");
+  // Second review, test gap 1: every app.js assertion above is textual. Lift
+  // app.js's getPin WRAPPER and the suspect predicate and EXECUTE them against
+  // a real rolled-back store — a wrapper that strips the flag (`{ ed, mldsa,
+  // ecdh, mlkem }`) passed every regex and reopened the finding.
+  const wrapperSrc = liftFunction(src, "getPin", assert);
+  assert.match(wrapperSrc, /return contacts\.isUnlocked\(\) \? contacts\.getPin\(key\) : null;/, "app.js's getPin is a pass-through");
+  const predicate = "pin && pin.suspect === true";
+  assert.ok(rv.includes(`if (${predicate}) {`));
+  const wrapper = new Function("contacts", `${wrapperSrc}; return getPin;`)(contacts);
+  return (async () => {
+    device();
+    await establishBob();
+    const archived = localStorage._dump();
+    await contacts.savePin("user:bob", BOB2);
+    localStorage._restore(archived);
+    contacts.lock();
+    await contacts.unlock(PASS);
+    const pin = wrapper("user:bob");
+    assert.strictEqual(new Function("pin", `return ${predicate};`)(pin), true,
+      "F-P7-6 (executed): app.js's own getPin wrapper + suspect predicate refuse a rolled-back pin");
+    console.log("OK  F-P7-6: app.js refuses to auto-unlock on a suspect pin (executed), shows one combined hint, names rollbacks");
+  })();
 }
 
 await testRolledBackContactStoreOpensWithSuspectPins();
@@ -379,8 +461,10 @@ await testFreshStoreAfterWipeCatchesUpWithTheSlot();
 await testExistingStoresArmOnFirstUnlock();
 await testChatStoreVerdicts();
 await testParkedSlotIsLoudForever();
+await testChatRollbackEvidenceIsDurable();
+await testRoomPinsAreMarkedSuspectToo();
 testPoisonedIsIntegerCannotBlindTheFloor();
 await testClaimNeverLoweredAndFloorRaisedAfterTheWrite();
 testPlainBrowserIsUnchanged();
-testAppJsHonoursSuspectPinsAndSurfacesWarnings();
+await testAppJsHonoursSuspectPinsAndSurfacesWarnings();
 console.log("All store-floor (F-P7-6) checks passed.");

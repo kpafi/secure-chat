@@ -265,7 +265,26 @@ export class Identity {
       inner.mlkemSecret = b64(this._mlkemSecret);
       inner.mlkemPub = b64(this.mlkemPub);
     }
-    const plain = enc.encode(JSON.stringify(inner));
+    // Phase-7 pentest 2026-09-16 F-P7-20: AES-GCM keeps length, and `flags`,
+    // `gen` and `floor` are variable-width, so the ciphertext length told a
+    // device-local reader — with no passphrase — which anchors were set and
+    // roughly how often the blob had been written (five distinct lengths over
+    // seven states), and let them pick the "claims nothing" copy out of an
+    // archive by size alone. Pad the plaintext to a 512-byte boundary.
+    // A FIXED target, not a boundary: padding to the next 512-byte block still
+    // leaked the state whenever two states straddled a block edge. The inner
+    // record is ~13 KiB and its variable part under 100 bytes, so 16 KiB is
+    // constant for every reachable state; only a blob that outgrows it (a
+    // future field) steps to the next block.
+    let serialized = JSON.stringify(inner);
+    const PAD_TARGET = 16384;
+    const overhead = '"pad":"",'.length + 1;
+    const target = serialized.length + overhead <= PAD_TARGET
+      ? PAD_TARGET
+      : Math.ceil((serialized.length + overhead) / 512) * 512;
+    inner.pad = " ".repeat(Math.max(0, target - serialized.length - overhead));
+    serialized = JSON.stringify(inner);
+    const plain = enc.encode(serialized);
     const salt = crypto.getRandomValues(new Uint8Array(16));
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const iters = KDF_ITERS;

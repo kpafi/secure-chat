@@ -19,7 +19,7 @@
 // for inbound dedup (a retried fetch after a lost response could deliver
 // twice).
 
-import { probeStoreFloor, armStoreFloor, judgeStoreFloor, readClaim } from "./store-floor.js";
+import { probeStoreFloor, armStoreFloor, judgeStoreFloor, readClaim, nextStoreGeneration } from "./store-floor.js";
 
 const LS_CHATS = "sc.chats.v1";
 // Phase-7 F-P7-6: the generation is mirrored into the native floor under this
@@ -215,15 +215,16 @@ export async function unlock(passphrase, { startFresh = false } = {}) {
   generation = Number.isInteger(data.gen) ? data.gen : 0;
   await assertNotRolledBack(Number.isInteger(data.gen) ? data.gen : null);
   // F-P7-6: the witness is restorable together with the store; the native
-  // floor is not. On a bad verdict every negotiated mode is reset (fail closed
-  // on the part a rollback can downgrade) and the user is told that replay
-  // protection may have been rewound; the write below heals the record.
+  // floor is not. On a bad verdict every chat is marked `rollback` (durable,
+  // inside the AEAD, cleared by the next deliberate mode negotiation) and the
+  // user is told what a rollback can have undone; the write below heals the
+  // record. Modes and secrets are KEPT — see noteRollback.
   floorClaim = readClaim(data.floor);
   const floorVerdict = judgeStoreFloor(FLOOR_SLOT, generation, floorClaim);
   let warning = null;
   let dirty = sanitizeModes();
   if (!floorVerdict.ok) {
-    warning = describeRollback(floorVerdict);
+    warning = noteRollback(floorVerdict);
     dirty = true;
   } else if (floorVerdict.arm) {
     dirty = true;
@@ -234,22 +235,29 @@ export async function unlock(passphrase, { startFresh = false } = {}) {
   return warning;
 }
 
-// F-P7-6, the response to a bad floor verdict for the chat store: NAME it.
-// The first cut reset every negotiated mode and deleted every AES256 secret —
-// the review pointed out the secret exists nowhere else (it is agreed out of
-// band), so one process kill in the flush window cost every shared
+// F-P7-6, the response to a bad floor verdict for the chat store: NAME it,
+// durably. The first cut reset every negotiated mode and deleted every AES256
+// secret — the review pointed out the secret exists nowhere else (it is agreed
+// out of band), so one process kill in the flush window cost every shared
 // passphrase, while a stale mode or secret is not a downgrade: a frame sent
 // under the wrong layer fails LOUDLY on the peer's side (2026-07-27 L-2). The
-// envelope-replay ring cannot be restored either way; the user is told what
-// that means (envelopes the relay still holds may arrive again as new).
-function describeRollback(verdict) {
+// second review then found that a one-shot warning was the only evidence: the
+// next unlock was clean and a deliberately ROTATED AES256 passphrase could be
+// silently reverted to its leaked predecessor. So every chat is marked
+// `rollback` inside the AEAD — the chat view says so beside the mode until
+// the next deliberate setMode() clears it — and the warning names the secret.
+// The envelope-replay ring cannot be restored either way; the user is told
+// what that means (envelopes the relay still holds may arrive again as new).
+function noteRollback(verdict) {
+  for (const c of Object.values(chats || {})) c.rollback = true;
   const why = {
     rollback: `your chat history is OLDER than this device's protected record of it (generation ${verdict.generation}, device recorded ${verdict.floor}) — an earlier copy has been restored, or a save did not reach disk`,
+    exhausted: "this device's protected record for your chat history is exhausted (its counter can no longer advance), so a rollback could no longer be told from a save",
     deleted: "this device's protected record for your chat history has been DELETED",
     tampered: "this device's protected record for your chat history is damaged or forged",
     unavailable: "this device says it has protected storage for your chat history's rollback guard, but none is usable",
   }[verdict.reason] || "the rollback guard for your chat history could not be checked";
-  return why + ". Replay protection for sealed messages may have been rewound: envelopes the relay still holds may arrive again as new, and a chat mode you negotiated since may be stale";
+  return why + ". Replay protection for sealed messages may have been rewound (envelopes the relay still holds may arrive again as new), and any chat passphrase or mode you changed since may have been reverted to the OLD one — re-agree it in person before relying on it";
 }
 
 // F-P7-6: a warning from the last floor probe/arm, or null.
@@ -533,11 +541,7 @@ async function persistLocked() {
   const probe = probeStoreFloor(FLOOR_SLOT, floorClaim);
   floorClaim = probe.claim;
   floorWarning = probe.warning;
-  if (probe.current > generation) generation = probe.current;
-  generation += 1;
-  // A parked slot (review F-1): the generation stops one below it, so the slot
-  // reads as a rollback on every open — loud forever, never silently past it.
-  if (probe.ceiling) generation = probe.current;
+  generation = nextStoreGeneration(probe, generation);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   // F-CRYPTO-006 / F-ATREST-005: the domain tag and the generation live INSIDE
   // the AEAD, so neither can be stripped or rewritten without the passphrase.
@@ -723,6 +727,7 @@ export async function setMode(username, mode, { secret = null, salt = null } = {
   requireValidMode(mode);
   if (!chats[username]) await ensure(username);
   const c = chats[username];
+  if (c) delete c.rollback; // a deliberate re-negotiation settles the rollback (F-P7-6)
   c.mode = mode;
   if (mode === "AES256") {
     if (secret !== null) c.secret = secret;

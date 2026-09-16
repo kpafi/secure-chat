@@ -281,7 +281,35 @@ async function testTranscriptBindsTheSignersBundle() {
   console.log("OK  F-P7-A1: the handshake transcript binds the signer's full bundle (P-03)");
 }
 
+// Phase-7 pentest 2026-09-16 F-P7-20: AES-GCM keeps length, and the AEAD's
+// flags/gen/floor were variable-width, so the blob's ciphertext length told a
+// device-local reader which anchors were set and roughly how often the blob
+// had been written (five lengths over seven states). The plaintext is padded
+// to a boundary: every state below must produce the SAME ciphertext length.
+async function testIdentityBlobLengthHidesItsState() {
+  const id = await Identity.generate();
+  const lengths = new Set();
+  const states = [
+    { flags: {}, gen: 0, floor: false },
+    { flags: {}, gen: 1, floor: true },
+    { flags: {}, gen: 1, floor: "unconfirmed" },
+    { flags: { contactsEstablished: true }, gen: 1, floor: true },
+    { flags: { contactsEstablished: true, chatsEstablished: true }, gen: 1, floor: true },
+    { flags: { contactsEstablished: true, chatsEstablished: true }, gen: 999999, floor: true },
+  ];
+  for (const st of states) {
+    id.deviceFlags = st.flags; id.generation = st.gen; id.floorClaim = st.floor;
+    lengths.add(JSON.parse(await id.export("pw")).ct.length);
+  }
+  assert.strictEqual(lengths.size, 1, `F-P7-20: the ciphertext length must not vary with the sealed state (got ${[...lengths].join(", ")})`);
+  const back = await Identity.import(await id.export("pw"), "pw");
+  assert.strictEqual(back.generation, 999999, "padding does not disturb the fields");
+  assert.deepStrictEqual(back.deviceFlags, { contactsEstablished: true, chatsEstablished: true });
+  console.log("OK  F-P7-20: the identity blob's length is the same in every sealed state");
+}
+
 await testIdentityBasics();
+await testIdentityBlobLengthHidesItsState();
 await testDualSignatureIsMandatory();
 await testTranscriptBindsTheSignersBundle();
 await testFingerprints();

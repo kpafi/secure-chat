@@ -410,11 +410,31 @@ async function testParkedCeilingDoesNotBrickCreation() {
       assert.ok(id.generation <= MAX, "the writer never stamps a value it would refuse");
       if (saved.warning) assert.match(saved.warning, /ceiling/);
       const { identity, verdict } = await idstore.openIdentity(PASS, fakeImport);
-      assert.ok(verdict.ok || verdict.reason === "rollback", "clean, or the parked slot reads as a rollback");
+      assert.ok(verdict.ok || verdict.reason === "rollback" || verdict.reason === "exhausted",
+        "clean, or the parked slot reads as a rollback / exhausted (a slot the blob can never overtake is a permanent bad verdict)");
       if (!verdict.ok) assert.strictEqual(idstore.anchorEstablished(identity, "contactsEstablished"), true);
     }
   }
-  console.log("OK  round-2 F-3 / round-3 F-1: a parked ceiling never costs the ability to write the identity");
+  // Second store-floor review (H-1), applied here: a slot the blob can never
+  // overtake is a PERMANENT bad verdict. Park it one below the detector, let
+  // one honest write stamp MAX into the blob, then roll back to that
+  // post-freeze copy after a later write — all frozen states share the same
+  // counter, so only an "exhausted" verdict keeps this loud.
+  {
+    const floor = device();
+    floor.slots.set(FLOOR_SLOT, MAX - 1);
+    const id = fakeIdentity();
+    await idstore.persistIdentity(id, PASS);          // stamps MAX, slot -> MAX
+    const frozen = localStorage._dump();
+    id.deviceFlags.contactsEstablished = true;
+    await idstore.persistIdentity(id, PASS);          // a later state, same counter
+    localStorage._restore(frozen);                    // roll back among the frozen states
+    const { identity, verdict } = await idstore.openIdentity(PASS, fakeImport);
+    assert.strictEqual(verdict.ok, false, "a slot at the ceiling is a bad verdict on EVERY open — frozen states cannot be told apart");
+    assert.strictEqual(verdict.reason, "exhausted");
+    assert.strictEqual(idstore.anchorEstablished(identity, "contactsEstablished"), true, "...and the anchors fail closed");
+  }
+  console.log("OK  round-2 F-3 / round-3 F-1 / store-floor H-1: a parked ceiling never costs the ability to write the identity, and is never silent");
 }
 
 // ---- round-2 F-4: a pad file cannot name the identity's floor slot ----------------
@@ -667,6 +687,13 @@ function testAppJsWiring() {
   assert.match(unlock, /els\.atRestWarning\.hidden = verdict\.ok;/);
   assert.match(unlock, /setIdentityStatus\([^;]*verdict\.message/, "...and in the Live-room status row");
   assert.doesNotMatch(unlock, /setItem\(/, "no direct write in the unlock path");
+
+  // Phase-7 pentest 2026-09-16 F-P7-22: the sealed sender bundle reaches the
+  // contact store only through canonicalBundle (a non-canonical spelling is a
+  // malformed envelope), never verbatim.
+  const pe = liftFunction(src, "processEnvelope", assert);
+  assert.match(pe, /senderBundle = canonicalBundle\(opened\.from\);/, "F-P7-22: the sealed `from` is canonicalised");
+  assert.strictEqual((pe.match(/opened\.from\b/g) || []).length, 1, "...and `opened.from` is read nowhere else in processEnvelope");
 
   const create = liftFunction(src, "createIdentity", assert);
   assert.match(create, /await idstore\.persistIdentity\(identity,\s*pass\)/, "creation writes through the store");

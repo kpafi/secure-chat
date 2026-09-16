@@ -28,6 +28,8 @@ import sqlite3
 import posixpath
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
@@ -40,6 +42,18 @@ import config
 import mailbox
 from relay import Conn, ConnectionLimiter, JoinResult, RoomRegistry, TokenBucket
 from validation import Envelope, MsgType, is_ascii_printable
+
+
+class _ClientProtocolNoiseFilter(logging.Filter):
+    """Drop uvicorn's per-request client protocol errors (F-P7-15)."""
+    NOISE = ("Invalid HTTP request received", "Unsupported upgrade request")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:  # noqa: BLE001 — a broken record is not worth a traceback
+            return True
+        return not any(n in msg for n in self.NOISE)
 
 
 def _minimize_log_metadata() -> None:
@@ -57,7 +71,15 @@ def _minimize_log_metadata() -> None:
     access = logging.getLogger("uvicorn.access")
     access.handlers.clear()
     access.disabled = True
-    logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+    error = logging.getLogger("uvicorn.error")
+    error.setLevel(logging.WARNING)
+    # Phase-7 pentest 2026-09-16 F-P7-15: a malformed request line, header or
+    # Content-Length, or a TLS ClientHello on the plain port, is rejected by
+    # h11 BELOW the app and logged at WARNING once per request — unauthenticated,
+    # unthrottled, ~14x amplification, and over the .onion any visitor. Same
+    # class as the 2026-07-27 M-3 WebSocket fix. The line carries no client
+    # data; it is dropped.
+    error.addFilter(_ClientProtocolNoiseFilter())
 
 
 _minimize_log_metadata()
@@ -146,6 +168,15 @@ def _is_blocked_static(path: str) -> bool:
     )
 
 
+@app.exception_handler(RequestValidationError)
+async def _validation_without_echo(request: Request, exc: RequestValidationError) -> Response:
+    # F-P7-12: FastAPI's default 422 echoes the offending INPUT back. For a
+    # 40 MB body that is a 40 MB response; for a mistyped envelope it is the
+    # ciphertext reflected. Keep loc/msg/type, drop the input.
+    detail = [{k: v for k, v in e.items() if k in ("loc", "msg", "type")} for e in exc.errors()]
+    return JSONResponse(status_code=422, content={"detail": detail})
+
+
 @app.exception_handler(sqlite3.OperationalError)
 async def _sqlite_busy(request: Request, exc: sqlite3.OperationalError) -> Response:
     # Review of the Phase-7 fixes (L-2): a "database is locked" under load used
@@ -167,6 +198,16 @@ async def security_headers(request: Request, call_next):
     path = request.scope["path"]
     if not path.startswith("/api/") and _is_blocked_static(path):
         return Response(status_code=404)
+    # F-P7-12: refuse oversize bodies before they are read. Declared length
+    # only — a chunked body still lands in the handler, where pydantic's
+    # max_length fields bound every string; what this closes is the free
+    # 40 MB parse + echo.
+    try:
+        declared = int(request.headers.get("content-length", "0"))
+    except ValueError:
+        declared = 0
+    if path.startswith("/api/") and declared > config.MAX_API_BODY_BYTES:
+        return Response(status_code=413, content="request body too large", media_type="text/plain")
     resp: Response = await call_next(request)
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
@@ -314,9 +355,17 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 await _safe_send(ws, '{"type":"error","reason":"binary frames not accepted"}')
                 break
             except asyncio.TimeoutError:
-                if joined_room:
+                # Phase-7 pentest 2026-09-16 F-P7-10: the reason and the armed
+                # timeout were the PRE-await snapshot, so a guest admitted by the
+                # owner while blocked here, that then stayed silent, was closed
+                # at the pending deadline with "approval timeout" instead of
+                # getting the idle window a member is owed. Re-read the state:
+                # admitted mid-wait means re-arm with the idle window, not close.
+                if conn.admitted and conn.room and not joined_room:
+                    continue
+                if conn.admitted and conn.room:
                     reason = "idle timeout"
-                elif waiting_room:
+                elif conn.waiting_room:
                     reason = "approval timeout"
                 else:
                     reason = "join timeout"

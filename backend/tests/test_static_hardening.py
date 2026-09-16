@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import starlette  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+import config  # noqa: E402
 from main import app  # noqa: E402
 
 client = TestClient(app)
@@ -105,3 +106,16 @@ def test_api_paths_are_not_shadowed_by_the_static_gate():
     assert r.status_code == 404 and r.json()["detail"] == "no such user", r.text  # the API answered, not the gate
     r = client.get("/api/users/.alice", params={"t": "x"})
     assert r.status_code == 404 and r.json()["detail"] == "no such user", r.text
+
+
+def test_oversize_api_bodies_are_refused_and_422s_do_not_echo():
+    """Phase-7 pentest 2026-09-16 F-P7-12: a 40 MB envelope was parsed and then
+    echoed back inside the 422. Declared bodies past MAX_API_BODY_BYTES are 413
+    before being read; a validation error never reflects the input."""
+    big = "A" * (config.MAX_API_BODY_BYTES + 1024)
+    r = client.post("/api/mailbox/nobody", params={"t": "x"}, content=big.encode(), headers={"content-type": "application/json"})
+    assert r.status_code == 413, r.status_code
+    r = client.post("/api/mailbox/nobody", params={"t": "x"}, json={"envelope": "A" * 300, "extra": "MARKER_do_not_echo_9f2c"})
+    assert r.status_code == 422, r.text
+    assert "MARKER_do_not_echo_9f2c" not in r.text, "F-P7-12: the 422 must not reflect the request body"
+    assert r.json()["detail"][0]["type"], "...but still says what was wrong"

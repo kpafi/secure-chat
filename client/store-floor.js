@@ -54,6 +54,15 @@ const CLAIM_NONE = false;
 const CLAIM_UNCONFIRMED = "unconfirmed";
 
 const MAX_GENERATION = 0x7fffffff - 1;
+// The highest generation a STORE ever writes. Second review of this module
+// (H-1): the first ceiling fix tested the measured slot, so a slot parked one
+// below the detector let one honest write catch up to it, after which the
+// store was frozen EQUAL to the slot and every later rollback among the frozen
+// states read clean — silence, again. The rule that survives any off-by-one:
+// a slot the store can never overtake is itself a permanent bad verdict
+// ("exhausted"), whether an attacker parked it there or two billion honest
+// writes did. The store keeps at least one generation of headroom below it.
+const STORE_MAX = MAX_GENERATION - 1;
 
 // Review of the first cut (F-2): `Number.isInteger` is a writable global, and
 // routing the verdict through it was the H-1 poisoning shape otp.js was fixed
@@ -93,23 +102,36 @@ export function probeStoreFloor(slot, previousClaim) {
       warning: "this device could not durably record this store's rollback guard (storage full or unwritable?)",
     };
   }
-  if (current >= MAX_GENERATION) {
-    // Review of the first cut (F-1): a slot parked at the ceiling from the
-    // page realm (one `bump` on the frozen bridge) let the catch-up carry the
-    // store's generation past the ceiling, after which armStoreFloor returned
-    // null forever — no bump, no warning, and every verdict clean: the whole
-    // control silently off. The store never advances to the ceiling; the
-    // parked slot therefore reads as a rollback on EVERY open (identity-store
-    // does the same), i.e. a loud, permanent "verify again" — never silence.
+  if (current >= STORE_MAX) {
+    // Exhausted: the store can never overtake this slot, so no later state
+    // can be told from an earlier one. The store's own generation is left
+    // where it is (never advanced past STORE_MAX-1, never lowered), the slot
+    // is not touched, and judgeStoreFloor reports "exhausted" on EVERY open —
+    // a loud, permanent "verify again". Never silence.
     return {
       claim: previousClaim === CLAIM_ARMED ? CLAIM_ARMED : CLAIM_UNCONFIRMED,
-      current: MAX_GENERATION - 1,
-      ceiling: true, // the store's generation must stop HERE, one below the slot, forever
-      warning: "this device's protected record for this store is at its ceiling — the rollback guard cannot advance, " +
+      current: NATIVE_ABSENT,
+      ceiling: true,
+      warning: "this device's protected record for this store is exhausted — the rollback guard cannot advance, " +
         "and every pin will keep asking to be verified again. Clearing the app's data is the only repair",
     };
   }
   return { claim: CLAIM_ARMED, current, warning: null };
+}
+
+// The next generation a store may write: past both its own counter and the
+// slot (so the slot it then records is overtaken), never wrapping the int32
+// bridge, and in ceiling mode unchanged. No clamping below the ceiling — a
+// clamp is a freeze, and a store frozen EQUAL to its slot reads clean while
+// its later states can no longer be told apart (the second review's H-1,
+// one value lower). Once a write lands at or above STORE_MAX the slot follows
+// it there and judgeStoreFloor reports "exhausted" from then on: loud.
+export function nextStoreGeneration(probe, generation) {
+  const own = isGen(generation) ? generation : 0;
+  if (probe.ceiling) return own;
+  const base = probe.current > own ? probe.current : own;
+  const next = base + 1;
+  return next > MAX_GENERATION ? own : next;
 }
 
 // Raise the slot to the generation just written. Only when the probe measured
@@ -134,6 +156,7 @@ export function judgeStoreFloor(slot, generation, claim) {
   if (!usable) return { ok: false, arm: false, reason: "unavailable" };
   const f = floor.read(slot);
   if (f !== NATIVE_ABSENT && !(f >= 0)) return { ok: false, arm: false, reason: "tampered" };
+  if (f >= STORE_MAX) return { ok: false, arm: false, reason: "exhausted", floor: f, generation: isGen(generation) ? generation : 0 };
   if (f === NATIVE_ABSENT) {
     if (claim === CLAIM_ARMED) return { ok: false, arm: false, reason: "deleted" };
     return { ok: true, arm: true };

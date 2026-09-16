@@ -1032,10 +1032,12 @@ def vouch(req: VouchReq, username: str = Depends(current_user)) -> dict:
     # Both verifications always run, and the verdict is combined afterwards, so
     # neither the status code nor the number of expensive operations depends on
     # whether the target exists.
-    if missing_target or not ed_ok:
+    # Phase-7 pentest 2026-09-16 F-P7-11: two different strings told a holder
+    # of the target's bundle whether the target exists (a valid Ed25519 vouch
+    # with junk ML-DSA answered "post-quantum … invalid" only for a REAL target)
+    # — M-7's oracle, without the lookup token. One message for all three.
+    if missing_target or not ed_ok or not mldsa_ok:
         raise HTTPException(status_code=400, detail="vouch signature invalid")
-    if not mldsa_ok:
-        raise HTTPException(status_code=400, detail="post-quantum vouch signature invalid")
 
     with _db() as conn:
         total = conn.execute("SELECT COUNT(*) FROM vouches").fetchone()[0]

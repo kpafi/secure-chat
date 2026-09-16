@@ -16,7 +16,7 @@
 // The store is keyed by username (unique in the directory). The lookup token
 // is kept so the contact can be re-fetched / vouch-checked later.
 
-import { probeStoreFloor, armStoreFloor, judgeStoreFloor, readClaim } from "./store-floor.js";
+import { probeStoreFloor, armStoreFloor, judgeStoreFloor, readClaim, nextStoreGeneration } from "./store-floor.js";
 
 const LS_CONTACTS = "sc.contacts.v1";
 // Phase-7 F-P7-6: the generation is mirrored into the native floor under this
@@ -185,10 +185,12 @@ function resetTrust(verdict) {
     c.verified = false;
     c.verifiedAt = null;
     c.reverify = true;
+    c.reverifyReason = "rollback"; // the Users view must not call this the H-01 migration (review L-1)
     delete c.vouchedBy;
   }
   const why = {
     rollback: `your saved contacts are OLDER than this device's protected record of them (generation ${verdict.generation}, device recorded ${verdict.floor}) — an earlier copy has been restored, or a save did not reach disk`,
+    exhausted: "this device's protected record for your saved contacts is exhausted (its counter can no longer advance), so a rollback could no longer be told from a save",
     deleted: "this device's protected record for your saved contacts has been DELETED",
     tampered: "this device's protected record for your saved contacts is damaged or forged",
     unavailable: "this device says it has protected storage for your saved contacts' rollback guard, but none is usable",
@@ -549,11 +551,9 @@ async function persist() {
   const probe = probeStoreFloor(FLOOR_SLOT, floorClaim);
   floorClaim = probe.claim;
   floorWarning = probe.warning;
-  if (probe.current > generation) generation = probe.current;
-  generation += 1; // L-1: every write moves the store forward, monotonically
-  // A parked slot (review F-1): the generation stops one below it, so the slot
-  // reads as a rollback on every open — loud forever, never silently past it.
-  if (probe.ceiling) generation = probe.current;
+  // L-1: every write moves the store forward, monotonically — past the slot
+  // too, and never into a slot it could not overtake (store-floor.js).
+  generation = nextStoreGeneration(probe, generation);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   // `d` is the H-2 domain tag: it makes this plaintext unmistakably a STORE, so
   // no other record encrypted under the same key can be substituted for it.
@@ -575,7 +575,9 @@ async function persist() {
 
 export function getPin(key) {
   if (!pins) throw new Error("contact store is locked");
-  return pins[key] || null;
+  // A copy (second review of F-P7-6): a live reference let any caller
+  // `delete pin.suspect` in place and the next persist made it durable.
+  return pins[key] ? { ...pins[key] } : null;
 }
 
 // Pins store ALL FOUR public keys (audit 2026-07-18 H-01): a pin that only
@@ -704,7 +706,7 @@ export async function upsert({
     if (verified) {
       cur.verified = true;
       cur.verifiedAt = now;
-      delete cur.reverify; // fresh in-person check supersedes the H-01 reset
+      delete cur.reverify; delete cur.reverifyReason; // fresh in-person check supersedes the H-01 reset
     }
   }
   await persist();
@@ -717,7 +719,7 @@ export async function setVerified(username, on) {
   if (!cur) throw new Error("unknown contact");
   cur.verified = !!on;
   cur.verifiedAt = on ? Date.now() : null;
-  if (on) delete cur.reverify; // fresh in-person check supersedes the H-01 reset
+  if (on) delete cur.reverify; delete cur.reverifyReason; // fresh in-person check supersedes the H-01 reset
   // Pentest 2026-08-07 F-ATREST-007: the pin used to outlive "Unverify". The
   // pin is what makes the next session auto-unlock messaging with NO prompt
   // (app.js sameBundle(pin, bundle) -> unlockMessaging()), so a contact whose

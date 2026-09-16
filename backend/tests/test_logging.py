@@ -36,3 +36,16 @@ def test_runsh_keeps_metadata_off():
     assert "--no-access-log" in run_sh
     assert "--log-level warning" in run_sh
     assert main is not None  # import kept referenced
+
+
+def test_client_protocol_noise_is_not_logged():
+    """Phase-7 pentest 2026-09-16 F-P7-15: h11 rejects a malformed request
+    below the app and uvicorn logs "Invalid HTTP request received." at WARNING
+    once per request — unauthenticated, unthrottled, from any onion visitor.
+    The line carries no client data and is dropped; real warnings still pass."""
+    import main  # noqa: F401 — installs the filter at import
+    log = logging.getLogger("uvicorn.error")
+    noise = logging.LogRecord("uvicorn.error", logging.WARNING, __file__, 1, "Invalid HTTP request received.", None, None)
+    real = logging.LogRecord("uvicorn.error", logging.WARNING, __file__, 1, "Exception in ASGI application", None, None)
+    assert not log.filter(noise), "F-P7-15: the per-request protocol noise must be dropped"
+    assert log.filter(real), "...while genuine warnings still reach the log"

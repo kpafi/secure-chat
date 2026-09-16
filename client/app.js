@@ -1018,12 +1018,15 @@ function installStoreAnchor(pass) {
 }
 
 async function unlockContacts(pass) {
+  const storeWarnings = [];
   try {
     const warning = await contacts.unlock(pass, { startFresh: freshStoreConsent.contacts });
     if (freshStoreConsent.contacts) addLine("sys", "", "[contact store started over EMPTY at your request — every contact must be re-verified]");
     // F-P7-6: a bad floor verdict opens the store with its trust reset; say so.
+    // All store warnings are collected and shown as ONE hint (second review,
+    // M-2: four back-to-back hint() calls left only the last one visible).
     for (const w of [warning, contacts.lastFloorWarning()]) {
-      if (w) { addLine("sys", "", "[contacts: " + w + "]"); hint(w, true); }
+      if (w) { addLine("sys", "", "[contacts: " + w + "]"); storeWarnings.push("Contacts: " + w); }
     }
     contactsError = null;
     contactsErrorCode = null;
@@ -1036,7 +1039,7 @@ async function unlockContacts(pass) {
     const warning = await chats.unlock(pass, { startFresh: freshStoreConsent.chats }); // chat history shares the at-rest posture
     if (freshStoreConsent.chats) addLine("sys", "", "[chat history started over EMPTY at your request]");
     for (const w of [warning, chats.lastFloorWarning()]) {
-      if (w) { addLine("sys", "", "[chats: " + w + "]"); hint(w, true); }
+      if (w) { addLine("sys", "", "[chats: " + w + "]"); storeWarnings.push("Chats: " + w); }
     }
     chatsError = null;
     chatsErrorCode = null;
@@ -1051,6 +1054,7 @@ async function unlockContacts(pass) {
     contactsError = contactsError || e.message;
     addLine("sys", "", `[chat history did not unlock — ${e.message}]`);
   }
+  if (storeWarnings.length) hint(storeWarnings.join(" — "), true);
 }
 
 function usersStatus(text, isErr = false) {
@@ -1279,7 +1283,12 @@ function renderUserList() {
       // fingerprint that did not cover the encryption keys.
       const warn = document.createElement("div");
       warn.className = "hint err";
-      warn.textContent = "⚠ verification reset — the fingerprint format now also covers this user's encryption keys; compare it again in person";
+      // Second review of F-P7-6 (L-1): a rollback reset used to be described
+      // as the routine H-01 format migration — an alarm that names something
+      // benign. Say which it was.
+      warn.textContent = c.reverifyReason === "rollback"
+        ? "⚠ verification reset — your saved contacts were ROLLED BACK on this device (or their rollback guard was deleted); compare the fingerprint again in person"
+        : "⚠ verification reset — the fingerprint format now also covers this user's encryption keys; compare it again in person";
       li.appendChild(warn);
     }
 
@@ -1594,6 +1603,11 @@ function renderConversation() {
     chatHint("No handle token saved for this user — re-add them by their full username#token handle to reply.", true);
   } else if (!c.ecdh || !c.mlkem) {
     chatHint("This user has not published encryption keys yet (older app) — they must unlock once with the updated app; then re-add them.", true);
+  } else if (chat.rollback) {
+    // F-P7-6 (second review, M-1): durable evidence. The chat store was rolled
+    // back on this device; a passphrase or mode changed since may have been
+    // reverted to the old one. Cleared by the next deliberate mode change.
+    chatHint(`⚠ ${chat.mode} — your chat history was ROLLED BACK on this device: if you changed this chat's passphrase or mode since, it may have reverted to the OLD one. Re-agree it in person, then set the mode again.`, true);
   } else if (chat.mode === "AES256") {
     chatHint("🔒 AES256 — extra AES-256-GCM under your shared chat passphrase, inside the sealed PQ envelope.");
   } else {
@@ -1827,7 +1841,17 @@ async function processEnvelope(m) {
   } catch {
     return false; // undecryptable/forged envelope: drop silently
   }
-  const senderBundle = opened.from;
+  // Phase-7 pentest 2026-09-16 F-P7-22: sealed.open verifies `from` but
+  // canonically decodes only ed/mldsa; ecdh/mlkem reached the contact store
+  // verbatim — the one surviving second encoding domain of the H-1 shape in a
+  // value contacts.js string-compares. Every bundle that reaches storage goes
+  // through canonicalBundle; a non-canonical spelling is a malformed envelope.
+  let senderBundle;
+  try {
+    senderBundle = canonicalBundle(opened.from);
+  } catch {
+    return false;
+  }
   // Match the sender to a saved user by their SIGNING keys — never by any
   // string they supplied.
   let sender = contacts.list().find((c) => c.ed === senderBundle.ed && c.mldsa === senderBundle.mldsa) || null;

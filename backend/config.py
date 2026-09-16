@@ -148,6 +148,21 @@ TURNAWAY_NOTICE_SEC = 5.0
 TRUSTED_PROXY_IPS = frozenset(
     p.strip() for p in os.environ.get("SECURE_CHAT_TRUSTED_PROXIES", "").split(",") if p.strip()
 )
+# Phase-7 pentest 2026-09-16 F-P7-13: the paragraph above was the whole
+# control — with 127.0.0.1 in the set the port-0 detector is never consulted,
+# so every limiter was silently defeatable via X-Forwarded-For and nothing at
+# runtime said so. A loopback proxy IP cannot be told apart from Tor's raw
+# forward on the shipped topology, so it is refused at startup unless the
+# operator states they have separated the two (different ports, or a secret
+# header) with SECURE_CHAT_TRUSTED_PROXIES_ALLOW_LOOPBACK=1.
+_LOOPBACK_PROXIES = {ip for ip in TRUSTED_PROXY_IPS if ip in ("127.0.0.1", "::1", "localhost")}
+if _LOOPBACK_PROXIES and os.environ.get("SECURE_CHAT_TRUSTED_PROXIES_ALLOW_LOOPBACK") != "1":
+    raise RuntimeError(
+        f"SECURE_CHAT_TRUSTED_PROXIES contains a loopback address {sorted(_LOOPBACK_PROXIES)}: on the shipped "
+        "topology Caddy and Tor share 127.0.0.1:8000, so trusting it lets any onion visitor forge its "
+        "rate-limit bucket (F-RELAY-001). Separate the two front ends first, then set "
+        "SECURE_CHAT_TRUSTED_PROXIES_ALLOW_LOOPBACK=1 to state that you have."
+    )
 
 # --- HTTP /api abuse bounds (account directory) ---------------------------
 # The /ws relay has its own token bucket; the HTTP account endpoints need their
@@ -342,6 +357,10 @@ TOKEN_TTL_SEC = 3600         # issued session-token lifetime
 # endpoint is not an existence oracle); fetching requires the recipient's
 # session token and DELETES what it returns. Everything is bounded.
 MAX_ENVELOPE_BYTES = 64 * 1024        # one sealed envelope (matches WS frame cap)
+# Phase-7 pentest 2026-09-16 F-P7-12: no request body on /api is legitimately
+# larger than an envelope plus JSON overhead; a 40 MB body used to be parsed
+# and then ECHOED back verbatim inside the 422.
+MAX_API_BODY_BYTES = 128 * 1024
 MAX_MAILBOX_PER_RECIPIENT = 200       # queued envelopes per inbox
 # Phase-7 pentest 2026-09-16 F-P7-1 (and the review of its first fix): a row
 # count alone let ~100 KB of one-byte envelopes to throwaway accounts fill the

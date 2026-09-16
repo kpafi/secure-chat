@@ -312,3 +312,25 @@ def test_vouch_list_is_token_gated():
     r2 = client.get("/api/users/wot-nobody/vouches", params={"t": "wrong"})
     assert r1.status_code == r2.status_code == 404
     assert r1.json() == r2.json()
+
+
+def test_vouch_error_strings_do_not_reveal_the_target():
+    """Phase-7 pentest 2026-09-16 F-P7-11: a valid Ed25519 vouch with junk
+    ML-DSA used to answer "post-quantum vouch signature invalid" for a REAL
+    target and "vouch signature invalid" for a missing one — the M-7 oracle
+    without the lookup token. One string, whatever the target."""
+    accounts._lookup_limiter._buckets.clear()
+    accounts._vouch_host_limiter._buckets.clear()
+    alice = _register("wot-str-alice")
+    bob = _register("wot-str-bob")
+    tok = _login(alice)
+    real = _vouch_body(alice, bob)
+    pq = [k for k in real if "mldsa" in k][0]
+    raw = bytearray(base64.b64decode(real[pq]))
+    raw[0] ^= 0x01
+    real[pq] = base64.b64encode(bytes(raw)).decode("ascii")  # ed valid, pq well-formed but wrong
+    ghost = dict(real, target="wot-str-ghost")
+    r_real = client.post("/api/vouch", json=real, headers=_auth(tok))
+    accounts._lookup_limiter._buckets.clear()
+    r_ghost = client.post("/api/vouch", json=ghost, headers=_auth(tok))
+    assert (r_real.status_code, r_real.json()) == (r_ghost.status_code, r_ghost.json()) == (400, {"detail": "vouch signature invalid"})

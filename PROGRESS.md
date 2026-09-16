@@ -67,10 +67,40 @@ so the eviction ORDER is pinned by the unit anchor only — noted).
    have undone). Six of the reviewer's mutants were green (floor raised before
    the write, claim lowered, chats catch-up/claim/arm-on-read untested,
    vouchedBy kept) — all RED now, 25 store-floor mutants in total.
+   **Second review (of `1ee021b`): 1 High, 2 Medium, 2 Low, all fixed in the
+   next commit.** The ceiling test was still one value late (a slot parked at
+   MAX−1 let one honest write catch up, the store froze EQUAL to the slot and
+   every later rollback among the frozen states read clean). The rule that
+   survives any off-by-one: **a slot the store can never overtake is itself a
+   permanent bad verdict ("exhausted")**, however it got there — no clamp (a
+   clamp is a freeze), and identity-store.js gets the same rule (it had the
+   same latent freeze). Chats now carry a durable `rollback` mark inside the
+   AEAD (the one-shot warning let a deliberately rotated AES256 passphrase be
+   silently reverted to its leaked predecessor); the chat view shows it until
+   the next deliberate setMode; the warning names the secret. All store
+   warnings are ONE hint (four back-to-back hint() calls kept only the last).
+   The Users view names a rollback as a rollback, not as the H-01 migration.
+   getPin returns a copy. Test gaps closed: table-driven ceiling over
+   {MAX−2, MAX−1, MAX, MAX+1, 0x7fffffff} × both stores; `room:` pins; app.js's
+   getPin wrapper + suspect predicate EXECUTED against a real rolled-back store
+   (the first behavioural test of an app.js decision); chats' durable mark.
+   11 more mutants RED (one equivalent: with the exhaustion verdict in place,
+   the probe's own threshold no longer decides loudness).
 4. **⬜ 7a — a behavioural `app.js` test** against a DOM stub; wire
    `proto001.mjs` + `crypto-tamper.mjs` + `room-admission.mjs` into an
    automated runner (`npm run e2e:tamper` exists; the rest still needs a relay).
-5. **⬜ The Lows left from the report:** F-P7-10, 11, 12, 13, 15, 20, 21, 22.
+5. ✅ **The Lows** (same commit as the second-review fixes): F-P7-10 (the
+   relay re-reads admission on the timeout branch; an admitted guest gets the
+   idle window), F-P7-11 (one vouch error string), F-P7-12 (413 above
+   MAX_API_BODY_BYTES; 422s no longer echo the input), F-P7-13 (a loopback
+   trusted proxy is refused at startup unless
+   SECURE_CHAT_TRUSTED_PROXIES_ALLOW_LOOPBACK=1), F-P7-15 (h11's per-request
+   "Invalid HTTP request" line is filtered), F-P7-20 (the identity blob is
+   padded to a FIXED 16 KiB, so its length is the same in every sealed
+   state), F-P7-22 (the sealed sender bundle is canonicalised). Each with a
+   test and a RED mutant. **F-P7-21 stays open on purpose:** digesting each
+   bundle before concatenating changes every displayed safety number — a
+   version decision for the owner, not exploitable at HEAD.
 
 ## ⮕ (2026-09-16, evening — Phase 7's fix list items 1-4 LANDED; next: review the delta, then merge)
 
