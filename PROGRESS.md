@@ -42,8 +42,15 @@ so the eviction ORDER is pinned by the unit anchor only — noted).
 1. **⬜ Decide push + Phase 8 deploy.** The order is settled: APK first, then
    relay + web client together (F-P7-8). Nothing here pushes.
 2. **⬜ Phase 9 — Android on-device** (unchanged list + F-P7-17).
-3. **⬜ 7b — floors for the contact and chat witnesses** (F-P7-6, the last
-   runtime Medium; the `deviceFloor()` primitive is ready, zero Kotlin).
+3. ✅ **7b — floors for the contact and chat witnesses (F-P7-6)** — landed
+   after the merge (see `git log -1`): `client/store-floor.js` shared by
+   contacts.js and chats.js; claim inside each store's AEAD; probe → store →
+   witness → floor; a bad verdict resets TRUST (pins dropped, contacts
+   "verify again", chat modes default) and heals rather than refusing; a fresh
+   store after a wipe writes past the surviving slot; existing stores arm on
+   their first unlock; warnings reach the transcript and the visible hint.
+   `store-floor.test.mjs` (new), 10 mutants RED. Reviewed by pentest-new-code
+   after the commit (result recorded below when in).
 4. **⬜ 7a — a behavioural `app.js` test** against a DOM stub; wire
    `proto001.mjs` + `crypto-tamper.mjs` + `room-admission.mjs` into an
    automated runner (`npm run e2e:tamper` exists; the rest still needs a relay).

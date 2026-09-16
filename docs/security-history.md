@@ -72,6 +72,16 @@ each has been addressed (see PROGRESS.md for the code):
   rewind one. Closing the browser case would need OS-level trusted monotonic
   storage, which the web platform does not offer.
 
+  *Same primitive, third use (2026-09-16, F-P7-6):* the contact and chat
+  stores' generation counters are mirrored into the same floor under their own
+  slots (`store-floor.js`). Their witnesses were plain localStorage keys, so
+  restoring store + witness together rewound a store undetected and brought a
+  superseded, already-replaced pin back as verified. On Android a store behind
+  the floor now opens with its TRUST reset — every pin dropped, every contact
+  "verify again", every negotiated chat mode back to the default — and heals;
+  it is never refused, so the crash window is a re-verification, not a lock-out.
+  In the browser the residual above stands.
+
   *Same primitive, second use (2026-09-16, F-ATREST-008):* the identity blob now
   carries a monotone write generation inside its AEAD, mirrored into the same
   native floor under its own slot. The contact store's anti-deletion anchor

@@ -6,7 +6,7 @@
   "description": "secure-chat web client (E2EE, classical + post-quantum identity).",
   "scripts": {
     "e2e:tamper": "node ../e2e/hostile-relay/crypto-tamper.mjs",
-    "test": "node test-source.test.mjs && node crypto.test.mjs && node rsa-deprecation.test.mjs && node keyconfirm.test.mjs && node identity.test.mjs && node identity-store.test.mjs && node contacts.test.mjs && node contacts-anchor.test.mjs && node sealed.test.mjs && node otp-rollback.test.mjs && node otp-padgen.test.mjs && node vouch.test.mjs && node chats.test.mjs && node chats-rollback.test.mjs && node canonical-b64.test.mjs && node no-fallback.test.mjs && node peer-approval.test.mjs && node regseq.test.mjs && node android-source.test.mjs && node views.test.mjs"
+    "test": "node test-source.test.mjs && node crypto.test.mjs && node rsa-deprecation.test.mjs && node keyconfirm.test.mjs && node identity.test.mjs && node identity-store.test.mjs && node contacts.test.mjs && node contacts-anchor.test.mjs && node sealed.test.mjs && node otp-rollback.test.mjs && node otp-padgen.test.mjs && node vouch.test.mjs && node chats.test.mjs && node chats-rollback.test.mjs && node canonical-b64.test.mjs && node no-fallback.test.mjs && node peer-approval.test.mjs && node regseq.test.mjs && node android-source.test.mjs && node views.test.mjs && node store-floor.test.mjs"
   },
   "dependencies": {
     "@noble/post-quantum": "^0.6.1",

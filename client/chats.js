@@ -19,7 +19,14 @@
 // for inbound dedup (a retried fetch after a lost response could deliver
 // twice).
 
+import { probeStoreFloor, armStoreFloor, judgeStoreFloor, readClaim } from "./store-floor.js";
+
 const LS_CHATS = "sc.chats.v1";
+// Phase-7 F-P7-6: the generation is mirrored into the native floor under this
+// slot (see store-floor.js).
+const FLOOR_SLOT = "sc.chats.v1#gen";
+let floorClaim = false;  // what the store's AEAD says about the native floor
+let floorWarning = null; // the last probe/arm warning, for app.js to show
 // Pentest 2026-08-07 F-ATREST-005 / F-CRYPTO-006. The chat store had no
 // generation counter, no witness and no domain tag — the only one of the four
 // at-rest stores with no rollback control at all. One `removeItem` silently
@@ -125,7 +132,8 @@ export function lock() {
   dataKey = null;
   salt = null;
   chats = null;
-  generation = 0;
+  generation = 0;  floorClaim = false;
+  floorWarning = null;
 }
 
 export async function unlock(passphrase, { startFresh = false } = {}) {
@@ -151,7 +159,7 @@ export async function unlock(passphrase, { startFresh = false } = {}) {
     generation = 0;
     await persist();
     await noteStoreEstablished();
-    return;
+    return null;
   }
   const blob = JSON.parse(raw);
   salt = unb64(blob.salt);
@@ -206,10 +214,50 @@ export async function unlock(passphrase, { startFresh = false } = {}) {
   chats = newStore(tagged ? data.chats : data);
   generation = Number.isInteger(data.gen) ? data.gen : 0;
   await assertNotRolledBack(Number.isInteger(data.gen) ? data.gen : null);
+  // F-P7-6: the witness is restorable together with the store; the native
+  // floor is not. On a bad verdict every negotiated mode is reset (fail closed
+  // on the part a rollback can downgrade) and the user is told that replay
+  // protection may have been rewound; the write below heals the record.
+  floorClaim = readClaim(data.floor);
+  const floorVerdict = judgeStoreFloor(FLOOR_SLOT, generation, floorClaim);
+  let warning = null;
   let dirty = sanitizeModes();
+  if (!floorVerdict.ok) {
+    warning = resetModes(floorVerdict);
+    dirty = true;
+  } else if (floorVerdict.arm) {
+    dirty = true;
+  }
   if (!tagged) dirty = true; // rewrite tagged, so adoption happens exactly once
   if (dirty) await persist();
   await noteStoreEstablished();
+  return warning;
+}
+
+// F-P7-6, the fail-closed response to a bad floor verdict for the chat store:
+// every negotiated mode goes back to the default (a rolled-back store may
+// carry a mode and secret the peer no longer holds), and the user is told
+// that the envelope-replay ring may have been rewound — that part cannot be
+// restored, only named.
+function resetModes(verdict) {
+  for (const c of Object.values(chats || {})) {
+    c.mode = "SEALED";
+    delete c.secret;
+    delete c.salt;
+    delete c.pending;
+  }
+  const why = {
+    rollback: `your chat history is OLDER than this device's protected record of it (generation ${verdict.generation}, device recorded ${verdict.floor}) — an earlier copy has been restored, or a save did not reach disk`,
+    deleted: "this device's protected record for your chat history has been DELETED",
+    tampered: "this device's protected record for your chat history is damaged or forged",
+    unavailable: "this device says it has protected storage for your chat history's rollback guard, but none is usable",
+  }[verdict.reason] || "the rollback guard for your chat history could not be checked";
+  return why + ". Every negotiated chat mode has been reset, and replay protection for sealed messages may have been rewound";
+}
+
+// F-P7-6: a warning from the last floor probe/arm, or null.
+export function lastFloorWarning() {
+  return floorWarning;
 }
 
 // ---- rollback / deletion detection (F-ATREST-005) --------------------------
@@ -484,11 +532,16 @@ async function persistLocked() {
       "Reload before sending or reading more, so the other tab's messages are not lost.",
     );
   }
+  // F-P7-6: probe before the write, never write a generation the floor is past.
+  const probe = probeStoreFloor(FLOOR_SLOT, floorClaim);
+  floorClaim = probe.claim;
+  floorWarning = probe.warning;
+  if (probe.current > generation) generation = probe.current;
   generation += 1;
   const iv = crypto.getRandomValues(new Uint8Array(12));
   // F-CRYPTO-006 / F-ATREST-005: the domain tag and the generation live INSIDE
   // the AEAD, so neither can be stripped or rewritten without the passphrase.
-  const plain = enc.encode(JSON.stringify({ d: CHATS_DOMAIN, gen: generation, chats }));
+  const plain = enc.encode(JSON.stringify({ d: CHATS_DOMAIN, gen: generation, chats, floor: floorClaim }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, dataKey, plain));
   localStorage.setItem(
     LS_CHATS,
@@ -498,6 +551,8 @@ async function persistLocked() {
   // reads as "fine" rather than as a rollback. The other order would lock the
   // user out of their own history on a quota error.
   await writeWitness();
+  // F-P7-6: the floor is raised only now, after both localStorage writes.
+  floorWarning = armStoreFloor(FLOOR_SLOT, generation, floorClaim) || floorWarning;
 }
 
 export function wipe() {

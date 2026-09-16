@@ -16,7 +16,12 @@
 // The store is keyed by username (unique in the directory). The lookup token
 // is kept so the contact can be re-fetched / vouch-checked later.
 
+import { probeStoreFloor, armStoreFloor, judgeStoreFloor, readClaim } from "./store-floor.js";
+
 const LS_CONTACTS = "sc.contacts.v1";
+// Phase-7 F-P7-6: the generation is mirrored into the native floor under this
+// slot (see store-floor.js). A pad id is 32 hex characters, so no collision.
+const FLOOR_SLOT = "sc.contacts.v1#gen";
 // Pentest 2026-07-27 L-1: an authenticated, monotonic generation counter kept
 // BESIDE the store. See assertNotRolledBack() for what it buys and what it does
 // not. Encrypted under the same data key, so only the passphrase holder can
@@ -86,6 +91,8 @@ let pins = null;     // { "<key>": {ed, mldsa} } — TOFU identity pins (M-02)
 // time, so it needs no guess about who holds those keys now. See dropPinsFor.
 let swept = null;
 let generation = 0;  // monotonic store generation (L-1); bumped on every persist
+let floorClaim = false; // F-P7-6: what the store's AEAD says about the native floor
+let floorWarning = null; // F-P7-6: the last probe/arm warning, for app.js to show
 
 // ---- the anti-deletion anchor (pentest 2026-08-07 F-ATREST-003/004) --------
 // Both findings are the same shape: every piece of evidence that a store OUGHT
@@ -151,6 +158,35 @@ export function lock() {
   pins = null;
   swept = null;
   generation = 0;
+  floorClaim = false;
+  floorWarning = null;
+}
+
+// F-P7-6: a warning from the last floor probe/arm (storage full, forged slot,
+// bridge unusable), or null. Read by app.js after unlock.
+export function lastFloorWarning() {
+  return floorWarning;
+}
+
+// F-P7-6, the fail-closed-on-TRUST response to a bad floor verdict. Every pin
+// is dropped and every contact must be verified again in person, so a
+// rolled-back or deleted-floor store behaves like a first contact with
+// everybody — never like a store whose pins are current.
+function resetTrust(verdict) {
+  pins = {};
+  for (const c of contacts) {
+    c.verified = false;
+    c.verifiedAt = null;
+    c.reverify = true;
+    delete c.vouchedBy;
+  }
+  const why = {
+    rollback: `your saved contacts are OLDER than this device's protected record of them (generation ${verdict.generation}, device recorded ${verdict.floor}) — an earlier copy has been restored, or a save did not reach disk`,
+    deleted: "this device's protected record for your saved contacts has been DELETED",
+    tampered: "this device's protected record for your saved contacts is damaged or forged",
+    unavailable: "this device says it has protected storage for your saved contacts' rollback guard, but none is usable",
+  }[verdict.reason] || "the rollback guard for your saved contacts could not be checked";
+  return why + ". Every saved identity pin has been dropped and every contact must be verified again in person before their messages are trusted";
 }
 
 // Unlock (or create) the store with the identity passphrase. Throws if a blob
@@ -183,7 +219,7 @@ export async function unlock(passphrase, { startFresh = false } = {}) {
     dropLegacyPins();
     await persist();
     await noteStoreEstablished();
-    return;
+    return null;
   }
   const blob = JSON.parse(raw);
   salt = unb64(blob.salt);
@@ -276,7 +312,21 @@ export async function unlock(passphrase, { startFresh = false } = {}) {
   }
   generation = Number.isInteger(data.gen) ? data.gen : 0;
   await assertNotRolledBack(data.gen);
+  // F-P7-6: the witness above is a localStorage key an attacker can restore
+  // together with the store; the native floor is not. A store behind the
+  // floor, a floor that is gone while the store claims one, a forged slot or
+  // an unusable bridge all fail TRUST closed (see resetTrust) and are healed
+  // by the write below; a device with no record yet is armed by that write.
+  floorClaim = readClaim(data.floor);
+  const floorVerdict = judgeStoreFloor(FLOOR_SLOT, generation, floorClaim);
+  let warning = null;
   let dirty = dropLegacyPins();
+  if (!floorVerdict.ok) {
+    warning = resetTrust(floorVerdict);
+    dirty = true;
+  } else if (floorVerdict.arm) {
+    dirty = true;
+  }
   if ((blob.v || 1) < 3 && migrateH01Verification()) dirty = true;
   // An adopted pre-v4 store is rewritten tagged, so it only ever happens once.
   if (!tagged) dirty = true;
@@ -287,6 +337,7 @@ export async function unlock(passphrase, { startFresh = false } = {}) {
   // Record that this device has a store, so a later deletion cannot pass as a
   // first run and a later legacy-shaped blob cannot pass as a migration.
   await noteStoreEstablished();
+  return warning;
 }
 
 // Pentest 2026-07-27 H-2: this used to be migrateLegacyPins(), which COPIED any
@@ -484,11 +535,19 @@ async function persist() {
       "Reload before making further changes, so the other tab's changes are not lost.",
     );
   }
+  // F-P7-6: measure the floor slot before the write (a probe cannot advance
+  // it), and never write a generation the floor is already past — that is how
+  // a fresh store after a wipe catches up with the slot instead of reading as
+  // a rollback on every unlock until it does.
+  const probe = probeStoreFloor(FLOOR_SLOT, floorClaim);
+  floorClaim = probe.claim;
+  floorWarning = probe.warning;
+  if (probe.current > generation) generation = probe.current;
   generation += 1; // L-1: every write moves the store forward, monotonically
   const iv = crypto.getRandomValues(new Uint8Array(12));
   // `d` is the H-2 domain tag: it makes this plaintext unmistakably a STORE, so
   // no other record encrypted under the same key can be substituted for it.
-  const plain = enc.encode(JSON.stringify({ d: STORE_DOMAIN, contacts, pins, swept, gen: generation }));
+  const plain = enc.encode(JSON.stringify({ d: STORE_DOMAIN, contacts, pins, swept, gen: generation, floor: floorClaim }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, dataKey, plain));
   localStorage.setItem(
     LS_CONTACTS,
@@ -498,6 +557,8 @@ async function persist() {
   // one generation ahead of its witness, which reads as "newer than recorded"
   // — not a rollback, so an ordinary crash never locks the user out.
   await writeWitness();
+  // F-P7-6: the floor is raised only now, after both localStorage writes.
+  floorWarning = armStoreFloor(FLOOR_SLOT, generation, floorClaim) || floorWarning;
 }
 
 // ---- identity pins (TOFU, now inside the authenticated store) -------------

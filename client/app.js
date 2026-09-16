@@ -1019,8 +1019,12 @@ function installStoreAnchor(pass) {
 
 async function unlockContacts(pass) {
   try {
-    await contacts.unlock(pass, { startFresh: freshStoreConsent.contacts });
+    const warning = await contacts.unlock(pass, { startFresh: freshStoreConsent.contacts });
     if (freshStoreConsent.contacts) addLine("sys", "", "[contact store started over EMPTY at your request — every contact must be re-verified]");
+    // F-P7-6: a bad floor verdict opens the store with its trust reset; say so.
+    for (const w of [warning, contacts.lastFloorWarning()]) {
+      if (w) { addLine("sys", "", "[contacts: " + w + "]"); hint(w, true); }
+    }
     contactsError = null;
     contactsErrorCode = null;
   } catch (e) {
@@ -1029,8 +1033,11 @@ async function unlockContacts(pass) {
     addLine("sys", "", "[contact store did not unlock — key-change warnings are OFF until it does]");
   }
   try {
-    await chats.unlock(pass, { startFresh: freshStoreConsent.chats }); // chat history shares the at-rest posture
+    const warning = await chats.unlock(pass, { startFresh: freshStoreConsent.chats }); // chat history shares the at-rest posture
     if (freshStoreConsent.chats) addLine("sys", "", "[chat history started over EMPTY at your request]");
+    for (const w of [warning, chats.lastFloorWarning()]) {
+      if (w) { addLine("sys", "", "[chats: " + w + "]"); hint(w, true); }
+    }
     chatsError = null;
     chatsErrorCode = null;
   } catch (e) {

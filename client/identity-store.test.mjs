@@ -30,8 +30,6 @@ import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
-import * as contacts from "./contacts.js";
-import * as chats from "./chats.js";
 import { Identity } from "./identity.js";
 import { stripComments, liftFunction, referencesOf } from "./test-source.mjs";
 import { PASS, fakeLocalStorage, fakeFloor, fakeIdentity, fakeImport, preFixBlob } from "./identity-store-helpers.test.mjs";
@@ -47,6 +45,10 @@ globalThis.__SECURE_CHAT_PAD_FLOOR__ = {
 };
 const idstore = await import("./identity-store.js");
 const otp = await import("./otp.js");
+// F-P7-6: contacts.js and chats.js now import otp.js too (via store-floor.js),
+// so they must load AFTER the bridge above is installed, like identity-store.
+const contacts = await import("./contacts.js");
+const chats = await import("./chats.js");
 const { LS_IDENTITY, FLOOR_SLOT } = idstore;
 
 function device(floor = fakeFloor()) {
@@ -738,7 +740,7 @@ function testAppJsWiring() {
   const storesRange = lineRangeOf(src, "unlockContacts");
   for (const h of freshUses) {
     assert.ok(within(storesRange)(h), `app.js:${h.line}: store unlocks live in unlockContacts only`);
-    assert.match(h.text, /^await (contacts|chats)\.unlock\(pass, \{ startFresh: freshStoreConsent\.\1 \}\);/,
+    assert.match(h.text, /^(?:const warning = )?await (contacts|chats)\.unlock\(pass, \{ startFresh: freshStoreConsent\.\1 \}\);/,
       "each unlock passes ITS OWN consent flag (round-3 M-B cross-wired them) and nothing else");
   }
   // Round-3 M-A / M-H: the consent object may be ASSIGNED only inside the gate,
