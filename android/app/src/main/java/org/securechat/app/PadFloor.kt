@@ -51,6 +51,13 @@ import javax.crypto.SecretKey
  * direction we want. `allowBackup=false` plus the L-6 dataExtractionRules already
  * close the backup and device-transfer routes, so this means on-device root.
  *
+ * NOT ONLY PADS. Slots are keyed by an opaque string and the MAC covers the
+ * key, so the same primitive serves any monotone counter the JS side needs to
+ * keep out of localStorage's reach. Since 2026-09-16 (F-ATREST-008) the
+ * identity blob's write generation lives under `sc.identity.v1#gen` (see
+ * client/identity-store.js); pad ids are 32 hex characters, so the names
+ * cannot collide. Nothing here knows or needs to know which slot is which.
+ *
  * NOT a secret store. The values are consumption offsets, not key material;
  * confidentiality is irrelevant here, integrity is everything. That is why this
  * is an HMAC over plain SharedPreferences rather than EncryptedSharedPreferences

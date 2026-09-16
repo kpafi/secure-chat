@@ -203,6 +203,36 @@ const nativeFloor = (() => {
   };
 })();
 
+// F-ATREST-008. The identity blob's write counter (identity-store.js) is mirrored
+// into the same native floor, under its own slot. The bridge is captured ONCE, at
+// this module's load, precisely so no later page script can substitute it (see
+// above) — so rather than have a second module repeat that capture (and give an
+// attacker a second copy of the same ceremony to defeat), the one captured bridge
+// is reached through here. `null` in a plain browser; a `broken` object when the
+// marker says a floor should exist but none is usable — callers must treat that
+// as evidence, never as "no floor".
+//
+// Pentest of this change (2026-09-16, F-2): the first cut returned `nativeFloor`
+// ITSELF — a plain, unfrozen object literal that this module also calls through.
+// One assignment on the returned object (`otp.deviceFloor().read = () => -1`)
+// then rewrote what `padWasUsed` and `unlockPad` saw, and the H-1/H-A ceremony
+// (frozen bridge, non-configurable globals) was bypassed one hop downstream, the
+// same shape as the `parseInt` poisoning it had already been fixed for once. So
+// this returns a fresh facade per call, closing over the private object: a
+// caller may mutate what it was handed and reach nothing this module or any
+// other holder uses. (`Object.freeze` would not do: it is a writable global and
+// a document-start attacker runs first — closures are language constructs.)
+export function deviceFloor() {
+  if (!nativeFloor) return null;
+  const f = nativeFloor;
+  return {
+    read: (id) => f.read(id),
+    bump: (id, v) => f.bump(id, v),
+    broken: f.broken === true,
+  };
+}
+export { NATIVE_ABSENT, NATIVE_TAMPERED, NATIVE_COMMIT_FAILED };
+
 // Max without `Math.max` (H-1). `Math.max` is writable, and the rollback verdict
 // is a single call to it over the four floors — so one assignment overruled the
 // native floor, the authenticated watermark, the in-AEAD `hwSend` and the legacy
@@ -691,6 +721,14 @@ export async function importPad(fileText, passphrase) {
   // one this device has already consumed would rewind sendOffset to 0 and reuse
   // keystream the peer has already seen. The watermark survives `forgetPad`
   // precisely so this check can fire.
+  // F-ATREST-008 fix review round 2 (F-4): the pad id names the pad's native
+  // floor slots, and it arrives here from the FILE, unchecked — so a pad-file
+  // author chose the slot name. `randomId()` is 32 lowercase hex characters;
+  // anything else (e.g. the identity's `sc.identity.v1#gen` slot, whose
+  // "cannot collide" argument rests on exactly this check) is not a pad.
+  if (typeof o.padId !== "string" || !/^[0-9a-f]{32}$/.test(o.padId)) {
+    throw new Error("not a valid pad file (pad id)");
+  }
   if (nativeFloor && nativeFloor.broken) throw floorUnavailableError();
   if (padWasUsed(o.padId)) {
     throw new Error(

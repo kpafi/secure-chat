@@ -14,6 +14,9 @@
               aria-expanded="false" aria-controls="drawer">☰</button>
       <h1>secure-chat <span class="sub">end-to-end encrypted relay</span></h1>
     </header>
+    <!-- F-ATREST-008: the identity's at-rest verdict, shown on EVERY view so an
+         unlock from Profile / Users / Chats reports it too (fix-review F-7). -->
+    <p class="hint err" id="atRestWarning" aria-live="polite" hidden></p>
 
     <nav id="drawer" class="drawer" aria-label="Views" hidden>
       <div class="drawer-head">
@@ -362,6 +365,8 @@
                    aria-label="Identity passphrase" placeholder="identity passphrase" />
             <button id="usersUnlock" type="button" class="primary">Unlock</button>
           </div>
+          <!-- F-ATREST-008 fix review (F-2): shown only behind the deletion alarm; confirms first. -->
+          <button id="usersStartFresh" type="button" class="danger" hidden>Start over with an empty contact store…</button>
           <p class="hint" id="usersUnlockStatus"></p>
         </div>
         <div id="usersUnlocked" hidden>
@@ -407,6 +412,8 @@
                    aria-label="Identity passphrase" placeholder="identity passphrase" />
             <button id="chatsUnlock" type="button" class="primary">Unlock</button>
           </div>
+          <!-- F-ATREST-008 fix review (F-2): shown only behind the deletion alarm; confirms first. -->
+          <button id="chatsStartFresh" type="button" class="danger" hidden>Start over with an empty chat store…</button>
           <p class="hint" id="chatsUnlockStatus"></p>
         </div>
 

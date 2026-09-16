@@ -108,6 +108,14 @@ let generation = 0;  // monotonic store generation (L-1); bumped on every persis
 // silent wipe; it is not the complete answer to F-ATREST-003/004 that the
 // first version of these comments claimed.
 //
+// F-ATREST-008 is closed as of 2026-09-16 (identity-store.js): the identity
+// blob carries a monotone generation mirrored into the Android native floor,
+// and under any at-rest verdict short of clean — rolled back, floor deleted,
+// tampered, or expected-but-unusable — the anchor app.js installs here answers
+// `established: true`. So on Android the rollback route now lands in the same
+// fail-closed branch as the deletion it was covering for. In a plain browser
+// there is no floor, and the paragraph above still describes the residual.
+//
 // Injected rather than imported so this module keeps knowing nothing about
 // identity storage; app.js owns the Identity object and wires it in before
 // unlocking. When no anchor is installed (an identity-less flow) every check
@@ -148,7 +156,7 @@ export function lock() {
 // Unlock (or create) the store with the identity passphrase. Throws if a blob
 // exists but does not decrypt with this passphrase (foreign/tampered blob —
 // the caller decides whether to offer `wipe()`).
-export async function unlock(passphrase) {
+export async function unlock(passphrase, { startFresh = false } = {}) {
   if (!passphrase) throw new Error("passphrase required to unlock the contact store");
   const raw = localStorage.getItem(LS_CONTACTS);
   if (!raw) {
@@ -156,7 +164,16 @@ export async function unlock(passphrase) {
     // really IS a first run and not a store somebody deleted — see L-1. The
     // witness carries its OWN salt precisely so it stays readable when the
     // store that would otherwise hold the salt has been removed.
-    await assertStoreNotDeleted(passphrase);
+    // F-ATREST-008 fix review (F-2): `startFresh` is the consent gate. "No store,
+    // but this device says one was established" is, by construction, the same
+    // state for an attacker who deleted the store as for a device that lost an
+    // unflushed first write in a crash — the floor cannot tell them apart, so
+    // no policy can both refuse the attacker and spare the crash without a
+    // human in the loop. Same trade as otp.js's adoption gate: the alarm is
+    // shown with its full wording, and only an explicit, separately confirmed
+    // action (app.js, behind `confirm()`) passes `startFresh`. It skips ONLY
+    // this check; a store that exists is never discarded by it.
+    if (!startFresh) await assertStoreNotDeleted(passphrase);
     salt = crypto.getRandomValues(new Uint8Array(16));
     dataKey = await deriveKey(passphrase, salt, KDF_ITERS);
     contacts = [];
@@ -349,6 +366,16 @@ async function writeWitness() {
   }));
 }
 
+// F-ATREST-008 fix review (2026-09-16, F-2): every "the store is gone" refusal
+// carries a code, so app.js can offer the ONE recovery that does not destroy
+// the identity — starting over with an empty store, behind an explicit consent
+// gate (see unlock's `startFresh`). The message stays the user-facing text.
+function storeDeleted(message) {
+  const e = new Error(message);
+  e.code = "STORE_DELETED";
+  return e;
+}
+
 async function assertStoreNotDeleted(passphrase) {
   const w = await readWitness(passphrase);
   if (w === null) {
@@ -360,7 +387,7 @@ async function assertStoreNotDeleted(passphrase) {
     // remove without locking the user out of their identity.
     if (storeExpected()) {
       lock();
-      throw new Error(
+      throw storeDeleted(
         "your saved contacts and their generation record have BOTH been deleted from this device — " +
         "refusing to start over with an empty store, because that would silently turn off " +
         "key-change warnings for every contact you have verified",
@@ -370,12 +397,12 @@ async function assertStoreNotDeleted(passphrase) {
   }
   lock();
   if (w.corrupt) {
-    throw new Error(
+    throw storeDeleted(
       "a contact store was expected on this device but is missing, and its generation record does not " +
       "decrypt — refusing to start over with an empty (unpinned) store",
     );
   }
-  throw new Error(
+  throw storeDeleted(
     `your saved contacts (generation ${w.gen}) have been DELETED from this device — refusing to start ` +
     "over with an empty store, because that would silently turn off key-change warnings",
   );

@@ -128,14 +128,23 @@ export function lock() {
   generation = 0;
 }
 
-export async function unlock(passphrase) {
+export async function unlock(passphrase, { startFresh = false } = {}) {
   if (!passphrase) throw new Error("passphrase required to unlock the chat store");
   const raw = localStorage.getItem(LS_CHATS);
   if (!raw) {
     // F-ATREST-005: "no store" is a first run only if this device never had
     // one. Otherwise it is a deletion, and adopting a fresh empty store would
     // silently reset the envelope-replay ring and every negotiated chat mode.
-    await assertStoreNotDeleted(passphrase);
+    // F-ATREST-008 fix review (F-2): `startFresh` is the consent gate. "No store,
+    // but this device says one was established" is, by construction, the same
+    // state for an attacker who deleted the store as for a device that lost an
+    // unflushed first write in a crash — the floor cannot tell them apart, so
+    // no policy can both refuse the attacker and spare the crash without a
+    // human in the loop. Same trade as otp.js's adoption gate: the alarm is
+    // shown with its full wording, and only an explicit, separately confirmed
+    // action (app.js, behind `confirm()`) passes `startFresh`. It skips ONLY
+    // this check; a store that exists is never discarded by it.
+    if (!startFresh) await assertStoreNotDeleted(passphrase);
     salt = crypto.getRandomValues(new Uint8Array(16));
     dataKey = await deriveKey(passphrase, salt, KDF_ITERS);
     chats = newStore();
@@ -238,12 +247,22 @@ async function writeWitness() {
   }));
 }
 
+// F-ATREST-008 fix review (2026-09-16, F-2): every "the store is gone" refusal
+// carries a code, so app.js can offer the ONE recovery that does not destroy
+// the identity — starting over with an empty store, behind an explicit consent
+// gate (see unlock's `startFresh`). The message stays the user-facing text.
+function storeDeleted(message) {
+  const e = new Error(message);
+  e.code = "STORE_DELETED";
+  return e;
+}
+
 async function assertStoreNotDeleted(passphrase) {
   const w = await readWitness(passphrase);
   if (w === null) {
     if (storeExpected()) {
       lock();
-      throw new Error(
+      throw storeDeleted(
         "your chat history and its generation record have BOTH been deleted from this device — " +
         "refusing to start over with an empty store, because that would silently turn message-replay " +
         "protection off and reset every negotiated chat mode",
@@ -253,12 +272,12 @@ async function assertStoreNotDeleted(passphrase) {
   }
   lock();
   if (w.corrupt) {
-    throw new Error(
+    throw storeDeleted(
       "a chat history was expected on this device but is missing, and its generation record does not " +
       "decrypt — refusing to start over with an empty store",
     );
   }
-  throw new Error(
+  throw storeDeleted(
     `your chat history (generation ${w.gen}) has been DELETED from this device — refusing to start ` +
     "over with an empty store, because that would silently reset message-replay protection",
   );

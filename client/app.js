@@ -26,6 +26,7 @@ import {
 } from "./auth.js";
 import * as account from "./account.js";
 import * as otp from "./otp.js";
+import * as idstore from "./identity-store.js";
 import * as contacts from "./contacts.js";
 import * as chats from "./chats.js";
 import * as sealed from "./sealed.js";
@@ -59,6 +60,7 @@ const els = {
   admitWarn: $("admitWarn"), admitOk: $("admitOk"), admitNo: $("admitNo"),
   admitTitle: $("admitTitle"), admitHint: $("admitHint"),
   idHint: $("idHint"), roomHint: $("roomHint"), roomHelp: $("roomHelp"),
+  atRestWarning: $("atRestWarning"),
   stepIdentity: $("stepIdentity"), stepRoom: $("stepRoom"),
   copyCode: $("copyCode"), algDetails: $("algDetails"), algSummary: $("algSummary"), peerFingerprint: $("peerFingerprint"),
   verifyOk: $("verifyOk"), verifyNo: $("verifyNo"),
@@ -80,6 +82,7 @@ const els = {
   profileUnlockStatus: $("profileUnlockStatus"),
   usersUnlockPass: $("usersUnlockPass"), usersUnlock: $("usersUnlock"),
   usersUnlockStatus: $("usersUnlockStatus"),
+  usersStartFresh: $("usersStartFresh"), chatsStartFresh: $("chatsStartFresh"),
   chatsUnlockPass: $("chatsUnlockPass"), chatsUnlock: $("chatsUnlock"),
   chatsUnlockStatus: $("chatsUnlockStatus"),
   profileName: $("profileName"), profileAvatar: $("profileAvatar"),
@@ -146,7 +149,11 @@ function promptSecret(message) {
 
 // localStorage keys. Private keys live only inside the passphrase-encrypted
 // identity blob; pins hold peers' PUBLIC bundles only.
-const LS_IDENTITY = "sc.identity.v1";
+// F-ATREST-008: every WRITE of this key goes through identity-store.js, which
+// stamps the blob with a monotone generation and mirrors it into the native
+// floor (captured there at load, from otp.js — nothing to wire up here);
+// identity-store.test.mjs pins this file to zero direct writes of the key.
+const LS_IDENTITY = idstore.LS_IDENTITY;
 const LS_PINS = "sc.pins.v1";
 const LS_USERNAME = "sc.username.v1";
 const LS_LOOKUP_TOKEN = "sc.lookuptoken.v1"; // our directory lookup token
@@ -612,8 +619,8 @@ async function createIdentity() {
   setIdentityStatus("Generating identity keys (Ed25519 + ML-DSA-65)…");
   try {
     identity = await Identity.generate();
-    const blob = await identity.export(pass);
-    localStorage.setItem(LS_IDENTITY, blob);
+    const saved = await idstore.persistIdentity(identity, pass);
+    if (saved.warning) addLine("sys", "", "[identity: " + saved.warning + "]");
     installStoreAnchor(pass);
     await unlockContacts(pass); // contact store shares the identity passphrase
     els.idPass.value = "";
@@ -632,21 +639,53 @@ async function unlockWithPassphrase(pass) {
   const blob = localStorage.getItem(LS_IDENTITY);
   if (!blob) return "Nothing to unlock — create an identity in the Live room first.";
   if (!pass) return "Enter your identity passphrase to unlock.";
+  let verdict;
   try {
-    identity = await Identity.import(blob, pass);
-    if (identity.upgraded) {
-      // Pre-v3 blob: encryption keys were just added — persist them so the
-      // upgrade happens exactly once, then re-publish the bundle below.
-      localStorage.setItem(LS_IDENTITY, await identity.export(pass));
-    }
-    installStoreAnchor(pass);
-    await unlockContacts(pass); // contact store shares the identity passphrase
-    await showIdentityUnlocked();
-    return null;
+    ({ identity, verdict } = await idstore.openIdentity(pass, Identity.import));
   } catch (e) {
     identity = null;
     return "Wrong passphrase or corrupted identity.";
   }
+  // F-ATREST-008. A bad verdict is not a lock-out: the keys are the user's own
+  // in every version of the blob. It is reported, and identity-store.js reads
+  // every anchor as established from here on (fail closed), which
+  // installStoreAnchor below also commits into the in-memory flags.
+  // F-ATREST-008 (pentest of the change, F-7): the verdict has to reach the
+  // user on whichever view they unlocked from, and the per-view unlock rows
+  // hide themselves on success — so it goes into the one banner every view
+  // shows, plus the transcript.
+  els.atRestWarning.textContent = verdict.ok ? "" : "Identity unlocked, but " + verdict.message + ".";
+  els.atRestWarning.hidden = verdict.ok;
+  if (!verdict.ok) {
+    addLine("sys", "", "[identity at rest: " + verdict.message + "]");
+  }
+  installStoreAnchor(pass);
+  if (identity.upgraded || !verdict.ok || verdict.arm) {
+    // Three reasons to write, one write. Pre-v3 blob: encryption keys were
+    // just added — persist them so the upgrade happens exactly once, then
+    // re-publish the bundle below. Bad verdict: the write re-converges the
+    // counter with the floor and carries the fail-closed flags into the blob,
+    // so the warning shows once. `arm`: this device has no record of this
+    // identity yet (every existing install, on its first unlock after the
+    // F-ATREST-008 update) — the write is what creates the record, and without
+    // it the guard never arms (pentest of the change, F-1). The identity is
+    // usable either way; a refused write (a full localStorage) is reported,
+    // not fatal.
+    try {
+      const saved = await idstore.persistIdentity(identity, pass);
+      if (saved.warning) addLine("sys", "", "[identity: " + saved.warning + "]");
+    } catch (e) {
+      addLine("sys", "", "[identity could not be re-saved: " + e.message + "]");
+    }
+  }
+  await unlockContacts(pass); // contact store shares the identity passphrase
+  await showIdentityUnlocked();
+  if (!verdict.ok) {
+    // showIdentityUnlocked wrote the routine "unlocked" line; the at-rest
+    // verdict is the more important one, so it gets the status row too.
+    setIdentityStatus("Identity unlocked, but " + verdict.message + ".", "err");
+  }
+  return null;
 }
 
 async function unlockIdentity() {
@@ -689,6 +728,29 @@ function wireViewUnlock(passEl, btnEl, statusFn, render) {
   passEl.addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); go(); }
   });
+  return go;
+}
+
+// F-ATREST-008 fix review (F-2): the consent gate for starting a store over
+// EMPTY. Reachable only while the store's deletion alarm is showing (the button
+// is hidden otherwise), confirms with the cost spelled out, and arms the
+// consent for exactly one unlock attempt — the `finally` disarms it whether the
+// passphrase was right or not, so a typo cannot leave consent lying around for
+// a later unlock the user did not mean this way.
+function wireStartFresh(btnEl, store, what, cost, go) {
+  btnEl.addEventListener("click", async () => {
+    if (!confirm(
+      `Start over with an EMPTY ${what}? This device says one existed and it is gone. ` +
+      "If someone deleted it to switch off key-change warnings, starting over is exactly what they want — " +
+      `only continue if YOU know why it is missing. ${cost}`,
+    )) return;
+    try {
+      freshStoreConsent[store] = true;
+      await go();
+    } finally {
+      freshStoreConsent[store] = false;
+    }
+  });
 }
 
 async function exportIdentity() {
@@ -721,6 +783,9 @@ async function forgetIdentity() {
   if (staleToken) await account.logout(API_BASE, staleToken);
 
   localStorage.removeItem(LS_IDENTITY);
+  els.atRestWarning.hidden = true;
+  contactsErrorCode = null;
+  chatsErrorCode = null;
   contacts.wipe(); // bound to the identity passphrase; unusable without it
   chats.wipe();
   // Pentest 2026-07-27 L-4: the handle and the lookup token are PLAINTEXT and
@@ -869,6 +934,14 @@ async function loginAccount() {
 
 let contactsError = null; // unlock failure message, shown in the Users view
 let chatsError = null;    // chat-store unlock failure, kept separate (F3)
+let contactsErrorCode = null; // "STORE_DELETED" when the contact store is gone but was expected
+let chatsErrorCode = null;
+// F-ATREST-008 fix review (F-2): consent to start a store over, EMPTY, when the
+// device says one was established and none is there. Armed only by the two
+// "Start over" buttons, each behind a confirm() that names what is lost, and
+// only for the duration of that one unlock attempt (see the click handlers).
+// Never set anywhere else: identity-store.test.mjs pins the writers.
+const freshStoreConsent = { contacts: false, chats: false };
 let apiToken = null;      // directory session token (from Log in), memory only
 
 // Unlock the contact store with the identity passphrase. Called wherever the
@@ -879,16 +952,18 @@ let apiToken = null;      // directory session token (from Log in), memory only
 // visible wherever it matters — so besides `contactsError` for the Users view,
 // the room screen warns and the verification gate refuses to auto-accept.
 // F-ATREST-003/004: give the contact store its anti-deletion anchor before it
-// opens. The flag lives inside the identity's AEAD, so clearing it means
-// deleting the identity — loud, unlike deleting two localStorage keys.
-// `markEstablished` re-exports the identity, i.e. one PBKDF2; it runs once in
-// the life of the device, not once per save.
+// opens. The flag lives inside the identity's AEAD, so it cannot be forged or
+// stripped without the passphrase; F-ATREST-008 (identity-store.js) is what
+// stops it being ROLLED BACK with the whole blob — under any at-rest verdict
+// short of clean, `anchorEstablished` answers true. `markEstablished`
+// re-exports the identity, i.e. one PBKDF2; it runs once in the life of the
+// device, not once per save.
 function installStoreAnchor(pass) {
   const anchorFor = (flag) => ({
-    established: identity.deviceFlags[flag] === true,
+    established: idstore.anchorEstablished(identity, flag),
     markEstablished: async () => {
       identity.deviceFlags[flag] = true;
-      localStorage.setItem(LS_IDENTITY, await identity.export(pass));
+      await idstore.persistIdentity(identity, pass);
     },
   });
   contacts.setStoreAnchor(anchorFor("contactsEstablished"));
@@ -897,15 +972,20 @@ function installStoreAnchor(pass) {
 
 async function unlockContacts(pass) {
   try {
-    await contacts.unlock(pass);
+    await contacts.unlock(pass, { startFresh: freshStoreConsent.contacts });
+    if (freshStoreConsent.contacts) addLine("sys", "", "[contact store started over EMPTY at your request — every contact must be re-verified]");
     contactsError = null;
+    contactsErrorCode = null;
   } catch (e) {
     contactsError = e.message;
+    contactsErrorCode = e.code || null;
     addLine("sys", "", "[contact store did not unlock — key-change warnings are OFF until it does]");
   }
   try {
-    await chats.unlock(pass); // chat history shares the at-rest posture
+    await chats.unlock(pass, { startFresh: freshStoreConsent.chats }); // chat history shares the at-rest posture
+    if (freshStoreConsent.chats) addLine("sys", "", "[chat history started over EMPTY at your request]");
     chatsError = null;
+    chatsErrorCode = null;
   } catch (e) {
     // Fix review 2026-08-07 (F3): this used to fold into `contactsError` with no
     // line of its own, so a chat store that refuses to open — which the new
@@ -913,6 +993,7 @@ async function unlockContacts(pass) {
     // the user nothing but a locked Chats pane, and re-entering the passphrase
     // failed identically with no explanation. Say what happened and why.
     chatsError = e.message;
+    chatsErrorCode = e.code || null;
     contactsError = contactsError || e.message;
     addLine("sys", "", `[chat history did not unlock — ${e.message}]`);
   }
@@ -930,9 +1011,12 @@ function refreshUsers() {
   if (!unlocked) {
     els.usersLocked.querySelector("p").textContent = contactsError
       ? "Contact store error: " + contactsError +
-        " (Forget + recreate the identity resets it — contacts are bound to the identity passphrase.)"
+        (contactsErrorCode === "STORE_DELETED"
+          ? " (If you know why — a fresh install, a cleared browser — you can start over with an empty store below; every contact must then be re-verified in person.)"
+          : " (Forget + recreate the identity resets it — contacts are bound to the identity passphrase.)")
       : "Contacts are stored encrypted under your identity passphrase. " +
         "Enter it to unlock them here.";
+    els.usersStartFresh.hidden = contactsErrorCode !== "STORE_DELETED";
     return;
   }
   renderMyHandle();
@@ -1344,7 +1428,20 @@ function refreshChats() {
   const unlocked = chats.isUnlocked() && contacts.isUnlocked();
   els.chatsLocked.hidden = unlocked;
   els.chatsUnlocked.hidden = !unlocked;
-  if (!unlocked) return;
+  if (!unlocked) {
+    // Fix review round 3 (F-3): `chatsError` was write-only, so the pane showed
+    // a red "Start over" button under a routine "enter your passphrase" line.
+    // The alarm is rendered here exactly as the Users pane renders its own.
+    els.chatsLocked.querySelector("p").textContent = chatsError
+      ? "Chat store error: " + chatsError +
+        (chatsErrorCode === "STORE_DELETED"
+          ? " (If you know why — a fresh install, a cleared browser — you can start over with an empty chat history below; replay protection for sealed messages is reset and every negotiated chat mode returns to the default.)"
+          : " (Forget + recreate the identity resets it — chats are bound to the identity passphrase.)")
+      : "Chats are stored encrypted under your identity passphrase. " +
+        "Enter it to unlock them here.";
+    els.chatsStartFresh.hidden = chatsErrorCode !== "STORE_DELETED";
+    return;
+  }
   if (!apiToken) {
     chatsStatus("You can send now; to RECEIVE messages, log in (Live room → step 1) so the mailbox can be fetched.");
   } else {
@@ -3509,10 +3606,14 @@ const setUnlockStatus = (el) => (text, isErr = false) => {
 };
 wireViewUnlock(els.profileUnlockPass, els.profileUnlock,
   setUnlockStatus(els.profileUnlockStatus), renderProfile);
-wireViewUnlock(els.usersUnlockPass, els.usersUnlock,
+const usersGo = wireViewUnlock(els.usersUnlockPass, els.usersUnlock,
   setUnlockStatus(els.usersUnlockStatus), refreshUsers);
-wireViewUnlock(els.chatsUnlockPass, els.chatsUnlock,
+const chatsGo = wireViewUnlock(els.chatsUnlockPass, els.chatsUnlock,
   setUnlockStatus(els.chatsUnlockStatus), refreshChats);
+wireStartFresh(els.usersStartFresh, "contacts", "contact store",
+  "Every contact must then be re-verified in person.", usersGo);
+wireStartFresh(els.chatsStartFresh, "chats", "chat history",
+  "Replay protection for sealed messages is reset and every negotiated chat mode returns to the default.", chatsGo);
 
 els.gen.addEventListener("click", () => {
   els.room.value = newRoomCode();

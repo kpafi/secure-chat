@@ -71,6 +71,24 @@ each has been addressed (see PROGRESS.md for the code):
   (root): such an attacker can destroy a floor, which fails closed, but cannot
   rewind one. Closing the browser case would need OS-level trusted monotonic
   storage, which the web platform does not offer.
+
+  *Same primitive, second use (2026-09-16, F-ATREST-008):* the identity blob now
+  carries a monotone write generation inside its AEAD, mirrored into the same
+  native floor under its own slot. The contact store's anti-deletion anchor
+  lives inside that blob, and rolling the blob back — one `setItem` — used to
+  make the anchor read "never established" and hand out an empty, pin-less
+  store. On Android a blob older than the device's record now makes every
+  anchor read established instead (fail closed, and the identity still
+  unlocks: the keys are the same in every version). An existing install arms
+  on its first unlock after the update (one re-export). Because "the device
+  says a store existed and none is there" is the same state for a deletion
+  and for a first write lost in a crash, the deletion alarm now offers ONE
+  recovery that keeps the identity: start over with an empty store, behind an
+  explicit confirm (the OTP adoption gate's trade). Residual, stated:
+  root can delete the slot AND restore a blob that claims nothing (every
+  pre-fix blob is one), which reads as a first run — root cannot rewind, but
+  can make the device forget; and in the browser the same residual as above
+  applies.
 - **M-03 / L-01 / L-02.** Dedicated stricter rate bucket on `/api/auth/challenge`;
   `Strict-Transport-Security` sent over HTTPS; dev files (`package.json`,
   `*.test.mjs`) are 404'd and removed from the deployed client.
