@@ -345,11 +345,27 @@ def test_api_rate_limit(monkeypatch):
 
 def test_lookup_rate_limit(monkeypatch):
     from relay import KeyedRateLimiter
-    # The lookup path has its own, stricter bucket (anti-enumeration).
+    # The lookup path has its own, stricter bucket (anti-enumeration). Phase-7
+    # pentest 2026-09-16 F-P7-3: it is charged AFTER the token gate and keyed on
+    # the TARGET, so garbage without a token spends nothing and a token holder
+    # can only exhaust the one handle they hold a token for.
     monkeypatch.setattr(accounts, "_lookup_limiter", KeyedRateLimiter(3, 0.001))
-    codes = [client.get("/api/users/whoever", params={"t": "x"}).status_code for _ in range(6)]
-    assert 429 in codes, codes
-    assert codes.count(429) >= 2, codes
+    ident = _new_identity()
+    r = client.post("/api/register", json=_register_body("lookup-target", ident))
+    assert r.status_code == 200, r.text
+    token = r.json()["lookup_token"]
+    # 1. Unauthenticated garbage (no token) never reaches the bucket.
+    garbage = [client.get("/api/users/lookup-target", params={"t": "x"}).status_code for _ in range(8)]
+    assert garbage == [404] * 8, garbage
+    # 2. ...so the target is still reachable with its token afterwards.
+    codes = [client.get("/api/users/lookup-target", params={"t": token}).status_code for _ in range(6)]
+    assert codes[:3] == [200, 200, 200], codes
+    assert codes[3:] == [429, 429, 429], codes
+    # 3. Exhausting one target's bucket says nothing about another's.
+    ident2 = _new_identity()
+    r = client.post("/api/register", json=_register_body("lookup-other", ident2))
+    assert r.status_code == 200, r.text
+    assert client.get("/api/users/lookup-other", params={"t": r.json()["lookup_token"]}).status_code == 200
 
 
 def test_account_cap_enforced(monkeypatch):

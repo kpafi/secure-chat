@@ -1695,6 +1695,7 @@ async function sendChatMessage(e) {
 // = the SEALED bundle (signature-verified in sealed.open). The self-claimed
 // handle inside is used only to (a) name a brand-new contact and (b) store the
 // reply token; an existing contact keyed by the same bundle always wins.
+let mailThrottled = false; // F-P7-2: the 429 warning is said once per outage
 async function pollMailbox() {
   if (!identity || !chats.isUnlocked() || !contacts.isUnlocked()) return;
   // Fix review round 2 (M-1): re-authenticate from HERE, not only from the 401
@@ -1717,11 +1718,19 @@ async function pollMailbox() {
   let batch;
   try {
     batch = await account.fetchMail(API_BASE, apiToken);
+    mailThrottled = false;
   } catch (e) {
     // A directory session lasts TOKEN_TTL_SEC. When it expires the fetch 401s
     // forever and mail stops arriving with no visible sign, so drop the token
     // and let the block above re-authenticate on the next tick.
     if (e && e.status === 401) apiToken = null;
+    // Phase-7 pentest 2026-09-16 F-P7-2: a 429 used to be a bare return — mail
+    // silently stopped while the client kept polling. Say so, once per outage.
+    if (e && e.status === 429 && !mailThrottled) {
+      mailThrottled = true;
+      hint("The directory is rate-limiting mail fetches — sealed messages are delayed. Retrying.", true);
+      addLine("sys", "", "[the directory is rate-limiting mail fetches — sealed messages are delayed]");
+    }
     return;
   }
   let changed = false;

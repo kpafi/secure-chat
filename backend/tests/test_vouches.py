@@ -191,8 +191,12 @@ def test_vouch_is_throttled_on_the_anti_enumeration_bucket():
 
     Identical answers are not enough on their own — an oracle you can hit at
     router speed is still an oracle if any OTHER signal (timing, or simply a
-    later behavioural difference) ever leaks. /vouch shares `lookup_rate_limit`
-    with `GET /users/{username}`, so enumeration is bounded either way.
+    later behavioural difference) ever leaks. /vouch is on the same strict
+    `_lookup_limiter` as `GET /users/{username}`, so enumeration is bounded
+    either way. Phase-7 pentest 2026-09-16 F-P7-3: the bucket is keyed per
+    SUBJECT now — the authenticated voucher here, the target for lookups — and
+    charged after the gate, so it can no longer be drained by anyone behind Tor
+    with no account. The bound per prober is unchanged.
     """
     accounts._lookup_limiter._buckets.clear()
     alice = _register("wot-lim-alice")
@@ -206,10 +210,18 @@ def test_vouch_is_throttled_on_the_anti_enumeration_bucket():
     ]
     assert 429 in codes, f"/vouch is not on the anti-enumeration bucket: {codes}"
 
-    # Cross-check that it is the SAME bucket, not merely some limiter: draining
-    # it via /vouch must throttle a /users lookup too.
+    # Probing many DIFFERENT targets is what enumeration looks like; the
+    # voucher's bucket bounds it whatever the target is.
+    probe = dict(body, target="wot-lim-ghost")
+    assert client.post("/api/vouch", json=probe, headers=_auth(tok)).status_code == 429
+
+    # The bucket is per voucher: another account is not throttled by alice's
+    # probing, and bob's own lookup budget (per target) is untouched by it.
+    carol = _register("wot-lim-carol")
+    r = client.post("/api/vouch", json=_vouch_body(carol, bob), headers=_auth(_login(carol)))
+    assert r.status_code == 200, r.text
     r = client.get(f"/api/users/{bob['username']}", params={"t": bob["token"]})
-    assert r.status_code == 429, "/vouch must share lookup_rate_limit, not have its own"
+    assert r.status_code == 200, "F-P7-3: draining one prober's budget must not deny lookups of the target to everyone"
 
 
 def _register_v2(username):

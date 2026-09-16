@@ -343,8 +343,17 @@ TOKEN_TTL_SEC = 3600         # issued session-token lifetime
 # session token and DELETES what it returns. Everything is bounded.
 MAX_ENVELOPE_BYTES = 64 * 1024        # one sealed envelope (matches WS frame cap)
 MAX_MAILBOX_PER_RECIPIENT = 200       # queued envelopes per inbox
-MAX_MAILBOX_TOTAL = 100_000           # queued envelopes server-wide
+MAX_MAILBOX_TOTAL = 100_000           # queued envelopes server-wide (row count)
+# Phase-7 pentest 2026-09-16 F-P7-1: the row count alone let ~100 KB of one-byte
+# envelopes to throwaway accounts fill the server-wide budget for the full TTL.
+# The budget is BYTES first (rows second), per inbox and server-wide, and mail
+# queued to a recipient that has NEVER fetched dies much sooner than the TTL —
+# an attacker's throwaway inboxes never fetch; a real one polls within seconds
+# of registering.
+MAX_MAILBOX_TOTAL_BYTES = 256 * 1024 * 1024       # queued envelope bytes server-wide
+MAX_MAILBOX_PER_RECIPIENT_BYTES = 8 * 1024 * 1024  # queued envelope bytes per inbox
 MAILBOX_TTL_SEC = 14 * 24 * 3600      # unfetched mail expires
+MAILBOX_UNFETCHED_TTL_SEC = 24 * 3600 # ...much sooner for an inbox that has never been fetched
 # Pentest 2026-08-07 F-RELAY-004: this bucket was keyed per host (one global
 # bucket behind Tor) and charged BEFORE the lookup-token gate, so unauthenticated
 # posts to a nonexistent recipient drained mail delivery for everyone. It is now
@@ -366,8 +375,17 @@ MAILBOX_GLOBAL_RATE_REFILL_PER_SEC = 10.0 # sustained posts/second, all recipien
 # starved registration/lookup for everyone. This bucket is sized for polling
 # (~180 concurrent pollers) while still bounding a flood, and it cannot starve
 # the other endpoints because it is separate.
-MAILBOX_FETCH_RATE_CAPACITY = 120     # burst fetches
-MAILBOX_FETCH_RATE_REFILL_PER_SEC = 30.0  # sustained fetches/second
+# F-P7-2: keyed PER AUTHENTICATED USER (it was per client host, charged before
+# the token gate — one shared bucket for everyone behind Tor, drainable by
+# anyone with no account). A client polls every 6 s.
+MAILBOX_FETCH_RATE_CAPACITY = 30      # burst fetches per user
+MAILBOX_FETCH_RATE_REFILL_PER_SEC = 1.0   # sustained fetches/second per user
+# The per-host ceiling on the mailbox router, charged before anything else.
+# Behind Tor this is one bucket for everybody, so it is a backstop against
+# runaway clients and nothing more: the controls that matter are per user and
+# per recipient, after the gates (F-P7-2, F-P7-4).
+MAILBOX_HOST_RATE_CAPACITY = 600
+MAILBOX_HOST_RATE_REFILL_PER_SEC = 50.0
 
 # --- Web-of-trust vouches --------------------------------------------------
 # A vouch is a dual-signed public statement "voucher has verified target's

@@ -285,8 +285,17 @@ def challenge_rate_limit(request: Request) -> None:
         raise HTTPException(status_code=429, detail="rate limited")
 
 
-def lookup_rate_limit(request: Request) -> None:
-    if not _lookup_limiter.allow(client_key(request)):
+# Phase-7 pentest 2026-09-16 F-P7-3: `_lookup_limiter` used to be a dependency
+# keyed on the client host and charged before the token gate — eleven
+# unauthenticated garbage lookups drained it, and at 1 req / 2 s nobody behind
+# Tor could look up a handle (add-by-handle, or a Live room with a handle
+# filled in). It is now charged INSIDE each handler, after the token gate, keyed
+# on the TARGET (or on the authenticated voucher for POST /vouch): garbage
+# without a token spends nothing, and a token holder can only exhaust the one
+# handle they hold a token for. The per-host `_api_limiter` on the router is the
+# ceiling in front of the gate.
+def _charge_lookup(key: str) -> None:
+    if not _lookup_limiter.allow(key):
         raise HTTPException(status_code=429, detail="rate limited")
 
 
@@ -747,7 +756,7 @@ def register(req: RegisterReq) -> dict:
     return {"status": "registered", "username": req.username, "lookup_token": token}
 
 
-@router.get("/users/{username}", dependencies=[Depends(lookup_rate_limit)])
+@router.get("/users/{username}")
 def get_user(username: str, t: str = Query(default="", max_length=64)) -> dict:
     # Anti-enumeration (I1): a lookup must present the per-account token. A
     # missing user AND a wrong token return an IDENTICAL 404, so probing a
@@ -763,6 +772,7 @@ def get_user(username: str, t: str = Query(default="", max_length=64)) -> dict:
     stored = row["lookup_token"] if row is not None else secrets.token_urlsafe(config.LOOKUP_TOKEN_BYTES)
     if not token_matches(t, stored) or row is None:
         raise HTTPException(status_code=404, detail="no such user")
+    _charge_lookup("lookup:" + username)  # F-P7-3: after the gate, per target
     # The public identity bundle others will pin + verify in person. Encryption
     # keys (bundle v2) are included when the account has published them.
     out = {"username": username, "ed": row["ed_pub"], "mldsa": row["mldsa_pub"]}
@@ -944,7 +954,7 @@ class VouchReq(BaseModel):
     mldsa_sig: str  # voucher's ML-DSA-65 signature over the same message
 
 
-@router.post("/vouch", dependencies=[Depends(lookup_rate_limit)])
+@router.post("/vouch")
 def vouch(req: VouchReq, username: str = Depends(current_user)) -> dict:
     """Publish (or refresh) a dual-signed vouch for `target`.
 
@@ -953,6 +963,7 @@ def vouch(req: VouchReq, username: str = Depends(current_user)) -> dict:
     can only ever hold statements the voucher really signed about the target's
     real directory entry. Clients still re-verify against their own pins.
     """
+    _charge_lookup("vouch:" + username)  # F-P7-3: per authenticated voucher
     _check_username(req.target)
     if req.target == username:
         raise HTTPException(status_code=422, detail="cannot vouch for yourself")
@@ -1029,7 +1040,7 @@ def unvouch(target: str, username: str = Depends(current_user)) -> dict:
     return {"status": "removed", "target": target}
 
 
-@router.get("/users/{username}/vouches", dependencies=[Depends(lookup_rate_limit)])
+@router.get("/users/{username}/vouches")
 def get_vouches(username: str, t: str = Query(default="", max_length=64)) -> dict:
     """Vouches ABOUT `username`, gated by the same lookup token as the bundle.
 
@@ -1046,6 +1057,7 @@ def get_vouches(username: str, t: str = Query(default="", max_length=64)) -> dic
         stored = row["lookup_token"] if row is not None else secrets.token_urlsafe(config.LOOKUP_TOKEN_BYTES)
         if not token_matches(t, stored) or row is None:
             raise HTTPException(status_code=404, detail="no such user")
+        _charge_lookup("lookup:" + username)  # F-P7-3: after the gate, per target
         rows = conn.execute(
             """
             SELECT v.voucher, v.sig_ed, v.sig_mldsa, v.created_at, a.ed_pub, a.mldsa_pub
