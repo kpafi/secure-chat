@@ -2,7 +2,7 @@
 
 A thin native shell around the **exact same** web client in `../client`. The
 point of the app (versus opening the site in a browser) is to close the web
-deployment's one honest trust gap (README "H1"): a browser trusts the server to
+deployment's one honest trust gap (README, "Trust boundary of the web client"): a browser trusts the server to
 serve honest JavaScript on every load, so a compromised server could ship
 malicious crypto. The app instead **bundles the audited client inside the APK**
 and treats the relay as nothing but a dumb WebSocket/HTTP endpoint for opaque
@@ -35,6 +35,11 @@ ciphertext.
   tcp:8000` and set the relay to `http://127.0.0.1:8000`.
 - Identity keys and pins live in the WebView's `localStorage` (managed by the
   bundled client), exactly as on the web. The app persists only the relay URL.
+- **OTP pad floor** (`PadFloor.kt`): the monotone consumption watermark for
+  one-time pads lives in app-private storage behind an AndroidKeyStore HMAC, not
+  in `localStorage`, so a rolled-back pad is refused outright instead of
+  prompting. This is why OTP's rollback guarantee is stronger in the app than in
+  a browser (README, "OTP mode"; pentest 2026-07-28 F-1).
 
 ## Relay-side requirement
 Because the app's origin differs from the relay's, the relay must allow-list it
@@ -48,25 +53,42 @@ with `SECURE_CHAT_EXTRA_ORIGINS="https://…"` — no code edit needed.
 # Needs a full JDK 21 (with jlink) and the Android SDK (platform 34, build-tools 34).
 export ANDROID_HOME=$HOME/android-sdk
 ./gradlew assembleDebug        # -> app/build/outputs/apk/debug/app-debug.apk
+
+# If `java -version` is not 21, point Gradle at a 21 explicitly. On this box the
+# system default is a JDK 25 EA, which fails with a Gradle/AGP incompatibility
+# that reads like a project error but is not (it fails identically on unmodified
+# master). This is the invocation that works:
+./gradlew assembleDebug -Dorg.gradle.java.home=/usr/lib/jvm/java-21-openjdk-amd64
 ```
+Dependency verification is on (`gradle/verification-metadata.xml`), so artifacts
+are hash-pinned. A first run after a Gradle-cache change can report a transient
+verification failure for test-only artifacts; re-running resolves it. A failure
+that PERSISTS is a real one — do not add hashes to make it quiet without knowing
+what changed.
 The bundled web client is **generated at build time** from `../client` by the
 `syncWebClient` Gradle task (so it can never drift from the reviewed source);
 `assets/web/` is gitignored.
 
-## Verification status (2026-07-08)
-- Debug APK builds clean from source; all 21 client files packaged.
-- Cross-origin mechanism verified in a real browser (Chromium): bundled client
-  on one origin, relay on another, relay config injected before scripts, app CSP
-  applied — full DHKE handshake (matching safety numbers), two-way messages, and
-  a cross-origin `/api` register all succeed.
-- **Verified ON-DEVICE** (Android 14 emulator, `google_apis;x86_64`, KVM): app
-  installs and renders the full UI in the real WebView; the relay config is
-  injected before page scripts (`addDocumentStartJavaScript` works on WebView
-  113); driven via CDP against a host-side AES256 peer over the relay (through
-  `adb reverse` loopback), the on-device WebSocket reached the relay, the AES256
-  nonce exchange completed, and messages decrypted **both directions** on the
-  device. This is what surfaced the Mixed-Content transport constraint above
-  (a `ws://10.0.2.2` relay was blocked; `127.0.0.1` via `adb reverse` works).
-- Remaining polish: app icon, a release-signing config, and an on-device pass of
-  the identity + safety-number gate (DHKE/RSA/PQKEM) — only AES256 was driven
-  end-to-end on-device so far (the handshake modes are covered in-browser).
+## Verification status
+- 2026-07-08: debug APK builds clean from source; cross-origin mechanism verified
+  in a real browser (bundled client on one origin, relay on another, relay config
+  injected before scripts, app CSP applied — DHKE handshake with matching safety
+  numbers, two-way messages, cross-origin `/api` register). On an Android 14
+  emulator the on-device WebSocket reached the relay via `adb reverse` and AES256
+  messages decrypted both ways — which is what surfaced the Mixed-Content
+  transport constraint above.
+- 2026-07-27/28: installed on a physical phone and used against the live
+  relay; contact-store and OTP-pad at-rest migrations confirmed on-device
+  (details in `PROGRESS.md`).
+- Release signing is configured via a gitignored `keystore.properties` (copy
+  `keystore.properties.example`); `assembleRelease` without it produces an
+  unsigned APK. A launcher icon ships.
+- 2026-08-21: `assembleDebug` **builds clean** here with JDK 21 (see above) —
+  the JDK-25 breakage recorded in earlier notes was a toolchain mismatch, not a
+  project defect. The password `prompt` dialog now sets its own `FLAG_SECURE`
+  (see below).
+- Not recorded as driven end-to-end on a device: the identity + safety-number
+  gate for DHKE/PQKEM (those modes are covered in-browser by `e2e/all-modes.mjs`).
+- **Still needs a physical device** (no device was attached when this was
+  written): that the recents snapshot is blank, that the password prompt cannot
+  be screen-captured, and the `PadFloor` native-floor proof.

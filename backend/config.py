@@ -121,8 +121,30 @@ TURNAWAY_NOTICE_SEC = 5.0
 # nobody, so a misconfigured deployment fails CLOSED (one shared bucket) rather
 # than open (unlimited buckets).
 #
-# Set SECURE_CHAT_TRUSTED_PROXIES=127.0.0.1 when running behind the Caddy
-# reverse proxy. Leave it UNSET for a direct/.onion deployment.
+# DO NOT set SECURE_CHAT_TRUSTED_PROXIES=127.0.0.1. Pentest 2026-08-07
+# F-RELAY-001: this file used to recommend exactly that "when running behind
+# the Caddy reverse proxy", and on the shipped topology that recommendation
+# reopens F-03.
+#
+# `deploy/Caddyfile` proxies to 127.0.0.1:8000 and `deploy/torrc.secure-chat`
+# forwards the onion service to the SAME socket (`HiddenServicePort 80
+# 127.0.0.1:8000`). Caddy appends the real client address as the rightmost
+# X-Forwarded-For hop, which is why trusting the rightmost hop is sound for
+# Caddy — but Tor is a raw TCP forward that neither sanitises nor appends
+# anything, and both arrive as the identical loopback peer. Trusting the IP
+# 127.0.0.1 therefore trusts Tor's visitors as if they were Caddy: an onion
+# visitor sets any X-Forwarded-For it likes and mints a fresh, uncontended
+# bucket per request, defeating the anti-enumeration lookup limiter, the
+# challenge limiter, the registration limiter and both mailbox limiters at
+# once. Measured on a loopback relay: 25 challenge POSTs with a rotating header
+# gave 25x 200 / 0x 429 with the variable set, versus 10x 200 / 15x 429 without.
+#
+# `deploy/secure-chat.service` leaves it unset and `deploy/README.md` says so;
+# this file is now consistent with both. An operator who genuinely needs
+# X-Forwarded-For must first make the trusted front end distinguishable from a
+# raw TCP forward — bind Caddy and Tor to DIFFERENT loopback ports and trust
+# only Caddy's, or have Caddy inject a shared secret header Tor cannot supply.
+# Trusting a bare IP that two different front ends share is the bug.
 TRUSTED_PROXY_IPS = frozenset(
     p.strip() for p in os.environ.get("SECURE_CHAT_TRUSTED_PROXIES", "").split(",") if p.strip()
 )
@@ -137,10 +159,48 @@ API_RATE_REFILL_PER_SEC = 5.0 # sustained requests/second
 
 # Dedicated, stricter bucket for the login CHALLENGE endpoint (M-03). A
 # challenge is cheap for us but seeds pending state, so cap the mint rate well
-# below the general /api limiter. Keyed per client host (one global bucket
-# behind Tor, which is the meaningful control there).
-CHALLENGE_RATE_CAPACITY = 10        # burst allowance (challenges)
-CHALLENGE_RATE_REFILL_PER_SEC = 0.5 # sustained challenges/second
+# below the general /api limiter.
+#
+# Pentest 2026-08-07 F-RELAY-003: keyed per client host, this was one global
+# bucket behind Tor, so any unauthenticated visitor could hold it empty and deny
+# login to every account on the relay. It is now keyed per USERNAME (see
+# accounts.py), which is the only fairness axis available when every request
+# shares one loopback address.
+#
+# Pentest 2026-08-08 item 19, and the refill is 2.0 rather than the original 0.5
+# because of it. The reasoning is counter-intuitive, so it is written down.
+#
+# Every challenge request is charged to the GLOBAL bucket below BEFORE this
+# per-username one is consulted, so an attacker's total spend is capped at
+# CHALLENGE_GLOBAL_RATE_REFILL_PER_SEC no matter how they aim it. Holding one
+# victim's bucket empty costs this refill rate. So:
+#
+#     simultaneous victims = CHALLENGE_GLOBAL_RATE_REFILL_PER_SEC
+#                          / CHALLENGE_RATE_REFILL_PER_SEC
+#
+# At the original 0.5/s that was 4/0.5 = EIGHT accounts one unauthenticated
+# visitor could silence at once. At 2.0/s it is two. Making this bucket LOOSER
+# shrinks the attacker's reach, because the binding constraint on them is the
+# global ceiling, not this one.
+#
+# It costs honest users nothing: a client mints one or two challenges per login
+# and logs in about once an hour, and the client's own `autoLogin` backoff caps
+# retries at one per 12 s even when it is failing. There is no legitimate caller
+# anywhere near 2/s for a single account.
+#
+# Do not "tighten" this back without redoing that division — a lower number here
+# looks stricter and is strictly worse. `test_rate_limit_invariants.py` pins the
+# ratio so the mistake fails a test instead of shipping.
+CHALLENGE_RATE_CAPACITY = 10        # burst allowance (challenges per username)
+CHALLENGE_RATE_REFILL_PER_SEC = 2.0 # sustained challenges/second per username
+
+# The global ceiling that used to be implicit in the shared bucket (F-RELAY-003).
+# Sized so honest traffic never meets it — a real user logging in spends 1-2
+# challenges — while an attacker draining accounts one at a time still hits a
+# wall well before they can cover a directory. Keyed per client host, i.e. one
+# bucket behind Tor, which is correct for an absolute capacity limit.
+CHALLENGE_GLOBAL_RATE_CAPACITY = 120        # burst allowance (challenges, all accounts)
+CHALLENGE_GLOBAL_RATE_REFILL_PER_SEC = 4.0  # sustained challenges/second, all accounts
 
 # Dedicated bucket for REGISTRATION (pentest 2026-07-26 P-09). Registration is
 # the one endpoint that must distinguish a taken username (409) from a free one
@@ -283,10 +343,35 @@ TOKEN_TTL_SEC = 3600         # issued session-token lifetime
 # session token and DELETES what it returns. Everything is bounded.
 MAX_ENVELOPE_BYTES = 64 * 1024        # one sealed envelope (matches WS frame cap)
 MAX_MAILBOX_PER_RECIPIENT = 200       # queued envelopes per inbox
-MAX_MAILBOX_TOTAL = 100_000           # queued envelopes server-wide
+# Phase-7 pentest 2026-09-16 F-P7-1 (and the review of its first fix): a row
+# count alone let ~100 KB of one-byte envelopes to throwaway accounts fill the
+# server-wide budget, and "storage full" was a relay-wide 503 for the whole
+# 14-day TTL. Now: envelopes have a realistic MINIMUM size (a sealed envelope
+# carries an ML-KEM ciphertext, so a genuine one is well over 1 KiB), the
+# budget is BYTES first with a per-inbox share, the row cap only exists to
+# bound table size, and when the server-wide budget is full the OLDEST queued
+# mail is evicted instead of refusing new mail. Under a sustained flood
+# retention therefore degrades (mail must be fetched sooner) rather than
+# delivery stopping; with free registration that is the honest limit, and it
+# is stated in mailbox.py.
+MIN_ENVELOPE_BYTES = 256
+MAX_MAILBOX_TOTAL = 1_000_000                       # rows, bounds the table; bytes bind first
+MAX_MAILBOX_TOTAL_BYTES = 256 * 1024 * 1024        # queued envelope bytes server-wide (evict-oldest)
+MAX_MAILBOX_PER_RECIPIENT_BYTES = 4 * 1024 * 1024   # queued envelope bytes per inbox (hard)
 MAILBOX_TTL_SEC = 14 * 24 * 3600      # unfetched mail expires
-MAILBOX_RATE_CAPACITY = 30            # burst posts per host
-MAILBOX_RATE_REFILL_PER_SEC = 1.0     # sustained posts/second per host
+# Pentest 2026-08-07 F-RELAY-004: this bucket was keyed per host (one global
+# bucket behind Tor) and charged BEFORE the lookup-token gate, so unauthenticated
+# posts to a nonexistent recipient drained mail delivery for everyone. It is now
+# keyed per RECIPIENT and charged after the token check (see mailbox.py).
+MAILBOX_RATE_CAPACITY = 30            # burst posts per recipient inbox
+MAILBOX_RATE_REFILL_PER_SEC = 1.0     # sustained posts/second per recipient inbox
+
+# The absolute ceiling that used to be implicit in the shared bucket. Keyed per
+# host, so one bucket behind Tor — deliberate, since this is the "how much
+# mailbox POST traffic will this relay accept at all" limit. Generous enough
+# that honest senders never meet it.
+MAILBOX_GLOBAL_RATE_CAPACITY = 300        # burst posts, all recipients
+MAILBOX_GLOBAL_RATE_REFILL_PER_SEC = 10.0 # sustained posts/second, all recipients
 
 # Dedicated bucket for FETCHING mail (pentest 2026-07-26 P-11). GET used to have
 # no limiter at all; putting it on the shared /api bucket closed that but created
@@ -295,8 +380,25 @@ MAILBOX_RATE_REFILL_PER_SEC = 1.0     # sustained posts/second per host
 # starved registration/lookup for everyone. This bucket is sized for polling
 # (~180 concurrent pollers) while still bounding a flood, and it cannot starve
 # the other endpoints because it is separate.
-MAILBOX_FETCH_RATE_CAPACITY = 120     # burst fetches
-MAILBOX_FETCH_RATE_REFILL_PER_SEC = 30.0  # sustained fetches/second
+# F-P7-2: keyed PER AUTHENTICATED USER (it was per client host, charged before
+# the token gate — one shared bucket for everyone behind Tor, drainable by
+# anyone with no account). A client polls every 6 s.
+MAILBOX_FETCH_RATE_CAPACITY = 30      # burst fetches per user
+MAILBOX_FETCH_RATE_REFILL_PER_SEC = 1.0   # sustained fetches/second per user
+# The per-host ceiling on mailbox POST, charged before the token gate. Behind
+# Tor this is one bucket for everybody, so it is a backstop against runaway
+# clients and nothing more: the controls that matter are per user and per
+# recipient, after the gates (F-P7-2, F-P7-4). It is POST-only: the review of
+# the first fix showed one bucket on both verbs let a POST flood deny every
+# authenticated GET, which is F-P7-2 through the other door. GET charges
+# nothing before auth (`current_user` is a dict lookup).
+MAILBOX_POST_HOST_RATE_CAPACITY = 600
+MAILBOX_POST_HOST_RATE_REFILL_PER_SEC = 50.0
+# POST /api/vouch: per authenticated voucher (the anti-enumeration bound per
+# prober) AND a per-host ceiling, because accounts are free and a per-account
+# bound alone scales with throwaway accounts (review of the first F-P7-3 fix).
+VOUCH_HOST_RATE_CAPACITY = 30
+VOUCH_HOST_RATE_REFILL_PER_SEC = 1.0
 
 # --- Web-of-trust vouches --------------------------------------------------
 # A vouch is a dual-signed public statement "voucher has verified target's

@@ -113,6 +113,61 @@ export class Identity {
     this._mlkemSecret = mlkemSecret || null; // Uint8Array
     this.mlkemPub = mlkemPub || null;    // Uint8Array(1184)
     this.upgraded = false; // true when import() added missing encryption keys
+    // Authenticated device facts, carried INSIDE this identity's AEAD.
+    //
+    // Pentest 2026-08-07 F-ATREST-003/004 (both confirmed). The contact store's
+    // anti-deletion control was a witness in localStorage, and its whole truth
+    // table bottomed out in "neither store nor witness present -> genuine first
+    // run -> proceed". Both are plain localStorage keys and deleting one needs
+    // no passphrase, so two `removeItem` calls produced a silent, empty,
+    // PIN-LESS store: key-change detection simply off, alarm inverted, evidence
+    // healed on the next persist. L-1 raised the cost from one removeItem to
+    // two and bought nothing else.
+    //
+    // The bit that says "a store was established on this device" therefore
+    // cannot live in a deletable key. It lives here instead. Contents are
+    // one-shot booleans (see contacts.js), so this costs one extra re-export
+    // over the life of the device, not one per save.
+    //
+    // HONEST LIMIT (fix review 2026-08-07, F4). An earlier version of this
+    // comment claimed the flag "cannot be deleted without deleting the identity
+    // itself", and that is FALSE. An attacker does not have to delete the blob
+    // — they roll it back. A restored older `sc.identity.v1` opens with the
+    // same passphrase and carries the same keys, fingerprint and safety number,
+    // so the user notices nothing; `import` below then reads no `flags`, the
+    // anchor reads false, and the contact store's deletion check takes its
+    // "genuine first run" path. Cost to the attacker: one setItem plus the two
+    // removeItem calls they already had.
+    //
+    // Note this is not hypothetical for existing devices: every identity blob
+    // written before this change has no `flags` field at all, so today's blob
+    // IS the archived artifact.
+    //
+    // The anchor is therefore only as strong as the identity blob's own
+    // rollback resistance. F-ATREST-008 (fixed 2026-09-16, see identity-store.js)
+    // gives the blob that resistance ON ANDROID: `generation` below is a monotone
+    // counter sealed inside this AEAD and mirrored into the device's Keystore-MACed
+    // floor after every write, so a restored older blob is one whose counter is
+    // BEHIND the floor — and identity-store.js then reads every anchor as
+    // established (fails closed) instead of believing the archived copy. In a
+    // plain browser there is no floor and the residual stands, exactly as for OTP.
+    this.deviceFlags = {};
+    // F-ATREST-008. Monotone write counter for the blob AT REST. 0 means "never
+    // written with a counter" — every blob from before this change reads as 0,
+    // which is deliberately the OLDEST possible value: once a device has recorded
+    // any newer generation, the archived pre-fix blob is a rollback and is
+    // caught. This class only CARRIES the counter; identity-store.js is what
+    // advances it and compares it against the floor (the same split as
+    // contacts.js's generation vs. its witness).
+    this.generation = 0;
+    // What the writer measured about the native floor when this blob was sealed:
+    // `true` = a floor slot for the identity existed and was read back, `false`
+    // = no floor on that device (a plain browser), "unconfirmed" = a bridge was
+    // present but the slot's durable write could not be confirmed. The same three
+    // values, for the same reasons, as otp.js's CLAIM_* (A4/F-A3): a floor that
+    // was in force and is now ABSENT is evidence of deletion, and "could not
+    // arm" must never be spelled the same as "never had one".
+    this.floorClaim = false;
   }
 
   static async _genEncKeys() {
@@ -193,6 +248,15 @@ export class Identity {
       edPub: b64(this.edPubRaw),
       mldsaSecret: b64(this._mldsaSecret),
       mldsaPub: b64(this.mldsaPub),
+      // F-ATREST-003/004: inside the AEAD, so it cannot be forged or stripped
+      // without the passphrase. (It CAN be rolled back with the whole blob —
+      // that is what `gen` below is for; see the constructor.)
+      flags: this.deviceFlags || {},
+      // F-ATREST-008: both inside the AEAD, so a rolled-back blob carries its
+      // own OLD counter and cannot be re-labelled as current without the
+      // passphrase.
+      gen: this.generation,
+      floor: this.floorClaim,
     };
     if (this._ecdhPriv) {
       const ecdhPkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", this._ecdhPriv));
@@ -252,6 +316,21 @@ export class Identity {
       fields.mlkemPub = unb64(o.mlkemPub);
     }
     const id = new Identity(fields);
+    // Absent on any blob written before F-ATREST-003/004, which reads as "this
+    // device has not recorded a contact store yet" — the safe default, since a
+    // device that genuinely has one will record it on the next unlock.
+    id.deviceFlags = (o.flags && typeof o.flags === "object" && !Array.isArray(o.flags)) ? o.flags : {};
+    // F-ATREST-008. Absent on every pre-fix blob, and anything that is not a
+    // non-negative integer is read as 0 — the OLDEST value, so a malformed
+    // counter can only make the blob look older than the device's floor (a
+    // rollback verdict, fail-closed), never newer.
+    id.generation = (Number.isInteger(o.gen) && o.gen >= 0) ? o.gen : 0;
+    // Only the three known claim values are accepted; anything else reads as
+    // "unconfirmed", which claims nothing (no deletion alarm can be built on
+    // it) but still gets the rollback comparison. It must NOT read as `true`:
+    // a blob that claims a floor it never had would raise a false deletion
+    // alarm on the device it was written on.
+    id.floorClaim = (o.floor === true || o.floor === false) ? o.floor : "unconfirmed";
     if (!o.ecdhPriv) {
       // Pre-v3 blob: add encryption keys now. The SIGNING identity (and thus
       // fingerprint/safety number/pins) is unchanged; the caller should

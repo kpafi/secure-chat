@@ -99,6 +99,28 @@ export async function verifyHandshake(peerBundle, roomId, nonces, ephemeralPubB6
   );
 }
 
+// ---- admission proof: REMOVED 2026-08-08 ----------------------------------
+//
+// A `signAdmission`/`verifyAdmission` pair lived here between 2026-08-07 and
+// 2026-08-08, as the fix for F-PROTO-001's guest half: the owner signed "I let
+// this bundle in" over the room and both session nonces, and the guest verified
+// it before completing the handshake.
+//
+// It was unsound and is not coming back in this shape. The signature is checked
+// against the PEER's own bundle, and nothing in the transcript requires the
+// signer to be an identity the verifier trusts or a human to have been asked —
+// so an attacker signs one for its victim with a keypair it generates on the
+// spot. Reproduced end to end by `SCENARIO=attacker node
+// e2e/hostile-relay/proto001.mjs`: the shipped client, plus one assignment in
+// the attacker's copy, walked an unapproved identity all the way to the
+// safety-number screen.
+//
+// No binding repairs it. The room id reaches the relay in cleartext (it is the
+// `join` frame), so a hostile relay can always present itself as a legitimate
+// code-knowing participant, and every claim such a participant makes about its
+// own authority is the attacker's to choose. Approval is now decided from local
+// state on the receiving side — see `approvedBundle` in app.js.
+
 // ---- room admission (pentest 2026-07-26 P-08) ------------------------------
 // The knock is the introduction a waiting party sends to the room owner, who
 // decides whether to let them in. It is signed so the claim "these are my keys"

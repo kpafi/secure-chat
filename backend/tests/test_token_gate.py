@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from main import app  # noqa: E402
 from accounts import token_matches  # noqa: E402
 import accounts  # noqa: E402
+import config  # noqa: E402
 import mailbox  # noqa: E402
 
 client = TestClient(app)
@@ -35,6 +36,7 @@ def _reset_limiters():
     # cases below would otherwise throttle each other and mask the real result.
     accounts._api_limiter._buckets.clear()
     accounts._lookup_limiter._buckets.clear()
+    accounts._vouch_host_limiter._buckets.clear()
     accounts._challenge_limiter._buckets.clear()
     mailbox._post_limiter._buckets.clear()
 
@@ -65,7 +67,7 @@ def test_vouch_lookup_never_500s(t):
 @pytest.mark.parametrize("t", HOSTILE_TOKENS)
 def test_mailbox_post_never_500s(t):
     r = client.post(
-        "/api/mailbox/nosuchuser", params={"t": t}, json={"envelope": "AAAA"}
+        "/api/mailbox/nosuchuser", params={"t": t}, json={"envelope": "A" * config.MIN_ENVELOPE_BYTES}
     )
     assert r.status_code == 404, f"{t!r} -> {r.status_code}"
 

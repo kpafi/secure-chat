@@ -14,6 +14,7 @@
 // behaviour (the modules throw with crypto.subtle absent) and by source (the
 // specific shapes a fallback would take are absent from the code).
 import assert from "node:assert";
+import { stripComments } from "./test-source.mjs";
 import { readFile, readdir } from "node:fs/promises";
 
 const HERE = new URL("./", import.meta.url);
@@ -57,7 +58,7 @@ const HERE = new URL("./", import.meta.url);
 
     // Every negotiated cipher mode must fail to become ready, and must refuse
     // to encrypt. `ready` staying false is what app.js gates on.
-    for (const alg of ["AES256", "DHKE", "RSA", "PQKEM"]) {
+    for (const alg of ["AES256", "DHKE", "PQKEM"]) {
       const c = crypto_.makeCipher(alg, "a".repeat(64), { passphrase: "x" });
       await assert.rejects(async () => {
         await c.init();
@@ -102,13 +103,33 @@ console.log("OK  crypto.subtle absent: identity, every cipher mode, and the stor
     for (const [re, what] of banned) {
       assert.ok(!re.test(src), `${f} contains ${what} — that is a crypto.subtle fallback`);
     }
-    // Math.random is fine for UI jitter but never for key/nonce/id material.
-    for (const line of src.split("\n")) {
+    // Math.random: banned outright in the client modules.
+    //
+    // Pentest 2026-08-07 F-CRYPTO-014. This used to allow Math.random on any
+    // line whose text lacked key/nonce/iv/salt/secret/token/randomBytes — a
+    // keyword grep of the same line. `const TAB_ID = Math.random()...` contains
+    // none of those words, so this check reported green on the one Math.random
+    // in the client that gated key material: TAB_ID was the sole discriminator
+    // for the OTP pad lease, i.e. the value standing between the user and a
+    // two-time pad. A rule that decides what is security-relevant by reading
+    // the words on the line will keep missing exactly the cases where the
+    // security relevance lives somewhere else, so it is now unconditional.
+    // If UI jitter ever genuinely needs it, add a named allowlist here rather
+    // than reopening the keyword heuristic.
+    // ROUND-5 (cold reviewer). The comment skip was a LINE-PREFIX regex —
+    // `/^\s*(\/\/|\/\*|\*)/` — which is the exact bypassable pattern
+    // test-source.mjs's stripComments() was written to replace, and which this
+    // repo has already documented as defeated three separate ways (`/**/ stmt;`
+    // executes while reading as a comment; `/* code */ realCode;` keeps the code
+    // on a "comment" line). The reviewer walked straight through it:
+    //   /* legacy engines */ if (!crypto.getRandomValues) return String(Math.random()).slice(2);
+    // as the first line of otp.js's randomId() — the pad-id generator — passed
+    // green. Every other source anchor in this suite already uses the scanner;
+    // this one was the last holdout.
+    const stripped = stripComments(src);
+    for (const [i, line] of stripped.split("\n").entries()) {
       if (!/Math\.random/.test(line)) continue;
-      assert.ok(
-        !/key|nonce|iv|salt|secret|token|random(Bytes|Values)/i.test(line),
-        `${f}: Math.random on a security-relevant line: ${line.trim()}`,
-      );
+      assert.fail(`${f}:${i + 1}: Math.random in a client module: ${line.trim()}`);
     }
   }
 }

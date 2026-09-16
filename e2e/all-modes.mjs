@@ -6,11 +6,17 @@
 //     SECURE_CHAT_E2E_URL=http://<addr>.onion node e2e/all-modes.mjs
 //
 // The other e2e runs each pin one flow (admission, async chat, dead ends) and
-// all of them happen to use the default mode. Nothing drove DHKE, AES256, RSA,
-// PQKEM and OTP through a real pair of browsers, so a mode could rot without a
-// single test noticing. This walks all five: pick the mode, open a room, get
-// approved, clear whatever gate that mode raises, and send a message BOTH ways
-// asserting the exact text arrives.
+// all of them happen to use the default mode. Nothing drove DHKE, AES256, PQKEM
+// and OTP through a real pair of browsers, so a mode could rot without a single
+// test noticing. This walks all four: pick the mode, open a room, get approved,
+// clear whatever gate that mode raises, and send a message BOTH ways asserting
+// the exact text arrives.
+//
+// RSA used to be the fifth. It was removed on 2026-08-21 (pentest F-CRYPTO-009:
+// a counterparty-chosen modulus hands the session to a passive observer and no
+// validation catches it), so it is now ASSERTED ABSENT rather than exercised —
+// see assertRsaDeprecated() below. A mode that merely vanished from MODES would
+// be invisible to this harness, which is the same rot this file exists to stop.
 //
 // Adding SECURE_CHAT_E2E_PROXY is what makes it a Tor run — Chromium resolves
 // .onion through the SOCKS5 proxy, so the same script proves the same flows
@@ -28,10 +34,36 @@ const SLOW = PROXY ? 3 : 1;
 const T = (ms) => ms * SLOW;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const MODES = ["DHKE", "AES256", "RSA", "PQKEM", "OTP"];
+const MODES = ["DHKE", "AES256", "PQKEM", "OTP"];
 const SHARED_PASS = cfg.chatPassphrase;
 const PAD_XFER_PASS = "e2e pad transfer passphrase — test only";
 const PAD_LOCAL_PASS = "e2e pad at-rest passphrase — test only";
+
+// F-PROTO-001 (rebuilt 2026-08-08): the peer whose device did NOT run the knock
+// prompt is asked to approve the other side's key before the handshake
+// completes, unless that key is already trusted — which since 2026-08-08
+// item 14 means ONLY a 🟢 key verified in person, never a contact picked by
+// name. Every session here is a raw room code between strangers, so the guest
+// always gets it. Authenticated modes only — AES256/OTP exchange no
+// identity, so there is nothing to approve.
+//
+// Item 20 (2026-08-10): this waits for the PEER-approval prompt specifically.
+// `#admit` is shared with the owner's knock prompt, so "un-hidden" matched
+// either one — and this helper would then click "Let them in" on a knock while
+// reporting that the guest had approved a key. app.js marks the panel with
+// `data-mode`; the button label is checked too, so the marker cannot drift away
+// from what the user is shown.
+async function approvePeerKey(page, timeout = 45000) {
+  await page.waitForFunction(() => {
+    const el = document.querySelector("#admit");
+    return !!el && !el.hidden && el.dataset.mode === "peer";
+  }, { timeout });
+  const label = await page.evaluate(() => document.querySelector("#admitOk").textContent.trim());
+  if (label !== "Connect") {
+    throw new Error(`expected the peer-approval prompt ("Connect"), got ${JSON.stringify(label)}`);
+  }
+  await page.click("#admitOk");
+}
 
 const results = [];
 function check(name, ok, detail = "") {
@@ -139,6 +171,8 @@ async function selectMode(page, mode) {
     const d = document.querySelector("#algDetails");
     if (d) d.open = true;
     const r = document.querySelector(`input[name="alg"][value="${m}"]`);
+    // Name the failure: a missing radio used to be a TypeError on `.checked`.
+    if (!r) throw new Error(`mode ${m} is not offered by this build`);
     r.checked = true;
     r.dispatchEvent(new Event("change", { bubbles: true }));
   }, mode);
@@ -249,6 +283,8 @@ async function runMode(mode, alice, bob) {
   check(`${mode}: owner sees the knocker's real fingerprint`, shownFp === bob.fingerprint,
     `${shownFp.slice(0, 20)}…`);
   await alice.page.click("#admitOk");
+  // The guest approves alice's key in turn (see approvePeerKey).
+  if (["DHKE", "PQKEM"].includes(mode)) await approvePeerKey(bob.page, T(45000));
 
   // Each mode raises its own gate: the identity-authenticated ones show a
   // safety number, AES256/OTP unlock straight away. Wait for whichever comes.
@@ -259,7 +295,7 @@ async function runMode(mode, alice, bob) {
   await Promise.all([settle(alice.page), settle(bob.page)]);
 
   const gated = await alice.page.evaluate(() => !document.querySelector("#verify").hidden);
-  const authenticated = ["DHKE", "RSA", "PQKEM"].includes(mode);
+  const authenticated = ["DHKE", "PQKEM"].includes(mode);
   check(`${mode}: ${authenticated ? "raises" : "does not raise"} a safety-number gate`,
     gated === authenticated, gated ? "safety number shown" : "unlocked directly");
 
@@ -302,6 +338,36 @@ async function runMode(mode, alice, bob) {
   }
 }
 
+// The deprecation gate (F-CRYPTO-009). Both halves are asserted, because
+// either one alone is the decorative half: the UI check alone would pass if
+// someone re-added `case "RSA":` behind a hidden radio, and the engine check
+// alone would pass while a dead card still invited users to pick it. The third
+// check makes the mode inventory exhaustive, so neither RSA's return nor a
+// brand-new untested mode can slip past MODES unnoticed.
+async function assertRsaDeprecated(page) {
+  const gone = await page.evaluate(
+    () => document.querySelector('input[name="alg"][value="RSA"]') === null);
+  check("RSA is no longer offered in the UI", gone);
+
+  const msg = await page.evaluate(async () => {
+    try {
+      const { makeCipher } = await import("./crypto.js");
+      makeCipher("RSA", "a".repeat(64));
+      return "NO THROW";
+    } catch (e) {
+      return String(e && e.message);
+    }
+  });
+  check("makeCipher refuses RSA by name, with the reason",
+    /RSA/.test(msg) && /no longer supported/i.test(msg) && !/^unsupported or unavailable/.test(msg),
+    msg.slice(0, 80));
+
+  const offered = await page.evaluate(
+    () => [...document.querySelectorAll('input[name="alg"]')].map((i) => i.value).sort());
+  check("the offered mode set is exactly the set this run exercises",
+    JSON.stringify(offered) === JSON.stringify([...MODES].sort()), offered.join(","));
+}
+
 console.log(`\n=== all encryption modes, two agents ===`);
 console.log(`    target: ${APP}`);
 console.log(`    proxy:  ${PROXY || "(none — direct)"}\n`);
@@ -310,6 +376,7 @@ const alice = await agent("alice");
 const bob = await agent("bob");
 check("two independent identities created", alice.fingerprint !== bob.fingerprint);
 
+await assertRsaDeprecated(alice.page);
 await exchangePad(alice, bob);
 for (const mode of MODES) await runMode(mode, alice, bob);
 

@@ -34,6 +34,7 @@ client = TestClient(app)
 def _reset():
     accounts._api_limiter._buckets.clear()
     accounts._lookup_limiter._buckets.clear()
+    accounts._vouch_host_limiter._buckets.clear()
     accounts._challenge_limiter._buckets.clear()
     mailbox._post_limiter._buckets.clear()
     yield
@@ -75,10 +76,17 @@ def test_trusted_proxy_uses_rightmost_hop():
 
 
 def test_rotating_xff_cannot_mint_fresh_buckets():
-    """The actual exploit: with no trusted proxy, rotation must not help."""
+    """The actual exploit: with no trusted proxy, rotation must not help.
+
+    Measured on the per-host `/api` ceiling (`_api_limiter`), which is the
+    limiter still keyed on `client_key` in front of every gate. (Phase-7 pentest
+    2026-09-16 F-P7-3 moved the strict lookup bucket BEHIND the token gate and
+    keyed it per target, so garbage lookups no longer touch it — which is the
+    point of that change, and why this test no longer uses it as its probe.)
+    """
     config.TRUSTED_PROXY_IPS = frozenset()
     codes = []
-    for i in range(config.LOOKUP_RATE_CAPACITY + 6):
+    for i in range(config.API_RATE_CAPACITY + 6):
         r = client.get(
             f"/api/users/nobody{i}",
             params={"t": "zz"},
@@ -164,7 +172,7 @@ def test_rotating_loopback_xff_cannot_bypass_the_limiter():
     config.TRUSTED_PROXY_IPS = frozenset()
     onion = TestClient(app, client=("127.0.0.1", 54321))
     codes = []
-    for i in range(config.LOOKUP_RATE_CAPACITY + 6):
+    for i in range(config.API_RATE_CAPACITY + 6):
         # Alternate between the two buckets the old code handed out.
         xff = "127.0.0.1" if i % 2 else "203.0.113.7"
         r = onion.get(

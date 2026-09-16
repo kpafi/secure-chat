@@ -81,7 +81,64 @@ let dataKey = null;
 let salt = null;
 let contacts = null; // array of contact records while unlocked
 let pins = null;     // { "<key>": {ed, mldsa} } — TOFU identity pins (M-02)
+// F-A2-R1: { "<pin key>": {at} } — tombstones for pins deleted as collateral of
+// SOMEONE ELSE's revocation. Keyed by the pin key, which is in hand at deletion
+// time, so it needs no guess about who holds those keys now. See dropPinsFor.
+let swept = null;
 let generation = 0;  // monotonic store generation (L-1); bumped on every persist
+
+// ---- the anti-deletion anchor (pentest 2026-08-07 F-ATREST-003/004) --------
+// Both findings are the same shape: every piece of evidence that a store OUGHT
+// to exist lived in localStorage, where deleting it needs no passphrase. The
+// witness raised the price of a silent wipe from one `removeItem` to two.
+//
+// The anchor moves that fact out of the two deletable keys and into the
+// identity's own AEAD (identity.js `deviceFlags`), where forging it needs the
+// passphrase.
+//
+// HONEST LIMIT (fix review 2026-08-07, F4). An earlier version of this comment
+// said "clearing it means deleting the identity blob, which locks the user out
+// — loud, not silent". That is FALSE and the claim is withdrawn: an attacker
+// rolls the identity blob BACK rather than deleting it. The restored blob opens
+// on the same passphrase with the same keys and safety number, carries no
+// `flags`, and this check then reads false and fails open exactly as before.
+// See the HONEST LIMIT note in identity.js and finding F-ATREST-008 (the
+// identity blob has no anti-rollback control of its own). What this fix
+// genuinely buys is the SHAPE tightening below plus a higher price for the
+// silent wipe; it is not the complete answer to F-ATREST-003/004 that the
+// first version of these comments claimed.
+//
+// F-ATREST-008 is closed as of 2026-09-16 (identity-store.js): the identity
+// blob carries a monotone generation mirrored into the Android native floor,
+// and under any at-rest verdict short of clean — rolled back, floor deleted,
+// tampered, or expected-but-unusable — the anchor app.js installs here answers
+// `established: true`. So on Android the rollback route now lands in the same
+// fail-closed branch as the deletion it was covering for. In a plain browser
+// there is no floor, and the paragraph above still describes the residual.
+//
+// Injected rather than imported so this module keeps knowing nothing about
+// identity storage; app.js owns the Identity object and wires it in before
+// unlocking. When no anchor is installed (an identity-less flow) every check
+// below degrades to exactly the pre-fix behaviour, so nothing new can fire a
+// false alarm on a path that never had an identity to anchor to.
+let anchor = null;
+
+export function setStoreAnchor(a) {
+  anchor = a;
+}
+
+// True when this device has recorded that a contact store exists. `false` also
+// covers "we cannot know" (no anchor installed), which is why every caller
+// treats it as evidence FOR failing closed and never as permission to proceed.
+export function storeExpected() {
+  return anchor !== null && anchor.established === true;
+}
+
+async function noteStoreEstablished() {
+  if (anchor === null || anchor.established === true) return;
+  await anchor.markEstablished();
+  anchor.established = true;
+}
 
 export function isUnlocked() {
   return dataKey !== null;
@@ -92,13 +149,14 @@ export function lock() {
   salt = null;
   contacts = null;
   pins = null;
+  swept = null;
   generation = 0;
 }
 
 // Unlock (or create) the store with the identity passphrase. Throws if a blob
 // exists but does not decrypt with this passphrase (foreign/tampered blob —
 // the caller decides whether to offer `wipe()`).
-export async function unlock(passphrase) {
+export async function unlock(passphrase, { startFresh = false } = {}) {
   if (!passphrase) throw new Error("passphrase required to unlock the contact store");
   const raw = localStorage.getItem(LS_CONTACTS);
   if (!raw) {
@@ -106,14 +164,25 @@ export async function unlock(passphrase) {
     // really IS a first run and not a store somebody deleted — see L-1. The
     // witness carries its OWN salt precisely so it stays readable when the
     // store that would otherwise hold the salt has been removed.
-    await assertStoreNotDeleted(passphrase);
+    // F-ATREST-008 fix review (F-2): `startFresh` is the consent gate. "No store,
+    // but this device says one was established" is, by construction, the same
+    // state for an attacker who deleted the store as for a device that lost an
+    // unflushed first write in a crash — the floor cannot tell them apart, so
+    // no policy can both refuse the attacker and spare the crash without a
+    // human in the loop. Same trade as otp.js's adoption gate: the alarm is
+    // shown with its full wording, and only an explicit, separately confirmed
+    // action (app.js, behind `confirm()`) passes `startFresh`. It skips ONLY
+    // this check; a store that exists is never discarded by it.
+    if (!startFresh) await assertStoreNotDeleted(passphrase);
     salt = crypto.getRandomValues(new Uint8Array(16));
     dataKey = await deriveKey(passphrase, salt, KDF_ITERS);
     contacts = [];
     pins = {};
+    swept = {};
     generation = 0;
     dropLegacyPins();
     await persist();
+    await noteStoreEstablished();
     return;
   }
   const blob = JSON.parse(raw);
@@ -151,20 +220,59 @@ export async function unlock(passphrase) {
   };
   if (tagged && data.d !== STORE_DOMAIN) throw notAStore();
   // Defence in depth for the untagged path: a genuine pre-v4 store is either
-  // the bare v1 array or an object carrying contacts/pins. A record with
-  // neither is not a store, whatever it claims.
-  const looksLikeStore = Array.isArray(data) ||
-    Object.prototype.hasOwnProperty.call(data, "contacts") ||
-    Object.prototype.hasOwnProperty.call(data, "pins");
+  // the bare v1 array or an object carrying contacts/pins.
+  //
+  // Pentest 2026-08-07 F-ATREST-004: this used to accept any object with an own
+  // property NAMED `contacts` or `pins`, whatever its value. The chat store
+  // (chats.js) is keyed by contact local label under the same passphrase and
+  // wrapper, so a chat literally named "pins" made the chat blob a valid
+  // "contact store" — `sc.contacts.v1 := sc.chats.v1` plus one `removeItem`
+  // yielded an empty pin-less store. Require the SHAPE, not the key name.
+  const isPlainObject = (o) => o !== null && typeof o === "object" && !Array.isArray(o);
+  // A pin map is keyed by `user:<name>` / `room:<id>` and its values are pin
+  // records. The chat store's plaintext is keyed by contact LOCAL LABEL and its
+  // values are chat records, so this is the property that actually separates
+  // the two — the key name `pins` alone never did.
+  const isPinMap = (o) => isPlainObject(o) && Object.keys(o).every(
+    (k) => /^(user|room):/.test(k) && isPlainObject(o[k]) && typeof o[k].ed === "string",
+  );
+  const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+  const looksLikeStore = Array.isArray(data) || (
+    isPlainObject(data) &&
+    (hasOwn(data, "contacts") || hasOwn(data, "pins")) &&
+    (!hasOwn(data, "contacts") || Array.isArray(data.contacts)) &&
+    (!hasOwn(data, "pins") || isPinMap(data.pins))
+  );
   if (!tagged && !looksLikeStore) throw notAStore();
+  // F-ATREST-004, the durable half. The legacy exemptions below (untagged
+  // plaintext, and plaintext with no generation counter) are keyed on the
+  // SHAPE of the decrypted record, so they never burn out: an attacker holding
+  // one archived pre-L-1 blob could replay the downgrade indefinitely, even
+  // after many legitimate v4 generations, resurrecting pins the user had
+  // already replaced and auto-unlocking messaging with no prompt. Once this
+  // device has recorded a store, the legacy shapes are simply not acceptable
+  // any more — the migration they exist for provably already happened.
+  if (storeExpected() && (!tagged || !Number.isInteger(data.gen))) {
+    lock();
+    throw new Error(
+      "your saved contacts have been replaced with an older-format copy that carries no rollback " +
+      "record — refusing to open it, because adopting it would restore identity pins you have " +
+      "since changed and turn off key-change warnings",
+    );
+  }
 
   // v1 blobs stored the bare contacts array; v2 wraps {contacts, pins}.
   if (Array.isArray(data)) {
     contacts = data;
     pins = {};
+    swept = {};
   } else {
     contacts = data.contacts || [];
     pins = data.pins || {};
+    // F-A2-R1: tombstones for pins swept by someone else's revocation, keyed by
+    // the PIN KEY. Absent in pre-2026-08-20 stores, which is simply "no sweep has
+    // happened here yet".
+    swept = (data.swept && typeof data.swept === "object") ? data.swept : {};
   }
   generation = Number.isInteger(data.gen) ? data.gen : 0;
   await assertNotRolledBack(data.gen);
@@ -176,6 +284,9 @@ export async function unlock(passphrase) {
   // current state (there is nothing to roll back TO yet) and start counting.
   if (!Number.isInteger(data.gen)) dirty = true;
   if (dirty) await persist();
+  // Record that this device has a store, so a later deletion cannot pass as a
+  // first run and a later legacy-shaped blob cannot pass as a migration.
+  await noteStoreEstablished();
 }
 
 // Pentest 2026-07-27 H-2: this used to be migrateLegacyPins(), which COPIED any
@@ -255,17 +366,43 @@ async function writeWitness() {
   }));
 }
 
+// F-ATREST-008 fix review (2026-09-16, F-2): every "the store is gone" refusal
+// carries a code, so app.js can offer the ONE recovery that does not destroy
+// the identity — starting over with an empty store, behind an explicit consent
+// gate (see unlock's `startFresh`). The message stays the user-facing text.
+function storeDeleted(message) {
+  const e = new Error(message);
+  e.code = "STORE_DELETED";
+  return e;
+}
+
 async function assertStoreNotDeleted(passphrase) {
   const w = await readWitness(passphrase);
-  if (w === null) return; // no witness either: genuine first run
+  if (w === null) {
+    // Pentest 2026-08-07 F-ATREST-003 (confirmed). "No store and no witness"
+    // used to mean "genuine first run" unconditionally — but the witness is an
+    // ordinary localStorage key and deleting it needs no passphrase, so an
+    // attacker who removed BOTH landed here and got a fresh, empty, pin-less
+    // store with no warning anywhere. The anchor is the half they cannot
+    // remove without locking the user out of their identity.
+    if (storeExpected()) {
+      lock();
+      throw storeDeleted(
+        "your saved contacts and their generation record have BOTH been deleted from this device — " +
+        "refusing to start over with an empty store, because that would silently turn off " +
+        "key-change warnings for every contact you have verified",
+      );
+    }
+    return; // genuine first run
+  }
   lock();
   if (w.corrupt) {
-    throw new Error(
+    throw storeDeleted(
       "a contact store was expected on this device but is missing, and its generation record does not " +
       "decrypt — refusing to start over with an empty (unpinned) store",
     );
   }
-  throw new Error(
+  throw storeDeleted(
     `your saved contacts (generation ${w.gen}) have been DELETED from this device — refusing to start ` +
     "over with an empty store, because that would silently turn off key-change warnings",
   );
@@ -351,7 +488,7 @@ async function persist() {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   // `d` is the H-2 domain tag: it makes this plaintext unmistakably a STORE, so
   // no other record encrypted under the same key can be substituted for it.
-  const plain = enc.encode(JSON.stringify({ d: STORE_DOMAIN, contacts, pins, gen: generation }));
+  const plain = enc.encode(JSON.stringify({ d: STORE_DOMAIN, contacts, pins, swept, gen: generation }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, dataKey, plain));
   localStorage.setItem(
     LS_CONTACTS,
@@ -380,6 +517,24 @@ export async function savePin(key, bundle) {
     ed: bundle.ed, mldsa: bundle.mldsa,
     ecdh: bundle.ecdh ?? null, mlkem: bundle.mlkem ?? null,
   };
+  // F-A2: saving a pin IS the in-person safety-number confirmation, so it clears
+  // the "your pin was cleared by someone else's revocation" tombstone for this
+  // key. Without this the marker would outlive the re-verification it asks for on
+  // the room-pin path, where `onVerifyOk` has no handle to upsert against.
+  //
+  // Keyed on the pin key AND on the identity (ROUND-5). Saving a pin is an
+  // in-person check of a PERSON, so it may only clear the tombstone raised for
+  // that same person. Clearing on the key alone let a LATER, unrelated
+  // verification under the same key — a recycled `room:<id>` with somebody else —
+  // delete the victim's tombstone. That is worse than losing one alarm: since
+  // ROUND-3 F-3 made `pinWasSwept` fall through to an identity scan across
+  // tombstones, deleting the wrong one silences that peer's alarm in EVERY room,
+  // which is M-2's inverted alarm restored through a side door.
+  //
+  // Still per-key, so re-verifying one key does NOT silence the alarm for a
+  // different key swept in the same revocation.
+  const tomb = swept ? swept[key] : null;
+  if (tomb && tomb.ed === bundle.ed && tomb.mldsa === bundle.mldsa) delete swept[key];
   await persist();
 }
 
@@ -457,6 +612,11 @@ export async function upsert({
       cur.ed !== ed || cur.mldsa !== mldsa ||
       (ecdh != null && (cur.ecdh ?? null) !== ecdh) ||
       (mlkem != null && (cur.mlkem ?? null) !== mlkem);
+    // Item 17: capture the outgoing signing keys BEFORE they are overwritten, so
+    // a later Remove/Unverify can still find pins filed under them. Only when
+    // the signing keys themselves move — an ecdh/mlkem-only change leaves the
+    // identity that pins are matched on untouched.
+    if (keyChanged && (cur.ed !== ed || cur.mldsa !== mldsa)) rememberSupersededKeys(cur);
     cur.ed = ed;
     cur.mldsa = mldsa;
     if (ecdh) cur.ecdh = ecdh;
@@ -487,24 +647,233 @@ export async function setVerified(username, on) {
   cur.verified = !!on;
   cur.verifiedAt = on ? Date.now() : null;
   if (on) delete cur.reverify; // fresh in-person check supersedes the H-01 reset
+  // Pentest 2026-08-07 F-ATREST-007: the pin used to outlive "Unverify". The
+  // pin is what makes the next session auto-unlock messaging with NO prompt
+  // (app.js sameBundle(pin, bundle) -> unlockMessaging()), so a contact whose
+  // verification the user had explicitly REVOKED still walked straight in —
+  // the one outcome the button exists to prevent. Un-verifying is the user
+  // saying "I no longer trust this key"; drop the pin so the next session is
+  // treated as a first contact and the safety number must be compared again.
+  if (!on) dropPinsFor(cur);
   await persist();
   return get(username);
+}
+
+// Every pin that names this contact's keys, whatever it is keyed under.
+//
+// Fix review 2026-08-07 (F5): the first cut deleted only `pins["user:" + name]`.
+// But app.js pins under `room:<id>` whenever no directory handle was typed
+// (app.js `currentPinKey = expectedPeerName ? "user:"+name : "room:"+room`),
+// which is the DEFAULT for Live-room use — so for a peer verified in a live
+// room, the revocation deleted a key that was never written and left the pin
+// that actually gates auto-unlock. Revocation has to be about the KEYS, not
+// about the label they happen to be filed under, so sweep by bundle.
+// Pentest 2026-08-08 item 17: sweeping by the contact's CURRENT keys is not
+// enough, and the residual is the worst possible one.
+//
+// `upsert()` overwrites `cur.ed`/`cur.mldsa` on a key change without touching
+// `pins`. So after a rotation the record names K2 while the `room:<id>` pin
+// still names K1, the comparison below matches nothing, and Remove/Unverify
+// leave that pin in place. The key left behind is the SUPERSEDED one — exactly
+// the key a user revoking after a suspected compromise is trying to kill — and
+// anyone presenting K1 still matches a stored pin and still auto-unlocks
+// messaging with no prompt.
+//
+// Fixed by remembering superseded signing keys on the record (see
+// `rememberSupersededKeys`) and sweeping by the union: current bundle ∪ history.
+//
+// It does NOT over-sweep, which was checked in the other direction: a collateral
+// match needs both `ed` AND `mldsa` to equal this contact's, i.e. the same
+// identity filed under another label, and deleting that pin is correct.
+//
+// Honest limit: the history can only contain keys this store actually SAW being
+// replaced. A pin written under `room:<id>` at K1 by a device that never held a
+// contact record at K1 — pin first, contact added later already at K2 — is still
+// missed. Nothing in the record can recover a key it never stored; closing that
+// needs the pin to carry its owner, which is only knowable when a handle was
+// typed (`user:<name>` pins already carry it in the key).
+const MAX_PIN_KEY_HISTORY = 8;
+
+// Record the bundle a contact is moving AWAY from. Must be called BEFORE the new
+// keys are written over the record.
+function rememberSupersededKeys(cur) {
+  if (!cur || typeof cur.ed !== "string" || typeof cur.mldsa !== "string") return;
+  const history = Array.isArray(cur.pinKeys) ? cur.pinKeys : [];
+  if (history.some((k) => k.ed === cur.ed && k.mldsa === cur.mldsa)) return;
+  history.push({ ed: cur.ed, mldsa: cur.mldsa });
+  // Pentest 2026-08-10 (M-1): the first cut was `history.slice(-MAX)`, which
+  // drops the OLDEST superseded key — and the oldest is exactly the one whose
+  // pin has had the longest time to be written and forgotten. Nine rotations
+  // therefore evicted K1 while `room:<id>` still pinned K1, restoring verbatim
+  // the residual item 17 exists to close. Reproduced.
+  //
+  // The justification for capping at all was also simply wrong, and is corrected
+  // here rather than left as folklore: it claimed `upsert` is reachable from
+  // inbound mail. It is not, for this purpose — the inbound-mail path keys new
+  // records on `neutralName(senderBundle.ed)`, so a different key makes a
+  // different RECORD and never pushes onto an existing contact's history. Only a
+  // user action (re-adding a handle, or a live session with a rotated peer) can
+  // grow this list.
+  //
+  // So the bound never evicts a key that still has a pin naming it — those are
+  // the entries with work left to do. The cap only trims history that has become
+  // inert, which keeps the list bounded by the pins that actually exist.
+  const stillPinned = (k) =>
+    Object.values(pins).some((p) => p && p.ed === k.ed && p.mldsa === k.mldsa);
+  const keepFrom = Math.max(0, history.length - MAX_PIN_KEY_HISTORY);
+  cur.pinKeys = history.filter((k, i) => i >= keepFrom || stillPinned(k));
+}
+
+function dropPinsFor(contact) {
+  if (!contact) return;
+  delete pins["user:" + contact.username];
+  // Current keys ∪ every superseded pair we recorded for this contact.
+  const owned = [{ ed: contact.ed, mldsa: contact.mldsa }];
+  if (Array.isArray(contact.pinKeys)) {
+    for (const k of contact.pinKeys) {
+      if (!k || typeof k.ed !== "string" || typeof k.mldsa !== "string") continue;
+      owned.push(k);
+    }
+  }
+  // Pentest 2026-08-10 (M-2) and its repair's own defect (2026-08-10-night F-A2).
+  //
+  // M-2 first. `pinKeys` is fed from whatever `upsert` was called with, which
+  // includes an UNSIGNED directory answer (see item 14 — the directory binds
+  // nothing). So a relay that answers one lookup for "mallory" with alice's real
+  // bundle gets K_alice written into mallory's history; the record self-corrects
+  // on the next honest answer, but the history keeps the lie, and removing
+  // mallory weeks later deleted alice's pin. Alice's next session then rendered
+  // as a benign FIRST CONTACT — the alarm inverted, which is the shape this
+  // project has been bitten by before.
+  //
+  // The first repair was to SKIP a historical key that is some other contact's
+  // current identity. That inverted the failure instead of removing it: the
+  // attacker chooses whether such a record exists. One directory lookup answered
+  // with the superseded bundle (app.js upserts it), or one sealed envelope, which
+  // auto-creates a contact with no user action at all, is enough to manufacture
+  // the claimant — and the retained pin then reaches `unlockMessaging()` with no
+  // prompt and no safety-number check. Post-compromise revocation, defeated by
+  // the thing that was supposed to protect a bystander.
+  //
+  // Both failures come from trying to settle a key COLLISION by choosing which
+  // contact keeps the pin. There is no safe answer to that: retention is
+  // fail-open, deletion is a silent downgrade. So neither is used. The pin is
+  // ALWAYS deleted — revocation must be absolute, and the user asked for it —
+  // and the collision is recorded on the other contact instead, so their next
+  // session cannot be rendered as a benign first contact.
+  //
+  // The marker is a TOMBSTONE ON THE PIN KEY (F-A2-R1, closed 2026-08-20).
+  //
+  // It used to be a `reverify` flag on a contact whose CURRENT keys were the
+  // swept ones. That was measured to miss two reachable shapes: a `room:<id>` pin
+  // whose owner has no contact record at all (the DEFAULT for Live-room use —
+  // app.js only mirrors a record when a handle was typed), and a bystander who
+  // has since rotated, whose stale pin names keys the record no longer has. In
+  // both, the pin was swept and NO marker was set, so that peer's next session
+  // still rendered as a benign first contact — the alarm inversion this whole
+  // item is about, just narrower.
+  //
+  // The pin KEY is in hand right here, at the moment of deletion, and it is
+  // exactly what `renderVerify` looks the pin up by. So the tombstone is filed
+  // under it and needs no guess about who holds those keys now. Every swept pin
+  // gets one, so the coverage is the swept set itself rather than a subset of it.
+  //
+  // Deliberately NOT conditioned on any other record being `verified` or
+  // user-created: an attacker-made record is exactly the case that must not be
+  // able to change what revocation deletes, or what it announces.
+  for (const [key, pin] of Object.entries(pins)) {
+    if (!pin) continue;
+    // Signing keys alone are enough to identify the contact: they ARE the
+    // identity (the fingerprint and safety number cover only them), and a pin
+    // whose ed/mldsa match is a pin for this peer whatever else it carries.
+    const hit = owned.find((k) => pin.ed === k.ed && pin.mldsa === k.mldsa);
+    if (!hit) continue;
+    delete pins[key];
+    // The tombstone records the keys the swept pin named, so the next session on
+    // that key can be told apart from a genuine first contact even if the peer's
+    // record is gone, was never there, or has since rotated.
+    swept[key] = { ed: pin.ed, mldsa: pin.mldsa };
+  }
+}
+
+// Was the pin under this key deleted as collateral of someone else's revocation?
+// Read by app.js's no-pin path so that arrival renders as "re-verify", never as a
+// benign first contact (F-A2 / F-A2-R1).
+export function pinWasSwept(key, bundle = null) {
+  if (!pins) throw new Error("contact store is locked");
+  if (!swept) return false;
+  if (swept[key]) return true;
+
+  // ROUND-3 F-3 (pentest of this fix). Keyed on the pin key ALONE, the alarm
+  // followed the label rather than the peer — and `room:<id>` keys are per chat
+  // code, so the same person in a different room came back as a benign FIRST
+  // CONTACT. That is M-2's inverted alarm returning through a side door, and it
+  // is the DEFAULT shape for Live-room use. The tombstone already recorded the
+  // swept pin's ed/mldsa; nothing read them.
+  //
+  // Signing keys only, as everywhere else here: they are the identity (the
+  // fingerprint and safety number cover only them).
+  if (!bundle || !bundle.ed || !bundle.mldsa) return false;
+  const sameId = (x) => Boolean(x) && x.ed === bundle.ed && x.mldsa === bundle.mldsa;
+  if (!Object.values(swept).some(sameId)) return false;
+
+  // ...but a pin SAVED for this identity since the sweep is the in-person
+  // safety-number check the alarm exists to demand, and that check authenticates
+  // the PERSON, not the room it happened to be done in. So it settles the whole
+  // identity. Without this the alarm would be unclearable for every other room —
+  // and an alarm that cannot be cleared is one users are trained to click past,
+  // which costs more than it buys.
+  //
+  // Note this deliberately does NOT clear sibling TOMBSTONES (see the per-key
+  // test): a key that was swept keeps its own marker, so re-verifying in one room
+  // cannot silence the specific room whose pin is still missing.
+  return !Object.values(pins).some(sameId);
 }
 
 // Cache the locally VERIFIED voucher names for a contact (the 🟡 mark). Only
 // ever store names the caller has checked signatures for — this is a render
 // cache, not a trust source.
-export async function setVouches(username, names) {
+// `expected` is the bundle the caller VERIFIED the vouch signatures against.
+//
+// Pentest 2026-08-07 F-PROTO-005 (TOCTOU). The caller computes the 🟡 mark from
+// a SNAPSHOT of the contact taken before an awaited `/vouches` fetch, then wrote
+// it back with a live lookup by username. A directory that simply stalls that
+// fetch — no forgery needed — while the user re-adds the same handle buys the
+// window: the re-add replaces the stored bundle, the stalled response lands, and
+// "vouched by <someone you verified in person>" gets attached to keys that
+// voucher never signed. The room-admission prompt then renders that mark with no
+// key-changed warning beside it, which is precisely the trust the 🟡 is claiming
+// to convey.
+//
+// So the write is conditional on the bundle still being the one the signatures
+// were checked against. Same-process and same-tick as the read below, so there
+// is no second window here.
+export async function setVouches(username, names, expected = null) {
   if (!contacts) throw new Error("contact store is locked");
   const cur = contacts.find((c) => c.username === username);
-  if (!cur) return;
+  if (!cur) return false;
+  if (expected) {
+    const same = cur.ed === expected.ed && cur.mldsa === expected.mldsa &&
+      (cur.ecdh ?? null) === (expected.ecdh ?? null) &&
+      (cur.mlkem ?? null) === (expected.mlkem ?? null);
+    if (!same) return false; // re-added / key-changed under us: the mark is stale
+  }
   cur.vouchedBy = names;
   cur.vouchCheckedAt = Date.now();
   await persist();
+  return true;
 }
 
 export async function remove(username) {
   if (!contacts) throw new Error("contact store is locked");
+  // F-ATREST-007: same argument as setVerified(false), more so. "Remove" is the
+  // strongest revocation the UI offers, and it used to leave the pin behind —
+  // so a removed contact still auto-unlocked messaging with no prompt, and the
+  // Users list showed nothing at all to explain why. Read the record BEFORE
+  // dropping it, so the sweep knows which keys to look for.
+  const cur = contacts.find((c) => c.username === username);
   contacts = contacts.filter((c) => c.username !== username);
+  dropPinsFor(cur);
+  delete pins["user:" + username]; // also covers a pin with no contact record
   await persist();
 }

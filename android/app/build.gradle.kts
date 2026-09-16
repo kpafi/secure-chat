@@ -81,7 +81,8 @@ android {
 // client. (Safe here: the destination holds nothing but this task's output.)
 val syncWebClient = tasks.register<Sync>("syncWebClient") {
     from(rootProject.file("../client")) {
-        exclude("*.test.mjs", "*.integration.test.mjs", "package*.json", "node_modules")
+        exclude("*.test.mjs", "*.integration.test.mjs", "package*.json", "node_modules",
+            "test-source.mjs", "README.md") // F-P7-18: the three ship lists must agree
     }
     into(layout.projectDirectory.dir("src/main/assets/web"))
 }

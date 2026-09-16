@@ -29,32 +29,52 @@ import config
 from relay import KeyedRateLimiter
 from accounts import _db, current_user, _check_username, token_matches, client_key
 
+# Per-RECIPIENT bucket, charged only after the lookup token proves the sender
+# knows this handle (F-RELAY-004). Draining it now costs a valid token and
+# denies delivery to that one inbox, not to the whole relay.
 _post_limiter = KeyedRateLimiter(config.MAILBOX_RATE_CAPACITY, config.MAILBOX_RATE_REFILL_PER_SEC)
+# The absolute ceiling, keyed per client host as the old bucket was.
+_post_global_limiter = KeyedRateLimiter(
+    config.MAILBOX_GLOBAL_RATE_CAPACITY, config.MAILBOX_GLOBAL_RATE_REFILL_PER_SEC
+)
+# Phase-7 pentest 2026-09-16 F-P7-2: keyed per AUTHENTICATED user, charged
+# inside the handler after `current_user` — not per host, not before auth.
 _fetch_limiter = KeyedRateLimiter(
     config.MAILBOX_FETCH_RATE_CAPACITY, config.MAILBOX_FETCH_RATE_REFILL_PER_SEC
 )
+# The only thing charged before a gate, and only on POST: a generous per-host
+# ceiling. See config. GET has NO pre-auth charge — a shared pre-gate bucket on
+# both verbs let a POST flood deny every authenticated GET (review of the first
+# F-P7-2 fix).
+_post_host_limiter = KeyedRateLimiter(config.MAILBOX_POST_HOST_RATE_CAPACITY, config.MAILBOX_POST_HOST_RATE_REFILL_PER_SEC)
 
-# Envelopes are JSON of base64 fields — printable ASCII by construction.
-_ASCII_RE = re.compile(r"^[\x20-\x7e]+$")
+# Envelopes are JSON of base64 fields — printable ASCII by construction. `\Z`,
+# not `$`: `$` matches before a trailing newline, and the byte budget below
+# counts on every accepted envelope being one byte per character.
+_ASCII_RE = re.compile(r"^[\x20-\x7e]+\Z")
 
 router = APIRouter(prefix="/api/mailbox", tags=["mailbox"])
 
 
-def _fetch_rate_limit(request: Request) -> None:
-    # Pentest 2026-07-26 P-11: `GET /api/mailbox` was the only /api endpoint with
-    # NO limiter (POST had its own bucket; the accounts router limits everything
-    # it owns). Each fetch runs a full-table TTL prune plus a SELECT that can
-    # return up to MAX_MAILBOX_PER_RECIPIENT * MAX_ENVELOPE_BYTES (~12.8 MB), so
-    # an authenticated user could hammer it unthrottled. It gets its OWN generous
-    # bucket rather than the shared /api one, because clients poll this endpoint
-    # every 6 s and behind Tor they all share a single bucket.
-    if not _fetch_limiter.allow(client_key(request)):
-        raise HTTPException(status_code=429, detail="rate limited")
+def _post_host_rate_limit(request: Request) -> None:
+    """The one charge that happens before any gate: a generous per-host ceiling.
 
+    Pentest 2026-07-26 P-11 gave `GET /api/mailbox` a bucket; 2026-08-07
+    F-RELAY-004 moved the tight POST charge behind the token gate. The Phase-7
+    pentest (2026-09-16, F-P7-2 / F-P7-4) found what was left in front of the
+    gates: the fetch bucket was keyed per HOST and charged before `current_user`
+    (200 unauthenticated GETs denied polling to everyone behind Tor, silently),
+    and the POST "backstop" was small enough (300 / 10 per s) that unauthenticated
+    posts to NONEXISTENT recipients — charged before the 404 — still took mail
+    delivery down relay-wide at ~31 req/s.
 
-def _post_rate_limit(request: Request) -> None:
-    # Same trusted-proxy-aware keying as the /api limiters (pentest F-03).
-    if not _post_limiter.allow(client_key(request)):
+    Behind Tor every client is one host, so anything charged here is one shared
+    bucket for everybody and can only ever be a backstop against runaway
+    clients. Every control that matters is charged AFTER its gate and keyed on
+    the subject the gate proved: the recipient (a token holder), or the
+    authenticated user.
+    """
+    if not _post_host_limiter.allow(client_key(request)):
         raise HTTPException(status_code=429, detail="rate limited")
 
 
@@ -71,24 +91,53 @@ def init_db() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_recipient ON mailbox(recipient)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_created ON mailbox(created_at)")
+        # The first F-P7-1 fix added a `mailbox_fetches` table (who has ever
+        # fetched, with a timestamp) to expire never-fetched inboxes early. Its
+        # review showed it was a per-user last-seen log at rest that nothing
+        # read (I2), that one authenticated GET per throwaway inbox bought the
+        # long TTL back, and that it deleted real mail on deploy day and on a
+        # user's first poll. Dropped; the relay keeps no read history.
+        conn.execute("DROP TABLE IF EXISTS mailbox_fetches")
 
 
 def _prune(conn) -> None:
     conn.execute("DELETE FROM mailbox WHERE created_at < ?", (int(time.time()) - config.MAILBOX_TTL_SEC,))
 
 
+def _evict_oldest_to_fit(conn, incoming: int) -> None:
+    """F-P7-1: the server-wide budget evicts the OLDEST queued mail instead of
+    refusing new mail. A 503 for everyone until the TTL ran out was the
+    finding's impact; with free registration the budget can always be filled,
+    so what a flood may cost is RETENTION (mail must be fetched sooner), never
+    delivery. Bounded loop: each pass drops at least one row."""
+    for _ in range(64):
+        rows, total = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(envelope AS BLOB))), 0) FROM mailbox"
+        ).fetchone()
+        if rows < config.MAX_MAILBOX_TOTAL and total + incoming <= config.MAX_MAILBOX_TOTAL_BYTES:
+            return
+        if rows == 0:
+            return
+        conn.execute(
+            "DELETE FROM mailbox WHERE id IN (SELECT id FROM mailbox ORDER BY id LIMIT ?)",
+            (max(1, rows // 64),),
+        )
+
+
 class PostReq(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    envelope: str = Field(min_length=1, max_length=config.MAX_ENVELOPE_BYTES)
+    # F-P7-1: a real sealed envelope is well over 1 KiB (it carries an ML-KEM
+    # ciphertext); a one-byte "envelope" only ever existed to spend budget.
+    envelope: str = Field(min_length=config.MIN_ENVELOPE_BYTES, max_length=config.MAX_ENVELOPE_BYTES)
 
 
-@router.post("/{recipient}", dependencies=[Depends(_post_rate_limit)])
-def post_mail(recipient: str, req: PostReq, t: str = Query(default="", max_length=64)) -> dict:
+@router.post("/{recipient}", dependencies=[Depends(_post_host_rate_limit)])
+def post_mail(request: Request, recipient: str, req: PostReq, t: str = Query(default="", max_length=64)) -> dict:
     _check_username(recipient)
     if not _ASCII_RE.match(req.envelope):
         raise HTTPException(status_code=422, detail="envelope must be printable ASCII")
     with _db() as conn:
-        _prune(conn)
         row = conn.execute(
             "SELECT lookup_token FROM accounts WHERE username = ?", (recipient,)
         ).fetchone()
@@ -98,14 +147,29 @@ def post_mail(recipient: str, req: PostReq, t: str = Query(default="", max_lengt
         stored = row["lookup_token"] if row is not None else secrets.token_urlsafe(config.LOOKUP_TOKEN_BYTES)
         if not token_matches(t, stored) or row is None:
             raise HTTPException(status_code=404, detail="no such user")
-        total = conn.execute("SELECT COUNT(*) FROM mailbox").fetchone()[0]
-        if total >= config.MAX_MAILBOX_TOTAL:
-            raise HTTPException(status_code=503, detail="mailbox storage full")
-        count = conn.execute(
-            "SELECT COUNT(*) FROM mailbox WHERE recipient = ?", (recipient,)
-        ).fetchone()[0]
-        if count >= config.MAX_MAILBOX_PER_RECIPIENT:
+        # F-RELAY-004: charge the tight bucket HERE — past the token gate, so a
+        # sender with no valid token cannot spend anyone's budget, and keyed per
+        # recipient, so a sender who does hold one can only exhaust the inbox
+        # they actually hold a token for.
+        if not _post_limiter.allow("mail:" + recipient):
+            raise HTTPException(status_code=429, detail="rate limited")
+        # F-P7-4: the global ceiling is charged HERE too — past the token gate —
+        # so a sender with no valid token cannot spend it. Keyed per host, so
+        # behind Tor it is shared, but only among real senders.
+        if not _post_global_limiter.allow(client_key(request)):
+            raise HTTPException(status_code=429, detail="rate limited")
+        # The TTL prune runs only past the gates (review of the first fix: two
+        # full scans per unauthenticated request, rolled back on the 404 anyway).
+        _prune(conn)
+        # F-P7-1: per-inbox share first (hard — the recipient can fetch), then
+        # the server-wide budget, which evicts the oldest queued mail to fit.
+        count, inbox_bytes = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(envelope AS BLOB))), 0) FROM mailbox WHERE recipient = ?",
+            (recipient,),
+        ).fetchone()
+        if count >= config.MAX_MAILBOX_PER_RECIPIENT or inbox_bytes + len(req.envelope) > config.MAX_MAILBOX_PER_RECIPIENT_BYTES:
             raise HTTPException(status_code=429, detail="recipient inbox full")
+        _evict_oldest_to_fit(conn, len(req.envelope))
         conn.execute(
             "INSERT INTO mailbox (recipient, envelope, created_at) VALUES (?,?,?)",
             (recipient, req.envelope, int(time.time())),
@@ -113,7 +177,7 @@ def post_mail(recipient: str, req: PostReq, t: str = Query(default="", max_lengt
     return {"status": "queued"}
 
 
-@router.get("", dependencies=[Depends(_fetch_rate_limit)])
+@router.get("")
 def fetch_mail(username: str = Depends(current_user)) -> dict:
     """Return AND DELETE the queued envelopes for the authenticated user.
 
@@ -123,6 +187,10 @@ def fetch_mail(username: str = Depends(current_user)) -> dict:
     remove an envelope that arrived after the SELECT and was never returned,
     losing it silently.
     """
+    # F-P7-2: the fetch bucket is per authenticated user, charged only once
+    # `current_user` has resolved — an unauthenticated request never reaches it.
+    if not _fetch_limiter.allow("fetch:" + username):
+        raise HTTPException(status_code=429, detail="rate limited")
     with _db() as conn:
         _prune(conn)
         # Bound the response explicitly (P-11) rather than relying on the

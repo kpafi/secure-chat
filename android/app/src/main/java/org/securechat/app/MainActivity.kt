@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.net.Uri
 import android.os.Bundle
 import android.text.InputType
+import android.view.WindowManager
 import android.webkit.JsPromptResult
 import android.webkit.JsResult
 import android.webkit.WebChromeClient
@@ -75,6 +76,20 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Pentest 2026-08-07 F-ANDROID-003. Without FLAG_SECURE the OS takes a
+        // screenshot of this window every time the app is backgrounded and
+        // keeps it for the recents task switcher — on disk, outside the
+        // WebView's storage, and untouched by anything the web client does at
+        // rest. Whatever was on screen at that moment (decrypted chat text,
+        // safety numbers, the contact list, identity fields) is then readable
+        // by any component with screen-capture capability, or by anyone with
+        // brief physical access to an unlocked device.
+        //
+        // FLAG_SECURE makes the OS substitute a blank frame for the recents
+        // snapshot and blocks screenshots and non-secure display mirroring. It
+        // has to be set BEFORE the first frame is drawn, so it goes here rather
+        // than in onResume.
+        window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         // The web client renders its own header (wordmark + drawer button), so
@@ -220,13 +235,32 @@ class MainActivity : AppCompatActivity() {
                     }
                     setText(defaultValue ?: "")
                 }
-                AlertDialog.Builder(this@MainActivity)
+                val dialog = AlertDialog.Builder(this@MainActivity)
                     .setMessage(shown)
                     .setView(input)
                     .setCancelable(false)
                     .setPositiveButton(android.R.string.ok) { _, _ -> result.confirm(input.text.toString()) }
                     .setNegativeButton(android.R.string.cancel) { _, _ -> result.cancel() }
-                    .show()
+                    .create()
+                // Pentest 2026-08-07 F-ANDROID-003, the open question from the fix
+                // review (§C10), answered: a Dialog gets its OWN Window, and
+                // FLAG_SECURE marks a SURFACE, not a task. The flag set on the
+                // Activity in onCreate therefore does not cover this dialog — a
+                // screen capture taken while it is open blacks out the activity
+                // behind it and renders the dialog, passphrase field and all,
+                // perfectly legibly. Which is to say the one window in the app that
+                // is guaranteed to hold a secret was the one window not covered.
+                //
+                // Gated on `secret` to match the masking decision directly above,
+                // including its fail-SECURE fallback: whenever we decide the input
+                // must be masked, we also decide it must not be capturable.
+                if (secret) {
+                    dialog.window?.setFlags(
+                        WindowManager.LayoutParams.FLAG_SECURE,
+                        WindowManager.LayoutParams.FLAG_SECURE,
+                    )
+                }
+                dialog.show()
                 return true
             }
         }

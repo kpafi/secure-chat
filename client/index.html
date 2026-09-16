@@ -14,6 +14,9 @@
               aria-expanded="false" aria-controls="drawer">☰</button>
       <h1>secure-chat <span class="sub">end-to-end encrypted relay</span></h1>
     </header>
+    <!-- F-ATREST-008: the identity's at-rest verdict, shown on EVERY view so an
+         unlock from Profile / Users / Chats reports it too (fix-review F-7). -->
+    <p class="hint err" id="atRestWarning" aria-live="polite" hidden></p>
 
     <nav id="drawer" class="drawer" aria-label="Views" hidden>
       <div class="drawer-head">
@@ -125,11 +128,11 @@
               <span class="alg-name">AES-256</span>
               <span class="alg-desc">Shared passphrase → AES-256-GCM</span>
             </label>
-            <label class="alg-card">
-              <input type="radio" name="alg" value="RSA" />
-              <span class="alg-name">RSA</span>
-              <span class="alg-desc">RSA-2048-OAEP hybrid — per-message AES-256</span>
-            </label>
+            <!-- The RSA card was removed on 2026-08-21 (pentest F-CRYPTO-009): a
+                 counterparty-chosen modulus can hand the session to a passive
+                 observer and no validation catches it. Do not re-add it — the
+                 implementation is gone and crypto.js's makeCipher refuses the
+                 mode by name. Use DHKE or PQKEM. -->
             <label class="alg-card">
               <input type="radio" name="alg" value="PQKEM" />
               <span class="alg-name">Post-quantum <em class="badge pq">ML-KEM-768</em></span>
@@ -333,6 +336,7 @@
           <div class="row">
             <label>Status</label>
             <div class="chips" id="profileStatus"></div>
+        <p class="hint" id="profileHint" aria-live="polite"></p>
           </div>
           <div class="row inline">
             <button id="profileExport" type="button">Copy backup</button>
@@ -362,6 +366,8 @@
                    aria-label="Identity passphrase" placeholder="identity passphrase" />
             <button id="usersUnlock" type="button" class="primary">Unlock</button>
           </div>
+          <!-- F-ATREST-008 fix review (F-2): shown only behind the deletion alarm; confirms first. -->
+          <button id="usersStartFresh" type="button" class="danger" hidden>Start over with an empty contact store…</button>
           <p class="hint" id="usersUnlockStatus"></p>
         </div>
         <div id="usersUnlocked" hidden>
@@ -382,6 +388,7 @@
             </div>
           </div>
           <p class="hint" id="usersStatus" aria-live="polite"></p>
+          <p class="hint" id="usersHint" aria-live="polite"></p>
           <ul id="userList" class="userlist"></ul>
           <div class="legend">
             <span class="legend-item">🟢 <b>verified</b> — you compared the fingerprint in person</span>
@@ -407,11 +414,14 @@
                    aria-label="Identity passphrase" placeholder="identity passphrase" />
             <button id="chatsUnlock" type="button" class="primary">Unlock</button>
           </div>
+          <!-- F-ATREST-008 fix review (F-2): shown only behind the deletion alarm; confirms first. -->
+          <button id="chatsStartFresh" type="button" class="danger" hidden>Start over with an empty chat store…</button>
           <p class="hint" id="chatsUnlockStatus"></p>
         </div>
 
         <div id="chatsUnlocked" hidden>
           <p class="hint" id="chatsStatus" aria-live="polite"></p>
+          <p class="hint" id="chatsHint" aria-live="polite"></p>
 
           <div id="chatListWrap">
             <div class="row">

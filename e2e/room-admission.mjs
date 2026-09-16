@@ -24,6 +24,32 @@ const APP = process.env.SECURE_CHAT_E2E_URL || cfg.relay;
 const PASS = cfg.users[0].passphrase;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// F-PROTO-001 (rebuilt 2026-08-08): the peer whose device did NOT run the knock
+// prompt is asked to approve the other side's key before the handshake
+// completes, unless that key is already trusted — which since 2026-08-08
+// item 14 means ONLY a 🟢 key verified in person, never a contact picked by
+// name. Every session here is a raw room code between strangers, so the guest
+// always gets it. Authenticated modes only — AES256/OTP exchange no
+// identity, so there is nothing to approve.
+//
+// Item 20 (2026-08-10): this waits for the PEER-approval prompt specifically.
+// `#admit` is shared with the owner's knock prompt, so "un-hidden" matched
+// either one — and this helper would then click "Let them in" on a knock while
+// reporting that the guest had approved a key. app.js marks the panel with
+// `data-mode`; the button label is checked too, so the marker cannot drift away
+// from what the user is shown.
+async function approvePeerKey(page, timeout = 45000) {
+  await page.waitForFunction(() => {
+    const el = document.querySelector("#admit");
+    return !!el && !el.hidden && el.dataset.mode === "peer";
+  }, { timeout });
+  const label = await page.evaluate(() => document.querySelector("#admitOk").textContent.trim());
+  if (label !== "Connect") {
+    throw new Error(`expected the peer-approval prompt ("Connect"), got ${JSON.stringify(label)}`);
+  }
+  await page.click("#admitOk");
+}
+
 const results = [];
 function check(name, ok, detail = "") {
   results.push({ name, ok });
@@ -157,6 +183,8 @@ const bobFp = await text(alice.page, "#admitFingerprint");
 check("the second prompt shows bob's fingerprint", bobFp === bob.fingerprint,
   `${bobFp.slice(0, 24)}… vs ${bob.fingerprint.slice(0, 24)}…`);
 await alice.page.click("#admitOk");
+// The guest approves alice's key in turn (see approvePeerKey).
+await approvePeerKey(bob.page);
 
 // --- 4. the squatter did NOT cost the invited peer the room ----------------
 console.log("\n4. the real session completes anyway (the finding itself)");

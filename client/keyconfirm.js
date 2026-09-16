@@ -25,8 +25,9 @@
 // until one stuck. Keeping a set for the race (below) must not throw that away,
 // so the set is hard-capped at the maximum a legitimate peer can produce: each
 // side derives once in the staggered case and twice in the simultaneous-connect
-// race (its own offer secret, then the answer), never more, in PQKEM and RSA
-// alike. A third distinct tag is not a peer with bad luck; it is someone
+// race (its own offer secret, then the answer), never more — PQKEM is the mode
+// that can do it (RSA could too, until it was removed on 2026-08-21,
+// F-CRYPTO-009). A third distinct tag is not a peer with bad luck; it is someone
 // guessing.
 export const MAX_PEER_CONFIRMS = 2;
 
@@ -153,9 +154,23 @@ export function makeKeyConfirmation(io) {
         // for the post-confirmation re-derivation above; it changes nothing.
         return false;
       }
+      // Phase-7 pentest 2026-09-16, F-P7-19. The confirm frame is the one key
+      // payload that is NOT signature-covered, and it used to be counted toward
+      // the cap even before our chains existed — i.e. before any tag could
+      // possibly be checked. A relay that injected two tags ahead of the honest
+      // one made the honest peer's tag the third, and BOTH sides then printed
+      // that the other side had sent too many confirmations and disconnected.
+      // A tag that cannot be matched yet is not evidence of anything; it is
+      // ignored. In the shipped flow an honest tag always follows the key frame
+      // it belongs to through the same serial pump, so the chains exist by the
+      // time it arrives (M-5's derive-twice race sends its stale tag AFTER the
+      // first derivation, which is also post-chain on the receiving side).
+      if (!confirmation) return false;
       if (!peerTags.has(tag)) {
         if (peerTags.size >= MAX_PEER_CONFIRMS) {
-          fail("the other side sent more key confirmations than any honest peer can");
+          // Not "the other side": the honest peer sends at most two, so a third
+          // distinct tag came from whoever sits between us — the relay.
+          fail("more key confirmations arrived than any honest peer can send — the relay is injecting them");
           return false;
         }
         peerTags.add(tag);

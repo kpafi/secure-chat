@@ -12,7 +12,13 @@ cd backend && ./run.sh          # terminal 1
 node e2e/two-user-flow.mjs      # terminal 2 — async chat + web of trust
 node e2e/room-admission.mjs     #            — live room join approval
 node e2e/no-dead-ends.mjs       #            — every failure path says something
+node e2e/all-modes.mjs          #            — a live room in each of the five modes, both ways
 ```
+
+`all-modes.mjs` also runs against a deployed relay (`SECURE_CHAT_E2E_URL=…`) or
+over Tor (`SECURE_CHAT_E2E_PROXY=socks5://127.0.0.1:9050`); see its header.
+`hostile-relay/` is the F-PROTO-001 regression test against a relay that lies —
+it has its own README.
 
 Needs Node 20+, system Chromium (`/usr/bin/chromium`, override with `$CHROMIUM`)
 and `puppeteer-core` resolvable from `e2e/` (`cd e2e && npm install --no-save

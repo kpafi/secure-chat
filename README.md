@@ -5,9 +5,9 @@ A deliberately tiny, security-first text chat. ASCII only. The server is a
 forwards opaque ciphertext between two parties in a room. The server never
 holds keys, never decrypts, and never stores or logs message content.
 
-> Status: **backend relay + web client working locally and deployed**, four
-> encryption modes verified end-to-end (DHKE, AES-256, RSA, PQKEM), all
-> forward-secret ratchets. The DHKE/RSA/PQKEM key exchange is **authenticated in
+> Status: **backend relay + web client working locally and deployed**, five
+> encryption modes verified end-to-end in real browsers (DHKE, AES-256, PQKEM,
+> OTP; `e2e/all-modes.mjs`), all forward-secret ratchets. The DHKE/PQKEM key exchange is **authenticated in
 > the browser client** with long-term identity keys (Ed25519 + ML-DSA-65) and an
 > in-person safety-number check, closing the relay-MITM gap. The relay is
 > reachable over a **Tor v3 onion service** as well as clearnet — see
@@ -49,15 +49,33 @@ Client A --[ciphertext]--> Relay server --[ciphertext]--> Client B
 ```
 - Transport: WebSocket (`/ws`).
 - Rooms: 256-bit random hex ids, max 2 members, vanish when empty.
-- **Entry is owner-approved.** The first party in owns the room; anyone else who
-  has the code is queued and must be let in by the owner, who is shown that
-  peer's key fingerprint and trust mark. Waiting occupies no member slot, so
-  knowing a code no longer lets a stranger take the room from the person you
-  invited (pentest P-08). The approval is only as good as its binding: the
+- **Entry is approved on both devices.** The first party in owns the room;
+  anyone else who has the code is queued and must be let in by the owner, who is
+  shown that peer's key fingerprint and trust mark. Waiting occupies no member
+  slot, so knowing a code no longer lets a stranger take the room from the person
+  you invited (pentest P-08). The approval is only as good as its binding: the
   client pins the identity it admitted and refuses a handshake from any other,
   because the relay chooses who is routed to whom.
+
+  Approval is **symmetric**, which is what makes it independent of the relay
+  (pentest F-PROTO-001). Each side refuses a handshake from an identity its own
+  user never approved: the owner through the queue prompt, the other side
+  through the same prompt shown when the peer's signed handshake arrives. One
+  thing skips it: a key you have already verified **in person** (🟢 in your users
+  list, behind the at-rest passphrase). Everything else — including your first
+  chat with a contact you picked by name — costs one approve/deny prompt, shown
+  immediately before the safety-number step. Nothing on the wire can switch it
+  off, because nothing on the wire is consulted: a relay knows the room code (it
+  is the join frame) and can always present itself as a legitimate participant,
+  so anything a peer says about its own authority is worthless.
+
+  Picking a contact by name used to skip the prompt too, by matching the peer
+  against the bundle fetched for that handle. That was removed (2026-08-08): the
+  directory answer carries **no signature**, so nothing binds a handle to its
+  key material, and a hostile directory could switch the approval off for exactly
+  the flow it was meant to protect. Restoring it needs signed directory answers.
 - Wire format: strict JSON envelope, printable ASCII only, validated by pydantic.
-- The encryption menu (RSA / AES-256 / DHKE / post-quantum KEM / OTP) is a
+- The encryption menu (AES-256 / DHKE / post-quantum KEM / OTP) is a
   **client** concern; the `alg` field is just an advisory tag the server relays.
 
 ## Run locally
@@ -66,27 +84,22 @@ cd backend
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# Server-side validation tests:
-pytest tests/test_validation.py -q
-
 # Start the relay + web client (loopback only):
 ./run.sh            # or: python main.py
 # Then open http://127.0.0.1:8000 in two browser tabs/windows,
 # click Generate in one, copy the room id to the other, pick the same
 # encryption mode in both, and Connect.
+```
 
-# Client-side crypto round-trip tests (Node 20+):
-node ../client/crypto.test.mjs
-
-# Full-stack integration test (server must be running):
-node ../client/integration.test.mjs
-# Authenticated-handshake integration test (server must be running):
-node ../client/auth.integration.test.mjs
-# Account directory integration test (server must be running):
-node ../client/accounts.integration.test.mjs
-
-# Legacy two-client smoke test (raw relay, no crypto):
-python tests/smoke_client.py
+Tests, from least to most environment:
+```bash
+cd backend && python -m pytest -q            # server: validation, rate limits, logging guard, ... (165 tests)
+cd client  && npm test                       # client crypto/identity/OTP/contacts/chats unit tests (Node 20+)
+# with the relay running:
+node client/integration.test.mjs             # full-stack relay round trip
+node client/auth.integration.test.mjs        # authenticated handshake
+node client/accounts.integration.test.mjs    # account directory
+# real browsers (see e2e/README.md): two-user flows, room admission, all five modes, hostile relay
 ```
 
 ## Deployment
@@ -108,7 +121,6 @@ Two rules that are easy to get wrong and expensive to get wrong:
 |---------|-------------------------------------|---------------------|---------------------------------------------|
 | DHKE    | ephemeral ECDH P-256                | ratcheted AES-256-GCM (one-time keys) | **identity-authenticated**, **forward-secret** |
 | AES256  | PBKDF2 from shared passphrase + session nonces | ratcheted AES-256-GCM (one-time keys) | no key swap → not relay-MITM-able |
-| RSA     | RSA-OAEP-2048 key transport         | ratcheted AES-256-GCM (one-time keys) | **identity-authenticated**, **forward-secret** |
 | PQKEM   | **hybrid ECDH P-256 + ML-KEM-768**  | ratcheted AES-256-GCM (one-time keys) | post-quantum; **identity-authenticated**, **forward-secret** |
 | OTP     | pre-shared pad, exchanged in person | **true XOR one-time pad** + one-time HMAC-SHA-256 tag | information-theoretic *confidentiality* (see caveats); no network key swap → not relay-MITM-able |
 
@@ -122,14 +134,14 @@ secret *and* an ML-KEM-768 (FIPS-203) secret, so the session stays
 confidential unless an attacker breaks **both** — defeating "harvest now,
 decrypt later" while remaining no weaker than DHKE if ML-KEM were faulted. It is
 authenticated by the same dual (Ed25519 + ML-DSA-65) identity handshake, so the
-*authentication* is also one-classical-one-post-quantum. Like RSA, it erases
-its handshake material (ECDH private key, KEM secret key, raw shared secrets)
+*authentication* is also one-classical-one-post-quantum. It erases its
+handshake material (ECDH private key, KEM secret key, raw shared secrets)
 the moment real traffic starts; **DHKE** drops its private key even earlier, as
-soon as the chains are derived. So all three handshake modes have in-session
+soon as the chains are derived. So both handshake modes have in-session
 *and* cross-session forward secrecy: state captured at time T decrypts nothing
 from before T, and never another session.
 
-DHKE and RSA handshakes are signed by a long-term identity (Ed25519 + ML-DSA-65)
+DHKE and PQKEM handshakes are signed by a long-term identity (Ed25519 + ML-DSA-65)
 that each user generates locally and the other verifies **in person** by
 comparing a safety number. A hostile relay that swaps the ephemeral key cannot
 forge the signature; one that swaps the whole identity is caught because the two
@@ -141,20 +153,20 @@ new one — it can never cover the nonce the victim just generated. Identity
 private keys are passphrase-encrypted on the device and never sent to the
 server.
 
-**RSA mode** is RSA *key transport* plus a forward-secret symmetric ratchet.
-The handshake answer transports an RSA-OAEP-wrapped 32-byte root secret; both
-sides HKDF it into two direction-separated HMAC-SHA-256 *chain* keys, and every
-message is encrypted with a **one-time AES-256-GCM key** drawn from the
-sender's chain (`msgKey = HMAC(chain, 0x01)`, `chain' = HMAC(chain, 0x02)`).
-The chain only steps forward and consumed keys are deleted, and the moment real
-traffic starts the client erases the root secret *and* the per-session RSA
-private key — so compromising a device mid-conversation reveals nothing about
-earlier messages (**forward secrecy**), and past sessions are never affected.
-Authenticity comes with it: the relay never learns the wrapped root, so forged
-frames fail AEAD authentication; direction-separated chains reject reflection;
-strictly increasing sequence numbers plus one-time keys reject replay. (The
-other modes get forgery protection implicitly: their AES-GCM key is a shared
-secret the relay never learns.)
+**RSA mode was removed on 2026-08-21** (pentest finding F-CRYPTO-009) and this
+build refuses it: it is not offered in the menu, and `makeCipher` throws with
+the reason if anything asks for it. RSA *key transport* lets one side choose the
+modulus that the other side's root secret is encrypted to, and a counterparty
+who offers `e = 65537` with `n = <small factor> x <large prime>` hands the whole
+session — both directions, past and future — to any passive observer of the
+handshake. No cheap validation can detect that (nothing certifies a modulus is
+the product of two large primes), and the alternative fix, making the root
+contributory, needs a third handshake frame the protocol has no room for. DHKE
+and PQKEM have no analogue: their peer material is a P-256 point (on-curve and
+non-identity enforced by WebCrypto, prime order) plus an ML-KEM encapsulation
+key, and the secret is contributory. Use those.
+(The remaining modes get forgery protection implicitly: their AES-GCM key is a
+shared secret the relay never learns.)
 
 **AES256 mode** runs the same ratchet, rooted in the PBKDF2-derived passphrase
 secret **plus a fresh random session nonce from each peer** (exchanged in a
@@ -165,7 +177,7 @@ replay residual. Honest limit: the passphrase is a long-term secret that lives
 outside the code (your head, the input field), so an attacker who learns *it*
 and recorded the ciphertext can still derive every session's keys — the
 ratchet's forward secrecy protects only against captured ratchet *state*. For
-real forward secrecy use DHKE, PQKEM, or RSA.
+real forward secrecy use DHKE or PQKEM.
 
 **OTP mode** is a genuine **one-time pad**: a large random pad is generated on
 one device and carried to the other **in person** (exported as a
@@ -253,16 +265,21 @@ captured on the wire — the `AES256` mode's out-of-band passphrase mitigates
 exactly this.
 
 ## Wire protocol
-Client -> server JSON envelope:
+Client -> server JSON envelope (`backend/validation.py`, `extra="forbid"`):
 | field   | type   | notes                                                        |
 |---------|--------|--------------------------------------------------------------|
-| type    | enum   | `join` \| `leave` \| `key` \| `msg`                          |
+| type    | enum   | `join` \| `leave` \| `key` \| `msg` \| `knock` \| `admit` \| `deny` |
 | room    | string | exactly 64 lowercase hex chars (256-bit id)                  |
-| payload | string | base64 ciphertext / key material; required for `msg`/`key`   |
-| alg     | enum?  | advisory: `RSA`,`AES256`,`DHKE`,`PQKEM`,`OTP` (server ignores)|
+| payload | string | base64; ciphertext / key material / the knocker's opaque self-introduction |
+| alg     | enum?  | advisory: `AES256`,`DHKE`,`PQKEM`,`OTP` (server ignores; the `RSA` member is kept for wire compat with old clients, which this client refuses) |
+| jid     | string?| only on `admit`/`deny`: the server-issued join id of the waiting socket |
 
-Server -> client: `{"type":"joined"}`, relayed envelopes, or
-`{"type":"error","reason":"..."}`.
+Server -> client: `{"type":"joined","role":"owner"|"guest"}`,
+`{"type":"pending"}` (you are queued), `{"type":"knock","jid":…,"payload":…}`
+(owner only), `{"type":"denied"}`, `{"type":"withdrawn","jid":…}` (a knocker
+left), `{"type":"turned-away","count":…}`, relayed envelopes, or
+`{"type":"error","reason":"..."}`. The admission flow is described under
+"Architecture" above.
 
 ## Metadata & residual risks
 
@@ -284,7 +301,7 @@ A room id is therefore a secret: anyone who learns one can take a slot in that
 include confidentiality or impersonation:
 - **No plaintext.** Everything the relay forwards is opaque ciphertext; a
   squatter reads nothing.
-- **No impersonation.** For DHKE/RSA/PQKEM the key exchange is signed by a
+- **No impersonation.** For DHKE/PQKEM the key exchange is signed by a
   long-term identity and gated by an in-person safety number, so a squatter
   cannot pose as the real contact — the handshake fails and the UI says so. For
   AES256 the passphrase (never sent) is the gate.
@@ -304,83 +321,20 @@ expose one.
 (length padding is a possible future addition). This is the minimal routing
 metadata a relay cannot avoid.
 
-## External pentest (2026-07-18) — findings & fixes
-An independent black-box audit of the live web instance raised nine items;
-each has been addressed (see PROGRESS.md for the code):
+## Security reviews
+The project has been pentested repeatedly; every report is in the repo and every
+finding's status is tracked in `PROGRESS.md`.
 
-- **C-01 (critical) — session key not atomically bound to the peer identity.**
-  A malicious relay could deliver its own validly-signed handshake first (the
-  cipher locks that key, "first key wins") then the real peer's, flipping the
-  displayed identity/safety-number to the honest peer while the channel kept the
-  attacker's key. **Fixed:** message handling is serialized and the peer
-  identity is *pinned on the first accepted handshake*; any later frame from a
-  different identity hard-closes the connection. Regression-tested with two
-  validly-signed offers from different identities on the same nonces.
-- **H-01 (high) — relay could swap the async encryption keys.** Fingerprint and
-  safety number covered only the signing keys, so a relay could pair the real
-  `ed`/`mldsa` with its own `ecdh`/`mlkem`. **Fixed:** the fingerprint and
-  safety number now fold in `ecdh`+`mlkem`, and any change to those keys resets
-  a contact's verified state — the in-person check now authenticates the keys
-  used to seal async messages.
-- **M-02 (medium) — trust pins in plaintext localStorage.** A forged pin could
-  auto-unlock a session. **Fixed:** pins moved into the identity-encrypted,
-  GCM-authenticated contact store. The one-time migration that read the old
-  plaintext key was itself a hole (2026-07-27 **H-2**: it ran on every unlock and
-  laundered any planted pin into the authenticated store, inverting the MITM
-  alarm) and has been **removed** — the plaintext key is now only deleted, never
-  read. The contact store also carries an authenticated generation counter, so
-  deleting or rolling it back fails closed instead of quietly disabling
-  key-change detection (**L-1**).
-- **M-01 (medium) — OTP rollback.** A wholesale restore of an old encrypted pad
-  blob reused consumed keystream. **Fixed:** a monotonic high-water tripwire
-  refuses a pad whose consumption regressed.
-  *Corrected 2026-07-27* — the original wording understated what remained. That
-  tripwire was a single **plaintext** integer that read as 0 when absent, so one
-  extra `removeItem` restored the full two-time pad (**H-3**, demonstrated: a
-  message's plaintext was recovered from two ciphertexts); and it only tracked
-  the SEND offset, so a restore taken after a stretch of receiving rewound the
-  replay guard (**M-7**). Both are fixed: the watermark is now an AEAD record
-  under the pad's own at-rest key, it covers send AND receive, it is mirrored
-  inside the pad blob, and a pad that has run on this device but cannot produce
-  its watermark refuses to open. The `exported` flag that guards against handing
-  one pad to two importers moved inside the AEAD too (**L-3**).
-  *Corrected again 2026-07-28* — "a pad that has run on this device but cannot
-  produce its watermark refuses to open" held only for **v3** blobs. On a
-  **v2-shaped** blob there is no watermark mirrored inside the AEAD, so the whole
-  check rested on one deletable plaintext key: restoring a v2 snapshot and
-  deleting three keys reopened the pad at offset 0, and the two-time pad was back
-  (**F-1**, demonstrated end-to-end). Two things changed:
-  * **Adopting a pad with no verifiable usage record is no longer silent.** It
-    now takes an explicit confirmation naming the danger, so the attack has to
-    get past the user instead of past nobody. In a plain browser that is the only
-    control available — every byte of storage is attacker-writable, so no marker
-    can be made undeletable, and user attention is the honest answer.
-  * **In the Android app the floor moved out of localStorage**, into app-private
-    storage behind an AndroidKeyStore HMAC (`android/…/PadFloor.kt`). It is
-    monotone — there is no lowering call — unforgeable without the non-exportable
-    key, and its absence beside a pad that exists is itself evidence. There the
-    attack is refused outright, with no prompt to click through.
-  * An unverifiable `exported` flag now resolves to **true**, not to whatever the
-    plaintext index says, so it cannot be cleared through the one migrating
-    unlock (**F-2**).
+| date | report | scope |
+|---|---|---|
+| 2026-07-18 | `docs/pentests/secure-chat-security-audit-2026-07-18.md` | external black-box audit of the live web instance (9 items, all addressed — narrative in `docs/security-history.md`) |
+| 2026-07-25 | `docs/pentests/secure-chat-pentest-2026-07-25.md` | in-depth pentest; 8 findings (token gate, client canonicalisation), all addressed |
+| 2026-07-26 | `docs/pentests/secure-chat-pentest-2026-07-26.md` | first full pentest of the final product (P-08 room admission; OTP at-rest), all fixed |
+| 2026-07-27 | `docs/pentests/secure-chat-pentest-2026-07-27.md` | re-test of the 07-26 fixes; 4 High / 7 Medium (OTP rollback H-3/M-7, trust-pin migration H-2), all fixed |
+| 2026-07-29 | `docs/pentests/secure-chat-pentest-2026-07-29.md` | whole-project review after the onion deployment; 3 High in the at-rest layer (Android pad floor), rate-limit keying M-1..M-3 |
+| 2026-08-07 | `docs/pentests/secure-chat-pentest-2026-08-07.md` | multi-agent red team; no Critical/High, 47 Medium/Low/Info incl. F-PROTO-001 (admission binding). Fixes in progress on `pentest-2026-08-07-fixes` — see `PROGRESS.md` |
+| 2026-09-16 | `docs/pentests/secure-chat-pentest-2026-09-16.md` | Phase 7: the whole `pentest-2026-08-07-fixes` branch, five lanes; 0 Critical / 0 High at runtime, 1 High + 4 Medium assurance gaps, 9 Medium (4 directory/mailbox availability, OTP `v`-byte gate, contact/chat witness floors, RSA-refusal DoM flood, deploy skew, hidden mail warning) |
 
-  *Residual, genuinely:* an attacker who snapshots **both** the pad blob and its
-  watermark and restores both still rewinds undetected. In the browser that
-  remains a deletion away, which is why **OTP's guarantee is materially stronger
-  in the app** — and pads are exchanged in person, device to device, so the app is
-  where they actually live. On Android the bar is now app-data file access
-  (root): such an attacker can destroy a floor, which fails closed, but cannot
-  rewind one. Closing the browser case would need OS-level trusted monotonic
-  storage, which the web platform does not offer.
-- **M-03 / L-01 / L-02.** Dedicated stricter rate bucket on `/api/auth/challenge`;
-  `Strict-Transport-Security` sent over HTTPS; dev files (`package.json`,
-  `*.test.mjs`) are 404'd and removed from the deployed client.
-- **H-02 (architecture) — the relay serves the web client.** Unchanged by
-  design and documented above ("Trust boundary of the web client"): the web
-  client is the *honest-but-curious* model; the **bundled Android app** (audited
-  client shipped in the APK, not server-delivered) is the answer for the
-  *actively-malicious-relay* model. C-01/H-01 make that app's guarantees hold
-  against a hostile relay.
-- **L-03 (SSH) / PQ-assurance.** SSH is key-only on a disposable test box
-  (accepted); `@noble/post-quantum` is the current self-audited release (no
-  constant-time guarantee) — an assurance note, not a known vulnerability.
+`docs/PENTEST-PROMPT.md` is the standing brief for a full review;
+`.claude/agents/pentest-new-code.md` is the narrower agent that attacks only
+changed code (run it after every fix — a fix is new code).

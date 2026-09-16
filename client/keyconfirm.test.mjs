@@ -179,10 +179,43 @@ console.log("OK  M-5: a real desync fails loudly at the deadline, never silently
 }
 console.log("OK  M-5: a withheld confirm frame is a timeout, not a hang");
 
+// --- Phase-7 pentest 2026-09-16, F-P7-19 ---------------------------------------
+// The confirm frame is not signature-covered and was counted toward the cap
+// even before our chains existed. Two relay-injected tags ahead of the honest
+// one made the honest tag the third: both sides printed that the OTHER SIDE had
+// sent too many confirmations and disconnected. Tags that cannot be checked yet
+// must be ignored, and the honest exchange must still complete afterwards.
+{
+  const A = driver();
+  const c = chains(1);
+  assert.strictEqual(await A.kc.onPeerTag("BOGUS0", null), false, "a tag before the chains exist is ignored");
+  assert.strictEqual(await A.kc.onPeerTag("BOGUS1", null), false);
+  assert.strictEqual(await A.kc.onPeerTag("BOGUS2", null), false, "...however many of them");
+  assert.deepStrictEqual(A.log.failed, [], "F-P7-19: pre-chain tags burn no budget and raise no alarm");
+  await A.kc.onChains(c.a);
+  assert.strictEqual(await A.kc.onPeerTag(c.a.theirs, c.a), true,
+    "F-P7-19: the honest peer's tag still confirms after the injected ones");
+  assert.deepStrictEqual(A.log.failed, []);
+  // The wording of the overflow no longer accuses the peer.
+  const B = driver();
+  await B.kc.onChains(c.a);
+  for (let i = 0; i < MAX_PEER_CONFIRMS; i++) await B.kc.onPeerTag(`g${i}`, c.a);
+  await B.kc.onPeerTag("g-over", c.a);
+  assert.match(B.log.failed[0], /the relay is injecting them/, "F-P7-19: the overflow names the relay, not the peer");
+  assert.doesNotMatch(B.log.failed[0], /the other side/);
+  console.log("OK  F-P7-19: key-confirmation tags that arrive before the chains exist are ignored, not counted");
+}
+
 // --- the tag set must not become a guessing oracle ---------------------------
 // The confirm frame is NOT signature-covered, so the original code took only
 // the first tag. The set that makes the race work must stay hard-capped.
 {
+  // Phase-7 pentest 2026-09-16, F-P7-A6: this block imported the cap from the
+  // module under test and looped to it, so raising the constant moved the
+  // expectation with it — the test only ever asserted "a cap exists". Pin the
+  // literal: two is the number an honest peer can produce (one per direction
+  // of a race), and anything above that is a guessing oracle.
+  assert.strictEqual(MAX_PEER_CONFIRMS, 2, "MAX_PEER_CONFIRMS is the literal 2 — a security constant, not a tunable");
   const A = driver();
   const c = chains(1);
   await A.kc.onChains(c.a);
@@ -192,7 +225,7 @@ console.log("OK  M-5: a withheld confirm frame is a timeout, not a hang");
   }
   await A.kc.onPeerTag("guess-over-cap", c.a);
   assert.strictEqual(A.log.failed.length, 1, "past the cap it is an attack, and loud");
-  assert.match(A.log.failed[0], /more key confirmations than any honest peer/);
+  assert.match(A.log.failed[0], /more key confirmations arrived than any honest peer can send/);
   assert.strictEqual(A.log.finished, 0);
 
   // Repeating the SAME tag is not a new guess and must not count toward the cap

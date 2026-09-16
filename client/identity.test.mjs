@@ -230,7 +230,60 @@ async function testCrossSessionReplayDefeated() {
   console.log("OK  cross-session handshake replay (reused room id) DEFEATED by session nonces");
 }
 
+// Phase-7 pentest 2026-09-16, F-P7-A1 #1. identity.js:14-15 is the project's
+// headline claim — "Both signatures must verify for any check to pass" — and it
+// had no test: the only dual-signature check used a signature from a DIFFERENT
+// identity, which fails the classical half too. Deleting the whole ML-DSA half
+// of Identity.verify left every test file green. This pins each half alone.
+async function testDualSignatureIsMandatory() {
+  const id = await Identity.generate();
+  const other = await Identity.generate();
+  const bundle = id.publicBundle();
+  const msg = new TextEncoder().encode("both halves, or nothing");
+  const good = await id.sign(msg);
+  const alien = await other.sign(msg);
+  assert.strictEqual(await Identity.verify(bundle, msg, good), true, "control: the genuine dual signature verifies");
+  assert.strictEqual(await Identity.verify(bundle, msg, { ed: good.ed, mldsa: alien.mldsa }), false,
+    "a valid Ed25519 signature with a wrong ML-DSA signature must be REFUSED — the post-quantum half is not decorative");
+  assert.strictEqual(await Identity.verify(bundle, msg, { ed: alien.ed, mldsa: good.mldsa }), false,
+    "a valid ML-DSA signature with a wrong Ed25519 signature must be REFUSED — the classical half is not decorative");
+  assert.strictEqual(await Identity.verify(bundle, msg, { ed: good.ed }), false,
+    "an ABSENT ML-DSA signature must be refused, not skipped");
+  assert.strictEqual(await Identity.verify(bundle, msg, { ed: good.ed, mldsa: "AAAA" }), false,
+    "a malformed ML-DSA signature must be refused, not skipped");
+  console.log("OK  F-P7-A1: each signature half is independently load-bearing in Identity.verify");
+}
+
+// Phase-7 pentest 2026-09-16, F-P7-A1 #2. The 2026-07-26 P-03 fix binds the
+// signer's whole bundle (through its 32-byte digest) into the handshake
+// transcript, so a relay that swaps or strips the long-term ENCRYPTION keys in
+// a `key` frame fails signature verification instead of relying on the user
+// to spot a changed safety number. Dropping that digest from auth.js left
+// every test green. This pins it: the same signature must verify against the
+// bundle as presented and fail against a swapped or stripped copy.
+async function testTranscriptBindsTheSignersBundle() {
+  const id = await Identity.generate();
+  const other = await Identity.generate();
+  const nonces = [freshNonce(), freshNonce()];
+  const pub = await ephemeralPub(makeCipher("DHKE", ROOM));
+  const sig = await signHandshake(id, ROOM, nonces, pub);
+  const b = id.publicBundle();
+  assert.strictEqual(await verifyHandshake(b, ROOM, nonces, pub, sig), true, "control: genuine bundle verifies");
+  const swappedEcdh = { ...b, ecdh: other.publicBundle().ecdh };
+  assert.strictEqual(await verifyHandshake(swappedEcdh, ROOM, nonces, pub, sig), false,
+    "P-03: a relay-swapped idb.ecdh must fail the handshake signature");
+  const swappedKem = { ...b, mlkem: other.publicBundle().mlkem };
+  assert.strictEqual(await verifyHandshake(swappedKem, ROOM, nonces, pub, sig), false,
+    "P-03: a relay-swapped idb.mlkem must fail the handshake signature");
+  const stripped = { ed: b.ed, mldsa: b.mldsa };
+  assert.strictEqual(await verifyHandshake(stripped, ROOM, nonces, pub, sig), false,
+    "P-03: stripping the encryption keys from the presented bundle must fail the handshake signature");
+  console.log("OK  F-P7-A1: the handshake transcript binds the signer's full bundle (P-03)");
+}
+
 await testIdentityBasics();
+await testDualSignatureIsMandatory();
+await testTranscriptBindsTheSignersBundle();
 await testFingerprints();
 await testExportImport();
 await testLegacyBlobImport();

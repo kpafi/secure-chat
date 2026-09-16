@@ -260,7 +260,7 @@ class RatchetChannel {
 // user's head, the input field) and the session nonces cross the relay in the
 // clear — an attacker who learns the PASSPHRASE and recorded the ciphertext can
 // still re-derive every session, past and future. That is inherent to any
-// passphrase-only mode; real forward secrecy needs DHKE/PQKEM/RSA.
+// passphrase-only mode; real forward secrecy needs DHKE or PQKEM.
 
 const AES_CHAIN_INFO = "secure-chat/aes-fs/v1|";
 const AES_MSG_DOMAIN = "secure-chat/aes-msg/v2";
@@ -396,8 +396,8 @@ class Dhke {
     //
     // Pentest 2026-07-27 M-4: this guard used to be a bare `b64 === this.myPub`
     // string compare on a malleable encoding, so a re-SPELLED copy of our own
-    // signed offer walked straight past it (RSA and PQKEM survived only because
-    // they compare signature-covered inner JSON fields). The guest then derived
+    // signed offer walked straight past it (PQKEM survived only because it
+    // compares signature-covered inner JSON fields). The guest then derived
     // a channel with herself and was prompted to verify her OWN fingerprint;
     // clicking through pinned her own bundle as the room's contact. Decode
     // FIRST — b64ToBuf is canonical now (H-1), so the decode rejects every
@@ -444,7 +444,7 @@ class Dhke {
   }
 }
 
-// ---- shared byte helpers (RSA + PQKEM) -------------------------------------
+// ---- shared byte helpers (PQKEM) -------------------------------------------
 
 // Byte equality. Not constant-time and does not need to be: every value
 // compared with it is PUBLIC key material already on the wire.
@@ -470,167 +470,51 @@ async function sha256Hex(bytes) {
   return Array.from(d, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// ---- RSA: RSA-OAEP-2048 key transport + forward-secret symmetric ratchet ---
-// Peers swap per-session RSA public keys (identity-signed at the app layer).
-// The handshake ANSWER transports a random 32-byte ROOT secret, RSA-OAEP-
-// encrypted to the offerer's public key (`ws`) — classic RSA key transport.
-// Both sides HKDF the root into the two chain heads of a RatchetChannel (the
-// HKDF info binds each chain to its sender's public key).
+// ---- RSA key transport: REMOVED (deprecated 2026-08-21) --------------------
+// TOMBSTONE. There used to be an `Rsa` cipher here (RSA-OAEP-2048 key transport
+// feeding the same forward-secret ratchet as the other modes), plus a partial
+// public-key validator (`assertRsaPublicKeyUsable`, SP 800-56B Rev.2 §6.4.2.2)
+// and its helpers (base64url->BigInt, bit length, integer n-th root, a small-
+// prime sieve). All of it is gone, deliberately. Do not restore it.
 //
-// FORWARD SECRECY: the ratchet erases consumed keys (see RatchetChannel), and
-// because a recorded transcript plus EITHER the root secret OR the RSA private
-// key would replay the whole schedule, both are erased (`_seal`) the moment
-// the first real message is sent or received — the handshake is settled by
-// then (messaging sits behind the safety-number gate; a relay withholding a
-// race answer past that point could only ever cause a loud decrypt failure,
-// which it can anyway). The RSA keypair is per-session, so today's compromise
-// never touches past sessions either. Note the previous design's per-message
-// RSA wrapping of the AES key had to go: wrapping every message key to one
-// session-long RSA key is exactly what forfeits forward secrecy.
+// WHY (pentest 2026-08-07 F-CRYPTO-009, accepted as a RESIDUAL that validation
+// cannot close). In RSA key transport the ROOT secret is chosen by one side and
+// encrypted to a modulus chosen by the OTHER side, and that one root is the sole
+// HKDF IKM for BOTH direction chains. A counterparty who offers e = 65537 with
+// n = <one small factor> x <one large prime> therefore hands the entire session
+// — past and future traffic, in both directions — to any passive observer of the
+// handshake frame. That variant was demonstrated against this file. Partial
+// public-key validation CANNOT catch it: no cheap check certifies that a modulus
+// is the product of two large primes, and raising the trial-division bound does
+// not help — the attacker simply picks a larger factor. The validator that used
+// to live here removed only the trivially catastrophic keys (e in {0,1,2,3},
+// even moduli, perfect powers, mis-declared sizes) and was never a defence
+// against this; keeping it would have read as "peer RSA keys are validated",
+// which was exactly the false assurance the finding is about.
 //
-// Like PQKEM, the exchange tolerates the join-order race: root secrets are
-// folded into HKDF keyed by a hash of the recipient key and sorted, so both
-// peers feed HKDF identical input whether one or two secrets were exchanged.
-
-const RSA_CHAIN_INFO = "secure-chat/rsa-fs/v1|";
-const RSA_MSG_DOMAIN = "secure-chat/rsa-msg/v2";
-
-// Smallest peer modulus we will wrap a root secret to (P-16). Matches the size
-// we generate; 2048 is today's floor rather than a recommendation, which is why
-// DHKE/PQKEM are the preferred modes.
-const RSA_MIN_MODULUS_BITS = 2048;
-
-class Rsa {
-  constructor(roomId) {
-    this.roomId = roomId;
-    this.kp = null;
-    this.myPub = null;        // my SPKI public key (base64)
-    this.peerPub = null;      // peer public key (CryptoKey, wraps root secrets)
-    this.peerPubB64 = null;
-    this.secrets = new Map(); // tag (hex SHA-256 of recipient pub b64) -> root secret
-    this.answer = null;       // our reply payload, set when we answer a peer offer
-    this.chan = null;
-    this.sealed = false;      // handshake material erased; ratchet-only from here
-    this._derivedFrom = null; // signature of the inputs the current chains came from
-  }
-  get needsHandshake() {
-    return true;
-  }
-  get ready() {
-    return this.chan !== null;
-  }
-  // Key confirmation (pentest 2026-07-27 M-5): {mine, theirs} once the chains
-  // exist. `mine` goes to the peer; a peer that derived the same material sends
-  // back exactly `theirs`. See app.js for the exchange and why it gates the
-  // in-person verification step.
-  get confirmation() {
-    return this.chan ? { mine: this.chan.confirmMine, theirs: this.chan.confirmTheirs } : null;
-  }
-  async init() {
-    this.kp = await crypto.subtle.generateKey(
-      { name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
-      false, // private key non-extractable
-      ["decrypt"],
-    );
-    this.myPub = bufToB64(await crypto.subtle.exportKey("spki", this.kp.publicKey));
-  }
-  async handshakePayload() {
-    if (this.answer) return this.answer;   // reply to a peer offer
-    return packMsg({ pub: this.myPub });   // initial offer
-  }
-  async onPeerKey(b64) {
-    // Post-seal the key is final and the unwrap/wrap material is gone; a late
-    // handshake frame can only be relay mischief, so ignore it (never desync).
-    if (this.sealed) return;
-    const m = unpackMsg(b64);
-    // Our own key echoed back can only be relay mischief: honest peers never
-    // share a keypair, and identical pubs would collapse the direction chains.
-    if (m.pub === this.myPub) throw new Error("reflected handshake rejected");
-    if (m.pub && this.peerPubB64 === null) { // first key wins
-      const peerPub = await crypto.subtle.importKey(
-        "spki", b64ToBuf(m.pub), { name: "RSA-OAEP", hash: "SHA-256" }, false, ["encrypt"],
-      );
-      // Pentest 2026-07-26 P-16: we are about to RSA-OAEP-encrypt this session's
-      // 32-byte root secret to this key, so refuse a short modulus outright
-      // rather than trusting the counterparty to have picked a sane size.
-      const bits = peerPub.algorithm && peerPub.algorithm.modulusLength;
-      if (typeof bits !== "number" || bits < RSA_MIN_MODULUS_BITS) {
-        throw new Error(`peer RSA key is too small (${bits} bits; minimum ${RSA_MIN_MODULUS_BITS})`);
-      }
-      this.peerPub = peerPub;
-      this.peerPubB64 = m.pub;
-    }
-    if (this.peerPubB64 === null) throw new Error("malformed RSA handshake message");
-    if (m.ws) {
-      // Peer answered our offer: unwrap the root secret sent to our key. First
-      // write wins, so a replayed answer cannot diverge the derived chains.
-      const tag = await sha256Hex(enc.encode(this.myPub));
-      if (!this.secrets.has(tag)) {
-        const secret = new Uint8Array(
-          await crypto.subtle.decrypt({ name: "RSA-OAEP" }, this.kp.privateKey, b64ToBuf(m.ws)),
-        );
-        if (secret.length !== 32) throw new Error("bad root secret length");
-        this.secrets.set(tag, secret);
-      }
-    } else {
-      // Peer offered their key: choose a root secret, wrap it to them, answer.
-      const tag = await sha256Hex(enc.encode(this.peerPubB64));
-      if (!this.secrets.has(tag)) {
-        this.secrets.set(tag, crypto.getRandomValues(new Uint8Array(32)));
-      }
-      const ws = await crypto.subtle.encrypt(
-        { name: "RSA-OAEP" }, this.peerPub, this.secrets.get(tag),
-      );
-      this.answer = packMsg({ pub: this.myPub, ws: bufToB64(ws) });
-    }
-    await this._derive();
-  }
-  // (Re)derive the direction-separated chain heads from every root secret we
-  // hold, ordered by tag so both peers feed HKDF identical input. Idempotent:
-  // if the inputs are unchanged (e.g. a relay replayed a handshake frame) the
-  // existing chains — and their positions — are kept intact.
-  async _derive() {
-    if (this.peerPubB64 === null || this.secrets.size === 0) return;
-    const tags = [...this.secrets.keys()].sort();
-    const signature = tags.join(",");
-    if (signature === this._derivedFrom) return;
-    this._derivedFrom = signature;
-    const ikm = concatBytes(tags.map((t) => this.secrets.get(t)));
-    const base = await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveKey"]);
-    const chain = (senderPubB64) =>
-      crypto.subtle.deriveKey(
-        { name: "HKDF", hash: "SHA-256", salt: enc.encode(this.roomId), info: enc.encode(RSA_CHAIN_INFO + senderPubB64) },
-        base,
-        HMAC_CHAIN,
-        false,
-        ["sign"],
-      );
-    this.chan = await RatchetChannel.create(this.roomId, RSA_MSG_DOMAIN, await chain(this.myPub), await chain(this.peerPubB64));
-  }
-  // Erase everything that could reconstruct past (or all) message keys: the
-  // root secrets and the RSA private key. From here only the forward-stepping
-  // chain heads remain. Runs on the first real message in either direction.
-  _seal() {
-    for (const s of this.secrets.values()) s.fill(0);
-    this.secrets.clear();
-    this.kp = null;      // per-session; only ever needed to unwrap `ws`
-    this.peerPub = null; // only ever needed to wrap `ws`
-    this.answer = null;
-    this._derivedFrom = null;
-    this.sealed = true;
-  }
-  async encrypt(text) {
-    if (!this.chan) throw new Error("handshake not complete");
-    if (!this.sealed) this._seal();
-    return this.chan.encrypt(text);
-  }
-  async decrypt(b64) {
-    if (!this.chan) throw new Error("handshake not complete");
-    const pt = await this.chan.decrypt(b64);
-    if (!this.sealed) this._seal();
-    return pt;
-  }
-}
+// WHY NOT THE OTHER FIX. Making the root contributory (each side wraps its OWN
+// secret to the other's key, both folded into the IKM, so one bad key exposes
+// only one half) would close it, but it needs a THIRD handshake frame: the
+// two-frame offer/answer exchange has nowhere to put the offerer's ciphertext,
+// and app.js's "answer the initiator exactly once" invariant forbids adding one.
+// The repo owner's decision (2026-08-21) was to drop the mode rather than grow
+// the handshake.
+//
+// WHAT REPLACES IT. DHKE and PQKEM. Neither has a peer-chosen-modulus analogue:
+// their peer material is a P-256 point (WebCrypto enforces on-curve and rejects
+// the identity; P-256 has prime order, so there is no degenerate-parameter
+// choice to make) plus, for PQKEM, an ML-KEM-768 encapsulation key. Both derive
+// a CONTRIBUTORY secret — neither side alone fixes it.
+//
+// HOW THE REFUSAL IS ENFORCED. Three layers, none of them decorative:
+//   1. index.html no longer offers an RSA radio, so it cannot be selected.
+//   2. makeCipher refuses "RSA" via DEPRECATED_ALGS below, with the reason —
+//      never a fallback to another mode (a silent downgrade would be a finding
+//      in its own right), and app.js turns the throw into a red hint.
+//   3. The implementation is gone, so there is no `case "RSA":` for a future
+//      contributor to re-enable one line away from the residual.
+// Anchored by rsa-deprecation.test.mjs (all three layers) and by
+// e2e/all-modes.mjs (which asserts the mode inventory exhaustively).
 
 // ---- PQKEM: hybrid ECDH P-256 + ML-KEM-768 -> forward-secret ratchet -------
 // Post-quantum-secure session root. The ratchet chains are derived
@@ -639,7 +523,7 @@ class Rsa {
 // i.e. it resists "harvest now, decrypt later" by a future quantum adversary,
 // while remaining no weaker than DHKE if ML-KEM were ever faulted.
 // Authenticated by the same dual (Ed25519 + ML-DSA-65) identity handshake as
-// DHKE/RSA (see app.js / auth.js).
+// DHKE (see app.js / auth.js).
 //
 // The exchange is symmetric: each peer OFFERS an ML-KEM public key, the other
 // ENCAPSULATES to it, and the resulting shared secret(s) are folded in keyed by
@@ -648,7 +532,7 @@ class Rsa {
 // offers are delivered) with no role negotiation: in the common case exactly
 // one secret is established, in the race two, and both peers agree either way.
 //
-// FORWARD SECRECY: like RSA, the handshake material that could replay the key
+// FORWARD SECRECY: the handshake material that could replay the key
 // schedule from a recorded transcript — the ECDH private key, the KEM secret
 // key, and the raw shared secrets — is erased (`_seal`) the moment the first
 // real message is sent or received (messaging sits behind the safety-number
@@ -988,18 +872,37 @@ class OtpPad {
   }
 }
 
-// OTP is now available (see OtpPad). Kept as an (empty) export for callers that
-// import it; a mode listed here would be UI-disabled with the given reason.
-export const UNAVAILABLE = {};
+// Modes this build refuses to construct, and WHY — the reason is the user-facing
+// half of the refusal, so it is written to be read out loud in a red hint.
+//
+// This replaces the old `UNAVAILABLE = {}` export, which was DEAD: nothing in
+// the tree ever read it, yet its comment claimed a mode listed in it "would be
+// UI-disabled with the given reason" — a mechanism that did not exist. This
+// project treats dead security code as a hazard precisely because a comment
+// like that is believed. `DEPRECATED_ALGS` is genuinely consumed: makeCipher
+// below is its only reader and refuses on it, so emptying this object visibly
+// changes behaviour (and turns rsa-deprecation.test.mjs red).
+export const DEPRECATED_ALGS = Object.freeze({
+  RSA: "peer-chosen RSA key transport is deprecated: a crafted peer modulus " +
+    "(e = 65537, n = small factor x large prime) hands the whole session to a " +
+    "passive observer and no validation can catch it (F-CRYPTO-009). " +
+    "Use DHKE or PQKEM.",
+});
 
 export function makeCipher(alg, roomId, opts = {}) {
+  // Checked BEFORE the switch so a deprecated mode reports its actual reason
+  // rather than the generic "unsupported" default — and so re-adding a `case`
+  // below could not quietly resurrect it. Never falls back to another mode: a
+  // silent downgrade is itself a finding in this codebase, so the caller
+  // (app.js) surfaces this throw and refuses to connect.
+  if (Object.prototype.hasOwnProperty.call(DEPRECATED_ALGS, alg)) {
+    throw new Error(`${alg} is no longer supported — ${DEPRECATED_ALGS[alg]}`);
+  }
   switch (alg) {
     case "AES256":
       return new AesPassphrase(roomId, opts.passphrase);
     case "DHKE":
       return new Dhke(roomId);
-    case "RSA":
-      return new Rsa(roomId);
     case "PQKEM":
       return new Pqkem(roomId);
     case "OTP":

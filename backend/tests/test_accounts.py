@@ -35,6 +35,7 @@ def _reset_api_limiter():
     # client host, so otherwise the buckets would deplete across the suite).
     accounts._api_limiter._buckets.clear()
     accounts._lookup_limiter._buckets.clear()
+    accounts._vouch_host_limiter._buckets.clear()
     accounts._challenge_limiter._buckets.clear()
     yield
 
@@ -61,6 +62,23 @@ def _register_message(username, ed, mldsa):
 def _login_message(challenge_b64):
     # Mirror accounts._login_message: domain prefix + the raw challenge bytes.
     return b"secure-chat/login/v1\n" + base64.b64decode(challenge_b64)
+
+
+def _login_body(username, challenge, ident):
+    """Dual-signed login body (pentest 2026-08-07 F-RELAY-006).
+
+    Directory login used to accept the Ed25519 signature alone — the one place
+    the dual-scheme identity was not AND-composed, while the token it minted
+    could drain and delete the mailbox and delete the account's vouches.
+    """
+    ed_priv, _ed, _mldsa, mldsa_secret = ident
+    msg = _login_message(challenge)
+    return {
+        "username": username,
+        "challenge": challenge,
+        "sig": _b64(ed_priv.sign(msg)),
+        "mldsa_sig": _b64(ML_DSA_65.sign(mldsa_secret, msg)),
+    }
 
 
 def _register_body(username, ident):
@@ -185,12 +203,10 @@ def test_verify_unknown_user_is_401_not_404():
 
 def test_full_login_flow():
     ident, _ = _register("carol")
-    ed_priv = ident[0]
     ch = client.post("/api/auth/challenge", json={"username": "carol"})
     assert ch.status_code == 200
     challenge = ch.json()["challenge"]
-    sig = ed_priv.sign(_login_message(challenge))
-    ver = client.post("/api/auth/verify", json={"username": "carol", "challenge": challenge, "sig": _b64(sig)})
+    ver = client.post("/api/auth/verify", json=_login_body("carol", challenge, ident))
     assert ver.status_code == 200, ver.text
     token = ver.json()["token"]
 
@@ -199,11 +215,10 @@ def test_full_login_flow():
     assert me.json()["username"] == "carol"
 
 
-def _login(username, ed_priv):
+def _login(username, ident):
     """Complete a real challenge/response login and return the bearer token."""
     ch = client.post("/api/auth/challenge", json={"username": username}).json()["challenge"]
-    sig = ed_priv.sign(_login_message(ch))
-    r = client.post("/api/auth/verify", json={"username": username, "challenge": ch, "sig": _b64(sig)})
+    r = client.post("/api/auth/verify", json=_login_body(username, ch, ident))
     assert r.status_code == 200, r.text
     return r.json()["token"]
 
@@ -230,10 +245,10 @@ def test_relogin_does_not_revoke_the_previous_session():
     sealed mail. Revocation on demand is /auth/logout's job, not login's.
     """
     ident, _ = _register("revoke-relogin")
-    first = _login("revoke-relogin", ident[0])
+    first = _login("revoke-relogin", ident)
     assert _me(first) == 200, "precondition: the first token works"
 
-    second = _login("revoke-relogin", ident[0])
+    second = _login("revoke-relogin", ident)
     assert second != first, "a fresh login must mint a new token"
     assert _me(second) == 200, "the new session works"
     assert _me(first) == 200, "M-C: a second tab must not revoke the first"
@@ -242,10 +257,10 @@ def test_relogin_does_not_revoke_the_previous_session():
 def test_sessions_per_account_are_capped_with_oldest_evicted():
     """…but not unbounded, or a leaked token outlives every remedy but the TTL."""
     ident, _ = _register("revoke-cap")
-    tokens = [_login("revoke-cap", ident[0]) for _ in range(config.MAX_SESSIONS_PER_ACCOUNT)]
+    tokens = [_login("revoke-cap", ident) for _ in range(config.MAX_SESSIONS_PER_ACCOUNT)]
     assert all(_me(t) == 200 for t in tokens), "every session up to the cap is live"
 
-    extra = _login("revoke-cap", ident[0])
+    extra = _login("revoke-cap", ident)
     assert _me(extra) == 200, "the newest session works"
     assert _me(tokens[0]) == 401, "the OLDEST session is the one evicted"
     assert all(_me(t) == 200 for t in tokens[1:]), "the rest are untouched"
@@ -253,7 +268,7 @@ def test_sessions_per_account_are_capped_with_oldest_evicted():
 
 def test_logout_revokes_the_presented_token():
     ident, _ = _register("revoke-logout")
-    token = _login("revoke-logout", ident[0])
+    token = _login("revoke-logout", ident)
     assert _me(token) == 200
 
     r = client.post("/api/auth/logout", headers={"Authorization": f"Bearer {token}"})
@@ -269,7 +284,7 @@ def test_logout_is_idempotent_and_not_a_validity_oracle():
     mistake, so it is pinned here.
     """
     ident, _ = _register("revoke-oracle")
-    token = _login("revoke-oracle", ident[0])
+    token = _login("revoke-oracle", ident)
     real = client.post("/api/auth/logout", headers={"Authorization": f"Bearer {token}"})
     again = client.post("/api/auth/logout", headers={"Authorization": f"Bearer {token}"})
     bogus = client.post("/api/auth/logout", headers={"Authorization": "Bearer not-a-real-token"})
@@ -284,15 +299,15 @@ def test_eviction_and_logout_are_scoped_to_one_account():
     """Neither the cap nor logout may reach another user's sessions."""
     a_ident, _ = _register("revoke-a")
     b_ident, _ = _register("revoke-b")
-    b_tok = _login("revoke-b", b_ident[0])
+    b_tok = _login("revoke-b", b_ident)
 
     # Drive account A past its cap; B must be untouched throughout.
     for _ in range(config.MAX_SESSIONS_PER_ACCOUNT + 2):
-        _login("revoke-a", a_ident[0])
+        _login("revoke-a", a_ident)
     assert _me(b_tok) == 200, "another account's session survives A's evictions"
 
     # And A signing out does not touch B either.
-    a_tok = _login("revoke-a", a_ident[0])
+    a_tok = _login("revoke-a", a_ident)
     client.post("/api/auth/logout", headers={"Authorization": f"Bearer {a_tok}"})
     assert _me(a_tok) == 401
     assert _me(b_tok) == 200, "another account's session survives A's logout"
@@ -309,13 +324,12 @@ def test_login_rejects_wrong_signature():
 
 def test_challenge_is_one_time():
     ident, _ = _register("erin")
-    ed_priv = ident[0]
     ch = client.post("/api/auth/challenge", json={"username": "erin"}).json()["challenge"]
-    sig = _b64(ed_priv.sign(_login_message(ch)))
-    first = client.post("/api/auth/verify", json={"username": "erin", "challenge": ch, "sig": sig})
+    body = _login_body("erin", ch, ident)
+    first = client.post("/api/auth/verify", json=body)
     assert first.status_code == 200
     # Replaying the same challenge must fail (consumed).
-    second = client.post("/api/auth/verify", json={"username": "erin", "challenge": ch, "sig": sig})
+    second = client.post("/api/auth/verify", json=body)
     assert second.status_code == 400
 
 
@@ -332,11 +346,27 @@ def test_api_rate_limit(monkeypatch):
 
 def test_lookup_rate_limit(monkeypatch):
     from relay import KeyedRateLimiter
-    # The lookup path has its own, stricter bucket (anti-enumeration).
+    # The lookup path has its own, stricter bucket (anti-enumeration). Phase-7
+    # pentest 2026-09-16 F-P7-3: it is charged AFTER the token gate and keyed on
+    # the TARGET, so garbage without a token spends nothing and a token holder
+    # can only exhaust the one handle they hold a token for.
     monkeypatch.setattr(accounts, "_lookup_limiter", KeyedRateLimiter(3, 0.001))
-    codes = [client.get("/api/users/whoever", params={"t": "x"}).status_code for _ in range(6)]
-    assert 429 in codes, codes
-    assert codes.count(429) >= 2, codes
+    ident = _new_identity()
+    r = client.post("/api/register", json=_register_body("lookup-target", ident))
+    assert r.status_code == 200, r.text
+    token = r.json()["lookup_token"]
+    # 1. Unauthenticated garbage (no token) never reaches the bucket.
+    garbage = [client.get("/api/users/lookup-target", params={"t": "x"}).status_code for _ in range(8)]
+    assert garbage == [404] * 8, garbage
+    # 2. ...so the target is still reachable with its token afterwards.
+    codes = [client.get("/api/users/lookup-target", params={"t": token}).status_code for _ in range(6)]
+    assert codes[:3] == [200, 200, 200], codes
+    assert codes[3:] == [429, 429, 429], codes
+    # 3. Exhausting one target's bucket says nothing about another's.
+    ident2 = _new_identity()
+    r = client.post("/api/register", json=_register_body("lookup-other", ident2))
+    assert r.status_code == 200, r.text
+    assert client.get("/api/users/lookup-other", params={"t": r.json()["lookup_token"]}).status_code == 200
 
 
 def test_account_cap_enforced(monkeypatch):
@@ -358,12 +388,10 @@ def test_pending_challenge_cap_enforced(monkeypatch):
 
 def test_active_token_cap_enforced(monkeypatch):
     ident, _ = _register("tokcap")
-    ed_priv = ident[0]
     accounts._tokens.clear()
     monkeypatch.setattr(config, "MAX_ACTIVE_TOKENS", 0)
     ch = client.post("/api/auth/challenge", json={"username": "tokcap"}).json()["challenge"]
-    sig = _b64(ed_priv.sign(_login_message(ch)))
-    ver = client.post("/api/auth/verify", json={"username": "tokcap", "challenge": ch, "sig": sig})
+    ver = client.post("/api/auth/verify", json=_login_body("tokcap", ch, ident))
     assert ver.status_code == 503, ver.text
 
 
@@ -445,3 +473,54 @@ def test_register_rejects_non_canonical_base64():
 
     # …and the canonical original is still accepted, unchanged.
     assert client.post("/api/register", json=_register_body("canon-ok", ident)).status_code == 200
+
+
+# ---- F-RELAY-006: directory login must require BOTH schemes ----------------
+
+def test_login_requires_both_signatures():
+    """Pentest 2026-08-07 F-RELAY-006.
+
+    Registration proves control of both identity keys and the handshake requires
+    both signatures (AND-composed). Directory login was the exception: a token
+    minted on the Ed25519 signature alone, and that token drains and DELETES the
+    mailbox and deletes the account's vouches. So breaking the classical scheme
+    — exactly what the ML-DSA half hedges against — handed over the directory
+    session while every other surface still held.
+    """
+    ident, _ = _register("dualauth")
+    ed_priv, _ed, _mldsa, mldsa_secret = ident
+
+    # Ed25519 alone: refused (this is the finding).
+    ch = client.post("/api/auth/challenge", json={"username": "dualauth"}).json()["challenge"]
+    only_ed = {
+        "username": "dualauth", "challenge": ch,
+        "sig": _b64(ed_priv.sign(_login_message(ch))),
+    }
+    assert client.post("/api/auth/verify", json=only_ed).status_code == 401
+
+    # A valid Ed25519 signature with a WRONG ML-DSA one: still refused, so the
+    # PQ half is genuinely verified rather than merely required to be present.
+    ch = client.post("/api/auth/challenge", json={"username": "dualauth"}).json()["challenge"]
+    other = _new_identity()
+    mixed = {
+        "username": "dualauth", "challenge": ch,
+        "sig": _b64(ed_priv.sign(_login_message(ch))),
+        "mldsa_sig": _b64(ML_DSA_65.sign(other[3], _login_message(ch))),
+    }
+    assert client.post("/api/auth/verify", json=mixed).status_code == 401
+
+    # And the reverse: a valid ML-DSA signature with a wrong Ed25519 one.
+    ch = client.post("/api/auth/challenge", json={"username": "dualauth"}).json()["challenge"]
+    mixed2 = {
+        "username": "dualauth", "challenge": ch,
+        "sig": _b64(other[0].sign(_login_message(ch))),
+        "mldsa_sig": _b64(ML_DSA_65.sign(mldsa_secret, _login_message(ch))),
+    }
+    assert client.post("/api/auth/verify", json=mixed2).status_code == 401
+
+    # Both correct: 200, and the token works.
+    ch = client.post("/api/auth/challenge", json={"username": "dualauth"}).json()["challenge"]
+    good = client.post("/api/auth/verify", json=_login_body("dualauth", ch, ident))
+    assert good.status_code == 200, good.text
+    me = client.get("/api/me", headers={"Authorization": f"Bearer {good.json()['token']}"})
+    assert me.status_code == 200 and me.json()["username"] == "dualauth"

@@ -3,7 +3,1459 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (2026-07-28, Tor onion service LIVE)
+> **Read the git log before trusting the top entry.** A session in progress can
+> land several commits between updates to this file, and this file's top section
+> going stale has already cost one session an afternoon of duplicated work
+> (2026-08-21: Phase 2 was re-implemented from scratch against a stale entry that
+> said it was still open). `git log --oneline -15` is the authority on what has
+> landed; this file is the authority on WHY.
+
+## ⮕ RESUME HERE (2026-09-16, night — the delta was reviewed, its 16 findings fixed, and the branch MERGED into master locally)
+
+**HEAD:** `master` == `pentest-2026-08-07-fixes` after a local `--no-ff` merge
+(see `git log --oneline -3`). **Not pushed. Not deployed.** Tree clean.
+
+**The review of the delta (item 5 of the previous entry) found the mailbox
+commit `018652d` did NOT do what it claimed** — 8 Medium / 6 Low / 2 Info, no
+Critical/High. Every one is fixed in the last commit before the merge and
+recorded, with resolutions, as §9 of `docs/pentests/secure-chat-pentest-2026-09-16.md`.
+The short version: the first F-P7-1 fix's `mailbox_fetches` table was a
+last-seen log at rest that nothing read, was bought back with one GET per
+throwaway inbox, and deleted real mail on deploy day — it is GONE; the budget
+is now bytes-first with a minimum envelope size and evict-oldest instead of a
+relay-wide 503; the host ceiling is POST-only; `#log` eviction keeps system
+lines and collapses repeats; the callee allow-list normalises `?.(`; the
+ship-list test strips comments; the Kotlin raw string is pinned to `$config`
+only; each view has its own hint element; `/api` is no longer behind the static
+gate (closes F-P7-16 too).
+
+Verification for the merge: client suite exit 0 (279 OK), backend **177
+passed** (run with nothing on :8000), `crypto-tamper.mjs` **10 modes** green
+(`msgflood` and `confirmpost` are new), `two-user-flow` 8/8, `no-dead-ends`
+12/12, `room-admission` 13/13, `all-modes` 29/29 against a scratch relay
+running the final backend. 7 review-fix mutants RED (one e2e mutant is GREEN
+by construction: with repeats collapsed, a junk flood never reaches the cap,
+so the eviction ORDER is pinned by the unit anchor only — noted).
+
+### ⬜ NEXT — in order
+
+1. **⬜ Decide push + Phase 8 deploy.** The order is settled: APK first, then
+   relay + web client together (F-P7-8). Nothing here pushes.
+2. **⬜ Phase 9 — Android on-device** (unchanged list + F-P7-17).
+3. **⬜ 7b — floors for the contact and chat witnesses** (F-P7-6, the last
+   runtime Medium; the `deviceFloor()` primitive is ready, zero Kotlin).
+4. **⬜ 7a — a behavioural `app.js` test** against a DOM stub; wire
+   `proto001.mjs` + `crypto-tamper.mjs` + `room-admission.mjs` into an
+   automated runner (`npm run e2e:tamper` exists; the rest still needs a relay).
+5. **⬜ The Lows left from the report:** F-P7-10, 11, 12, 13, 15, 20, 21, 22.
+
+## ⮕ (2026-09-16, evening — Phase 7's fix list items 1-4 LANDED; next: review the delta, then merge)
+
+**HEAD:** see `git log --oneline -6` (this file is written before the last
+commit of the batch; the four fix commits are `1d240d0` item 1, `6695cf1`
+item 2, `018652d` item 3, and item 4 lands with this entry). Tree clean apart
+from the untracked session `.claude/launch.json`. Not pushed, not merged, not
+deployed.
+
+**What landed today, after the Phase-7 report `32fabaf`:**
+
+1. ✅ **Item 1 — the assurance gaps (F-P7-A1..A6, A8)** `1d240d0`. Every
+   unpinned control now has a test shown to bind (21 mutants RED): each
+   signature half of `Identity.verify`; the P-03 transcript binding;
+   `RATCHET_MAX_SKIP === 64` and enforced at exactly 64; `MAX_PEER_CONFIRMS
+   === 2` (the cap test had imported the constant it tested); both OTP
+   spent-keystream guards; `maxOf` without `Math.max`; `padWasUsed`'s
+   recv/exported evidence; `probeFloors`' create-side COMMIT_FAILED; an exact
+   six-writer allow-list for `approvedBundle` and a callee allow-list for
+   `renderPeerApproval`; canonical base64 on `ecdh`/`mlkem` in the relay; the
+   Kotlin anchors (unconditional flag, no clearFlags, `secret` pinned, WebView
+   settings, single bridge, debug-only devtools, CSP, both defineProperty
+   descriptors; the Kotlin after the raw string is scanned too). NEW HARNESS:
+   `e2e/hostile-relay/tamper.mjs` + `crypto-tamper.mjs` — a relay that attacks
+   the key material (keysub, idbswap, idbstrip, ctflip, msgreplay, confirmpre,
+   algflood) with two real browsers asserting the shipped client's response.
+   All eight modes pass.
+2. ✅ **Item 2 — the one-liners (F-P7-5, F-P7-19, F-P7-7)** `6695cf1`. The OTP
+   adoption gate and its migration rewrite ask the AEAD (`inner.hwSend`), not
+   the outer `v` byte; `onPeerTag` ignores tags that arrive before the chains
+   exist and the overflow names the relay; the deprecated-alg refusal is said
+   once per connection and `#log` is bounded at 500 lines. 6 mutants RED, three
+   of them also in the browser harness.
+3. ✅ **Item 3 — directory/mailbox availability (F-P7-1..4)** `018652d`. Fetch
+   bucket per authenticated user after auth (+ the client says 429 once);
+   global post ceiling charged after the token gate; lookup bucket per TARGET
+   after the gate (per voucher for POST /vouch); mailbox budget in BYTES
+   (256 MiB / 8 MiB per inbox) with a 24 h TTL for inboxes that have never
+   fetched (new `mailbox_fetches` table). Per-host ceilings remain only as
+   documented backstops. 8 mutants RED; the two XFF tests now probe the /api
+   ceiling.
+4. ✅ **Item 4 — before-deploy (F-P7-8, F-P7-9, F-P7-18)** (this commit). The
+   skew claim in item 8 below is corrected (APK first, then relay); `hint()`
+   routes by VIEW first (`views.test.mjs`, new); `test-source.mjs` and
+   `vendor/README.md` are on all three ship lists and
+   `test_the_three_ship_lists_agree` pins that they stay in step.
+
+### ⬜ NEXT — in order
+
+5. **⬜ Review the delta `32fabaf..HEAD` with `pentest-new-code`** (a fix is
+   new code; four commits of it), fix what it finds, then **merge into master**
+   (local merge only — no push, no deploy). The report's own recommendation:
+   merging is defensible now.
+6. **⬜ Phase 8 — deploy.** See item 8 in the previous entry (corrected) for
+   the order: APK first, then relay + web client together.
+7. **⬜ Phase 9 — Android on-device** (unchanged list, plus F-P7-17: the
+   alert/confirm dialogs still have no FLAG_SECURE of their own — Low, not
+   fixed, needs a device to judge).
+8. **⬜ 7a/7b** — a behavioural `app.js` test (four rounds of regex anchors
+   over `app.js` have each been walked past once); floors for the contact and
+   chat witnesses (F-P7-6, the one remaining runtime Medium, deliberately left
+   for its own commit).
+9. **⬜ Lows not yet fixed from the report:** F-P7-10 (relay timeout snapshot),
+   F-P7-11 (vouch error strings), F-P7-12 (body size cap), F-P7-13 (loopback
+   trusted-proxy warning), F-P7-15 (h11 log lines), F-P7-16 (static gate on
+   /api), F-P7-20 (identity blob length oracle), F-P7-21/22 (Info).
+
+**Environment trap (2026-09-16, evening):** the backend suite HANGS past 10
+minutes when a relay is listening on 127.0.0.1:8000 (`tests/test_static_hardening.py`
+and `smoke_client.py` reference it). Stop any dev relay before `pytest -q tests`;
+with the port free the suite takes ~25 s.
+
+## ⮕ (2026-09-16, later — Phase 7 DONE: whole-branch pentest reported; next is fixing its list, then merge)
+
+**HEAD: `ea0dcba`** plus two UNCOMMITTED files: `docs/pentests/secure-chat-pentest-2026-09-16.md`
+(the Phase 7 report) and this entry + a README table row. Left uncommitted on purpose
+(the pentest brief's ROE: leave the tree for the author unless asked). Tree otherwise
+clean; all lane mutants were restored byte-identically and the branch code is exactly
+`ea0dcba`.
+
+**Phase 7 result, in one line:** no Critical, no High at runtime; the E2EE, admission,
+directory-counter, dual-scheme-login and identity-anti-rollback promises all held under
+five parallel lanes with real traffic. What did not hold: the test estate (1 High + 4
+Medium assurance gaps — deleting the ML-DSA half of `Identity.verify` AND the P-03
+transcript binding AND both ratchet caps AND both OTP spent-keystream guards keeps all 16
+test files and `all-modes` green), four directory/mailbox availability holes (row-counted
+mailbox budget; three host-keyed buckets charged before auth / before the 404), the OTP
+adoption gate keyed on the outer `v` byte (browser two-time pad, pre-existing), the
+contact/chat witnesses without a floor (7b), the new RSA refusal as a DOM flood, an
+inverted skew claim in THIS FILE's earlier entry (an old APK cannot log in to the new
+relay, so it never receives sealed mail), and the mail warning rendered into a hidden
+node off the Live view. 34 findings, 28 reproduced by the lead. Full detail, code paths,
+PoC outputs and the fix list: `docs/pentests/secure-chat-pentest-2026-09-16.md` §3-§4;
+priorities §8.
+
+### ⬜ NEXT — in order (from the report's §8)
+
+1. **⬜ Pin the crypto and the floor verdict (F-P7-A1, A3, A2, A4, A5).** Dual-signature
+   and transcript tests; literal checks for `RATCHET_MAX_SKIP`/`MAX_PEER_CONFIRMS`; both
+   OTP spent-keystream guards; `maxOf` / `padWasUsed` / `probeFloors` create-side;
+   `approvedBundle` writer allow-list; `_respell` on `ecdh`/`mlkem`; Kotlin anchors for
+   the WebView settings, the bridge surface and the two `defineProperty` descriptors.
+   Adopt lane B2's key-tampering relay into `e2e/hostile-relay/`.
+2. **⬜ Two one-liners:** OTP adoption gate on `inner.hwSend` not `o.v` (F-P7-5);
+   `if (!confirmation) return false;` in `onPeerTag` (F-P7-19). Then latch the RSA
+   refusal and cap `#log` (F-P7-7).
+3. **⬜ Directory/mailbox availability (F-P7-1..4):** byte budget with per-account
+   fairness; per-user fetch bucket after auth; per-user lookup bucket; 404 before the
+   global post bucket; surface 429 in `pollMailbox`.
+4. **⬜ Before deploy:** correct the skew note (item 8 below was WRONG: the legacy body
+   sniff is in the NEW client; an old APK gets 401 on `/auth/verify` forever) and decide
+   APK-first order or a sunset flag (F-P7-8); route `hint()` by VIEW (F-P7-9); drop
+   `client/test-source.mjs` + `vendor/README.md` from all three ship lists (F-P7-18).
+5. **⬜ Then merge** — the report's recommendation: merging is defensible now (nothing
+   is worse than master); deploying is not until 2-4 are done.
+6. **⬜ Phase 8 deploy, Phase 9 Android on-device** (unchanged; the device list grows by
+   the identity floor slot, the dialog FLAG_SECURE gaps F-P7-17, and the crash-window
+   premise).
+7. **⬜ 7a/7b as before** (behavioural `app.js` test; contact/chat witness floors — now
+   also F-P7-6).
+
+## ⮕ (2026-09-16 — F-ATREST-008 closed; plan items 1-6 all landed; next is Phase 7)
+
+**HEAD: `bd696b1`** on `pentest-2026-08-07-fixes`. Tree clean. Not pushed, not
+merged, not deployed. Client suite **256 OK / exit 0** (15 of those new this
+session), backend **168 passed**. Browser smoke of the real client against a
+scratch relay: create identity → reload → unlock, same fingerprint, no console
+errors, no at-rest warning. Android `assembleDebug` NOT re-run this session
+(the only Kotlin change is a doc comment in `PadFloor.kt`).
+
+**The 2026-08-21 entry below went stale by nine commits** — exactly the trap its
+own preamble warns about. Its items 1-5 are all DONE; the record of what landed is
+in `git log fc712ad..7e5c3af` and summarised here so nobody re-does them:
+
+* ✅ **Item 1, the owed Phase-2 pentest gate** → ran as ROUND-3. Four fixes:
+  `902ed8c` F-1 HIGH (a frozen native floor must fail the SAVE, not the pad —
+  armFloors verifies its read-back covers the sealed watermark), `782c755` F-3
+  (the swept-pin alarm follows the peer's identity, not the `room:<id>` label),
+  `01ffbf1` F-2+F-6 (receive path persists BEFORE display; `withWriteLock`'s
+  timeout only reports, never releases), `2eb2ea5` F-4 (Android `commit()`
+  false → `COMMIT_FAILED` sentinel → the save fails; F-A3's third claim value is
+  finally reachable through the real bridge).
+* ✅ **Item 2, `SCENARIO=directory` binds** → `7190aff`: `CLIENT_ROOT` override;
+  shipped client 13/13, item-14 mutant 4/13 with the harm in the log.
+* ✅ **Item 3, Phase 3 client** → `49f1bf0`: the counter retry resyncs to the
+  server's echoed `stored_seq + 1` (never believed on sight), `err.code`
+  branching, legacy body sniff kept as fallback, 200-char clamp on the relay's
+  message. Its own tests were found NOT RUNNING (an un-restored stub) and fixed.
+* ✅ **Item 4, Phase 4** → `630c92f` (was already ✅ in the old entry).
+* ✅ **Item 5, Phase 5 test debt** → `7e5c3af`: every "green against deletion"
+  gate is mutation-bound; three independent reviewers (hot, cold, pentest); and
+  it uncovered a LIVE bug — `savePin` cleared the swept-pin tombstone by key
+  alone, ignoring the bundle, which let an unrelated verification under a
+  recycled `room:<id>` silence the victim's alarm in every room. Fixed there.
+* ✅ **Item 6, F-ATREST-008** → `bd696b1` (this session, below).
+
+### What landed this session — F-ATREST-008, the identity blob's anti-rollback control
+
+The finding: the F-ATREST-003/004 anchor lives inside the identity's AEAD, and
+the fix review (F4) had already withdrawn the claim that this made it
+undeletable — the attacker restores an OLDER `sc.identity.v1` (one `setItem`),
+which opens on the same passphrase, carries no `flags`, and every anchor reads
+"not established", so `contacts.unlock()` takes its first-run path and hands out
+an empty, pin-less store. Every pre-fix blob is that copy.
+
+The fix, same shape as the OTP watermark and the contacts witness:
+
+* `identity.js` carries `generation` (monotone integer) and `floorClaim`
+  (`true` / `false` / `"unconfirmed"`, the A4/F-A3 triple) inside the AEAD.
+  Absent or malformed reads as 0 / `"unconfirmed"` — the OLDEST value and a
+  claim of nothing, so a bad field can only make a blob look older, never newer.
+* New **`client/identity-store.js`** owns every write (`persistIdentity`: probe
+  the floor slot with `bump(_, 0)` → `gen = max(memory, floor) + 1` → export →
+  `setItem` → bump the floor; floor never ahead of a blob on disk except through
+  the async WebView flush, which is reported, never fatal) and every open
+  (`openIdentity` → `judge` → verdict `ok | rollback | deleted | tampered |
+  unavailable`, plus `arm`). `anchorEstablished(identity, flag)` answers `true`
+  under EVERY non-ok verdict AND sets the flag, so the heal write app.js
+  triggers right after installing the anchors carries the conservative answer —
+  otherwise the attacker needs two unlocks instead of one.
+* **The floor is captured at module load from otp.js and there is no setter**
+  (round-1 F-9: the first cut's `setIdentityFloor`/`_resetForTests` shipped in
+  the APK as an off switch). Tests that need a different load-time state spawn
+  a fresh node process. Exports are pinned to an exact inventory.
+* **`arm`**: a clean verdict with no slot (or a blob that does not claim an
+  armed one) makes app.js write once — this is what arms EXISTING installs on
+  their first unlock after the update (round-1 F-1, High: without it a v3 blob
+  with both flags set never wrote, never created its slot, and the finding was
+  reopened unchanged on exactly the deployed population).
+* On Android the floor is the existing Keystore-MACed `PadFloor` via a new
+  `otp.deviceFloor()` export — a fresh FACADE per call closing over the private
+  bridge (round-1 F-2, High: the first cut returned the object itself, and
+  `deviceFloor().read = () => -1` disabled the identity guard AND `padWasUsed`
+  — a two-time pad one hop downstream of the frozen bridge). Slot
+  `sc.identity.v1#gen`. **No Kotlin change**: slots are opaque strings and the
+  MAC covers key+value.
+* A claim is NEVER LOWERED (round-1 F-3): ARMED is carried through a session
+  that cannot measure the floor; a plain browser keeps what the blob had; a
+  broken bridge writes `"unconfirmed"`. A TAMPERED slot is a warning plus an
+  unconfirmed claim on write, not a throw (round-1 F-6: throwing made a device
+  with one forged prefs entry unable to CREATE an identity — a regression on
+  plain `setItem`).
+* The verdict is shown in a new every-view banner (`#atRestWarning`, outside the
+  view sections) as well as the Live-room status row and the transcript
+  (round-1 F-7: the per-view unlock rows hide themselves on success, so an
+  unlock from Profile/Users/Chats showed nothing).
+* **A bad verdict does NOT refuse the unlock.** The keys are the same in every
+  version of the blob; what a rollback buys is the flags reading false, and
+  only that. So the anchors fail closed, the user gets one warning in the
+  status row and the transcript, and the re-write converges the counter. A
+  refusal would turn the non-adversarial case (process kill in the seconds
+  between `setItem` and the async localStorage flush, with the synchronous
+  prefs `commit()` already landed → floor one ahead of the blob) into a
+  permanent lock-out from the user's own keys.
+* `app.js` is pinned to ZERO direct `setItem(LS_IDENTITY…)` / `identity.export(`
+  calls and to reading the anchor only through `anchorEstablished`; the anchors
+  must be installed BEFORE the heal write (source anchors via `liftFunction`).
+* Plain browser: no floor, the residual stands, exactly as for OTP. Documented
+  in `docs/security-history.md`.
+
+**Binding proofs run by hand — 22 mutants, all RED:** rollback-by-one tolerated;
+conservative answer not committed to the flags; `import` ignores `gen`; `export`
+drops `gen`; app.js reads the flag directly; no heal write on a bad verdict;
+deletion never reported; generation ignores the floor (stale tab alarms); failed
+create still claims ARMED; unknown claim reads as armed; broken floor reads as no
+floor; tampered floor reads ok; `judge` never asks to arm; heal condition
+without `arm`; `deviceFloor` returns the shared object; claim lowered to NONE;
+TAMPERED throws again; flag committed only under `rollback` (round-1 mutant A);
+a second `setStoreAnchor` after `installStoreAnchor` (mutant B); heal write via
+`Identity.prototype.export` + aliased key (mutant K); banner never shown; a
+floor setter exported.
+
+**Pentest of this change, ROUND 1** (agent, full context): 2 High (F-1 never
+arms on an existing install; F-2 mutable `deviceFloor()`), 4 Medium (F-3 claim
+lowered; F-4 root picks the blob — RESIDUAL, documented in identity-store.js and
+security-history; F-5 the app.js anchors were presence-only regexes and three
+mutants stayed green; F-6 TAMPERED brick on create), 3 Low/Info (F-7 verdict
+invisible off the Live room; F-8 flags last-writer-wins across tabs —
+pre-existing, DEFERRED: the fix is to mirror the one-shot flags into floor slots
+of their own; F-9 exported off switch). All but F-4/F-8 fixed as above; the
+app.js anchors are now allow-lists over `referencesOf()` hits bounded to
+`liftFunction` line ranges, and every round-1 mutant is RED.
+
+**ROUND 2** (the re-fix is new code): the rollback control itself held against
+nine same-realm attacks (namespace reassignment, defineProperty, swapping or
+deleting the bridge global after load, mutating a handed-out facade, prototype
+pollution of `broken`, poisoning `Number.isInteger` / `Math.max` / `parseInt`).
+Findings, all addressed: **F-1 High (assurance)** — the app.js anchors bound
+spellings, not bindings: `contacts["setStoreAnchor"]`, a renamed destructure, a
+shadowing `const idstore = {…}` that left the anchored line byte-identical, and
+an early `return` before the anchors all stayed green (the fourth mutant is the
+lock-out the module's own header rules out). Now: no bracket/computed access on
+the bound modules or storage, no reflection/enumeration/spread over them, no
+re-declaration or parameter shadowing, every use of `contacts`/`chats`/`idstore`
+is a plain member expression (strings stripped first), `idstore.` is limited to
+its four members, and `unlockWithPassphrase` has exactly two returns after
+`openIdentity`. **This is still a regex arms race** — see NEXT item 7a.
+**F-2 Medium (regression)** — the forced anchor is LATCHED into the AEAD by the
+heal write, and when no store exists (the attacker's deletion, or the same
+unflushed first write that lost the blob in the crash window) the contact store
+refused to open on every later unlock with "forget the identity" as the only
+recovery; HEAD gave a silent fresh store. The two states are identical on disk,
+so no policy can separate them: **a consent gate**, as for OTP adoption —
+`contacts.unlock(pass, {startFresh})` / `chats.unlock(…)` skip exactly the
+deletion check; app.js offers "Start over with an empty … store" only behind
+the `STORE_DELETED` alarm, behind a `confirm()` that says an attacker would want
+exactly this, armed for one unlock attempt and disarmed in a `finally`. The
+deletion throws now carry `code: "STORE_DELETED"`. **F-3 Low** — a page-realm
+`bump` on the frozen bridge could park the identity slot at the int32 ceiling
+and `persistIdentity` then threw forever (no identity could be CREATED): now a
+warning + unconfirmed claim, the parked slot reads as a rollback (fail closed,
+identity usable). **F-4 Low** — `importPad` never validated `padId`, so a pad
+FILE could name the identity's slot (and vice versa; no fail-open, bump never
+lowers): now `/^[0-9a-f]{32}$/`. **F-5 Info** — an unrecognised negative floor
+answer fell through to a clean verdict: now every negative except ABSENT is
+evidence. Verified sound by round 2: `arm` creates no loop/brick/downgrade;
+never-lower-a-claim cannot become a permanent false alarm (app→browser→app,
+second device, forget+create all traced); ARMED→unconfirmed downgrade
+impossible; both deploy paths exclude the new helper test file.
+
+**Binding proofs after round 2 — 18 more mutants, all RED** (the four round-2
+green ones B′/M2/M3/M4 plus alias, enumeration, ceiling throw, padId
+unvalidated, unknown negative, `startFresh` ignored in each store, codes
+dropped, consent without confirm / never disarmed / written from
+`unlockContacts` / always true, button always visible, banner kept on forget),
+and the 22 earlier ones re-run RED against the grown test. Client **262 OK /
+exit 0**, backend **168 passed**.
+
+**ROUND 3** (the consent gate is new code): no High. The consent gate held —
+`freshStoreConsent` is a module-scope const with no export or global handle;
+`go()` always settles so the `finally` always disarms; `startFresh` is read
+only inside the no-store branch, so it never skips the CAS, `assertNotRolledBack`,
+the H-2 domain tag or legacy adoption; and **the surviving-witness case holds**
+(a consented fresh start draws a new salt, so the old witness reads `corrupt`,
+the CAS skips it, and `writeWitness` overwrites it — traced and PoC'd in both
+stores). Findings, all addressed: **F-1 Medium** — the round-2 ceiling fix was
+off by one: a slot parked at MAX−1 let one honest write stamp MAX into the blob
+and every later write threw, with a CLEAN verdict (no banner). Now the blob is
+ALWAYS writable: at the ceiling it is written at its own counter, never
+advanced, never refused; boundary tests at 0x7fffffff, MAX, MAX−1, MAX−2 over
+four consecutive writes. **F-2 Medium (assurance)** — four more green mutants:
+`if (verdict.ok) installStoreAnchor(pass)` (reopens the finding outright),
+self-consent via `freshStoreConsent["contacts"] = true` inside `unlockContacts`,
+a non-literal consent write in `refreshUsers`, cross-wired consent (two
+unbackreferenced alternations), and a shadowed `confirm`. Now: the anchor call
+is pinned as an unconditional own statement; consent assignments are counted as
+every `=` after the identifier in any spelling; `\1` backreferences; `confirm`
+and `freshStoreConsent` in the no-re-declaration and no-parameter lists.
+**F-3 Low/Med** — `chatsError` was write-only, so the Chats pane showed a red
+"Start over" button under a routine "enter your passphrase" line, and the
+confirm named the contacts cost for the chat store: the pane now renders its
+alarm like the Users pane and each button carries its own cost sentence.
+**F-4 Info** — the write side now folds unknown negatives like `judge`.
+Also fixed from its coverage notes: the arrow-parameter rule ran on
+string-intact source and tripped on a harmless default-string parameter (now
+on string-stripped source, with a GREEN control mutant proving it).
+
+**Binding proofs after round 3 — 11 mutants RED + 1 control GREEN**, client
+**262 OK / exit 0**. **Browser end-to-end of the gate**, against the scratch
+relay: contact store + witness deleted → unlock → Users pane shows the BOTH-
+deleted alarm and the red button → click → confirm text as designed → store
+recreated, transcript line "started over EMPTY at your request", pane unlocked.
+No console errors. **The round-3 re-fix (ceiling arithmetic, chats pane text,
+anchor rules) has had no agent review of its own** — it is covered by the
+mutants above and will be covered by Phase 7's whole-branch pentest.
+
+**Environment trap (2026-09-16):** do not run the backend suite while a
+pentest agent is running `npm test` on the same box. Under that contention the
+suite took 15 min instead of 22 s and `tests/test_ws.py::test_one_knock_per_socket`
+failed with `approval timeout` instead of `already knocked` (a timing test);
+alone it passes in 0.2 s and `backend/` is untouched by this change.
+
+### ⬜ NEXT — in order
+
+7a. **⬜ A behavioural test for app.js's identity/anchor wiring.** Three rounds
+   of source anchors over `app.js` for this one change (and three rounds for
+   item 14 before it) each fell to a spelling the previous round did not name.
+   The durable control is to import the real `app.js` against a DOM stub
+   (`document`, `localStorage`, `confirm`, `navigator`) and drive
+   `unlockWithPassphrase` end to end: rolled-back blob → anchors established →
+   contact store refuses → consent → fresh store. Until then every regex rule in
+   `identity-store.test.mjs` §(4)/(5) is a named-mutant control, not a proof.
+7b. **⬜ Mirror the one-shot anchor flags into floor slots of their own**
+   (round-1 F-8): the generation converges across tabs but the flags are
+   last-writer-wins, and the counter now certifies the losing blob as current.
+7. **⬜ Phase 7 — pentest the WHOLE branch (`master..pentest-2026-08-07-fixes`),
+   then merge.** Every commit on the branch has had its own review; nothing has
+   yet reviewed the branch as a whole for interactions between fixes (e.g. the
+   identity heal write vs. the contacts CAS, or `padWasUsed` after ROUND-3).
+8. **⬜ Phase 8 — deploy.** Relay + web client ship together (`register/v3`,
+   dual-scheme `/auth/verify`, the 409 body all refuse older clients). The
+   Android APK bundles the client and updates independently, and **an old APK
+   does NOT keep working against the new relay** (F-P7-8 corrected the earlier
+   claim here: `account.js`'s legacy body sniff is in the NEW client and handles
+   an OLD relay's 409): it registers, but `/auth/verify` is dual-scheme and the
+   old client never sends `mldsa_sig`, so it gets 401 forever, never mints a
+   session, and never receives sealed mail (queued mail expires after 14 d;
+   Live rooms still work). **Order: ship the APK first, then the relay** — or
+   accept `mldsa_sig`-less verify for one release behind an explicit sunset
+   flag. Measured matrix in the 2026-09-16 report §3.9.
+9. **⬜ Phase 9 — Android on-device.** Recents snapshot blank; the password
+   prompt not capturable (`5c8dbcf`, UNVERIFIED on hardware); PadFloor proof;
+   ROUND-3 F-4's `commit()` semantics; and now the identity floor slot
+   (`sc.identity.v1#gen` appears in `secure_chat_pad_floors` after the first
+   unlock, and a restored older WebView `sc.identity.v1` produces the "OLDER
+   than this device's record" warning with the contact store still opening).
+   No device was attached on 2026-09-16 either.
+
+## ⮕ (2026-08-21 — working the approved completion plan; 8 commits landed)
+
+**HEAD: `5c8dbcf`** on `pentest-2026-08-07-fixes`. Tree clean. Not pushed, not
+merged, not deployed. Client suite **221 OK / exit 0**, backend **168 passed**,
+hostile-relay `SCENARIO=directory` **13/13**.
+
+Working from a user-approved plan (phases 0-9). Three decisions were taken by the
+user on 2026-08-21 and are now settled:
+
+* **`/api/register`'s 409 echoes the stored `reg_seq`.** Approved as a wire change.
+* **Peer-chosen RSA key transport is to be DEPRECATED** (F-CRYPTO-009), rather
+  than adding a third handshake frame.
+* **Scope of "finished" = fixes + merge + deploy + an Android on-device pass.**
+  Lock-on-background (B5) is explicitly OUT. The anchor/restore design (B6) stays
+  deferred until a restore feature exists.
+
+### What landed (newest first)
+
+* `5c8dbcf` **android** — the `window.prompt()` password dialog now sets its OWN
+  `FLAG_SECURE`. A Dialog has its own Window and FLAG_SECURE marks a surface, so
+  the Activity's flag never covered it: a capture during the passphrase prompt
+  blacked out the activity and rendered the dialog legibly. Answers the open
+  question in §C10. **Also: the build is not broken** — `assembleDebug` succeeds
+  with JDK 21; the recorded breakage was the system default being a JDK 25 EA.
+* `ac36381` **Phase 6, item 8** — the hostile relay now serves a DIRECTORY
+  (`/api/register`, `/api/users/<name>`, auth/session, empty mailbox) behind
+  `DIRECTORY=honest|hostile`, plus `SCENARIO=directory`. Item 14 is visible end to
+  end for the first time: the directory names "bob", hands over the keys of the
+  peer that actually connects, and the client must still prompt. 13/13.
+  `EVIL_MODE=none` + `SCENARIO=attacker` now refuses to run instead of reporting
+  a meaningless 9/9.
+* `ea4afe9` **Phase 3 (backend)** — the three 409s carry `error` codes
+  (`username_taken`, `stale_counter`, `keys_locked`); `stale_counter` echoes
+  `stored_seq`. Reachable only after both ownership signatures verified AND the
+  stored row's keys matched, i.e. only the owner learns it. 3 tests pin that.
+* `7a0f6e3`, `7b1a933`, `c86fb74`, `08a20ef`, `ee13fdc` **Phase 2** — small
+  residuals (regseq output guard, `withWriteLock` timeout, stale prose); F-A3
+  ("arming failed" told apart from "never armed"); F-A2-R1 (the revocation marker
+  is now a TOMBSTONE on the pin key, not a contact record); F-A1-R1 (a probe-only
+  floor triple is no longer evidence of use, so an interrupted first save no
+  longer burns the padId); F-5 (the pad index is written right after the blob —
+  writing it last burned padIds, a regression `fc566dd` had shipped).
+* `568d3e3`, `f47c0df` **Phase 1** — the item-14 source controls now BIND. New
+  `client/test-source.mjs` replaces three inline prefix-filters with a real
+  comment scanner (knows strings, template literals, regex literals, nested
+  `${}`), a brace-matching `liftFunction` that asserts exactly one definition, and
+  a `referencesOf` allow-list. `describeIdentity` no longer returns a `mismatch`
+  boolean — it writes the prompt DOM and returns nothing, deleting the laundering
+  channel rather than naming it. `EXPECTED_WINDOW` now runs from the top of the
+  key-frame branch THROUGH the approval-gate body.
+  **The pentest of `f47c0df` found a High and it is fixed in `568d3e3`:** the
+  window ended AT the gate line, so the gate's body was unpinned and both a
+  blanket `approvedBundle = idbCanon` and item 14 rebuilt via `expectedPeerName`
+  passed 207/207. Both are RED now, as are an alias mutant and a regex-hiding
+  mutant.
+* `ccd7ffb` **docs** — reports moved to `docs/pentests/`, security history split
+  out of the README.
+
+### ⬜ NEXT — in order
+
+1. **⬜ The Phase-2 pentest gate is still OWED.** The agent reviewing
+   `568d3e3..7a0f6e3` was interrupted twice (once by a session limit) and has not
+   reported. Do not treat those five commits as reviewed. The highest-risk change
+   in them is **F-A1-R1, because it LOOSENS `padWasUsed`** — the guard against
+   one-time-pad reuse. Anything that makes a genuinely-consumed pad re-importable
+   at offset 0 reopens H-3 and is a Critical.
+2. **⬜ Prove `SCENARIO=directory` BINDS.** Install the item-14 route as a mutant
+   in `app.js` and confirm the scenario goes RED. Until that is shown, 13/13 is
+   not evidence — this project has produced three rounds of green-but-vacuous
+   controls and the harness is not exempt from the rule.
+3. **⬜ Phase 3, client half** — retry on `stored_seq + 1` instead of jumping to
+   `now + SLACK`; never re-send a refused value; stop reporting a counter 409 as
+   "username already taken" (`app.js:740-742`); replace `app.js:537`'s
+   `.catch(() => {})` with a visible warning. Then the `regseq.test.mjs` rework:
+   the M-1 test opens with `reset()` so it only ever exercises the fresh state and
+   passes while the bug it names is live; add `Date.now` stubs (no test stubs the
+   clock today, in the lane whose whole subject is clock skew).
+4. **✅ Phase 4 — RSA key transport REMOVED** (2026-08-21, F-CRYPTO-009). Two
+   premises of the original plan were wrong and were dropped: `UNAVAILABLE` was
+   not a mechanism (dead export, read nowhere, comment claiming a UI-disable that
+   did not exist) — it is deleted and replaced by `DEPRECATED_ALGS`, which
+   `makeCipher` actually consumes; and there is no inbound live-room "mode
+   change" to refuse — the mode is chosen 100% locally and `alg` on the wire is
+   advisory, never read to pick a cipher (a visible refusal for a frame TAGGED
+   `alg:"RSA"` was added anyway, as a backstop). The `Rsa` class,
+   `assertRsaPublicKeyUsable`, the `RSA_*` constants and the prime sieve are
+   deleted (with a tombstone recording the finding); the UI card is gone;
+   `all-modes.mjs` exercises 4 modes and asserts the deprecation + an exhaustive
+   mode inventory; `rsa-keyvalidation.test.mjs` → `rsa-deprecation.test.mjs`.
+5. **⬜ Phase 5 — the rest of the test debt** (item 7 and §C9).
+6. **⬜ F-ATREST-008** — the identity blob has no anti-rollback control, and the
+   contacts anchor is load-bearing on it: the anchor is defeated by ROLLING BACK
+   the identity blob rather than deleting it, and every pre-fix blob has no
+   `flags` field at all, so today's blob on every device is the archived artifact.
+   Needs a monotone generation inside the blob's AEAD mirrored into the native
+   floor (that plumbing lives in `otp.js` and would want extracting).
+7. **⬜ Phase 7** — pentest the WHOLE branch, then merge.
+8. **⬜ Phase 8** — deploy (relay + client ship together; `register/v3`,
+   dual-scheme `/auth/verify` and now the 409 body all refuse older clients).
+9. **⬜ Phase 9** — Android on-device: recents snapshot blank, the password prompt
+   not capturable (the fix in `5c8dbcf` is UNVERIFIED on hardware), PadFloor proof.
+   No device was attached on 2026-08-21.
+
+## ⮕ (2026-08-15 — A4's 3 Highs fixed in CODE; the item-14 TEST control still does not bind — 3 new Highs)
+
+**Committed: `fc566dd`.** Working tree CLEAN. Not pushed, not merged, not
+deployed. `master` is still 1 commit ahead of `origin/master` from an earlier
+session. `backend/accounts.db` untouched.
+
+**Read this before anything else.** `pentest-new-code` was run TWICE this
+session, and the second run is the one that matters.
+
+* **Round 1** reviewed the three fixes. It broke the H-1 fix, correctly. I
+  reproduced its mutant, re-fixed, and every mutant it named went red.
+* **Round 2** reviewed the re-fix — the part written *after* round 1 finished,
+  which nothing had reviewed. **It found 3 more Highs and installed 5 mutants
+  that restore the item-14 directory skip and pass the suite 195/195.** I
+  verified the cheapest two by hand before accepting them; both reproduce
+  exactly.
+
+So: **A4 items 1 and 2 are genuinely fixed in the runtime code. Item 3 is NOT.**
+Three attempts at pinning it have each produced a green control that does not
+bind. The runtime code in `fc566dd` is not itself vulnerable — `peerAlreadyTrusted`
+and the call site are correct as committed — but nothing stops a future commit
+from reintroducing the route, which is the entire job item 3 exists to do.
+
+**The pattern is now the finding.** Source-anchored tests over `app.js` (which
+cannot be imported — it touches `document` at module scope) have failed three
+rounds running, each time passing while the property was gone. A fourth, sharper
+regex is probably the wrong move. See item 1 below.
+
+### ⬜ NEXT SESSION — do these in order
+
+1. **⬜ ROUND-2/F-1 + F-2 (High, together) — the "comment stripper" is a prefix
+   test, and `lift()` never uses it.** Two independent holes that make every new
+   source-level check in all three test files bypassable:
+   - `codeOnly()` (`peer-approval.test.mjs:40-43`, plus inline copies at
+     `contacts-anchor.test.mjs:459-460` and `otp-rollback.test.mjs:1263-1264`)
+     drops any line whose trim starts with `/*`. **`/**/ statement;` is
+     executable JavaScript that satisfies that test.** Verified by hand:
+     `/**/ if (expectedPeerBundle && sameBundle(expectedPeerBundle, idbCanon))
+     approvedBundle = idbCanon;` is filtered out as a comment *and* executes and
+     assigns. One 4-character prefix defeats `EXPECTED_WINDOW`, the whole-file
+     `expectedPeerBundle` allow-list, the `describeIdentity` caller walk, and both
+     app.js anchors — including the F-A1 export-order check, where the mutant
+     hands the pad file over before the latch.
+   - `lift()` (`peer-approval.test.mjs:19-31`) does `src.indexOf("function
+     <name>(")` on **raw source**; `codeOnly` is applied only to its *output*, so
+     it can never undo a bad anchor. A `/* … */` block containing a decoy copy of
+     the function is found first. One mutant made **all 13 peer-approval checks,
+     including the 9 behavioural ones, assert against a comment.**
+   **Fix:** strip block comments AND line comments from `src` once, at load, and
+   run `lift()`/`indexOf`/the allow-lists over the stripped text. Assert `lift()`
+   matched exactly one `function <name>(` in the stripped source. A prefix test is
+   not a comment stripper and must not be spelled like one.
+2. **⬜ ROUND-2/F-3 (High) — the pinned window starts too late, and the
+   `describeIdentity` caller allow-list is line-based.** No comment tricks; this
+   is the ordinary-looking-commit version, and it is the same mutant shape round 1
+   used, one level out.
+   - `EXPECTED_WINDOW` begins **at** `const idbCanon = canonicalBundle(idb);`
+     (`peer-approval.test.mjs:186`). Everything earlier in the `key`-frame branch
+     is unconstrained, and `approvedBundle` assigned there makes the
+     `if (!approvedBundle)` gate at `app.js:2699` never run at all.
+   - the caller walk (`peer-approval.test.mjs:295-314`) attributes a call to the
+     nearest preceding `/^(?:async\s+)?function\s+(\w+)\s*\(/` — anchored at
+     **column 0**, so it cannot see arrow functions, class or object methods, or
+     an indented declaration. A module-scope
+     `const dirVerdict = (b) => describeIdentity(b);` placed after
+     `renderPeerApproval` is attributed to `renderPeerApproval`, and the
+     allow-list still reads `["renderPeerApproval","showNextKnock"]`. It also
+     pushes one owner per matching LINE, not per call.
+   **Fix, and this is the one worth doing properly:** stop policing
+   `describeIdentity` and remove the thing being laundered. It returns
+   `mismatch`, a decision-grade boolean, purely so two renderers can draw a ⚠
+   line — **have it return the rendered string (or take the element to write
+   into) so there is no boolean for a decision path to read.** That deletes the
+   whole attack class instead of naming it. Then start the window where
+   `approvedBundle` could first be written for the connection, not at `idbCanon`.
+3. **⬜ ROUND-2/F-4 (Medium) — F-A2's shape assertions validate the wrong line.**
+   `contacts-anchor.test.mjs:485` does `code.find((l) => l.includes("c.reverify"))`
+   over the whole stripped file, so it returns the **first** hit — `app.js:1092`,
+   `} else if (c.reverify && !c.verified) {` in the **Users-list renderer**, an
+   unrelated site. Verified by hand. So `assert.match(branch, /^\}\s*else if\s*\(/)`
+   never looks at `renderVerify` at all, and a mutant adding `&& !pinsReadable()`
+   — always false there, because `app.js:2845-2858` returns early when it is false
+   — makes F-A2's branch **dead code** while every shape assertion passes. The
+   bystander falls through to the benign first-contact panel: M-2's inverted
+   alarm, restored. **Fix:** anchor the `find` inside the `renderVerify` region
+   (slice from `const pin = await getPin(currentPinKey);` first) and assert the
+   SAME line carries both the `else if` shape and the unlock short-circuit.
+   `code[i-1]` is off-by-one safe (filtered array, `i===0` guarded) but is a weak
+   proxy that the dead branch satisfies.
+4. **⬜ ROUND-2/F-5 (Medium — I recorded this as Low and was wrong) —
+   `writeIndexEntry` moved late, and it BURNS the pad.** `fc566dd` reordered
+   `writePadBlob` to blob → wm → used → epoch → `writeIndexEntry` → `armFloors`.
+   A kill or quota error between the watermark and the index on a pad's FIRST save
+   leaves this, verified by PoC on the committed tree:
+   ```
+   keys on disk: [ sc.otp.pad.v1.<id>, sc.otp.wm.v1.<id> ]
+   listPads(): 0   padMeta(): null
+   pad IS durable and unlockable, sendOffset = 0
+   padWasUsed(): true     after forgetPad, padWasUsed(): true
+   ```
+   `refreshOtpPads` (`app.js:3179-3193`) builds the selector from `listPads()`,
+   and the selector is the ONLY route to `unlockPad` — so there is no UI path to
+   the pad. `padWasUsed()` then refuses re-import, and `forgetPad` deliberately
+   keeps the watermark. **The pad is gone and the two people must meet in person
+   again.** On a plain browser this window is strictly WORSE than F-A1-R1's (that
+   one leaves no keys and re-import is allowed). Same harm class as the bug
+   `fc566dd` was fixing, minus the alarm wording, which makes it harder to
+   diagnose. **This is a genuine regression introduced by `fc566dd`.**
+   **Fix — one line:** move `writeIndexEntry(record, …)` to immediately after
+   `setItem(padKey…)`, before the watermark. Nothing in the ordering rationale at
+   `otp.js:764-773` requires it to be late; the index is a render cache and
+   carries no security decision.
+5. **⬜ ROUND-2/F-6 (Info) — a comment of mine over-claims.** `contacts.js`
+   dropPinsFor says the marker "covers exactly the set the old code retained".
+   Not exactly: `claimedByAnother` applied only to `contact.pinKeys`, while
+   `otherHolderOf` is applied to every element of `owned` **including the
+   contact's own current keys** — so the marker set is a strict SUPERSET. Error is
+   in the conservative direction, but the sentence is load-bearing prose bounding
+   a residual. Reword to "at least the set the old code retained."
+6. **⬜ Test debt this round exposed** (distinct from item 12's older list):
+   - **F-5 has no test at all.** `testInterruptedSaveDoesNotBrickAPad`
+     (`otp-rollback.test.mjs:1170-1247`) only fails the BLOB write and only on an
+     ESTABLISHED pad. A one-line change to the fail predicate (`sc.otp.used.v1.`
+     on a first save) would fail against `fc566dd` and pass against `cbcedf9` —
+     i.e. it would have caught the regression the commit shipped. Write it first.
+   - `savePin`'s reverify-clearing has a positive test but no negative one:
+     nothing asserts that `savePin` for a DIFFERENT bundle leaves the marker alone.
+   - The `describeIdentity` caller allow-list has **no self-test**. Every other new
+     check is justified by a named mutant that beat the previous version; this one
+     is not, and it is the one that fails silently under aliasing.
+7. **⬜ The three A4 findings still open from round 1** — F-A2-R1 and F-A1-R1
+   (both Medium, both confirmed **pre-existing residuals, not regressions**:
+   the identical PoC gives byte-identical output on HEAD), and the `reverify`
+   overloading Info. All three are described in full in the round-1 block below.
+
+**Then** continue with items 8 onward (the old numbering, unchanged): item 6's
+`/api/register` 409 contract change **still needs the user's decision**, item 7's
+older test debt, item 8's harness gap, and the rest.
+
+**Baselines, measured on the committed tree:** client **195 OK, 0 failures**.
+Backend **165 passed**. Round 2 did not run e2e (no `backend/` change in the
+commit); round 1 ran `room-admission` 13/13, `two-user-flow` 8/8, `no-dead-ends`
+12/12 against a scratch relay. **Note what that green means: five mutants that
+skip the approval prompt against a hostile directory also score 195/195.** Do NOT
+merge this branch on the strength of a green suite.
+
+**Not attacked in either round:** F-A1 was exercised against a JS stub of
+`PadFloor`, never on a real device. `e2e/hostile-relay/` structurally cannot see
+any of the directory-driven mutants (it serves no `/api/*` routes — item 8 below
+is exactly this). `PadFloorBridge`'s Long↔JS-number marshalling and the Android
+side beyond `PadFloor.kt` were not reviewed.
+
+### Round 1 — what `fc566dd` actually fixed, and how it was verified
+
+1. **A4/F-A1 — `otp.js` floor/blob write ordering.** `armFloors` was split into
+   `probeFloors(id)` (bumps every slot with **0**, so it can only CREATE a slot,
+   never advance one; reads back; throws on TAMPERED) and `armFloors` (advances
+   to the real values, now called **only after** `setItem(padKey)`). The claim is
+   measured before the write, the value is raised after it, so a floor is never
+   above the blob it protects. `writeWatermark` became the pure `sealWatermark`,
+   and `writePadBlob` now finishes both crypto operations before the first
+   `setItem`, then writes blob → watermark → used → epoch → index → floors with
+   no `await` between writes that must agree. `app.js otpExport` now awaits
+   `markExported` **before** `downloadText`, so a failed latch cannot release a
+   pad file that nothing on the device records as exported.
+   *Verified:* the new test fails against `HEAD:client/otp.js` with `"pad state
+   was rolled back"`. The pentest's own fault-injection matrix (fail each of 5
+   localStorage key classes on 2 save paths) is **10/10 openable** on the new code
+   vs. 2 permanent bricks on HEAD.
+2. **A4/F-A2 — `contacts.js` revocation.** The `claimedByAnother` **retention**
+   rule is gone. A pin naming a revoked key is now **always** swept; the
+   collision is recorded as `reverify` on the other contact, and `app.js`
+   `enterVerification` reads that marker to render "Re-verify — their saved pin
+   was cleared" instead of the benign first-contact panel. Both M-2's alarm
+   inversion and F-A2's silent trust are removed without either side having to
+   win a key collision. Deliberately **not** conditioned on the other record
+   being `verified` or user-created — that dependency IS the bug.
+   *Verified:* an `auto`-contact control (one sealed envelope, no user action)
+   shows `SURVIVED (fail-open)` on HEAD and `swept` on the new code.
+3. **A4/H-1 — the call-site pin, twice.** First cut: anchor on the executable
+   `const idbCanon = ...` instead of a comment, plus an exact allow-list of the 8
+   `expectedPeerBundle` sites. **The pentest broke it**, and the lesson is worth
+   carrying: pinning the *identifier* is useless because the decision does not
+   need it. `describeIdentity()` re-exports the same directory comparison as
+   `.mismatch`, a decision-grade boolean on a plain object, so
+   `if (expectedPeerName && !d.mismatch) approvedBundle = canonicalBundle(idb)`
+   is item 14's deleted route with the forbidden string appearing nowhere — and
+   `canonicalBundle(idb)` also slipped the `approvedBundle = idbCanon` regex. It
+   passed 193/0. **Re-fixed by pinning the decision path, not the vocabulary:**
+   an exact allow-list of all **26** executable lines between the peer bundle and
+   the gate (nothing may be added there at all, whatever it is made of); an exact
+   body for `requestPeerApproval`; an assertion that `renderPeerApproval` cannot
+   settle the promise; and a call-site allow-list proving `describeIdentity` is
+   reachable **only** from the two prompt renderers.
+   **⚠ THE RE-FIX DOES NOT BIND EITHER — see items 1-3 at the top of this file.**
+   Round 2 defeated all four of those checks. "Proving" in the sentence above is
+   too strong and is left standing only so the next reader can see exactly which
+   claim failed and why.
+
+**Also fixed: three source anchors were satisfiable by a comment** — H-1's defect
+again, in two more files. `indexOf` over raw source let a mutant revert the
+`app.js` export order, and another delete the whole `reverify` branch, while a
+comment carrying the anchor string kept the check green (both passed 193/0). All
+source anchors now strip `//` lines first via a `codeOnly()` filter, and the
+F-A2 anchor gained shape assertions (`else if`, locked-store short-circuit, the
+`changed` styling).
+
+**Round 1's four mutants were re-run against the hardened tests and all went
+RED** (the `requestPeerApproval` short-circuit, the call-site
+`describeIdentity().mismatch` skip, the comment-hidden export reorder, and the
+comment-hidden `reverify` deletion). **That result stands but means much less
+than it looked like at the time** — round 2 then found five DIFFERENT mutants
+that pass, via `/**/`-prefixed code, a block-comment decoy for `lift()`, and an
+arrow-function alias. Killing the named mutants is not the same as binding the
+property. See items 1-3 at the top.
+
+### Round 1's own findings (still open — none fixed)
+
+Both Mediums were **confirmed as pre-existing residuals, not regressions** — the
+pentest ran the identical PoC against HEAD and got byte-identical output. They
+are recorded because each one falsifies a justification the fix leans on, and
+both code comments have been corrected to say so rather than left as folklore.
+
+* **⬜ F-A2-R1 (Medium) — the `reverify` marker misses two reachable shapes.**
+  It is keyed on a contact whose CURRENT keys are the swept ones, so a
+  `room:<id>` pin whose owner has no contact record (**the default** for Live-room
+  use) and a bystander who has since rotated both get the pin swept with **no
+  marker**, and still render as a benign first contact. Fix direction: the marker
+  belongs on the **pin key** as a tombstone, not on a contact record — the key is
+  in hand at deletion time and needs no guess about who holds those keys now.
+* **⬜ F-A1-R1 (Medium) — a pad's FIRST save is still all-or-nothing.**
+  `probeFloors` creates the send slot before any blob exists, and `padWasUsed`
+  counts a non-ABSENT send slot as used, so a failure during `saveNewPad` /
+  `importPad` / the v1-v2 migration rewrite **burns the padId** and the two people
+  must exchange a pad in person again. Identical on HEAD across all five write
+  classes. Fix direction: do not let `probeFloors` create the send slot before a
+  blob exists, or stop counting a bare send slot at exactly 0 (with no blob, no
+  watermark and no `usedKey`) as evidence of use.
+* **⬜ F-A1-R2 — SUPERSEDED by ROUND-2/F-5 (item 4 at the top). I rated this Low
+  and called it "recoverable state"; both were wrong.** Round 2's PoC shows the
+  padId is BURNED on both platforms and there is no UI route to the pad. It is a
+  Medium and a genuine regression shipped by `fc566dd`. Corrected here rather
+  than left to mislead the next reader.
+* **⬜ INFO — `reverify` is overloaded.** It already meant "your 🟢 predates
+  encryption-key coverage" (`contacts.js:414`). Consequences: a 🟢 contact whose
+  pin was just swept shows **nothing** in the Users list (`app.js:1092` renders it
+  only `if (c.reverify && !c.verified)`); a contact carrying the *migration*
+  marker now gets F-A2's wording, which is simply untrue of them; and
+  `setVerified(_, true)` from the one-click Users-list toggle clears the F-A2
+  marker **without any safety-number comparison and without restoring the pin**.
+  Consider a separate field.
+
+**Not attacked:** F-A1 was exercised against a JS stub of `PadFloor`, never on a
+real device. `e2e/hostile-relay/` was not run (item 8 below is why: it serves no
+`/api/*` routes, so it structurally cannot see the directory-driven mutants).
+`PadFloorBridge`'s Long↔JS-number marshalling and the Android side beyond
+`PadFloor.kt` were not reviewed.
+
+(Round 1's "state at hand-off" paragraph is superseded — that work is now
+committed as `fc566dd`. See the top of this file for the current state.)
+
+## ⮕ (2026-08-10 night — `40d132e`'s repairs pentested: 3 High, 4 Medium)
+
+**The previous TOP ITEM is DONE.** `pentest-new-code` was run over the repairs
+made AFTER the 2026-08-10 lanes reported — the code that had never been reviewed.
+It found **3 High and 4 Medium**, and **nothing is fixed yet**: this session
+ended at the report. That makes it a **fifth consecutive round in which the
+repair was more dangerous than the bug** (2026-07-29, 07-30, 08-08, 08-10, and
+now 08-10-night). Full detail in **section A4** below.
+
+Two things this round established that are worth carrying forward before the
+findings themselves:
+
+* **The regression tests are now the weakest part of this branch, not the code.**
+  Both lanes converged on this independently. Lane A found **8 changes with no
+  test that fails against the code they replaced**; lane B found that the test
+  written to pin item 14 — last round's High — **passes against the very mutant
+  it was written to catch**. The project's own rule ("every fix carries a test
+  verified to FAIL against the pre-fix code") was followed in letter and, in
+  these places, not in substance. Treat a green suite on this branch as weak
+  evidence until item 7 below is done.
+* **Item 18's protocol change got more load-bearing.** It was recorded as the
+  wrong-clock residual only. Lane B proved the same missing server echo also
+  causes an inert retry (A4/M-1) and a **two-device lockout at one hour of
+  skew** (A4/M-2) — and two devices on one identity is a supported flow
+  (`exportIdentity`, `app.js:673`). See item 6; it still needs the user.
+
+### NEXT SESSION — do these in order (items 1-3 CLOSED 2026-08-15, see the entry above)
+
+1. **✅ FIXED 2026-08-15 — A4/F-A1 (High, REGRESSION, no attacker needed) — `armFloors` arms the
+   native floors BEFORE the blob that backs them is written.** `otp.js:649` bumps
+   all three slots to the new offsets; the blob is not persisted until `:702`,
+   with a `JSON.stringify` and an `await crypto.subtle.encrypt` in between. A
+   process kill or a `QuotaExceededError` in that window leaves the floor AHEAD
+   of the blob, which the next unlock reads as a rollback and refuses
+   **permanently** — `forgetPad` + re-import is blocked by `padWasUsed`. The
+   pre-fix code bumped inside `writeWatermark`, i.e. AFTER `setItem(padKey)`, so
+   an interruption left the floor BEHIND the blob and was harmless; confirmed as
+   a regression by running the PoC against `9eb6fdd`. `markExported`
+   (`otp.js:1061`) is worse: `app.js:3287` hands the file to the user BEFORE the
+   latch at `:3288`, so a failed export brands the pad "already exported once"
+   forever. This is the exact harm the trade-off comment at `otp.js:288` names as
+   the worse outcome — a false tamper alarm that teaches the user to disbelieve
+   it — and `otpPersistFailed` still advises "Free up storage, then reconnect",
+   which now leads to "exchange a fresh pad". **Fix:** decide `armed` from the
+   PREVIOUSLY persisted watermark (0 on first save), and advance the slots to the
+   new offsets only after `setItem(padKey)` succeeds — old ordering for the
+   value, new read-back for the claim.
+2. **✅ FIXED 2026-08-15 — A4/F-A2 (High, fail-open) — the `claimedByAnother` skip retains a pin that
+   revocation must kill.** `contacts.js:694-699`. Closing M-2 ("removing X must
+   not delete a third party's pin") opened its inverse: if ANY other contact
+   record names the superseded key, `Remove`/`Unverify` will not sweep the pin
+   naming it — and **the attacker chooses whether that record exists**. Two cheap
+   routes: a hostile relay answering one directory lookup with the old bundle
+   (`app.js:1259` upserts it), or one sealed envelope, which auto-creates a
+   contact at `app.js:1645` with no user action and no `verified` requirement —
+   `claimedByAnother` checks neither. The surviving pin then reaches
+   `unlockMessaging()` at `app.js:2860` with **no prompt and no safety-number
+   check**. That defeats post-compromise revocation and restores item 17's
+   residual. **Fix:** never let an `auto` or unverified record claim a key; on
+   collision prefer deleting the pin plus a `reverify` marker over silent
+   retention, so neither M-2's alarm inversion nor this silent trust can happen.
+3. **✅ FIXED 2026-08-15 (in two passes — the first fix was bypassed) — A4/H-1 (High) — the item-14 call-site pin does not pin the call site.**
+   `peer-approval.test.mjs:161-176` slices `src` from a COMMENT string, so
+   `between` is the 13 comment lines at `app.js:2686-2699` and contains **zero
+   executable code**: the assertion checks that a comment does not mention
+   `expectedPeerBundle`. Two mutants reproducing exactly the M-2 shape — one
+   inserted above the anchor comment, one moved into `requestPeerApproval`
+   (`app.js:2216`) — each skip the approval prompt against a hostile directory
+   and **pass 184/184**. The guard on last round's High is decorative. **Fix:**
+   scan from the `idbCanon` assignment (or the start of the handshake branch) to
+   the gate rather than from a comment, and assert `expectedPeerBundle` appears
+   nowhere in the decision path of `requestPeerApproval`/`renderPeerApproval` —
+   ideally as an exact-line allow-list of its 8 known display/mismatch sites.
+4. **⬜ A4/F-A3 (Medium) — `nativeFloor: armed.send` can seal a permanently false
+   floor claim into the AEAD.** `otp.js:682`/`:698`. If the prefs write silently
+   does not take on a pad's FIRST save (unwritable file, full disk — `PadFloor
+   .bump` discards `commit()`'s boolean), the blob is sealed claiming no floor
+   was in force. Both guards (`otp.js:861`, `:891`) are keyed on that claim, so
+   they can never fire for that blob, and because it is AEAD-sealed, healing the
+   floor later cannot repair it — a snapshot taken during the degraded window
+   stays exploitable forever, into keystream reuse. **Fix:** do not collapse
+   "arming failed" and "never armed" into the same `false` a plain browser
+   writes; a third value routes that blob through the existing
+   `LEGACY_PAD_ADOPTION` consent gate. **Also correct two false statements in the
+   trade-off comment at `otp.js:288-298`** while there: "the pad opens UNGUARDED
+   for that slot — the pre-fix behaviour" is wrong (the code it replaced
+   REFUSED), and "the guard re-arms on the next save that succeeds" is true of
+   the live pad but not of a snapshot.
+5. **⬜ A4/M-3 (Medium) — a counter 409 is reported to the user as "username
+   already taken".** `app.js:740-742` branches on `e.status === 409` alone, so
+   item 18's "registration counter is not newer" arrives misdiagnosed, and the
+   user is advised to pick another name — the one action that loses their handle
+   and every contact's pin. Worse, the path that actually matters, the republish
+   of a rotated bundle on unlock (`app.js:537`), is
+   `.catch(() => {})` — so "your published encryption keys are frozen and sealed
+   mail is going to a superseded key" is either silent or wrongly diagnosed,
+   never true. Item 18's own rationale objects that the pre-fix poisoning was bad
+   partly because "nothing on the device showed why"; that is still the case.
+   Both lines predate the fix, but the fix makes a counter 409 the most likely
+   409 an EXISTING user will ever see.
+6. **⬜ Decide item 18's protocol change — STILL NEEDS THE USER, now for three
+   findings rather than one.** Have `/api/register`'s 409 echo the stored
+   `reg_seq` so a client can jump to `stored + 1` instead of guessing. It is a
+   wire/contract change, and it leaks an account's counter to anyone who can
+   produce a valid signature — which is why it is the user's call. It is the real
+   repair for all three of:
+   - the **wrong-clock residual** (a badly wrong future clock still freezes an
+     account; no client-side ceiling can fix it, since the ceiling is computed
+     from the lying clock);
+   - **A4/M-1**: the retry is inert in exactly the state its own first firing
+     creates — once pinned at the ceiling, `nextRegSeq()` and `regSeqCeiling()`
+     return the same number, so it re-sends the refused value. That is the M-1
+     shape it claimed to have fixed, reproduced against the real endpoint;
+   - **A4/M-2**: because the retry jumps to `now + SLACK` rather than
+     `stored + 1`, **any skew between two registrants for one identity ratchets
+     the slower one out permanently** — reproduced at ONE HOUR of skew, far
+     inside the week of "acceptable slack", and re-locked on every registration
+     by the faster device. The comment at `account.js:136-138` claiming the
+     client "overtakes it on the next registration rather than being locked out"
+     is true for one device and false for two. The slack window is **not** the
+     safe-skew budget it is documented as.
+   If the user declines the contract change, the fallback is narrower: refuse to
+   re-send a value equal to the one just refused, and advance rather than jump.
+7. **⬜ Pay down the test debt this round exposed — treat as a finding, not
+   chores.** The suite is green against mutants it was written to kill:
+   - **F-A1 survives the entire suite** — nothing tests a save interrupted
+     mid-`writePadBlob`. Add one that fails the save and asserts the pad still
+     opens.
+   - **A4/H-1's two mutants pass 184/184** (item 3 above).
+   - **The sharpest example, verified at close: `regseq.test.mjs:173-186` is
+     named `item 18 / M-1: the 409 retry advances instead of resending the
+     refused value` — the exact bug A4/M-1 reports — and it PASSES.** It opens
+     with `reset()`, so it only ever exercises the FRESH state, where `cur = 0`
+     and the ceiling really is an advance. It never re-registers, so it never
+     reaches the pinned-at-ceiling state that the first retry itself creates,
+     which is the only state where M-1 bites. A test can carry the finding's own
+     name, assert the finding's own property, pass, and still not test it. Fix
+     this one first: it is the cheapest possible demonstration for whoever needs
+     convincing that the green suite is not evidence.
+   - `regseq.test.mjs`: mutating the retry to `seq = regSeqCeiling() * 2` writes a
+     floor ~58 years ahead that the next `nextRegSeq()` discards — **pass 2's
+     exact bug, relocated into the one place the shipped code writes
+     `localStorage` outside `nextRegSeq`** — and it passes 8/8 and 184/184. The
+     file is not vacuous overall (a faithful pass-2 reconstruction goes red at
+     `regseq.test.mjs:160`), but the retry path has no "stays a usable floor"
+     assertion.
+   - **No test stubs `Date.now` anywhere.** All 8 regseq checks run against the
+     real wall clock, so the entire clock dimension — the named priority of the
+     lane, and the fix's own stated risk area — is untested. No backward-clock,
+     frozen-clock or skew test.
+   - Green against deletion, i.e. testing nothing: the `broken` gates on
+     `savePadProgress`/`markExported`, `contacts.js:697`'s `typeof k.ed` guard,
+     `chats.js:393`'s `!chats` guard, `chats.js:374-376`'s `writeChain` intra-tab
+     layer (the shim always supplies Web Locks, so the no-Web-Locks path is never
+     exercised), and `chats.js:371`'s `typeof navigator` guard.
+   - Missing shapes: a `claimedByAnother` test where the claiming record is an
+     `auto` contact (the current control only covers an UNCLAIMED superseded
+     key); an integer assertion on `seq`; and a test that a counter 409 is not
+     surfaced as "username already taken".
+8. **⬜ Close the harness gap** (was item 3, unchanged). `e2e/hostile-relay/
+   hostile.mjs` serves no `/api/*` routes and `proto001.mjs` never types a
+   handle, so `expectedPeerBundle` is null in every run — the entire
+   directory-driven flow that item 14 is ABOUT is invisible end to end. Add a
+   `DIRECTORY=hostile` policy (the relay already sees the bundle in the knock)
+   and a scenario that connects by handle. Also make `EVIL_MODE=none` loud: it
+   currently returns an unpatched client with no warning, so
+   `EVIL_MODE=none SCENARIO=attacker` reports a clean 9/9 that proves nothing.
+   **Note the overlap with item 3**: this harness is why H-1 could only be proven
+   at the unit level.
+9. **⬜ A4's Low/Info.** `nextRegSeq` has no integer guard on its own output, so
+   a hooked `Date.now` returning a fraction makes both `registerMessageBytes` and
+   `attempt` take their `Number.isInteger` false branches and the client silently
+   emits a **v2, counter-free, replayable** registration (backend stays
+   fail-closed, so no key rollback follows — the objection is the silent
+   downgrade of a control by a device-local attacker). A backward clock discards
+   the stored counter and rewrites `sc.regseq.v1` into the past, persisted even
+   when both attempts 409 — self-healing, but the backward direction is
+   undocumented while the forward one is. `clampRegSeq` (`account.js:157`) is
+   **dead code, called nowhere in the tree**. `otp.js`'s new `broken` gates are
+   **unreachable** — every producer of `{record, atRest}` already refuses in that
+   state; the finding they cite IS closed, but by `armFloors`'s read-back, so the
+   comment credits the wrong line and a future reader could delete the
+   load-bearing half and keep the decorative one. `importPad` returns `o.padId`
+   with no type/charset/length check while slots are derived by string
+   concatenation (`otp.js:124-125`), so a pad file with `padId =
+   "<victim>#recv"` aliases another pad's derived slot — an arbitrary-pad brick
+   primitive, unreachable today only **by accident** (`padWasUsed` finds the
+   aliased slot present and refuses the import). `chats.js:371` reads
+   `navigator.locks` from a poisonable global with no "a lock was expected here"
+   marker, unlike the hardening `otp.js` applies everywhere.
+10. **⬜ MOST IMPORTANT STALE COMMENT — fix it whenever `account.js` is next
+    touched.** The block at `account.js:93-111` still describes **pass 2's**
+    design as current and references `REG_SEQ_SANE_MAX` and `REG_SEQ_MAX`,
+    **neither of which exists**. That is exactly how a fix gets reverted by a
+    well-meaning reader who trusts the prose over the code.
+11. **⬜ The small open residuals** (recorded, none fixed): `chats.js` `unlock()`
+    reads store and witness outside the lock so a benign second tab can fire the
+    rollback alarm; `withWriteLock` has no timeout, so a same-origin script
+    holding it hangs writes silently; `contacts.js` `list()`/`get()` return a
+    shallow spread that now shares `pinKeys` by reference, contradicting the
+    "defensive copy" comment; `app.js` `describeIdentity` still compares keys as
+    strings where the gate compares bytes (no-op today, permissive if `unb64` is
+    ever loosened); the peer-approval prompt inherits an attacker-choosable
+    display name for auto-contacts; and `app.js:2721`'s comment about a knock
+    queuing behind the peer prompt is false — the two prompts are mutually
+    exclusive, so that `showNextKnock()` and the `approvalPending` guard are
+    unreachable-in-effect.
+12. **⬜ Then** A2's remaining Low/Info (22, 23, rest of 24), A3's coverage gaps
+    (25-27), and section B's decisions for the user.
+
+**State at hand-off:** branch `pentest-2026-08-07-fixes`, working tree CLEAN.
+`40d132e` is the last code commit; **this session added no code — only this
+report.** **Not pushed, not merged, not deployed.** `master` is still 1 commit
+ahead of `origin/master` from an earlier session. Both lanes reverted every
+mutant they installed; `git status` was verified clean after they finished, and
+`backend/accounts.db` was not touched.
+
+**Baselines re-run on the clean tree at close, not assumed:** client **184 OK,
+0 failures**; backend **165 passed**. e2e and hostile-relay were NOT re-run this
+session (neither lane touched them, and no code changed). Both numbers match the
+`40d132e` baseline exactly — which is the point of item 7: they matched while
+three Highs were open.
+
+**Do NOT merge this branch on the strength of a green suite.** Three Highs are
+open, and item 7 is the reason the green is not evidence.
+
+### A4 — the 2026-08-10-night review of `40d132e`'s repairs (2 lanes)
+
+Scope was defined by function name rather than by diff, because `40d132e`
+contains both the original fixes and the repairs to them, so they cannot be
+separated by commit. Lane A took `otp.js` `armFloors` + the
+`savePadProgress`/`markExported` gates, `contacts.js`
+`rememberSupersededKeys`/`dropPinsFor`, and `chats.js`'s two new guards. Lane B
+took `account.js`'s relative two-sided bound and rewritten 409 retry, with the
+clock as its named priority, plus the new call-site assertion in
+`peer-approval.test.mjs`. Lane C was not run: the backend was clean last round
+and unchanged since. Every finding is itemised as TODO items 1-5, 6 and 9 above.
+
+**What was attacked and HELD** — recorded so the next session does not re-spend
+the effort:
+
+* **The TAMPERED-vs-ABSENT refusal is genuinely closed and its test is not
+  vacuous** — deleting the `throw` at `otp.js:330` turns `otp-rollback.test.mjs`
+  red on "corrupting the SEND slot must FAIL CLOSED". The layer below was checked
+  too: `PadFloor.bump` (`PadFloor.kt:124-132`) returns `TAMPERED` and **writes
+  nothing** when the stored record does not verify, so bump-then-read cannot
+  launder a forged slot into a valid one. The read-back is real evidence.
+* **`bump(_, 0)` really does create the `#exported` slot** (`PadFloor.kt:128`:
+  `current == ABSENT` → `next = 0`, `0 != -1` → `commit()`), so that slot's
+  absence really is unambiguous evidence of deletion. The comment is accurate.
+* **The `derivedFloors` gate** is inside the AEAD (unstrippable), correctly keyed
+  on a NEW field rather than on `nativeFloor` (2026-07-29-era pads still open),
+  and strict `=== true`. Its only weakness is F-A3.
+* **A throwing save cannot cause keystream reuse** — `app.js:2977` persists
+  BEFORE `ws.send`, and `otpPersistFailed` clears `verified`, disables send and
+  closes the socket. Checked specifically because `armFloors`'s new `throw` fires
+  on the send path.
+* **M-1 (eviction order), M-2 (third-party pin) and item 17's base are closed** —
+  the mutants `history.slice(-MAX)`, removing `claimedByAnother`, and removing the
+  `rememberSupersededKeys` call site each turn `contacts-anchor.test.mjs` red on
+  the right assertion.
+* **The chats concurrency test is NOT the known vacuous shape** — it installs a
+  real FIFO Web Locks shim and redefines `globalThis.navigator`; dropping the
+  lock from `withWriteLock` kills it. (The warning recorded last round still
+  applies to any NEW such test.)
+* **Pass 2's freeze is genuinely gone.** `sc.regseq.v1` was poisoned with
+  `2**53-2`, `2**53-1`, `2**43`, `2**43±1`, `2**44` and `Date.now()+10×SLACK` and
+  driven through the real `/api/register`: every one heals on the first
+  registration, and three consecutive registrations then succeed. The new
+  inclusive bound does not recreate the self-discarding band, even with
+  `Date.now()` frozen so no millisecond can elapse.
+* **`detail.includes("counter")` cannot misfire on an honest server** — the only
+  other `accounts.py` 409 containing that substring is reachable only when
+  `req.seq is None`, while the client's branch requires `Number.isInteger(seq)`.
+* **Inducing the retry from a hostile relay yields no key rollback.** It does
+  harvest a valid dual signature dated ~7 days ahead, and the relay can then lie
+  `{"status":"updated"}` so nothing is visible to the user — but the client
+  persists the ceiling it signed, so every later registration is strictly above
+  it, and clearing `localStorage` routes through a retry that jumps to a LATER
+  ceiling. Moot against a hostile relay anyway: `/api/users` answers carry no
+  signature and item 14 already forbids trusting them.
+* **`Number.parseInt` junk** (`""`, `"NaN"`, `"1e999"`, `"-1"`, `"0"`, `"0x…"`,
+  `2**60`, non-safe-integer decimals) is all either discarded or yields a valid
+  counter. Intra-call clock skew between `ceiling` and `Date.now()` is absorbed
+  in both directions.
+* **The backend v2/v1 downgrade path is fail-closed** (`accounts.py:711-718`): a
+  no-counter registration may only ADD encryption keys to an account that has
+  none.
+
+**Not attacked / open uncertainty:** neither lane ran the Puppeteer e2e or
+hostile-relay suites (out of lane, and the tree was being mutated concurrently);
+H-1 is proven at source/unit level only, which item 8 is the reason for. F-A1 and
+F-A3 are argued from the JS ordering plus the Kotlin source with in-process PoCs,
+**not exercised on a real device**. The Android side beyond `PadFloor.kt` was not
+reviewed. M-2's severity depends on how real "two registrants for one identity"
+is in practice — `exportIdentity` exists, but the import path was not traced end
+to end. Baseline held throughout both lanes: client **184**, backend **165**.
+
+
+`pentest-new-code` was run over this session's own fixes, in three lanes. **It
+found 2 High and 3 Medium in the fix code — a fourth consecutive round in which
+the repair was more dangerous than the bug.** All are fixed, each with a
+regression test verified to fail against the code it replaces. Detail per item in
+A2 below; the short version:
+
+* **H (item 13 repair) — `armFloors` collapsed `NATIVE_TAMPERED` (-2) and
+  `NATIVE_ABSENT` (-1) with `>= 0`.** Corrupting a prefs entry costs an attacker
+  exactly what deleting one costs, so corruption silently disarmed the guard that
+  deletion trips: my repair turned a fail-CLOSED path fail-OPEN, and the lane
+  rewound `recvHighWater` 4000 bytes through it. Tampering is a hard refusal now.
+  Also: `savePadProgress`/`markExported` had NO native-floor gate, and `app.js`
+  caches `{record, atRest}` per session — so after one unlock every per-message
+  save bypassed every floor check in the file. Both gated.
+* **H (item 18) — the fix did not close the freeze.** An ABSOLUTE ceiling can
+  only relocate it: the acceptance bound was inclusive, so a stored `2**43` was
+  signed as `2**43+1` and then discarded by the next call, leaving the server
+  holding a value the device could never reach again. Proved end to end against
+  the real endpoint. Rebuilt on a RELATIVE two-sided bound (`now + slack` does
+  both jobs), so nothing signed can ever become un-signable. **Residual, needs a
+  protocol change: a badly wrong wall clock still freezes an account, and no
+  client-side ceiling can fix it because the ceiling is computed from the lying
+  clock. The repair is for the server to echo its stored counter on 409** — it
+  currently says only "not newer", which is why `Date.now()` had to be guessed
+  at. Open item.
+* **M (item 13 fix) — the first cut could BRICK a pad** (claim written before the
+  bump that backs it), unrecoverable, wearing the tamper alarm's own wording.
+* **M (item 17 fix) — the history cap evicted the OLDEST superseded key**, the
+  one whose pin has had longest to be forgotten, restoring the exact residual
+  item 17 closes. Also: the stated justification for the cap was false, and is
+  corrected rather than left as folklore.
+* **M (item 17 fix) — `pinKeys` is fed from UNSIGNED directory answers**, so a
+  hostile relay could plant a third party's key in someone's history and have
+  removing that someone delete the third party's pin — inverting the key-change
+  alarm. Absent from pre-fix code: the old sweep was self-limiting.
+* **M (item 14 coverage) — the harness could not see a call-site reintroduction.**
+  A mutant restoring route (a) at the CALL SITE passed 9/9 in both suites while
+  skipping the prompt against a hostile directory. The call site is pinned now.
+
+**Still open, recorded not buried:** `chats.js unlock()` reads store and witness
+outside the lock, so a benign second tab can fire the rollback alarm (transient,
+pre-existing); `withWriteLock` has no timeout, so a same-origin script holding it
+hangs writes; `list()`'s shallow spread shares `pinKeys` by reference against its
+own "defensive copy" comment; `describeIdentity` still compares keys as strings
+where the gate uses bytes (no-op today, permissive if `unb64` is ever loosened);
+the peer-approval prompt inherits an attacker-choosable display name for
+auto-contacts; `hostile.mjs` serves no `/api` routes so the directory-driven flow
+is untestable end to end, and `EVIL_MODE=none` returns an unpatched client with
+no warning. **`pentest-new-code` has NOT been re-run over THIS round of repairs.**
+
+## ⮕ (2026-08-10 midday, ALL of A2 closed)
+
+**Every A2 High and every A2 Medium is closed** — items 13, 14, 15, 16, 17, 18,
+20 fixed, item 19 decided/documented/hardened, plus 21 and the two
+`forge.mjs`/string-compare parts of 24. **Each fix has a regression test that was
+verified to FAIL against the pre-fix code**, and two findings the report had only
+modelled (13's second export, 18's account freeze) were REPRODUCED end to end
+before being fixed. Everything is still **uncommitted** on
+`pentest-2026-08-07-fixes`.
+
+**Next, in order:**
+
+1. **Re-run `pentest-new-code` over the whole branch.** Eight fixes have landed
+   since it last ran, and on this project fix code has been the most dangerous
+   code in the tree three times running — all three A2 Highs were fixes for
+   earlier findings. This is the highest-value thing left before merge.
+2. **A2 items 22, 23, the rest of 24** — all Low/Info.
+3. **A3's coverage gaps** (25-27), then section B's decisions for the user and
+   section C's items 8-11.
+
+**Still needs the user** (section B, unchanged): F-CRYPTO-009's RSA residual,
+lock-on-background, the anchor/restore design, and the merge/deploy plan for the
+two breaking contract changes (`register/v3` and dual-scheme `/auth/verify` both
+refuse older clients).
+
+What was done, one line each — 13/14/15 first (the Highs), then 16/17/18:
+
+* **item 13 — FIXED.** New `derivedFloors` marker inside the v3 AEAD, plus
+  `#exported` is now bumped on EVERY save (0 or 1) so the slot exists from the
+  pad's first save and its absence is unambiguous. `unlockPad` refuses when the
+  marker is set and either derived slot reads ABSENT. **The exploit was
+  reproduced first** (pre-export snapshot + one prefs deletion ⇒ `unlockPad`
+  succeeded with `exported === false`, i.e. a pristine pad re-armed for a SECOND
+  export) and is refused after. Gated on a NEW field, not on `nativeFloor`,
+  because 2026-07-29-era pads legitimately have no derived slots — that reasoning
+  is now in the code, where the pentest correctly noted it was missing.
+* **item 14 — FIXED.** `peerAlreadyTrusted` route (a) is deleted. The only
+  remaining skip is a 🟢 key verified in person, which is genuinely local.
+  **Item 21 is fixed in the same function** (a set-but-mismatched
+  `expectedPeerBundle` now returns null instead of falling through), and the
+  key comparison moved from string `===` to decoded bytes (`sameSigning`), the
+  last part of item 24's list. Cost, now stated honestly everywhere: first
+  contact by handle costs one click.
+* **item 15 — FIXED** by serialising `_mldsa65_verify` behind a module lock.
+  **`xoflib` is NOT installable in this environment** (`pip install xoflib
+  --no-index` → no distribution), so the dependency route could not have been
+  tested here and was rejected for that reason; the lock is correct whatever
+  backend is installed, which is the property that matters given the failure mode
+  being closed off is "deployed without xoflib and nothing says so". This is the
+  single `dilithium_py` call site in the process, so it also closes the same
+  latent bug in `register`.
+
+* **item 16 — FIXED.** The CAS is now a real critical section: a `writeChain`
+  orders writes within a tab, `navigator.locks` orders them across tabs, and the
+  losing tab refuses loudly instead of silently dropping the replay ring.
+  Folding store and witness into one value was rejected — the witness must stay
+  readable when the store is gone, which is F-ATREST-005's whole deletion check.
+* **item 17 — FIXED.** Superseded signing keys are recorded on the contact
+  record before `upsert` overwrites them, and the pin sweep matches the union of
+  current ∪ history, so Remove/Unverify now reach a pin filed under a rotated-away
+  key — the key a user revoking after a suspected compromise most wants dead.
+* **item 18 — FIXED, after reproducing the freeze end to end.** A stored counter
+  above a sane ceiling is discarded rather than used as a floor, and the signed
+  value is clamped below the server's cap. Discarding (not throwing) matters: the
+  counter is attacker-writable plaintext, so refusing would trade a server-side
+  freeze for a local one.
+* **item 19 — DECIDED, and hardened for free.** Accepted as a residual, with the
+  reasoning written where it was missing. Also `CHALLENGE_RATE_REFILL_PER_SEC`
+  0.5 → 2.0: because the global bucket is charged first, attacker reach is
+  `global refill / per-username refill`, so LOOSENING this bucket cut the number
+  of accounts one visitor can silence at once from **eight to two** at no cost to
+  honest users. The service-wide 4 req/s DoS is explicitly NOT closed and cannot
+  be by this bucket.
+* **item 20 — FIXED.** `#admit` now carries `data-mode` (`knock`/`peer`), and
+  every harness assertion checks the marker AND the visible button label, so the
+  two prompts can no longer be conflated and the marker cannot drift from what
+  the user sees. The README's control recipe was missing `SCENARIO=control`; a
+  wrong invocation now prints an explicit "this is not a broken fix" banner, and
+  a prompt that never appears FAILS instead of silently removing two checks from
+  the run.
+
+**Two numbers in the report that differ on this machine:** a verify is ~15 ms
+here, not ~7 ms, so the serialisation ceiling is **~66/s, not ~140/s** (still far
+above the relay's own throttles: challenges refill at 0.5/s per username, 4/s per
+host). And the unserialised failure rate reproduced at 179/320, against the
+report's 178/320.
+
+### Verified 2026-08-10, not assumed
+
+| suite | result |
+| --- | --- |
+| client (`npm test`, +2 new suites) | **184 OK, 0 failures** (was 143) |
+| backend (`pytest -q`, +11 new tests) | **165 passed** (was 154) |
+| e2e room-admission / all-modes / two-user-flow / no-dead-ends | **13/13 · 32/32 · 8/8 · 12/12** |
+| hostile-relay control / demote / attacker | **5/5 · 9/9 · 9/9** (9, not 8 — item 20 added a check) |
+
+Each new test was run against the pre-fix code and **fails there**:
+
+* 13 — at the slot-presence precondition (pre-fix the `#exported` slot is never
+  written until export, so it reads ABSENT).
+* 14 — "a directory answer must never authorise skipping the approval prompt",
+  checked by reintroducing route (a) by hand, since the pre-fix state is
+  uncommitted working-tree state rather than HEAD.
+* 15 — 179/320 valid signatures rejected.
+* 16 — "exactly one concurrent write may succeed — two successes IS the lost
+  update".
+* 17 — "Remove must sweep the pin naming the SUPERSEDED key".
+* 18 — pre-fix it signs `9007199254740991`, the server's cap exactly.
+* 20 — mislabelling the peer prompt as `knock` fails `room-admission.mjs` inside
+  `approvePeerKey`; and the README's OLD recipe, which used to report a green on
+  the check that matters, now reports 3/9 behind an explicit banner.
+
+Note for whoever writes the next concurrency test: **sign serially.**
+`ML_DSA_65.sign` shares the same process-global SHAKE state as the verify, so
+signing inside the threads corrupts the test's own signatures and blames the
+server. And in Node there is no `navigator.locks`, so a chats concurrency test
+that does not install a shim passes vacuously.
+
+**`pentest-new-code` has NOT been re-run over these fixes.** That is the next
+thing to do after item 16 — and on this project the fix has been the most
+dangerous code in the tree three times running, so it matters more than usual
+that these three are themselves fix code.
+
+### The previous entry (2026-08-08), for context
+
+The whole branch went through `pentest-new-code` in three parallel lanes (the new
+rewrite, the backend contract changes, at-rest + crypto). It found **3 High and 5
+Medium**. All three Highs were in FIX CODE — code added to close an earlier
+finding.
+
+---
+
+The rest of this section is what the 2026-08-08 session DID, and still stands
+except where A2 contradicts it.
+
+**A.1 — where the attack stops.** At the intended refusal, on the endpoint that
+receives the first handshake. The earlier "stalls at hello, no refusal" reading
+was the OTHER party — the one that is never sent a handshake to check, because
+the peer that refuses closes before replying. Full detail in TODO item 1,
+including two harness traps that manufacture false greens.
+
+**1a — the 2026-08-07 admission proof was unsound, and is gone.** It was
+verified against the peer's own bundle, with nothing requiring the signer to be
+trusted or a human to have been asked, so an attacker signs one for its victim
+with a keypair it makes on the spot. Reproduced in two browsers: the victim
+reached the safety-number screen with nobody having approved anything, against
+an attacker client that was the shipped code plus one assignment.
+
+**The rebuilt control: approval is symmetric.** Each side refuses a handshake
+from an identity ITS OWN user never approved — the owner through the queue
+prompt it already had, the other side through the same prompt shown when the
+peer's signed handshake arrives. Already-trusted keys skip it (the contact you
+picked by name, matched against the directory bundle; or a 🟢 key from the
+contacts store), so the ordinary named-contact flow gains no click. No relay
+frame and no peer assertion is consulted, so nothing on the wire can switch it
+off. The `adm` field is deleted, which also un-breaks the wire: the handshake is
+`handshake/v3` again with no new field.
+
+Why nothing weaker works: the room id reaches the relay in cleartext (it IS the
+`join` frame), so a hostile relay can always present itself as a legitimate
+code-knowing participant. Every claim such a peer makes about its own authority
+is the attacker's to choose. Local approval is the only input it cannot write.
+
+**Verified:** client **143 checks**, backend **154 passed**, e2e **13/13 +
+32/32 + 8/8 + 12/12**, and the new hostile-relay regression **8/8 in both
+scenarios** (`e2e/hostile-relay/`, in the repo this time — the previous harness
+was lost with its scratchpad).
+
+**Cost, stated plainly:** a guest joining by raw room code with an unknown peer
+now sees one approve/deny prompt before the safety-number step. That is the case
+where the human most needs to look, and it is the same prompt the owner gets.
+
+**⚠️ Superseded in part by A2 item 14:** the "already-trusted keys skip it" half
+of this is broken. One of the two skip routes reads an UNSIGNED directory answer,
+so a hostile relay turns the control off for the named-contact flow. The claim
+above that "no relay frame and no peer assertion is consulted" was wrong, and the
+same wrong claim is written into `client/app.js` and `client/auth.js`. Fix item
+14 (delete route (a)) and item 21 (route (b)'s fallthrough) together, then
+correct the comments in both files, `README.md`, and this paragraph.
+
+### Tree state at the end of the 2026-08-08 session
+
+**Uncommitted, on branch `pentest-2026-08-07-fixes`** (which is itself unmerged,
+and `master` is 1 commit ahead of `origin/master`):
+
+```
+ M PROGRESS.md          this file
+ M README.md            symmetric-approval description (CORRECTED 2026-08-10)
+ M client/app.js        the rewrite; items 14, 21, 24 fixed + comments corrected
+ M client/auth.js       admission proof removed; forge.mjs citation corrected
+ M e2e/all-modes.mjs    guest approval click (item 20 fixed: waits for peer mode)
+ M e2e/room-admission.mjs  same
+?? e2e/hostile-relay/   new regression harness (item 20 fixed: README + checks)
+```
+
+Added 2026-08-10 by the items 13-18 fixes:
+
+```
+ M backend/accounts.py            item 15: the ML-DSA lock + the decoy note
+ M client/otp.js                  item 13: derivedFloors marker + the guard
+ M client/otp-rollback.test.mjs   item 13 regressions; the false green removed
+ M client/chats.js                item 16: writeChain + Web Locks around persist
+ M client/chats-rollback.test.mjs item 16 regression (installs a Web Locks shim)
+ M client/contacts.js             item 17: superseded-key history + union sweep
+ M client/contacts-anchor.test.mjs item 17 regressions
+ M client/account.js              item 18: sane-ceiling discard + cap clamp
+ M client/app.js                  item 20: #admit data-mode marker
+ M client/package.json            registers the two new client suites
+ M backend/config.py              item 19: challenge refill 0.5 -> 2.0 + why
+ M e2e/hostile-relay/*            item 20: mode-based checks + corrected README
+?? backend/tests/test_rate_limit_invariants.py  item 19: relationship invariants
+?? backend/tests/test_concurrency.py  item 15 regressions (real threads)
+?? client/peer-approval.test.mjs      items 14/21 regressions
+?? client/regseq.test.mjs             item 18 regressions
+```
+
+Green as of the end of the session, BEFORE any A2 fix: client 143 checks,
+backend 154 passed, e2e 13/13 + 32/32 + 8/8 + 12/12, hostile-relay 5/5 control +
+8/8 shipped + 8/8 attacker. Note that green does not cover any A2 finding — see
+A3 for why (serial tests, no `app.js` unit surface, and the two confirmed
+coverage gaps).
+
+Per-finding PoCs from the three lanes were written to session scratchpads and are
+NOT preserved; the reproductions are described in enough detail in A2 to rebuild
+them. The one durable piece of attack tooling is `e2e/hostile-relay/`.
+
+## ⮕ (2026-08-07, the 2026-08-07 pentest: 15 of 15 fixed, ONE UNVERIFIED)
+
+Branch `pentest-2026-08-07-fixes`, **not merged, not deployed**. Backend
+**154 passed**, client **143 checks**, e2e **13/13 + 32/32 + 8/8 + 12/12**
+(room-admission, all-modes, two-user-flow, no-dead-ends). 20 files, ~1500 lines.
+
+**Read this first: one fix is NOT verified.** The rebuilt F-PROTO-001 admission
+check blocks the hostile-relay attack in both scenarios — but it does not stop
+at the new refusal. No refusal line in the victim log, socket still `connected`
+(so `ws.close()` never ran), no page errors, and both parties stall at the hello
+phase instead. Until that is explained the fix may be holding for an incidental
+reason, which is not a property to claim. Harness in the scratchpad `h/`
+(`hostile.mjs` on :8099 policy=demote + `proto001.mjs`); note its relay log only
+prints join/knock, so the absence of `key` lines there proves nothing.
+
+**What was fixed.** All 14 Medium findings plus three Lows whose severity is
+capped only by precondition (`F-CRYPTO-009` RSA parameter validation,
+`F-CRYPTO-012` unusable pad sizes, `F-CRYPTO-014` the OTP lease lock). Details
+per finding in the TODO section below.
+
+**The fix pass was itself pentested, and it found five things — two of them
+regressions this branch introduced.** That gate is why it is worth running:
+
+* **F1 (High)** — the first F-PROTO-001 fix inferred ownership from "we minted
+  this room code". Wrong twice: `selfMintedRooms` is empty after a reload and
+  never holds a PASTED code, so the attack stayed open in the ordinary
+  workflow. Rebuilt around a signed admission (below).
+* **F2 (Medium, introduced)** — the same fix fired on an HONEST relay. Room
+  ownership goes to whoever JOINS FIRST, not to whoever minted the code, so a
+  peer connecting first made the minter a legitimate guest and the client
+  disconnected them from their own room — silently, because `ws.onclose` →
+  `showScreen("room")` → `clearHints()` wipes the message and the log line is in
+  the hidden chat pane. Removed at the source.
+* **F3 (Medium, introduced)** — `chats.js persist()` copied the generation,
+  witness and write ordering from `contacts.js` but NOT its L-3 compare-and-swap.
+  Every chat operation persists, so two tabs is the ordinary case: the stale tab
+  silently discarded the `seenIds` replay ring and negotiated modes, and one
+  interleaving left store gen < witness gen = **permanent unrecoverable
+  lockout**. CAS ported; chats unlock failures now have their own message.
+* **F4 (Medium)** — the anchor comments claimed the flag "cannot be deleted
+  without deleting the identity". False: you roll the identity blob BACK, not
+  delete it, and every pre-fix blob has no `flags` field, so today's blob on
+  every device IS the archived artifact. Claim withdrawn in both files; the
+  dependency on **F-ATREST-008** (identity blob has no anti-rollback control) is
+  now stated where the fix lives.
+* **F5 (Low-Med)** — revocation deleted only `pins["user:"+name]`, but live-room
+  peers are pinned under `room:<id>` — usually the ONLY pin there is. Worse, the
+  new test asserted the residual was correct. Now sweeps by bundle.
+
+**Two contract changes that need saying out loud:**
+
+1. **Directory key rotation now requires a counter.** `register/v3` carries a
+   signed monotone `seq` (new `reg_seq` column). A registration WITHOUT one may
+   only ADD encryption keys to an account that has none — it can no longer
+   change or clear published ones, because a hostile replay is indistinguishable
+   from a genuine rotation. `test_same_identity_reregistration_refreshes_keys`
+   asserted the old, vulnerable contract and was rewritten.
+2. **Directory login is dual-scheme.** `/auth/verify` requires Ed25519 AND
+   ML-DSA over the same challenge. Old clients get a clean 401. Both decoy paths
+   run the ML-DSA verification anyway so the 401 does not become the timing
+   oracle F-RELAY-007 already noted (measured: ML-DSA verify ~7 ms).
+
+Also a wire break worth knowing: the admission proof (`adm` in the key frame,
+domain `secure-chat/room-admission-proof/v1`) is a separate signature rather
+than a new field in the `handshake/v3` transcript — deliberately, so the
+transcript is not silently changed — but a client that does not send it is
+refused as unapproved.
+
+**Not done, and deliberately not decided alone:**
+
+* **F-CRYPTO-009 residual.** Partial validation cannot certify a modulus is a
+  product of two large primes, so `e=65537` with `n = <small factor> × <large
+  prime>` still hands an RSA session to a passive observer. Closing it needs a
+  contributory root — which needs a THIRD handshake frame, breaking app.js's
+  "answer the initiator exactly once" invariant — or deprecating RSA transport.
+* **Lock-on-background (F-ANDROID-003).** `FLAG_SECURE` is set, which closes the
+  filed recents-snapshot leak. Lock-on-background is a different threat and would
+  re-prompt for the passphrase on every app switch.
+* **Anchor vs. identity restore.** There is no restore-from-backup flow today
+  (`Identity.import` only ever reads the localStorage blob; export is
+  clipboard-only), so this is unreachable — but if one is added, restoring a
+  backup carrying `contactsEstablished` onto a store-less device is a lockout.
+  Device-scoping the flag does NOT work: a device id in localStorage is
+  deletable, which reopens the original hole.
+* **Android build is unverified.** `FLAG_SECURE` is correct by inspection but was
+  never compiled: `./gradlew compileDebugKotlin` fails on this machine with
+  `25.0.3-ea` (JDK 25 vs this Gradle/AGP). Confirmed identical on unmodified
+  master, so it is pre-existing and not caused by the change. An open question
+  from the review: the JS `prompt` AlertDialog is a separate `Window` and may
+  need its own `FLAG_SECURE` on some API levels.
+
+**Run the relay for e2e with the venv, not `./run.sh`** — `run.sh` uses the
+system python and dies on `ModuleNotFoundError: dilithium_py`:
+
+```bash
+cd backend && SECURE_CHAT_DB=/tmp/e2e.db .venv/bin/python -m uvicorn main:app \
+  --host 127.0.0.1 --port 8000 --no-server-header --no-proxy-headers \
+  --no-access-log --log-level warning --ws-max-size 66560 &
+```
+
+## ⮕ (superseded) 2026-07-28, Tor onion service LIVE
 
 **The last never-started checklist item is done.** The relay is reachable at
 `http://626vkwn6znrko2xhorirvv5ttrbzcr3xkdjmk65cks26qkvadplyk5id.onion`
@@ -43,7 +1495,7 @@ distinguishes the two hypotheses on the number alone.
 > which land in the SAME branch, so the probe never separated the hypotheses at
 > all — it only ever measured one bucket twice. Every `/api` limiter is 2×, and
 > an attacker can starve the bucket honest traffic uses while working the
-> uncontended one. See M-1 in `secure-chat-pentest-2026-07-29.md` and item 1 of
+> uncontended one. See M-1 in `docs/pentests/secure-chat-pentest-2026-07-29.md` and item 1 of
 > the TODO. The claim is repeated verbatim in `deploy/README.md` and in commit
 > `d338e15`'s message; both need the same correction when it is fixed.
 >
@@ -134,7 +1586,7 @@ nobody has *watched* the bypass happen on this deployment.
 
 ## ⮕ (superseded) snapshot as of 2026-07-28, every 2026-07-27 pentest finding fixed
 
-**All 4 High, all 7 Medium, and L-1..L-6 from `secure-chat-pentest-2026-07-27.md`
+**All 4 High, all 7 Medium, and L-1..L-6 from `docs/pentests/secure-chat-pentest-2026-07-27.md`
 are fixed, with regression tests.** **Committed and pushed 2026-07-28**
 (`dc182d7` on `pentest-2026-07-27-fixes`, merged `--no-ff` as `97c0754`; both on
 `origin`). **DEPLOYED to Hetzner + APK installed on the phone 2026-07-28** —
@@ -564,7 +2016,7 @@ running a broken app for the duration.
 
 ## (2026-07-26, first full pentest of the final product — ALL FIXED)
 **Full pentest + remediation in one session.** Report:
-`secure-chat-pentest-2026-07-26.md` (findings in §4-6, remediation table in §9).
+`docs/pentests/secure-chat-pentest-2026-07-26.md` (findings in §4-6, remediation table in §9).
 Method: the two test agents (`e2e/two-user-flow.mjs`) plus a new PQKEM live-room
 canary harness drove two real browser peers while **tshark** captured loopback;
 four specialist agents then attacked in parallel (packet exploitation + live
@@ -754,7 +2206,7 @@ localStorage and so no identity blob at all, which tests nothing.
 ## ⮕ (2026-07-25) pentest: ALL 8 findings fixed
 **The remaining six findings (F-01, F-03, F-05, F-06, F-07, F-08) are now fixed,
 tested and verified against their own PoCs.** See the updated
-`secure-chat-pentest-2026-07-25.md`. Backend **103 passed**, client `npm test`
+`docs/pentests/secure-chat-pentest-2026-07-25.md`. Backend **103 passed**, client `npm test`
 green, Android unit tests green, all browser harnesses green.
 
 - **F-01 (Medium) — contact injection.** The local contact label is now always
@@ -806,7 +2258,7 @@ store** — only do it with an exported backup or a fresh identity.
 
 ## ⮕ (superseded) snapshot as of 2026-07-25, in-depth pentest: 2 of 8 fixed
 **Full-stack pentest run against `4b9f270`; report in
-`secure-chat-pentest-2026-07-25.md`. The crypto core held — nothing broke in
+`docs/pentests/secure-chat-pentest-2026-07-25.md`. The crypto core held — nothing broke in
 the handshake, ratchet, OTP, sealed envelope or web-of-trust. Every finding is
 in the layer ABOVE the crypto: the async mailbox treats AUTHENTICATED data (the
 sender really signed it) as TRUSTED (they are who they claim, and their values
@@ -1140,7 +2592,7 @@ android/app/build/outputs/apk/debug/app-debug.apk` when the phone is back.
 
 ## ⮕ RESUME HERE (snapshot as of 2026-07-18, Codex-Terra audit fixes)
 **A second external audit ("Codex Terra", pushed to GitHub as
-`secure-chat-security-audit-2026-07-18.md`, auditing commit 70bbfcc) found
+`docs/pentests/secure-chat-security-audit-2026-07-18.md`, auditing commit 70bbfcc) found
 1 High + 3 Medium + 3 Low. ALL 7 ARE FIXED, TESTED, AND DEPLOYED TO THE
 HETZNER BOX** (deploy commands were run by hand because the session's
 permission system blocked remote writes; ownership gotcha below).
@@ -2837,8 +4289,754 @@ Follow-up review after the receive-gate fix; fixed the remaining findings.
 
 ## TODO / NEXT (suggested order)
 
+### 🟡 OPEN — the 2026-08-07 pentest (branch `pentest-2026-08-07-fixes`, unmerged)
+Committed as `ba4233e`, plus **uncommitted** 2026-08-08 work. All 15 planned
+items implemented; backend **154 passed**, client **143 checks**, e2e **13/13 +
+32/32 + 8/8 + 12/12**. The branch is **NOT clean to merge** — everything below is
+what stands between it and master, in the order I would do it.
+
+**Read A2 before anything else.** The branch was pentested on 2026-08-08 and has
+3 High + 5 Medium open against it, none fixed. The green numbers above do not
+cover any of them (see A3).
+
+Report: `docs/pentests/secure-chat-pentest-2026-08-07.md`. Per-finding detail and PoCs live
+OUTSIDE this repo, in `/home/kpafi/secure-chat-pentest/state/findings/`.
+
+#### A. Blocking — must be resolved before merge
+
+1. **✅ ANSWERED 2026-08-08 — and it turned up a worse problem (new item 1a).**
+   The attack stops exactly where the fix intends, on the endpoint that receives
+   the first handshake: it logs `[a peer completed the key exchange without ever
+   being approved — refusing]` and closes the socket (`readyState 3`).
+   Harness now in the repo at `e2e/hostile-relay/` (the old one was lost with the
+   scratchpad); `README.md` there has the four run recipes and the result table.
+
+   **Why the earlier run saw nothing.** It was reading the WRONG PARTY. The peer
+   that answers the hello sends the first handshake and the peer that refuses it
+   closes before ever sending one back — so the refusing side has the log line
+   and a closed socket, while the other side sits at "connected" with an open
+   socket and its last frame a handshake nobody answered. "Both stall at hello"
+   is one endpoint's downstream symptom, not a second stopping point.
+   The refusal is also nearly invisible in the UI even on the right party:
+   `ws.onclose` → `showScreen("room")` → `clearHints()` wipes the hint, and
+   `case "error"` only ever calls `hint()`, so relay errors leave no log trace at
+   all. The `#log` line survives; the hint does not.
+
+   **"Both parties refuse" is not what happens, and cannot be.** Only one
+   endpoint ever evaluates the check in this configuration — the other is never
+   sent a handshake to check. Forcing both handshakes into flight at once
+   (`HS_DELAY_MS`) does not change it: the hello INITIATOR only sends a handshake
+   in reply to one it accepted. The answering endpoint's branch does fire and was
+   verified separately (`EVIL_MODE=nosign`), but the claim in `auth.js` should
+   read "the first endpoint to be handed an unaccompanied handshake refuses",
+   not "both refuse".
+
+   Two harness traps worth keeping, both of which would have produced a false
+   green: `queueKnock` drops any knock whose `jid` is not 16 hex chars (the
+   positive control caught this — the owner's prompt simply never appeared), and
+   a hostile relay that keeps the real relay's seat bookkeeping never routes the
+   `key` frames at all, so both victims stall for the ATTACKER's reasons and the
+   client's check is never reached. `demote` routes unconditionally on purpose.
+
+1a. **✅ FIXED 2026-08-08 — the admission proof was self-mintable; approval is
+   symmetric now.** Found and reproduced end to end in two real browsers
+   (`e2e/hostile-relay/`, `SCENARIO=attacker`).
+
+   **The fix.** `signAdmission`/`verifyAdmission` are deleted, the `adm` wire
+   field with them. In their place: a handshake from an identity no human on
+   THIS device approved is held at the approval prompt — the same one the owner
+   already had — and refused if the user says no. Two ways past without asking,
+   both read from local state: the peer matches `expectedPeerBundle` (the
+   directory key for the contact the user picked), or it is a 🟢 key in the
+   contacts store. Owner and guest routes both write one variable,
+   `approvedBundle`, and the handshake is compared against it.
+
+   Kept from before: the admitted-identity binding, the anon-then-signed refusal,
+   and M-2's owner half (`roomRole === "owner"` with nobody admitted). That last
+   one does consult a relay frame, which is safe in the one direction it runs —
+   it can only ADD a refusal, never skip the approval.
+
+   **Verified:** client 143, backend 154, e2e 13/13 + 32/32 + 8/8 + 12/12, and
+   the new regression 8/8 in both scenarios. `all-modes.mjs` and
+   `room-admission.mjs` gained the guest's approval click; `two-user-flow.mjs`
+   and `no-dead-ends.mjs` never complete a live handshake and were untouched.
+
+   **Cost:** one extra prompt for a guest joining a raw room code with an
+   unknown peer, immediately before the safety-number step.
+
+   **What it does NOT claim.** A relay that knows the room code can still be a
+   participant — that is inherent, the code is the join frame — so this does not
+   stop an attacker from getting a prompt shown. It restores the property the
+   attack removed: a human sees the peer's fingerprint and trust mark, with the
+   "⚠ NOT the user you selected" warning, BEFORE any key material is touched.
+   The safety-number comparison remains the last line, as designed.
+
+   The original finding, for the record:
+
+   `verifyAdmission` checks that the signature verifies against `idbCanon` — the
+   peer's own bundle. Nothing requires the signer to be an identity the victim
+   trusts, or that any human was asked. So an attacker signs an admission naming
+   the victim with her own key (a keypair is free), and the victim accepts it:
+   in the run, alice reached the safety-number screen with a peer nobody ever
+   approved, and the attacker's client is the SHIPPED code plus one assignment
+   (`admittedBundle = idbCanon`) — the existing `sendSignedKey` mints the proof.
+
+   So the control holds only against an attacker running an unmodified client,
+   which is not a threat model: the party running the hostile relay is exactly
+   the party who can patch their client. What still stands between this and a
+   readable session is the out-of-band safety-number comparison — the same last
+   line as before the fix — and NOT the admission control.
+
+   No binding repairs that shape, which is why the replacement moved the
+   decision to local state instead. The claims in `auth.js`, `app.js`, the main
+   `README.md` and this file are rewritten to match what the code now does.
+
+2. **✅ DONE 2026-08-08 — `pentest-new-code` ran over the whole branch**, in three
+   parallel lanes (the symmetric-approval rewrite; the backend contract changes;
+   at-rest + crypto). **It found 3 High and 5 Medium. Every High is in FIX CODE**
+   — code added to close an earlier finding. They are items 13-24 in section A2.
+   **The three Highs were fixed 2026-08-10; the lanes have NOT been re-run over
+   those fixes yet.** Re-run them.
+3. **✅ Re-ran the four e2e suites 2026-08-08** after the 1a fix: 13/13 + 32/32 +
+   8/8 + 12/12, plus the new hostile-relay regression 8/8 in both scenarios.
+   **Re-run after every fix in A2.** Relay must be started with the venv (item 12).
+
+#### A2. The 2026-08-08 pentest of this branch — ALL 8 CLOSED (2026-08-10)
+
+Ordered by severity. Where a claim was modelled rather than executed, it says so.
+
+**Status: every High and every Medium is closed** — 13, 14, 15, 16, 17, 18, 20
+fixed; 19 decided, documented and hardened. Plus 21 and the two
+`forge.mjs`/string-compare parts of 24. **Open: 22, 23, the rest of 24, and all
+of A3.** `pentest-new-code` has NOT been re-run over any of the fixes — that is
+now the top item.
+
+**HIGH**
+
+13. **✅ FIXED 2026-08-10 — and the FIX ITSELF had a Medium regression, found by
+    the follow-up pentest and repaired the same day. Read this part first.**
+
+    **The regression (pentest lane A).** The first cut wrote
+    `derivedFloors: !!nativeFloor` into the blob BEFORE the bumps that back it,
+    and discarded the bumps' return values. A derived bump that failed or was
+    interrupted during a pad's FIRST save therefore left the blob permanently
+    asserting two slots that were never written, and the new guard then refused
+    the pad forever — **an unrecoverable brick wearing the exact wording of the
+    tamper alarm**, which teaches the user to disbelieve that alarm. Worse via
+    `importPad`: `padWasUsed` sees the send slot at 0, so the in-person-exchanged
+    pad file could not be re-imported either and the padId was burned. The
+    triggers are non-adversarial: a transient Keystore error (the JS wrapper
+    swallows it into `NATIVE_TAMPERED`, which the caller discarded), a full disk
+    (`PadFloor.bump` ignores `commit()`'s boolean), or a kill between two JNI
+    calls. Reproduced, and confirmed to open normally on the pre-fix code — so it
+    was genuinely introduced by the fix, not pre-existing.
+
+    **The repair.** New `armFloors(id, wm, exportedNow)` bumps all three slots and
+    then **READS EACH BACK**, returning `{send, derived}`; `writePadBlob` calls it
+    BEFORE serialising and records `nativeFloor: armed.send` /
+    `derivedFloors: armed.derived`. The claim is now made only where it is true.
+    **Scope deliberately widened past the finding:** the 2026-07-29 `nativeFloor`
+    flag had the identical defect one level up — also a claim written before its
+    bump, with the result discarded — and could brick a pad the same way. It is
+    measured now too.
+
+    **The trade-off, because it is a security choice and not an obvious one:**
+    when arming fails the blob records `false` and the pad opens UNGUARDED for
+    that slot (the pre-fix behaviour) rather than being refused. A permanent brick
+    is the worse outcome — it destroys an in-person key exchange, no user action
+    undoes it, and it trains the user to ignore the alarm. The failure it protects
+    against is non-adversarial; an attacker who can actually suppress bumps is
+    inside the native floor's threat model and is still caught by
+    `broken`/`NATIVE_TAMPERED`, which refuse outright. The guard re-arms on the
+    next save that succeeds.
+
+    **Regression test:** `testFailedBumpDoesNotBrickAPad` covers all three slots
+    failing independently, asserts the pad stays usable, AND asserts the guard
+    re-arms once the floor works again, so the degraded state cannot silently
+    become permanent. Non-vacuous: with the read-back reverted it throws the
+    brick error.
+
+    The original fix, which still stands: a `derivedFloors: true` marker inside
+    the v3 AEAD (`writePadBlob`), `#exported` is bumped on every save with 0/1 rather
+    than only on export (so the slot exists from the first save and ABSENT is
+    unambiguous — `PadFloor.bump(_, 0)` does write, since ABSENT is `-1`), and
+    `unlockPad` refuses when the marker is set while either derived slot reads
+    ABSENT. Gated on the new field rather than on `nativeFloor`, because
+    2026-07-29-era pads legitimately have no derived slots; that reasoning is now
+    written in the code. Exploit reproduced pre-fix (`unlockPad` succeeded with
+    `exported === false` after a pre-export snapshot + one prefs deletion — a
+    pristine pad re-armed for a second export) and refused post-fix. The false
+    green the finding names is gone: `otp-rollback.test.mjs` no longer deletes
+    `padId + "#recv"` to isolate the export latch (it uses a second pad), and
+    gained three item-13 checks including one that a pre-derived-slot pad is NOT
+    bricked. Residual, stated in the code: a blob written by this branch between
+    the F-ATREST-001/002 fix and this one has the slots but not the marker, so it
+    keeps the old behaviour until its next save — this working tree only, since
+    the branch was never merged or deployed.
+
+    The original finding: `client/otp.js:733-756`. The 2026-07-29 H-1 deletion guard reads
+    `inner.nativeFloor === true && native === NATIVE_ABSENT`, and `native` is the
+    SEND slot only. `NATIVE_ABSENT` is `-1`, so a deleted `#exported` slot reads
+    as "never exported" at `:745` and a deleted `#recv` contributes `0` to the
+    max at `:804`. Each derived id is its own SharedPreferences entry, so this is
+    one file edit. With a pre-export snapshot it yields a SECOND export of a
+    pristine pad — a two-time pad, the one failure OTP cannot survive; the recv
+    half reopens the M-7 replay window. Reproduced against a faithful PadFloor
+    mock. F-ATREST-002's comment ("the native latch never lowers, so it outlives
+    any restore of the blob") is false for anyone who can remove the entry.
+    **Fix shape:** a `derivedFloors: true` marker (or a floor-schema version)
+    inside the v3 AEAD, written whenever the new code bumps a derived slot, and
+    refuse when it is set while either derived slot is ABSENT. It cannot simply
+    be made strict: pads written before this change legitimately have no derived
+    slots — which is presumably why the guard was omitted, and that reasoning
+    belongs in the code, where it currently is not.
+    Note `otp-rollback.test.mjs` deletes `padId + "#recv"` and then lets
+    `unlockPad` SUCCEED with nothing asserted about it.
+
+14. **✅ FIXED 2026-08-10 — route (a) deleted**, exactly as the fix shape said.
+    The only remaining skip is route (b), a 🟢 key verified in person behind the
+    contacts passphrase. **Item 21 is fixed in the same function** (a set-but-
+    mismatched `expectedPeerBundle` returns null instead of falling through) and
+    so is the `peerAlreadyTrusted` string-comparison half of item 24 (now
+    `sameSigning`, i.e. decoded bytes). The false claims are corrected in
+    `client/app.js` (both the `approvedBundle` header and the call site),
+    `client/auth.js`, `README.md`, and the two e2e helpers' comments; the
+    "gains no click" promise is replaced with the honest cost — a repeat chat
+    with an in-person-verified contact is free, everything else including first
+    contact by handle costs one prompt. The stale `e2e/hostile-relay/forge.mjs`
+    citations in `app.js` and `auth.js` (item 24) now name the command that
+    actually reproduces it, `SCENARIO=attacker node e2e/hostile-relay/proto001.mjs`.
+
+    **New regression: `client/peer-approval.test.mjs`, 9 checks.** `app.js` has
+    no export surface, so rather than refactor the largest file in the tree to
+    hang a test on it, the test lifts the REAL `peerAlreadyTrusted` source out of
+    `app.js` by brace matching and runs it against stubs — covering items 14 and
+    21, the routes that must survive, the fail-closed edges (⚪ contact, locked
+    store), and a source-level assertion that neither deleted route returns.
+    Confirmed to fail when route (a) is reintroduced by hand.
+
+    The original finding: `client/app.js:2142` (`peerAlreadyTrusted` route (a)).
+    `expectedPeerBundle` is set from `account.fetchBundle` (`client/account.js:152`),
+    which canonicalises base64 and length-checks the keys and **verifies no
+    signature** — nothing binds the handle to the key material, and the handle's
+    token is a random server-issued lookup token. So a hostile directory returns
+    its own bundle, the prompt is skipped, and the client prints an
+    attacker-chosen reassurance: "peer key matches the directory key for X — no
+    approval needed". Reproduced 6/6, victim's peer fingerprint == attacker's.
+    This is the flow the rewrite advertised as costing no click, and the comment
+    claiming both routes are "facts we hold locally and the relay cannot write"
+    is false. Not only same-origin: `RELAY.api` exists so the Android app can
+    serve trusted client bytes locally while pointing at a remote directory —
+    honest client, attacker-controlled directory, identical single `fetch`.
+    **Fix shape:** delete route (a). Route (b) (a 🟢 key in the passphrase-backed
+    contacts store) is genuinely local and can stay, so repeat chats with a
+    verified contact still skip; first contact by handle costs one click, which
+    is what the safety-number step asks for anyway. At minimum stop printing
+    "no approval needed".
+
+15. **✅ FIXED 2026-08-10 — serialised behind a module lock** in
+    `_mldsa65_verify`, the single `dilithium_py` call site in the process, so it
+    covers `/auth/verify` and `register` both (closing the latent `register` bug
+    the finding notes predates the branch).
+
+    **The decision, and why:** `xoflib` is not installable in this environment
+    (`pip install xoflib --no-index` → "No matching distribution"), so the
+    dependency route could not have been tested here — shipping an untestable
+    fast path is worse than the ceiling. The lock is correct whatever backend is
+    installed, which is the property that matters, since the failure mode being
+    closed off is precisely "someone deploys without xoflib and nothing says so".
+    Adopting `xoflib` later is a fine change, but it must come with the new
+    concurrency test run against the new backend; the comment says so, and says
+    not to delete the lock on the strength of a requirements pin alone.
+
+    **Measured, not assumed:** a verify is ~15 ms on this machine, so the ceiling
+    is **~66/s process-wide**, not the report's ~140/s. The relay's own throttles
+    bind far below that (0.5/s per username, 4/s per host). The always-on decoy
+    is kept — dropping it reopens F-RELAY-006's timing oracle — and its
+    interaction with the lock is now documented at the decoy: unauthenticated
+    garbage can no longer CORRUPT concurrent real logins, only hold the lock for
+    one verify each.
+
+    **New regression: `backend/tests/test_concurrency.py`, 4 tests** — the first
+    tests in the suite that use real threads, which is what item 26 says the
+    whole 154-test suite structurally lacks. Covers the primitive (320 valid
+    verifies over 8 threads) and the endpoint (8 concurrent valid logins), each
+    with a fail-closed counterpart. Without the lock it reports **179/320 valid
+    signatures rejected**. Note for whoever writes the next one: sign SERIALLY in
+    the test — `ML_DSA_65.sign` shares the same process-global SHAKE state, so
+    signing inside the threads corrupts the test's own signatures and blames the
+    server for it. That cost a debugging round here.
+
+    The original finding: `backend/accounts.py:736-752`. No `xoflib`
+    in this venv, so `dilithium_py` falls back to a SHAKE wrapper whose
+    `shake256`/`shake128` are module-level singletons with mutable buffer state;
+    `auth_verify` is a sync `def`, which FastAPI runs in the anyio threadpool (as
+    `accounts.py:534`'s own comment says). Independently reproduced twice:
+    library level, 8 threads over a VALID signature → 178/320 rejected; tampered
+    → 320/320 rejected. End to end, 5 concurrent valid logins → one spurious
+    `401 challenge signature invalid`; the same users all pass serially.
+    **Fails closed — no auth bypass.** Amplified by the always-on decoy at
+    `:745-752`, which runs the ML-DSA verify for legacy clients and nonexistent
+    users too, so unauthenticated garbage corrupts real users' logins. Master was
+    Ed25519-only (OpenSSL, no shared Python state), so this branch owns it;
+    `register` has the same latent bug but that predates the branch.
+    **Fix shape (a decision):** add `xoflib` as a dependency, or serialise the
+    verify behind a lock (~7 ms each ⇒ ~140/s ceiling), or give each call its own
+    XOF. Whichever is chosen, pin it so an `xoflib`-less deploy cannot silently
+    reintroduce it.
+
+**MEDIUM**
+
+16. **✅ FIXED 2026-08-10.** The read-modify-write is now serialised instead of
+    merely checked, in two layers: a `writeChain` promise queue that orders
+    writes WITHIN a tab (`persist()` has awaits, so two overlapping operations in
+    one tab could already interleave with no second tab involved), and
+    `navigator.locks` across tabs. With the lock held across compare AND swap the
+    losing tab reads the winner's witness and refuses loudly instead of silently
+    discarding history, and store+witness become one critical section so the
+    store can no longer end up older than the witness.
+
+    **The single-value alternative was rejected, deliberately:** the witness has
+    to stay readable when the store is gone — that is the whole of F-ATREST-005's
+    deletion detection, and it carries its own salt for it — so merging them
+    would let one `removeItem` delete the evidence with the data. Written up at
+    the fix.
+
+    **Fallback posture, and it is a real difference from OTP:** with no
+    `navigator.locks` the cross-tab layer is absent and the residual is exactly
+    today's behaviour. This does NOT copy F-CRYPTO-014's "no Web Locks, no OTP"
+    stance, because there the failure is keystream reuse and the feature can be
+    withheld, whereas here withholding means the user cannot open their own chat
+    history. Stated in the code rather than left implicit.
+
+    Regression in `chats-rollback.test.mjs`: two module instances over one
+    storage, both writes started without awaiting the first, asserting exactly
+    one succeeds and the other is told to reload. Node has no `navigator.locks`,
+    so the test installs a faithful FIFO shim on `globalThis` — without it the
+    cross-tab half is inert and the test would pass vacuously. Fails pre-fix with
+    "exactly one concurrent write may succeed — two successes IS the lost update".
+
+    The original finding: `client/chats.js:337-358`. `persist()` reads the witness, checks
+    `witness.gen > generation`, then encrypts (two awaits) before writing store
+    and witness. Two tabs that both read the witness BEFORE either writes both
+    see gen N and both write N+1. Lost update reproduced in-process with two real
+    module instances over one storage: both `markSeen` calls returned `true` and
+    `env-A1` was silently dropped from the P-13 replay ring, so the relay can
+    replay that envelope and it is accepted as new. The permanent-lockout half
+    was reproduced under a **write-ordering model, not two real browser tabs** —
+    WebCrypto resolves FIFO in one Node loop — but nothing in the code constrains
+    the relative order of the two tabs' four writes. It IS a faithful port of
+    `contacts.js:441-448`; the difference is that chats persists on EVERY
+    operation, so the residual that is rare there is ordinary here.
+    **Fix shape:** wrap read-modify-persist in `navigator.locks.request` (the
+    same fail-closed posture F-CRYPTO-014 already adopted for OTP), or make store
+    and witness a single localStorage value so there is one atomic write and no
+    CAS window at all.
+
+17. **✅ FIXED 2026-08-10** with the `pinKeys` shape (the second option in the fix
+    shape). `upsert()` now calls `rememberSupersededKeys(cur)` BEFORE overwriting
+    the signing keys, and `dropPinsFor` sweeps by the union of the current bundle
+    and that history, so Remove and Unverify reach pins filed under a key the
+    contact has since rotated away from. The list is capped at 8 entries, because
+    `upsert` is reachable from inbound mail and must not be growable without
+    limit by a peer. Only signing-key changes are recorded — an ecdh/mlkem-only
+    change leaves the identity that pins are matched on untouched.
+
+    **Honest limit, written at the fix:** the history can only hold keys this
+    store SAW being replaced. A pin written under `room:<id>` at K1 by a device
+    that never held a contact record at K1 (pin first, contact added later
+    already at K2) is still missed. Nothing in the record can recover a key it
+    never stored.
+
+    Regression in `contacts-anchor.test.mjs`: Remove and Unverify across a
+    rotation, a two-rotation chain (K1→K2→K3, both older pins swept), the
+    over-sweep control in the direction that matters (another peer's pin
+    untouched), and the history bound. Fails pre-fix on the first one.
+
+    The original finding: `client/contacts.js:610-620`.
+    `upsert()` overwrites `cur.ed`/`cur.mldsa` on a key change without touching
+    `pins`, so after a rotation the record names K2 while the `room:<id>` pin
+    still names K1 and the sweep matches nothing. Reproduced. The residual is the
+    SUPERSEDED key — the one a user revoking after a suspected compromise most
+    wants dead, and anyone presenting it still matches a stored pin.
+    **Checked the other direction:** it does not over-sweep (a collateral match
+    requires both `ed` and `mldsa` to equal the contact's, i.e. the same identity
+    under another label, which is correct). **Fix shape:** record the owning
+    label inside the pin at `savePin` time and sweep by label ∪ bundle, or keep a
+    `pinKeys: []` list on the contact record.
+
+18. **✅ FIXED 2026-08-10, and REPRODUCED END TO END first** — the finding was
+    "traced against both sides, not executed", so it was executed against the
+    real endpoint before fixing: `seq=1` → 200, `seq=2**53-1` → **200 "updated"**
+    (the poisoning succeeds), then `2**53` → 422 `less_than_equal`,
+    `Date.now()`-scale → 409 not newer, the same value → 409 not newer. Frozen,
+    exactly as modelled.
+
+    The fix is two bounds rather than the suggested throw. Any stored value above
+    `REG_SEQ_SANE_MAX` (2**43, ~year 2248 in ms — nothing this code writes can
+    reach it) is treated as GARBAGE and ignored rather than used as a floor, and
+    the result is clamped to `Number.MAX_SAFE_INTEGER` so the client cannot sign
+    a value the server will 422. **Discarding rather than refusing is the point:**
+    the counter is attacker-writable plaintext, so throwing near the cap would
+    just convert a permanent server-side freeze into a permanent local one.
+    Falling back to `Date.now()` heals it on the spot. The 409 retry is clamped
+    the same way. `Date.now()` is now the floor on the normal path too, which is
+    the trick the retry already used — it keeps the counter ahead across a
+    reinstall with no round trip.
+
+    New regression: **`client/regseq.test.mjs`, 6 checks**, driving the real
+    `register()` with a stubbed `fetch` so it covers the counter actually signed
+    and sent. Pre-fix it signs `9007199254740991` — the cap exactly.
+
+    The original finding: `client/account.js`. `sc.regseq.v1` is
+    plaintext and unbounded; set it to `2**53-2` and the next registration signs
+    `2**53-1`, exactly the server's cap (`backend/accounts.py:510`), so it is
+    ACCEPTED and stored. Afterwards every registration is refused forever: `<=`
+    stored → 409, higher → 422 from the Pydantic bound. The one-shot recovery
+    (`Math.max(seq, Date.now())`) is lower than the poisoned value and only fires
+    on 409, not on the 422. **Traced against both sides, not executed end to
+    end.** The comment says the counter "does not need to be unforgeable" — true
+    for forward forgery, false for exhaustion. **Fix shape:**
+    `Math.min(Math.max(cur + 1, Date.now()), 2**53 - 1)` and refuse to sign
+    within a margin of the cap.
+
+19. **✅ DECIDED AND HARDENED 2026-08-10 — accepted, with a 4x reduction in the
+    attacker's reach taken because it was free.**
+
+    **The tuning.** `CHALLENGE_RATE_REFILL_PER_SEC` 0.5 → **2.0**. The direction
+    is counter-intuitive and that is why it is written into `config.py`: every
+    challenge is charged to the per-`client_key` GLOBAL bucket BEFORE the
+    per-username one, so an attacker's total spend is capped at the global
+    ceiling however they aim it, and
+
+        simultaneous victims = global refill / per-username refill
+
+    At 0.5/s that was 4/0.5 = **eight** accounts one unauthenticated visitor
+    could hold offline at once; at 2.0/s it is **two**. Making the bucket LOOSER
+    shrinks the attack, because the binding constraint on the attacker is the
+    global ceiling, not this bucket. Honest cost: nil — a client mints 1-2
+    challenges per login, logs in about hourly, and `autoLogin`'s backoff caps
+    retries at one per 12 s.
+
+    **Measured, both components:** the per-username bucket refills at exactly its
+    configured rate (drained to 0.12 tokens, immediate retry 429, retry after 1 s
+    → 200 at refill 2.0), and a globally-throttled request **never creates the
+    per-username bucket at all** — so global really is charged first and the
+    attacker's budget really is capped at 4/s. Reach is a derived property of
+    those two facts, pinned by a test; an end-to-end multi-victim demonstration
+    was attempted and abandoned, because the harness has to clear the global
+    bucket to pace itself and that is precisely the constraint being measured.
+    Not claimed as demonstrated.
+
+    **The comment.** `accounts.py` now states the residual instead of glossing
+    it: that for an attacker whose goal is silencing one person, "denies that one
+    account" IS the objective; what the victim actually loses (nothing for up to
+    the 1 h token TTL, live chat never — a room join touches no account API —
+    then async mail with a **visible** hint and ~2 s recovery once the attacker
+    stops); the rejected alternative (refund-on-successful-verify does not help,
+    since the victim needs a challenge to REACH verify); and plainly that the
+    **service-wide DoS is not closed and cannot be by this bucket** — 4 req/s
+    still denies logins to everyone, because behind Tor `client_key` carries no
+    information. F-RELAY-003 moved that from 0.5 to 4 req/s: an 8x improvement,
+    not a fix.
+
+    **New: `backend/tests/test_rate_limit_invariants.py`, 6 tests.** These pin
+    RELATIONSHIPS, not values, so tuning stays possible but a change that widens
+    attacker reach fails: the reach bound (reverting to 0.5 fails it with "one
+    attacker could hold 8 accounts offline at once"), that one username may never
+    absorb the whole relay's budget, honest-login headroom, the pending-challenge
+    flood bound (which is what the OTHER way of satisfying the invariant —
+    lowering the global ceiling — would trade against), bystander isolation, and
+    that the 429 stays non-enumerable.
+
+    **Two corrections to the finding**, both lowering severity: delivery does not
+    stop "silently" (the client shows "Not signed in to the directory — sealed
+    messages will not arrive" on the 1st and 4th failure, routed through `hint()`
+    so it lands on whatever screen the user is on), and it is not permanent (it
+    recovers ~2 s after the attack stops). Live chat is unaffected throughout.
+
+    The original finding: `backend/accounts.py:687`, capacity 10 / refill
+    0.5-per-sec
+    (`config.py:170-171`); the global backstop (120 / 4-per-sec) sits far above
+    it, so the per-username bucket binds. Attacker drains it and sustains ~1
+    request per 1.8 s: victim **denied=23, ok=0**, bystanders unaffected. No
+    challenge ⇒ no new session token; when the 1 h TTL lapses the poller's
+    re-auth fails permanently and async mail delivery silently stops.
+    **This is a conscious tradeoff** (it fixed the service-wide F-RELAY-003 DoS)
+    — the item is that the comment treats "draining it denies that one account"
+    as acceptable without noting that targeted silencing may be the attacker's
+    goal. **Decide and write it down**, or soften (smaller charge + larger burst,
+    or exempt a challenge quickly followed by a successful verify).
+
+20. **✅ FIXED 2026-08-10.** Three parts, all of them.
+
+    **The marker.** `app.js` now sets `#admit`'s `data-mode` to `knock` or
+    `peer` and clears it on hide (a stale `peer` on a hidden panel is the same
+    class of residue). Prose was the only discriminator before, and asserting on
+    prose makes every test a hostage to copy-editing — but the marker alone would
+    let a bug where the marker says `peer` while the labels say `knock` pass, so
+    **every assertion checks the marker AND the visible button label**
+    ("Let them in" vs "Connect").
+
+    **The harness.** Victim selection is now `promptMode === "peer"` rather than
+    "`#admit` is un-hidden", so the check "the peer that received a handshake ASKS
+    its user" can no longer go green against the OWNER's knock prompt. The
+    control block waits for the RIGHT prompt per side and asserts which one it
+    got (it previously called `check(..., true)` — a literal, asserting nothing).
+    The refusal checks no longer sit behind `if (promptShown)`: a missing prompt
+    now reports **NOT RUN and fails**, where before the two checks vanished from
+    the run and the summary still read as a pass. And a wrong invocation prints
+    an explicit banner — "this is an ORDINARY session, the relay is almost
+    certainly POLICY=honest, these failures are not evidence the fix is broken"
+    — because the finding's real complaint was that the output misleads.
+
+    **The README.** The control recipe is `POLICY=honest` +
+    **`SCENARIO=control`**, which was the missing half; it now also says the
+    policy is read once at relay startup, records the old recipe's 3/9 as the
+    expected wrong-invocation result, and adds the false-green to the catalogue
+    it keeps.
+
+    **`approvePeerKey` in `e2e/all-modes.mjs` and `e2e/room-admission.mjs`** waits
+    for `data-mode="peer"` and throws unless the button reads "Connect", instead
+    of clicking OK on whatever `#admit` was showing.
+
+    **Verified:** control **5/5** (was un-runnable as documented), demote
+    **9/9**, attacker **9/9** — 9 rather than 8 because of the new
+    marker-matches-label check. The victim is `peer` under demote and `alice`
+    under attacker, which is exactly what selecting on mode buys. The old recipe
+    now yields 3/9 behind the banner. Non-vacuity checked by mislabelling the
+    peer prompt as `knock`: `room-admission.mjs` fails in `approvePeerKey`
+    instead of passing. All four e2e suites and the client suite still green.
+
+    The original finding: `e2e/hostile-relay/`. The README's control
+    is `POLICY=honest … && node proto001.mjs`, but `SCENARIO` defaults to
+    `"shipped"` and the control block is gated on `SCENARIO === "control"`. Run
+    verbatim it fails 6/8 with messages that read as *the fix is broken* rather
+    than *you invoked it wrong*. Worse, inside that run the check "the peer that
+    received a handshake ASKS its user" went GREEN against the OWNER's knock
+    prompt: the victim-selection heuristic is "is `#admit` visible", and `#admit`
+    is now shared by both prompts. Third instance of the false-green class the
+    README itself catalogues. **Fix:** correct the README, and make the check
+    assert the panel is in PEER mode (title/button label) rather than un-hidden.
+    Same conflation in `approvePeerKey` in `e2e/all-modes.mjs:42` and
+    `e2e/room-admission.mjs:34`, which assert only "not hidden" and then click OK.
+
+**LOW / INFO**
+
+21. **✅ FIXED 2026-08-10 with item 14** — a set-but-mismatched
+    `expectedPeerBundle` now returns null and prompts, never falls through.
+    Covered by `client/peer-approval.test.mjs`. Original finding:
+    `peerAlreadyTrusted` route (b) fires even when `expectedPeerBundle` is set and
+    does NOT match, so a 🟢 contact who is not the contact you selected skips the
+    prompt (`app.js:2140-2150`). `describeIdentity` computes exactly the right
+    verdict for this case and the gate never consults it. Reproduced 5/5; the
+    backstop held (`enterVerification` fires the directory-mismatch screen and
+    messaging never unlocks), which is why it is not High. Fix with item 14: if
+    `expectedPeerBundle` is set and does not match, prompt — never fall through.
+22. `reg_seq` check-then-update is not atomic (`backend/accounts.py:600-629`): no
+    `_store_lock`, no `BEGIN IMMEDIATE`, so two concurrent registrations both read
+    the old counter and both pass the gate (reproduced: both 200 in 2/10 rounds).
+    A completed rollback was NOT demonstrated — write ordering saved it, not the
+    check. Fix: `UPDATE … WHERE username = ? AND reg_seq < ?`, 0 rows = rejection.
+23. OTP derived floor ids share the padId namespace and `importPad` never
+    validates `padId` (`otp.js:123-125`, `:463`), so a crafted pad file named
+    `<padId>#exported` bricks the real pad. **DoS only** — every floor is monotone
+    and every consumer compares with `<`, so a collision can only RAISE a floor;
+    no collision produces keystream reuse. Fix: validate `^[0-9a-f]{32}$`, or use
+    a separator that cannot appear in a padId.
+24. Assorted. **Two of these are ✅ FIXED 2026-08-10 with item 14:** the
+    `auth.js:110`/`app.js:191` citations of the deleted
+    `e2e/hostile-relay/forge.mjs` now name `SCENARIO=attacker node
+    e2e/hostile-relay/proto001.mjs`, so the branch's most load-bearing claim is
+    reproducible from the tree again and `peer-approval.test.mjs` would catch the
+    forgery route's reintroduction; and `peerAlreadyTrusted` now compares decoded
+    bytes via `sameSigning` rather than base64 strings. **Still open:**
+    `setVouches(…, expected = null)` defaults to the pre-fix unbound
+    write (`contacts.js:640`, single caller does pass it — make it required);
+    `wipe()` leaves the anchor set with no `markUnestablished()`, unreachable
+    today but a trap for a future restore flow (relates to item 6);
+    `auth.js:110`/`app.js:191` cite `e2e/hostile-relay/forge.mjs`, which was
+    merged into `proto001.mjs` and no longer exists — so the branch's most
+    load-bearing claim is unreproducible from the tree and nothing would catch
+    the forgery's reintroduction; a dead `showNextKnock()` call whose comment
+    asserts a state `roomRole`'s write-once rule makes impossible
+    (`app.js:2678`); the `approvalPending` guard sits BEFORE `++knockRenderGen`
+    (`app.js:2040`), leaving a latent "approve a fingerprint you were not shown"
+    window that is currently unreachable ONLY because of the relay-frame-reading
+    check at `app.js:2635` — which is exactly the kind of check this project has
+    removed on review before; and `peerAlreadyTrusted` compares two keys with
+    string `===` where everything else compares four keys as decoded bytes
+    (fails safe, but the log line then asserts something about key material the
+    user did not verify).
+
+#### A3. Test-coverage gaps the 2026-08-08 pentest confirmed
+
+25. **Both PROGRESS item 9 suspicions are CONFIRMED, and one fixture has already
+    drifted.** `rsa-keyvalidation.test.mjs` asserts only `instanceof Error`, and
+    the `e=0` case now fails with `malformed RSA key parameter` from
+    `b64UrlToBigInt` (Node normalises the exported JWK `e` to an empty string) —
+    it never reaches the exponent check it exists to pin. Assert the message.
+    `otp-padgen.test.mjs` never takes the partial-tail branch: all three
+    `PAD_SIZES` and the drawn-entropy case are exact multiples of 65536, while
+    `generatePad` accepts any even `totalBytes >= 128`. Add e.g. 100000.
+26. **All three backend findings are invisible to the 154-test suite**, because
+    every test drives `TestClient` serially. Concurrency needs real threads.
+27. `chats-rollback.test.mjs`'s concurrency test only covers the interleaving the
+    CAS DOES catch (tab B completes before tab A writes), never the both-read-
+    first one that still loses data. No test deletes a derived native floor slot
+    (item 13). No test covers the pin sweep across a key change (item 17).
+    `app.js` has no unit-test surface at all — `approvedBundle` /
+    `peerAlreadyTrusted` / `requestPeerApproval` appear in no test file, and
+    `peerAlreadyTrusted` is a small pure-ish function that could be exported and
+    tested directly (items 14 and 21 are each a one-line unit test against it).
+28. **Good news, verified rather than assumed:** the new test files are NOT
+    vacuous — `rsa-keyvalidation`, `otp-padgen`, `otp-rollback`, `contacts-anchor`
+    and `chats-rollback` were all run against `master`'s sources and all fail
+    there, as did the F-ATREST-007 and F-PROTO-005 blocks in isolation.
+
+#### A4. Attacked and held (do not re-litigate without new information)
+
+The full 12-way cross-store blob-swap matrix (0 of 12 opened a wrong or empty
+store; every discriminator is the tag INSIDE the AEAD, never the outer `v` byte).
+The chats legacy-adoption path cannot launder another module's plaintext.
+F-ATREST-004(b) is genuinely dead (`isPinMap` tests shape, not the key name).
+`PadFloor`'s "MACs key and value together" framing claim is correct — the last
+NUL is an unambiguous separator, so derived ids really are separate authenticated
+slots and a floor cannot be lifted from one to another. `assertRsaPublicKeyUsable`
+runs BEFORE `this.peerPub` is assigned, and every fixture but `e=0` hits its
+intended branch. `fillRandom` chunking is correct (`subarray` is a view).
+F-RELAY-005: the counter is inside the signed bytes under its own domain, a v3
+cannot be downgraded to the counter-less path, v1/v2 replays against a keyed
+account are refused, and the migration boundary is safe. F-RELAY-006 requires
+both signatures on every success path with no cross-scheme replay, and the login
+existence oracle stays closed (21.3 ms vs 20.5 ms median). F-RELAY-004's mailbox
+charge ordering is correct. M-7's vouch oracle was not reopened. And the core of
+the 2026-08-08 rewrite: the original F-PROTO-001 attack is refused on BOTH
+endpoints (8/8 in both scenarios), `approvedBundle` has exactly five writers and
+no relay frame reaches any of them except via items 14/21, no path reaches key
+derivation with it null or mismatched, and the parked message pump is sound (the
+F-PROTO-002 gate is correctly re-checked after the await, no stale resolve
+crosses connections, FIFO order holds, and no path leaves the promise unsettled
+while the socket is open).
+
+#### B. Decisions for the user — each changes what gets built
+
+4. **F-CRYPTO-009 residual (RSA).** A counterparty using `e=65537` with
+   `n = <small factor> × <large prime>` still hands the session to a passive
+   observer; partial validation cannot catch it, and raising the trial-division
+   bound does not help. Either make the root contributory (needs a THIRD
+   handshake frame, breaking app.js's "answer the initiator exactly once"
+   invariant) or deprecate peer-chosen RSA key transport in favour of
+   DHKE/PQKEM. Documented at `assertRsaPublicKeyUsable` in crypto.js.
+5. **Lock-on-background (F-ANDROID-003).** `FLAG_SECURE` closes the filed
+   recents-snapshot leak. Lock-on-background is a different threat (device seized
+   while backgrounded and unlocked) and would re-prompt for the passphrase on
+   every app switch. Needs a new hook in the web client — the native shell does
+   not own lock state.
+6. **Anchor vs. a future identity-restore flow.** Unreachable today
+   (`Identity.import` only ever reads the localStorage blob; export is
+   clipboard-only). If a restore flow is added, a backup carrying
+   `contactsEstablished` restored onto a store-less device is a lockout.
+   Device-scoping the flag does NOT work — a device id in localStorage is
+   deletable, which reopens the original hole. Design it WITH the restore
+   feature, not before.
+7. **Merge / deploy plan for the two contract changes.** `register/v3` and
+   dual-scheme `/auth/verify` both refuse older clients. Decide whether the relay
+   and clients ship together (they are served from the same origin, so normally
+   yes) and whether existing accounts need a one-time re-registration to adopt
+   `reg_seq` — pre-v3 rows start at 0, so one v3 registration adopts the control.
+
+#### C. Work the review identified but this branch did not do
+
+8. **F-ATREST-008 — the identity blob has no anti-rollback control.** Still
+   `candidate`/low in the report, but the F-ATREST-003/004 fix is now
+   LOAD-BEARING on it: the anchor is defeated by rolling the identity blob back
+   rather than deleting it, and every pre-fix blob has no `flags` field, so
+   today's blob on every device is the archived artifact. Fixing this is what
+   would make the anchor argument actually hold.
+9. **Close the test-coverage gaps.** No regression test at all for F-PROTO-001,
+   F-PROTO-002, F-CRYPTO-014 or F-ANDROID-003. `otp-padgen.test.mjs` never
+   exercises the partial-tail branch (all three `PAD_SIZES` are exact multiples
+   of 65536 — add e.g. 100000). `rsa-keyvalidation.test.mjs` asserts only
+   `instanceof Error`, so a fixture could drift onto a different branch and still
+   pass green; assert the message. A cheap source-level test that `FLAG_SECURE`
+   appears before `setContentView` would at least catch deletion.
+10. **Verify `FLAG_SECURE` on real hardware, and check the AlertDialog.**
+    Never compiled here — `./gradlew compileDebugKotlin` fails with `25.0.3-ea`
+    (JDK 25 vs this Gradle/AGP), confirmed identical on unmodified master, so it
+    is pre-existing. Open question from the review: the JS `prompt` handler
+    builds an `AlertDialog` with a password field, which is a separate `Window`
+    and may need its own `FLAG_SECURE` on some API levels.
+11. **Get the pentest workspace under version control, or reference it.** The
+    committed report cross-references `state/findings/F-*.md` and
+    `state/coverage/<lane>.md` with no hint that they live in a sibling directory
+    outside the repo. Also `state/verified-sound.md` is an empty stub — the
+    cross-lane "attacked and held" digest exists only inside §5 of the report.
+
+#### D. Environment traps that cost time this session
+
+12. **`backend/run.sh` cannot run the relay for e2e.** It uses the system python
+    and dies on `ModuleNotFoundError: dilithium_py`. Use the venv:
+    ```bash
+    cd backend && SECURE_CHAT_DB=/tmp/e2e.db .venv/bin/python -m uvicorn main:app \
+      --host 127.0.0.1 --port 8000 --no-server-header --no-proxy-headers \
+      --no-access-log --log-level warning --ws-max-size 66560 &
+    ```
+    Worth fixing `run.sh` itself to prefer `.venv/bin/python`.
+
+#### Fixed on the branch, each with a regression test
+
+- **✅ F-ATREST-003 / F-ATREST-004** (the two CONFIRMED findings) — the "a store
+  was established here" bit moved out of two deletable localStorage keys into
+  the identity AEAD (`deviceFlags`), `looksLikeStore` now checks pin-map SHAPE
+  rather than the key name `pins`, and `pinsReadable()` no longer returns true
+  while the store is locked. **Honest limit: see item 8.**
+- **✅ F-ATREST-005 / F-CRYPTO-006** — chat store gets the domain tag, generation
+  counter, witness and L-3 CAS that contacts.js already had.
+- **✅ F-ATREST-001 / F-ATREST-002** — the native floor covered the SEND offset
+  only. The recv watermark and the `exported` latch now get their own slots via
+  derived ids (`<padId>#recv`, `<padId>#exported`). No Kotlin change: PadFloor
+  MACs key and value together, so each derived id is a separate authenticated
+  slot.
+- **✅ F-ATREST-007** — revocation sweeps every pin whose bundle matches the
+  contact, not just `user:<name>` (live-room peers are pinned under `room:<id>`,
+  usually the only pin there is).
+- **✅ F-PROTO-002** — `handleMessage` drops frames queued behind a refusal.
+  NOTE: the review could not reproduce the original finding in Chromium at all —
+  the browser's own readyState gate already drops the burst — so this is
+  defence-in-depth and the finding's severity rested on shim behaviour.
+- **✅ F-PROTO-005** — the vouch mark is bound to the bundle its signatures were
+  verified against.
+- **✅ F-RELAY-001** — `config.py` no longer recommends
+  `TRUSTED_PROXIES=127.0.0.1`; Tor and Caddy share `127.0.0.1:8000`, so trusting
+  the IP trusts a raw TCP forward that appends nothing.
+- **✅ F-RELAY-003 / F-RELAY-004** — tight buckets keyed on username / recipient
+  with a larger per-host backstop; the mailbox charge moved past the token gate.
+- **✅ F-RELAY-005** — `register/v3` with a signed monotone counter.
+- **✅ F-RELAY-006** — `/auth/verify` requires both signature schemes.
+- **✅ F-ANDROID-003** — `FLAG_SECURE` (uncompiled — see item 10).
+- **✅ F-CRYPTO-009 / -012 / -014** — RSA peer-key validation (residual: item 4);
+  `randomPad` chunked past the 64 KiB `getRandomValues` cap, which had made 2 of
+  3 advertised pad sizes ungeneratable; the OTP localStorage lease deleted in
+  favour of failing closed when Web Locks is absent.
+
+#### Fixed during the fix review (regressions this branch introduced)
+
+- **F1** — the first F-PROTO-001 fix inferred ownership from "we minted this room
+  code": empty after a reload, never true for a pasted code. Rebuilt around a
+  signed admission proof.
+- **F2** — the same fix fired on an HONEST relay (ownership goes to whoever joins
+  first, not whoever minted the code) and the disconnect was silent, because
+  `clearHints()` wipes the message and the log line sits in the hidden chat pane.
+- **F3** — `chats.js persist()` lacked the L-3 CAS: silent lost update, plus one
+  interleaving that left store gen < witness gen = permanent lockout.
+- **F4** — the anchor comments claimed a property the code does not have;
+  withdrawn rather than papered over.
+- **F5** — revocation missed `room:<id>` pins, and the new test asserted the
+  residual was correct.
+
 ### ✅ CLOSED — the 2026-07-29 pentest, all 13 items (fixed 2026-07-30)
-Every finding in `secure-chat-pentest-2026-07-29.md` is fixed on branch
+Every finding in `docs/pentests/secure-chat-pentest-2026-07-29.md` is fixed on branch
 `pentest-2026-07-29-fixes`. Backend **143 passed**, client **109 checks / 11
 suites**, `e2e/all-modes.mjs` **32/32 on 5 consecutive runs** (it used to fail 2
 in 5 — root-caused, below). **DEPLOYED 2026-07-30** — see DELIVERY at the end.
@@ -3255,7 +5453,7 @@ Still to do, in order:
 
 
 ### ⬜ OPEN from the 2026-07-27 pentest — SHIPPING, not fixing
-Every finding in `secure-chat-pentest-2026-07-27.md` is fixed and now merged to
+Every finding in `docs/pentests/secure-chat-pentest-2026-07-27.md` is fixed and now merged to
 `master` (see the snapshot at the top). What is left is entirely delivery — and
 after item 2 was dropped, none of it protects a running instance:
 
@@ -3361,7 +5559,7 @@ after item 2 was dropped, none of it protects a running instance:
    changes, not another localStorage key.
 
 ### ⬜ OPEN from the 2026-07-26 pentest (everything else in it is fixed + shipped)
-Full detail per item in `secure-chat-pentest-2026-07-26.md` (§4-6 findings,
+Full detail per item in `docs/pentests/secure-chat-pentest-2026-07-26.md` (§4-6 findings,
 §9 remediation). These are the deliberate leftovers, not forgotten work.
 
 1. ~~**P-08 (Low) — room-slot squatting.**~~ **FIXED 2026-07-27** with
