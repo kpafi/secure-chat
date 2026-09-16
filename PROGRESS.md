@@ -10,7 +10,248 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
 > said it was still open). `git log --oneline -15` is the authority on what has
 > landed; this file is the authority on WHY.
 
-## ⮕ RESUME HERE (2026-08-21 — working the approved completion plan; 8 commits landed)
+## ⮕ RESUME HERE (2026-09-16 — F-ATREST-008 closed; plan items 1-6 all landed; next is Phase 7)
+
+**HEAD: `bd696b1`** on `pentest-2026-08-07-fixes`. Tree clean. Not pushed, not
+merged, not deployed. Client suite **256 OK / exit 0** (15 of those new this
+session), backend **168 passed**. Browser smoke of the real client against a
+scratch relay: create identity → reload → unlock, same fingerprint, no console
+errors, no at-rest warning. Android `assembleDebug` NOT re-run this session
+(the only Kotlin change is a doc comment in `PadFloor.kt`).
+
+**The 2026-08-21 entry below went stale by nine commits** — exactly the trap its
+own preamble warns about. Its items 1-5 are all DONE; the record of what landed is
+in `git log fc712ad..7e5c3af` and summarised here so nobody re-does them:
+
+* ✅ **Item 1, the owed Phase-2 pentest gate** → ran as ROUND-3. Four fixes:
+  `902ed8c` F-1 HIGH (a frozen native floor must fail the SAVE, not the pad —
+  armFloors verifies its read-back covers the sealed watermark), `782c755` F-3
+  (the swept-pin alarm follows the peer's identity, not the `room:<id>` label),
+  `01ffbf1` F-2+F-6 (receive path persists BEFORE display; `withWriteLock`'s
+  timeout only reports, never releases), `2eb2ea5` F-4 (Android `commit()`
+  false → `COMMIT_FAILED` sentinel → the save fails; F-A3's third claim value is
+  finally reachable through the real bridge).
+* ✅ **Item 2, `SCENARIO=directory` binds** → `7190aff`: `CLIENT_ROOT` override;
+  shipped client 13/13, item-14 mutant 4/13 with the harm in the log.
+* ✅ **Item 3, Phase 3 client** → `49f1bf0`: the counter retry resyncs to the
+  server's echoed `stored_seq + 1` (never believed on sight), `err.code`
+  branching, legacy body sniff kept as fallback, 200-char clamp on the relay's
+  message. Its own tests were found NOT RUNNING (an un-restored stub) and fixed.
+* ✅ **Item 4, Phase 4** → `630c92f` (was already ✅ in the old entry).
+* ✅ **Item 5, Phase 5 test debt** → `7e5c3af`: every "green against deletion"
+  gate is mutation-bound; three independent reviewers (hot, cold, pentest); and
+  it uncovered a LIVE bug — `savePin` cleared the swept-pin tombstone by key
+  alone, ignoring the bundle, which let an unrelated verification under a
+  recycled `room:<id>` silence the victim's alarm in every room. Fixed there.
+* ✅ **Item 6, F-ATREST-008** → `bd696b1` (this session, below).
+
+### What landed this session — F-ATREST-008, the identity blob's anti-rollback control
+
+The finding: the F-ATREST-003/004 anchor lives inside the identity's AEAD, and
+the fix review (F4) had already withdrawn the claim that this made it
+undeletable — the attacker restores an OLDER `sc.identity.v1` (one `setItem`),
+which opens on the same passphrase, carries no `flags`, and every anchor reads
+"not established", so `contacts.unlock()` takes its first-run path and hands out
+an empty, pin-less store. Every pre-fix blob is that copy.
+
+The fix, same shape as the OTP watermark and the contacts witness:
+
+* `identity.js` carries `generation` (monotone integer) and `floorClaim`
+  (`true` / `false` / `"unconfirmed"`, the A4/F-A3 triple) inside the AEAD.
+  Absent or malformed reads as 0 / `"unconfirmed"` — the OLDEST value and a
+  claim of nothing, so a bad field can only make a blob look older, never newer.
+* New **`client/identity-store.js`** owns every write (`persistIdentity`: probe
+  the floor slot with `bump(_, 0)` → `gen = max(memory, floor) + 1` → export →
+  `setItem` → bump the floor; floor never ahead of a blob on disk except through
+  the async WebView flush, which is reported, never fatal) and every open
+  (`openIdentity` → `judge` → verdict `ok | rollback | deleted | tampered |
+  unavailable`, plus `arm`). `anchorEstablished(identity, flag)` answers `true`
+  under EVERY non-ok verdict AND sets the flag, so the heal write app.js
+  triggers right after installing the anchors carries the conservative answer —
+  otherwise the attacker needs two unlocks instead of one.
+* **The floor is captured at module load from otp.js and there is no setter**
+  (round-1 F-9: the first cut's `setIdentityFloor`/`_resetForTests` shipped in
+  the APK as an off switch). Tests that need a different load-time state spawn
+  a fresh node process. Exports are pinned to an exact inventory.
+* **`arm`**: a clean verdict with no slot (or a blob that does not claim an
+  armed one) makes app.js write once — this is what arms EXISTING installs on
+  their first unlock after the update (round-1 F-1, High: without it a v3 blob
+  with both flags set never wrote, never created its slot, and the finding was
+  reopened unchanged on exactly the deployed population).
+* On Android the floor is the existing Keystore-MACed `PadFloor` via a new
+  `otp.deviceFloor()` export — a fresh FACADE per call closing over the private
+  bridge (round-1 F-2, High: the first cut returned the object itself, and
+  `deviceFloor().read = () => -1` disabled the identity guard AND `padWasUsed`
+  — a two-time pad one hop downstream of the frozen bridge). Slot
+  `sc.identity.v1#gen`. **No Kotlin change**: slots are opaque strings and the
+  MAC covers key+value.
+* A claim is NEVER LOWERED (round-1 F-3): ARMED is carried through a session
+  that cannot measure the floor; a plain browser keeps what the blob had; a
+  broken bridge writes `"unconfirmed"`. A TAMPERED slot is a warning plus an
+  unconfirmed claim on write, not a throw (round-1 F-6: throwing made a device
+  with one forged prefs entry unable to CREATE an identity — a regression on
+  plain `setItem`).
+* The verdict is shown in a new every-view banner (`#atRestWarning`, outside the
+  view sections) as well as the Live-room status row and the transcript
+  (round-1 F-7: the per-view unlock rows hide themselves on success, so an
+  unlock from Profile/Users/Chats showed nothing).
+* **A bad verdict does NOT refuse the unlock.** The keys are the same in every
+  version of the blob; what a rollback buys is the flags reading false, and
+  only that. So the anchors fail closed, the user gets one warning in the
+  status row and the transcript, and the re-write converges the counter. A
+  refusal would turn the non-adversarial case (process kill in the seconds
+  between `setItem` and the async localStorage flush, with the synchronous
+  prefs `commit()` already landed → floor one ahead of the blob) into a
+  permanent lock-out from the user's own keys.
+* `app.js` is pinned to ZERO direct `setItem(LS_IDENTITY…)` / `identity.export(`
+  calls and to reading the anchor only through `anchorEstablished`; the anchors
+  must be installed BEFORE the heal write (source anchors via `liftFunction`).
+* Plain browser: no floor, the residual stands, exactly as for OTP. Documented
+  in `docs/security-history.md`.
+
+**Binding proofs run by hand — 22 mutants, all RED:** rollback-by-one tolerated;
+conservative answer not committed to the flags; `import` ignores `gen`; `export`
+drops `gen`; app.js reads the flag directly; no heal write on a bad verdict;
+deletion never reported; generation ignores the floor (stale tab alarms); failed
+create still claims ARMED; unknown claim reads as armed; broken floor reads as no
+floor; tampered floor reads ok; `judge` never asks to arm; heal condition
+without `arm`; `deviceFloor` returns the shared object; claim lowered to NONE;
+TAMPERED throws again; flag committed only under `rollback` (round-1 mutant A);
+a second `setStoreAnchor` after `installStoreAnchor` (mutant B); heal write via
+`Identity.prototype.export` + aliased key (mutant K); banner never shown; a
+floor setter exported.
+
+**Pentest of this change, ROUND 1** (agent, full context): 2 High (F-1 never
+arms on an existing install; F-2 mutable `deviceFloor()`), 4 Medium (F-3 claim
+lowered; F-4 root picks the blob — RESIDUAL, documented in identity-store.js and
+security-history; F-5 the app.js anchors were presence-only regexes and three
+mutants stayed green; F-6 TAMPERED brick on create), 3 Low/Info (F-7 verdict
+invisible off the Live room; F-8 flags last-writer-wins across tabs —
+pre-existing, DEFERRED: the fix is to mirror the one-shot flags into floor slots
+of their own; F-9 exported off switch). All but F-4/F-8 fixed as above; the
+app.js anchors are now allow-lists over `referencesOf()` hits bounded to
+`liftFunction` line ranges, and every round-1 mutant is RED.
+
+**ROUND 2** (the re-fix is new code): the rollback control itself held against
+nine same-realm attacks (namespace reassignment, defineProperty, swapping or
+deleting the bridge global after load, mutating a handed-out facade, prototype
+pollution of `broken`, poisoning `Number.isInteger` / `Math.max` / `parseInt`).
+Findings, all addressed: **F-1 High (assurance)** — the app.js anchors bound
+spellings, not bindings: `contacts["setStoreAnchor"]`, a renamed destructure, a
+shadowing `const idstore = {…}` that left the anchored line byte-identical, and
+an early `return` before the anchors all stayed green (the fourth mutant is the
+lock-out the module's own header rules out). Now: no bracket/computed access on
+the bound modules or storage, no reflection/enumeration/spread over them, no
+re-declaration or parameter shadowing, every use of `contacts`/`chats`/`idstore`
+is a plain member expression (strings stripped first), `idstore.` is limited to
+its four members, and `unlockWithPassphrase` has exactly two returns after
+`openIdentity`. **This is still a regex arms race** — see NEXT item 7a.
+**F-2 Medium (regression)** — the forced anchor is LATCHED into the AEAD by the
+heal write, and when no store exists (the attacker's deletion, or the same
+unflushed first write that lost the blob in the crash window) the contact store
+refused to open on every later unlock with "forget the identity" as the only
+recovery; HEAD gave a silent fresh store. The two states are identical on disk,
+so no policy can separate them: **a consent gate**, as for OTP adoption —
+`contacts.unlock(pass, {startFresh})` / `chats.unlock(…)` skip exactly the
+deletion check; app.js offers "Start over with an empty … store" only behind
+the `STORE_DELETED` alarm, behind a `confirm()` that says an attacker would want
+exactly this, armed for one unlock attempt and disarmed in a `finally`. The
+deletion throws now carry `code: "STORE_DELETED"`. **F-3 Low** — a page-realm
+`bump` on the frozen bridge could park the identity slot at the int32 ceiling
+and `persistIdentity` then threw forever (no identity could be CREATED): now a
+warning + unconfirmed claim, the parked slot reads as a rollback (fail closed,
+identity usable). **F-4 Low** — `importPad` never validated `padId`, so a pad
+FILE could name the identity's slot (and vice versa; no fail-open, bump never
+lowers): now `/^[0-9a-f]{32}$/`. **F-5 Info** — an unrecognised negative floor
+answer fell through to a clean verdict: now every negative except ABSENT is
+evidence. Verified sound by round 2: `arm` creates no loop/brick/downgrade;
+never-lower-a-claim cannot become a permanent false alarm (app→browser→app,
+second device, forget+create all traced); ARMED→unconfirmed downgrade
+impossible; both deploy paths exclude the new helper test file.
+
+**Binding proofs after round 2 — 18 more mutants, all RED** (the four round-2
+green ones B′/M2/M3/M4 plus alias, enumeration, ceiling throw, padId
+unvalidated, unknown negative, `startFresh` ignored in each store, codes
+dropped, consent without confirm / never disarmed / written from
+`unlockContacts` / always true, button always visible, banner kept on forget),
+and the 22 earlier ones re-run RED against the grown test. Client **262 OK /
+exit 0**, backend **168 passed**.
+
+**ROUND 3** (the consent gate is new code): no High. The consent gate held —
+`freshStoreConsent` is a module-scope const with no export or global handle;
+`go()` always settles so the `finally` always disarms; `startFresh` is read
+only inside the no-store branch, so it never skips the CAS, `assertNotRolledBack`,
+the H-2 domain tag or legacy adoption; and **the surviving-witness case holds**
+(a consented fresh start draws a new salt, so the old witness reads `corrupt`,
+the CAS skips it, and `writeWitness` overwrites it — traced and PoC'd in both
+stores). Findings, all addressed: **F-1 Medium** — the round-2 ceiling fix was
+off by one: a slot parked at MAX−1 let one honest write stamp MAX into the blob
+and every later write threw, with a CLEAN verdict (no banner). Now the blob is
+ALWAYS writable: at the ceiling it is written at its own counter, never
+advanced, never refused; boundary tests at 0x7fffffff, MAX, MAX−1, MAX−2 over
+four consecutive writes. **F-2 Medium (assurance)** — four more green mutants:
+`if (verdict.ok) installStoreAnchor(pass)` (reopens the finding outright),
+self-consent via `freshStoreConsent["contacts"] = true` inside `unlockContacts`,
+a non-literal consent write in `refreshUsers`, cross-wired consent (two
+unbackreferenced alternations), and a shadowed `confirm`. Now: the anchor call
+is pinned as an unconditional own statement; consent assignments are counted as
+every `=` after the identifier in any spelling; `\1` backreferences; `confirm`
+and `freshStoreConsent` in the no-re-declaration and no-parameter lists.
+**F-3 Low/Med** — `chatsError` was write-only, so the Chats pane showed a red
+"Start over" button under a routine "enter your passphrase" line, and the
+confirm named the contacts cost for the chat store: the pane now renders its
+alarm like the Users pane and each button carries its own cost sentence.
+**F-4 Info** — the write side now folds unknown negatives like `judge`.
+Also fixed from its coverage notes: the arrow-parameter rule ran on
+string-intact source and tripped on a harmless default-string parameter (now
+on string-stripped source, with a GREEN control mutant proving it).
+
+**Binding proofs after round 3 — 11 mutants RED + 1 control GREEN**, client
+**262 OK / exit 0**. **Browser end-to-end of the gate**, against the scratch
+relay: contact store + witness deleted → unlock → Users pane shows the BOTH-
+deleted alarm and the red button → click → confirm text as designed → store
+recreated, transcript line "started over EMPTY at your request", pane unlocked.
+No console errors. **The round-3 re-fix (ceiling arithmetic, chats pane text,
+anchor rules) has had no agent review of its own** — it is covered by the
+mutants above and will be covered by Phase 7's whole-branch pentest.
+
+**Environment trap (2026-09-16):** do not run the backend suite while a
+pentest agent is running `npm test` on the same box. Under that contention the
+suite took 15 min instead of 22 s and `tests/test_ws.py::test_one_knock_per_socket`
+failed with `approval timeout` instead of `already knocked` (a timing test);
+alone it passes in 0.2 s and `backend/` is untouched by this change.
+
+### ⬜ NEXT — in order
+
+7a. **⬜ A behavioural test for app.js's identity/anchor wiring.** Three rounds
+   of source anchors over `app.js` for this one change (and three rounds for
+   item 14 before it) each fell to a spelling the previous round did not name.
+   The durable control is to import the real `app.js` against a DOM stub
+   (`document`, `localStorage`, `confirm`, `navigator`) and drive
+   `unlockWithPassphrase` end to end: rolled-back blob → anchors established →
+   contact store refuses → consent → fresh store. Until then every regex rule in
+   `identity-store.test.mjs` §(4)/(5) is a named-mutant control, not a proof.
+7b. **⬜ Mirror the one-shot anchor flags into floor slots of their own**
+   (round-1 F-8): the generation converges across tabs but the flags are
+   last-writer-wins, and the counter now certifies the losing blob as current.
+7. **⬜ Phase 7 — pentest the WHOLE branch (`master..pentest-2026-08-07-fixes`),
+   then merge.** Every commit on the branch has had its own review; nothing has
+   yet reviewed the branch as a whole for interactions between fixes (e.g. the
+   identity heal write vs. the contacts CAS, or `padWasUsed` after ROUND-3).
+8. **⬜ Phase 8 — deploy.** Relay + client ship together (`register/v3`,
+   dual-scheme `/auth/verify`, the 409 body all refuse older clients). The
+   Android APK bundles the client and updates independently — `account.js`'s
+   legacy body sniff (Phase 3, L-1) is what keeps an old APK working against
+   the new relay.
+9. **⬜ Phase 9 — Android on-device.** Recents snapshot blank; the password
+   prompt not capturable (`5c8dbcf`, UNVERIFIED on hardware); PadFloor proof;
+   ROUND-3 F-4's `commit()` semantics; and now the identity floor slot
+   (`sc.identity.v1#gen` appears in `secure_chat_pad_floors` after the first
+   unlock, and a restored older WebView `sc.identity.v1` produces the "OLDER
+   than this device's record" warning with the contact store still opening).
+   No device was attached on 2026-09-16 either.
+
+## ⮕ (2026-08-21 — working the approved completion plan; 8 commits landed)
 
 **HEAD: `5c8dbcf`** on `pentest-2026-08-07-fixes`. Tree clean. Not pushed, not
 merged, not deployed. Client suite **221 OK / exit 0**, backend **168 passed**,
