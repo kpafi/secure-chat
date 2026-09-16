@@ -183,6 +183,12 @@ console.log("OK  M-5: a withheld confirm frame is a timeout, not a hang");
 // The confirm frame is NOT signature-covered, so the original code took only
 // the first tag. The set that makes the race work must stay hard-capped.
 {
+  // Phase-7 pentest 2026-09-16, F-P7-A6: this block imported the cap from the
+  // module under test and looped to it, so raising the constant moved the
+  // expectation with it — the test only ever asserted "a cap exists". Pin the
+  // literal: two is the number an honest peer can produce (one per direction
+  // of a race), and anything above that is a guessing oracle.
+  assert.strictEqual(MAX_PEER_CONFIRMS, 2, "MAX_PEER_CONFIRMS is the literal 2 — a security constant, not a tunable");
   const A = driver();
   const c = chains(1);
   await A.kc.onChains(c.a);

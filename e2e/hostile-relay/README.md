@@ -121,3 +121,24 @@ which is the point of selecting on mode rather than on visibility.
 Against the **previous** (2026-08-07) admission-proof control the attacker
 scenario failed: the victim accepted a self-signed admission and reached the
 safety-number screen with nobody having approved anything.
+
+## The crypto layer: `tamper.mjs` + `crypto-tamper.mjs` (Phase-7 pentest, 2026-09-16)
+
+`hostile.mjs` forwards every `key`/`msg` frame verbatim — it attacks roles and
+the directory, never the key material. Promise #1 of the pentest brief (a
+hostile relay cannot read, forge, replay or undetectably tamper with a
+conversation) therefore had no end-to-end control at all (F-P7-A8). `tamper.mjs`
+is a relay with HONEST role assignment that changes exactly one thing per mode:
+`keysub`, `idbswap`, `idbstrip` (the P-03 bundle binding, live), `ctflip`,
+`msgreplay`, `confirmpre` (F-P7-19) and `algflood` (F-P7-7). `crypto-tamper.mjs`
+spawns it per mode on its own port, drives two real browsers, and asserts what
+the shipped client must show — a loud `handshake signature INVALID` and no
+sending for the three key attacks, `undecryptable` and no plaintext for the
+tampered frame, exactly one render for the replayed one, an intact session and
+no blamed peer for the injected confirm tags, and a bounded transcript with one
+refusal line under the flood.
+
+```bash
+node e2e/hostile-relay/crypto-tamper.mjs              # every mode, exits non-zero on failure
+EVIL=idbswap MODE=PQKEM node e2e/hostile-relay/crypto-tamper.mjs
+```

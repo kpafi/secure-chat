@@ -1980,4 +1980,131 @@ async function testBrokenBridgeBlocksTheCachedWriters() {
 
 await testBrokenBridgeBlocksTheCachedWriters();
 
+// ---- Phase-7 pentest 2026-09-16, F-P7-A3: three floor-verdict controls that
+// were load-bearing at HEAD and pinned by nothing. Each test is the lane's PoC
+// turned into an assertion; the corresponding one-line mutant of otp.js kept
+// this file green before these existed.
+function padFloorLike(opts = {}) {
+  // PadFloor.kt semantics: monotone, ABSENT = -1; with `failSlot`, a bump on a
+  // matching slot moves the IN-MEMORY map (read() looks healthy) but returns
+  // COMMIT_FAILED and writes nothing durable.
+  const mem = new Map();
+  const disk = new Map();
+  const cur = (k) => (mem.has(k) ? mem.get(k) : -1);
+  return {
+    mem, disk,
+    read: (k) => cur(k),
+    bump: (k, v) => {
+      if (v < 0) return cur(k);
+      const c = cur(k);
+      const next = c === -1 ? v : (v > c ? v : c);
+      if (next === c) return c;
+      mem.set(k, next);
+      if (opts.failSlot !== undefined && k === opts.failSlot) return -3;
+      disk.set(k, next);
+      return next;
+    },
+  };
+}
+function withFloor(floor, fn) {
+  const prevLS = globalThis.localStorage;
+  const mem = new Map();
+  globalThis.localStorage = {
+    getItem: (k) => (mem.has(k) ? mem.get(k) : null),
+    setItem: (k, v) => mem.set(k, String(v)),
+    removeItem: (k) => mem.delete(k),
+    _mem: mem,
+  };
+  Object.defineProperty(globalThis, "__SECURE_CHAT_NATIVE_FLOOR__", { value: true, configurable: true });
+  Object.defineProperty(globalThis, "__SECURE_CHAT_PAD_FLOOR__", { value: Object.freeze({ read: floor.read, bump: floor.bump }), configurable: true });
+  return fn(mem).finally(() => {
+    delete globalThis.__SECURE_CHAT_NATIVE_FLOOR__;
+    delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+    globalThis.localStorage = prevLS;
+  });
+}
+
+// (a) maxOf() is hand-rolled WITHOUT Math.max because Math.max is a writable
+// global and the rollback verdict is one call to it over the four floors.
+// Reimplementing maxOf over Math.max (semantics otherwise identical) kept this
+// file green. Poison Math.max at "document start" and require the native floor
+// to still win.
+async function testFloorVerdictSurvivesPoisonedMathMax() {
+  const floor = padFloorLike();
+  await withFloor(floor, async (mem) => {
+    const otpN = await import(`./otp.js?p7=mathmax&t=${Date.now()}`);
+    const pad = await otpN.generatePad({ label: "mm", totalBytes: 64 * 1024, fingerBytes: new Uint8Array(0) });
+    const atRest = await otpN.saveNewPad(pad, PASS);
+    const pristine = new Map(mem);
+    pad.sendOffset = 3000;
+    pad.recvHighWater = 1200;
+    await otpN.savePadProgress(pad, atRest);
+    assert.strictEqual(floor.read(pad.padId), 3000, "fixture: the durable native send floor is 3000");
+    mem.clear(); for (const [k, v] of pristine) mem.set(k, v); // the attacker restores the pristine blob + watermark
+    const realMax = Math.max;
+    Math.max = () => 0;
+    try {
+      await assert.rejects(() => otpN.unlockPad(pad.padId, PASS), /rolled back|consumed/,
+        "F-P7-A3: with Math.max poisoned to 0, the native floor must STILL refuse the rollback — " +
+        "maxOf() may not depend on any writable global");
+    } finally { Math.max = realMax; }
+  });
+  console.log("OK  F-P7-A3: the floor verdict does not depend on Math.max");
+}
+
+// (b) padWasUsed's recv-only and exported-only evidence. Narrowing the clause
+// to `send > 0` kept this file green; without the other two, forget + delete
+// the markers + re-import the pristine file resurrects a receive-only pad at
+// recvHighWater 0 (M-7) or re-imports a pad this device already exported.
+async function testPadWasUsedHonoursRecvAndExportedEvidence() {
+  for (const shape of ["recv-only", "exported-only"]) {
+    const floor = padFloorLike();
+    await withFloor(floor, async (mem) => {
+      const otpN = await import(`./otp.js?p7=${shape}&t=${Date.now()}`);
+      const pad = await otpN.generatePad({ label: shape, totalBytes: 64 * 1024, fingerBytes: new Uint8Array(0) });
+      const atRest = await otpN.saveNewPad(pad, PASS);
+      const file = await otpN.exportPad(pad, "xfer"); // the pristine file the attacker keeps
+      if (shape === "recv-only") { pad.recvHighWater = 4096; await otpN.savePadProgress(pad, atRest); }
+      else await otpN.markExported(pad, atRest);
+      otpN.forgetPad(pad.padId);
+      for (const k of ["sc.otp.wm.v1.", "sc.otp.used.v1.", "sc.otp.hw.v1."]) mem.delete(k + pad.padId);
+      assert.strictEqual(floor.read(pad.padId), 0, `fixture (${shape}): the SEND floor is still 0`);
+      await assert.rejects(() => otpN.importPad(file, "xfer"), /already been used/,
+        `F-P7-A3 (${shape}): re-importing the pristine file must be refused on the ${shape === "recv-only" ? "#recv" : "#exported"} evidence alone`);
+    });
+  }
+  console.log("OK  F-P7-A3: padWasUsed refuses on recv-only and on exported-only floor evidence");
+}
+
+// (c) probeFloors' create-side COMMIT_FAILED -> CLAIM_UNCONFIRMED mapping —
+// the create half of commit 2eb2ea5. Setting it to false kept this file
+// green: the existing tests model a stale read-back or established slots,
+// never a FIRST save whose create-bump commits to nothing while the read-back
+// looks healthy (exactly what SharedPreferences.commit() does). A blob that
+// claimed ARMED over a floor that never reached disk is refused forever after a
+// restart, and with the markers gone the pristine re-import is a two-time pad.
+async function testFirstSaveWithFailedCreateCommitIsUnconfirmed() {
+  const floor = padFloorLike({ failSlot: null }); // filled in below: the SEND slot of the pad
+  await withFloor(floor, async () => {
+    const otpN = await import(`./otp.js?p7=commitfail&t=${Date.now()}`);
+    const pad = await otpN.generatePad({ label: "cf", totalBytes: 4096, fingerBytes: new Uint8Array(0) });
+    // The pad id exists only now; make its SEND slot the one whose commit fails.
+    const failing = padFloorLike({ failSlot: pad.padId });
+    Object.defineProperty(globalThis, "__SECURE_CHAT_PAD_FLOOR__", { value: Object.freeze({ read: failing.read, bump: failing.bump }), configurable: true });
+    const otpF = await import(`./otp.js?p7=commitfail2&t=${Date.now()}`);
+    await otpF.saveNewPad(pad, PASS);
+    assert.ok(!failing.disk.has(pad.padId), "fixture: the send slot's create never reached disk");
+    assert.strictEqual(failing.read(pad.padId), 0, "fixture: ...while the in-memory read-back looks healthy");
+    await assert.rejects(() => otpF.unlockPad(pad.padId, PASS),
+      (e) => e.code === "LEGACY_PAD_ADOPTION" && e.reason === "unarmable-floor",
+      "F-P7-A3: a first save whose create-bump did not commit must seal CLAIM_UNCONFIRMED and route the pad " +
+      "through the adoption gate — not claim a floor that is not durable");
+  });
+  console.log("OK  F-P7-A3: a failed create-commit on a first save is sealed as unconfirmed, not armed");
+}
+
+await testFloorVerdictSurvivesPoisonedMathMax();
+await testPadWasUsedHonoursRecvAndExportedEvidence();
+await testFirstSaveWithFailedCreateCommitIsUnconfirmed();
+
 console.log("All OTP native-floor scope checks passed.");

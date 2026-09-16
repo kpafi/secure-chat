@@ -329,6 +329,18 @@ const ok = (name) => { n++; console.log("OK  " + name); };
       "item 14 / H-1: `renderPeerApproval` may not settle or clear the pending approval — " +
       `only the user's click may do that. Offending line:\n      ${l}`);
   }
+  // Phase-7 pentest 2026-09-16, F-P7-A2: the deny-list above is evaded by
+  // `els.admitOk.click()`, `decideKnock(true)` and even `resolvePeerApproval(true)`
+  // (`\bresolve\b` does not match the longer name). A deny-list cannot win —
+  // the contributor picks the spelling — so pin the CALLEES instead: the
+  // renderer may call exactly the helpers that draw, and nothing else.
+  const callees = new Set();
+  for (const l of render) for (const m of l.matchAll(/\b([A-Za-z_$][\w$]*)\s*\(/g)) callees.add(m[1]);
+  callees.delete("renderPeerApproval"); // its own definition line
+  assert.deepStrictEqual([...callees].sort(), ["describeIdentity", "fingerprintOf", "if"].sort(),
+    "item 14 / F-P7-A2: `renderPeerApproval` may call only Identity.fingerprintOf and " +
+    "describeIdentity (both draw; neither decides). Any other call — a click(), a dispatchEvent, " +
+    `decideKnock, resolvePeerApproval, a timer — is a route past the human. Found: ${[...callees].join(", ")}`);
   ok("item 14: the approval prompt cannot be settled without a human");
 }
 
@@ -556,6 +568,26 @@ const ok = (name) => { n++; console.log("OK  " + name); };
     "declaration, the per-connection reset, and the single null->role transition inside the " +
     "`joined` arm. A new writer anywhere else lets the relay re-assert a role mid-session, " +
     `which is M-2's shape. Found: ${roleSetters.join(" | ")}`);
+  // Phase-7 pentest 2026-09-16, F-P7-A2: `approvedBundle` is "the whole
+  // admission control: it is written only by a click" (app.js:230-232), and
+  // its two siblings above had exact writer allow-lists while it had none — it
+  // was pinned only INSIDE the key-frame window. A one-line reintroduction of
+  // the deleted item-14 route (`if (dirPeer) approvedBundle = dirPeer;`) placed
+  // in the `joined` arm after the guest-seat gate passed the entire suite; only
+  // the manually-run browser harness caught it. Same rule as the two above: an
+  // allow-list over the WHOLE file, every assignment form.
+  const approvedSetters = codeOnly(src).filter((l) =>
+    /\bapprovedBundle\s*(?:\|\||&&|\?\?)?=(?!=)/.test(l) || /\bapprovedBundle\s*[-+*/%]=/.test(l));
+  assert.deepStrictEqual(
+    approvedSetters.sort(),
+    ["approvedBundle = idbCanon;", "approvedBundle = idbCanon;", "approvedBundle = k.bundle;",
+      "approvedBundle = null;", "approvedBundle = null;", "let approvedBundle = null;"].sort(),
+    "item 14 / F-P7-A2: `approvedBundle` may be written by exactly six statements — the " +
+    "declaration, the two per-connection resets, the owner's click (`k.bundle` in decideKnock) " +
+    "and the two guest-side assignments inside the approval gate. Any other writer is a route " +
+    `that approves a peer without a human. Found: ${approvedSetters.join(" | ")}`);
+  ok("item 14 / F-P7-A2: `approvedBundle` has an exact file-wide writer allow-list");
+
   // Both role-setting arms are write-once GUARDED; the allow-list above pins who
   // may write, this pins that neither can be re-driven mid-session by a relay
   // that simply repeats the frame.

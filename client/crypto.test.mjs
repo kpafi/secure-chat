@@ -3,6 +3,8 @@
 // full round-trip. Run: node client/crypto.test.mjs
 import assert from "node:assert";
 import { makeCipher, isAscii } from "./crypto.js";
+import { readFileSync } from "node:fs";
+import { stripComments } from "./test-source.mjs";
 
 const ROOM = "a".repeat(64);
 const MSG = "Hello over the relay! ~ ASCII only 123 #@$";
@@ -394,6 +396,56 @@ async function pqkemLateOfferChangesTheChains() {
 // Build two peer views of the SAME pad (as export/import would produce on two
 // devices): identical bytes, opposite roles, independent Uint8Arrays so zeroing
 // on one peer never touches the other's copy.
+// Phase-7 pentest 2026-09-16, F-P7-A1 #4. RATCHET_MAX_SKIP bounds how far
+// ahead a frame's sequence may be before the receiver refuses to derive (and
+// discard) skipped keys — the M-6 DoS fix. Raising it to 100000 left every test
+// green. Pinned twice: the literal in source, and the bound behaviourally at
+// exactly 64 (65 steps ahead is refused BEFORE any AEAD work; 64 is derived and
+// then fails authentication, i.e. the bound is the only thing that changed).
+async function ratchetSkipBoundChecks() {
+  const src = stripComments(readFileSync(new URL("./crypto.js", import.meta.url), "utf8"));
+  assert.match(src, /^const RATCHET_MAX_SKIP = 64;$/m,
+    "M-6: RATCHET_MAX_SKIP must be the literal 64 — the DoS bound is a security constant, not a tunable");
+  const mk = () => makeCipher("AES256", ROOM, { passphrase: "correct horse battery staple" });
+  const a = mk(); const b = mk();
+  await a.init(); await b.init();
+  await exchangeNonces(a, b);
+  const frame = JSON.parse(Buffer.from(await a.encrypt(MSG), "base64").toString());
+  const repack = (n) => Buffer.from(JSON.stringify({ ...frame, n })).toString("base64");
+  await assert.rejects(() => b.decrypt(repack(frame.n + 64)), /too far ahead/,
+    "a frame 65 steps ahead of the receiver must be refused by the skip bound");
+  await assert.rejects(() => b.decrypt(repack(frame.n + 63)), (e) => !/too far ahead/.test(e.message),
+    "a frame exactly 64 steps ahead passes the bound (and then fails authentication) — the bound is 64, not lower");
+  assert.strictEqual(await b.decrypt(await a.encrypt("still fine")), "still fine", "the channel survives both refusals");
+  console.log("OK  F-P7-A1: RATCHET_MAX_SKIP is 64 and enforced before any key derivation");
+}
+
+// Phase-7 pentest 2026-09-16, F-P7-A1 #7. The P-01 / L-5 spent-keystream
+// guards: consumed pad bytes are zeroed in place, so an all-zero span means we
+// are about to XOR with spent keystream (send: ct = pt, the plaintext falls out
+// on the wire; receive: decrypting against a region already consumed). Both
+// guards could be deleted with otp-rollback and otp-padgen green.
+async function otpSpentKeystreamGuardChecks() {
+  {
+    const [a, b] = otpPeers();
+    const base = a.role * a.regionSize;
+    a.pad.fill(0, base, base + 256); // our own send region, already spent
+    await assert.rejects(() => a.encrypt(MSG), /already spent/,
+      "P-01: sending from a zeroed (spent) region must be refused — ct = pt XOR 0 would hand the relay the plaintext");
+    assert.strictEqual(await a.decrypt(await b.encrypt("peer still fine")), "peer still fine",
+      "the refusal is scoped to the spent region: the other direction still works");
+  }
+  {
+    const [a, b] = otpPeers();
+    const wire = await a.encrypt(MSG);
+    const peerBase = a.role * a.regionSize; // A's send region, as seen from B
+    b.pad.fill(0, peerBase, peerBase + 256); // B has already consumed it (or it was tampered)
+    await assert.rejects(() => b.decrypt(wire), /already consumed|zeroed/,
+      "L-5: decrypting against a zeroed (consumed) peer region must be refused before the MAC is even checked");
+  }
+  console.log("OK  F-P7-A1: both OTP spent-keystream guards are load-bearing");
+}
+
 function otpPeers(regionSize = 4096) {
   const shared = crypto.getRandomValues(new Uint8Array(2 * regionSize));
   const view = (role) => makeCipher("OTP", ROOM, {
@@ -517,4 +569,6 @@ await concurrencyChecks("DHKE");
 await concurrencyChecks("PQKEM");
 otpChecksOffsetValidation();
 await otpChecks();
+await ratchetSkipBoundChecks();
+await otpSpentKeystreamGuardChecks();
 console.log("\nAll crypto checks passed.");

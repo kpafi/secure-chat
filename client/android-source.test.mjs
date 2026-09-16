@@ -59,6 +59,14 @@ assert.notStrictEqual(rawStringAt, -1,
 const scannable = raw.slice(0, rawStringAt);
 const src = stripComments(scannable);
 const lines = codeLines(src);
+// Phase-7 (F-P7-A5): the Kotlin AFTER the raw string closes (csp(), the
+// WebChromeClient's later handlers) is ordinary Kotlin again and is scanned as a
+// second slice; whole-file rules below run over BOTH so a mutant cannot hide
+// behind the raw string.
+const rawStringEnd = raw.indexOf('"""', rawStringAt + 3);
+assert.notStrictEqual(rawStringEnd, -1, "the raw string must close");
+const linesAfter = codeLines(stripComments(raw.slice(rawStringEnd + 3)));
+const allLines = lines.concat(linesAfter);
 
 // Prove the strip actually removed something and did not remove everything: a
 // scanner that returned whitespace for the whole file would make every
@@ -88,18 +96,18 @@ const ok = (m) => { n++; console.log("OK  " + m); };
 // So anchors are SCOPED to the function that must contain them. Kotlin bodies
 // are brace-matched over the stripped code lines; a second definition of the
 // same signature fails loudly rather than resolving to the first.
-function kotlinFun(sigRe, what) {
-  const start = lines.findIndex((l) => sigRe.test(l));
+function kotlinFun(sigRe, what, from = lines) {
+  const start = from.findIndex((l) => sigRe.test(l));
   assert.notStrictEqual(start, -1, `${what}: not found in MainActivity.kt`);
-  assert.strictEqual(lines.findIndex((l, i) => i > start && sigRe.test(l)), -1,
+  assert.strictEqual(allLines.filter((l) => sigRe.test(l)).length, 1,
     `${what}: more than one definition — an anchor pointed at it would be ambiguous`);
   let depth = 0;
   let opened = false;
-  for (let i = start; i < lines.length; i++) {
-    depth += (lines[i].match(/\{/g) || []).length;
-    depth -= (lines[i].match(/\}/g) || []).length;
+  for (let i = start; i < from.length; i++) {
+    depth += (from[i].match(/\{/g) || []).length;
+    depth -= (from[i].match(/\}/g) || []).length;
     if (depth > 0) opened = true;
-    if (opened && depth <= 0) return lines.slice(start, i + 1);
+    if (opened && depth <= 0) return from.slice(start, i + 1);
   }
   throw new Error(`${what}: body is not brace-balanced`);
 }
@@ -139,6 +147,27 @@ function kotlinFun(sigRe, what) {
     "FLAG_SECURE)` CLEARS the flag while still naming it, so counting the identifier once is " +
     `not enough. Got: ${flagLine}`);
   ok("F-ANDROID-003: the Activity sets FLAG_SECURE before setContentView");
+
+  // Phase-7 pentest 2026-09-16, F-P7-A5. Eight one-line Kotlin mutants kept
+  // this file green: the flag wrapped in `if (BuildConfig.DEBUG) { … }` on its
+  // own line (release builds then have NO FLAG_SECURE), `clearFlags(FLAG_SECURE)`
+  // added after setContentView, and so on. The statement must be UNCONDITIONAL
+  // — at the function body's own brace depth, not inside any block — and
+  // nothing in the file may clear the flag.
+  let depth = 0;
+  for (let i = 0; i < flagAt; i++) {
+    depth += (onCreate[i].match(/\{/g) || []).length;
+    depth -= (onCreate[i].match(/\}/g) || []).length;
+  }
+  assert.strictEqual(depth, 1,
+    "F-P7-A5: window.setFlags(FLAG_SECURE, …) must sit directly in onCreate's body (brace depth 1), " +
+    `not inside an if/when/try — found at depth ${depth}. \`if (BuildConfig.DEBUG) { … }\` around it ` +
+    "ships release builds with no FLAG_SECURE at all, and nothing on screen changes.");
+  assert.ok(!/^(if|when|try|else)\b/.test(onCreate[flagAt - 1] || ""),
+    "F-P7-A5: the line before the flag must not be a bare `if (…)` header (a single-statement if body needs no braces)");
+  assert.strictEqual(allLines.filter((l) => /clearFlags\(/.test(l) && l.includes("FLAG_SECURE")).length, 0,
+    "F-P7-A5: nothing in MainActivity.kt may clear FLAG_SECURE");
+  ok("F-P7-A5: the Activity flag is unconditional and never cleared");
 }
 
 // --- 2 & 3. the JS-prompt dialog's own window (commit 5c8dbcf) --------------
@@ -198,6 +227,74 @@ function kotlinFun(sigRe, what) {
     "statement has drifted out of is decoration, and it is the drift, not the deletion, that a " +
     "reviewer will not notice");
   ok("F-ANDROID-003: the JS-prompt dialog sets FLAG_SECURE on its own window, gated on `secret`, before show()");
+
+  // F-P7-A5: `secret` is the gate for BOTH the masking and the dialog flag, so
+  // its definition is load-bearing — `val secret = false` turned both off with
+  // this file green. Pin the exact fail-SECURE definition: the marker OR the
+  // substring fallback, never a constant and never a narrower condition.
+  const secretDef = onJsPrompt.find((l) => /^val secret = /.test(l));
+  assert.strictEqual(secretDef,
+    'val secret = marked || message?.contains("passphrase", ignoreCase = true) == true',
+    "F-P7-A5: `secret` must be exactly the marker OR the fail-SECURE substring fallback");
+  assert.strictEqual(allLines.filter((l) => /clearFlags\(/.test(l)).length, 0, "no dialog may clear its flags either");
+  ok("F-P7-A5: the masking/flag gate `secret` is pinned to its fail-SECURE definition");
+}
+
+// --- 4. Phase-7 pentest 2026-09-16, F-P7-A5: the WebView surface --------------
+// Green mutants: `allowFileAccess = true`, a second addJavascriptInterface
+// exposing the Activity, `connect-src *` in csp(), the marker's defineProperty
+// flipped to writable/configurable. These are the settings the whole
+// "bundled, audited client" argument rests on; pin each.
+{
+  const configure = kotlinFun(/^private fun configureWebView\(/, "configureWebView");
+  for (const must of ["allowFileAccess = false", "allowContentAccess = false",
+    "cacheMode = android.webkit.WebSettings.LOAD_NO_CACHE", "javaScriptEnabled = true", "domStorageEnabled = true"]) {
+    assert.ok(configure.includes(must), `F-P7-A5: configureWebView must set \`${must}\``);
+  }
+  const bridges = allLines.filter((l) => /addJavascriptInterface\(/.test(l));
+  assert.deepStrictEqual(bridges, ['wv.addJavascriptInterface(PadFloorBridge(this), "SecureChatPadFloor")'],
+    "F-P7-A5: exactly ONE JavaScript bridge, the pad floor, under its one name — a second " +
+    `interface is a new attack surface on the whole app. Found: ${bridges.join(" | ")}`);
+  const debug = allLines.filter((l) => /setWebContentsDebuggingEnabled\(/.test(l));
+  assert.deepStrictEqual(debug, ["if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true)"],
+    "F-P7-A5: remote debugging (which exposes localStorage over the devtools socket) only in debug builds");
+  const csp = kotlinFun(/^private fun csp\(/, "csp", linesAfter);
+  assert.ok(csp.some((l) => l.includes(`"connect-src 'self' $connect; " +`)),
+    "F-P7-A5: connect-src is pinned to 'self' plus the configured relay origins, nothing wider");
+  assert.ok(!csp.some((l) => /\*/.test(l) && !/^\/\//.test(l)),
+    "F-P7-A5: no wildcard source anywhere in the CSP");
+  assert.ok(csp.some((l) => l.includes("\"default-src 'none'; \"")), "F-P7-A5: default-src 'none'");
+  ok("F-P7-A5: the WebView settings, the single bridge, debug-only devtools and the CSP are pinned");
+}
+
+// --- 5. F-P7-A5: both document-start defineProperty descriptors -------------
+// The injected script lives in the Kotlin RAW STRING the slice above excludes.
+// otp-rollback.test.mjs pins the MARKER's `configurable: false`; nothing pinned
+// the BRIDGE's descriptor or either `writable: false`. Extract each
+// defineProperty call by paren-matching over the raw string and check both.
+{
+  const injected = raw.slice(rawStringAt);
+  const calls = [];
+  const re = /Object\.defineProperty\s*\(/g;
+  for (let m = re.exec(injected); m; m = re.exec(injected)) {
+    let i = injected.indexOf("(", m.index);
+    let d = 0;
+    for (; i < injected.length; i++) {
+      if (injected[i] === "(") d++;
+      else if (injected[i] === ")" && --d === 0) { i++; break; }
+    }
+    calls.push(injected.slice(m.index, i));
+  }
+  const want = ["__SECURE_CHAT_PAD_FLOOR__", "__SECURE_CHAT_NATIVE_FLOOR__"];
+  for (const name of want) {
+    const call = calls.find((c) => c.includes(`'${name}'`));
+    assert.ok(call, `F-P7-A5: the document-start script must publish ${name} with Object.defineProperty`);
+    assert.match(call, /writable:\s*false/, `${name}: must be non-writable`);
+    assert.match(call, /configurable:\s*false/, `${name}: must be non-configurable (or \`delete\` hides the downgrade, 2026-07-29 H-1)`);
+    assert.match(call, /enumerable:\s*false/, `${name}: must be non-enumerable`);
+  }
+  assert.strictEqual(calls.length, 2, `exactly two defineProperty calls in the injected script, found ${calls.length}`);
+  ok("F-P7-A5: both injected globals are published non-writable, non-configurable, non-enumerable");
 }
 
 // What this file deliberately does NOT assert, stated so nobody mistakes green
@@ -206,4 +303,4 @@ function kotlinFun(sigRe, what) {
 // the on-device verification phase. This control catches deletion, reordering
 // and drift of the two lines — nothing more, and it should never be cited for
 // more than that.
-console.log(`\nAll ${n} Android FLAG_SECURE source checks passed.`);
+console.log(`\nAll ${n} Android source checks passed.`);
