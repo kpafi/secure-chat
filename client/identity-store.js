@@ -116,6 +116,8 @@ const CLAIM_UNCONFIRMED = "unconfirmed";
 // park a slot at this ceiling — that is the documented "can destroy, cannot
 // rewind" power, the same one that can brick any pad, and not new here.)
 const MAX_GENERATION = 0x7fffffff - 1;
+// Only language constructs — `Number.isInteger` is a writable global (H-1).
+const isGen = (v) => typeof v === "number" && (v | 0) === v && v >= 0;
 
 // Captured once, at load. `null` in a plain browser; `broken` when the app's
 // marker says a floor should exist and none is usable.
@@ -322,6 +324,19 @@ export function judge(identity) {
     // First write on this device, a pre-fix blob, or an unconfirmed slot:
     // nothing to compare against yet, so record one now.
     return { ok: true, arm: true };
+  }
+  if (isGen(identity.generation) && identity.generation >= MAX_GENERATION) {
+    // The symmetric half of the exhaustion rule (see store-floor.js): a blob
+    // whose own counter can no longer advance is as unfalsifiable as a slot it
+    // can never overtake, and when the counter is PAST the ceiling the bump is
+    // refused too, so `f > generation` never fires again.
+    return {
+      ok: false,
+      arm: false,
+      reason: "exhausted",
+      message: "this device's record of your identity can no longer advance (its counter is exhausted), " +
+        "so a rollback could no longer be told from a save — treating every saved store as present",
+    };
   }
   if (f > identity.generation) {
     return {

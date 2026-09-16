@@ -145,6 +145,7 @@ under the alg flood, and the approval/pin lines still present under a junk
 message flood.
 
 ```bash
+node e2e/hostile-relay/run-scenarios.mjs              # all four role/directory scenarios, unattended
 node e2e/hostile-relay/crypto-tamper.mjs              # every mode, exits non-zero on failure
 EVIL=idbswap MODE=PQKEM node e2e/hostile-relay/crypto-tamper.mjs
 ```

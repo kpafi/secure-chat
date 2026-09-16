@@ -162,6 +162,16 @@ export function judgeStoreFloor(slot, generation, claim) {
     return { ok: true, arm: true };
   }
   const gen = isGen(generation) ? generation : 0;
+  // The symmetric half of the rule above, found by the sweep the third review
+  // left behind: a STORE whose own counter can no longer advance is exactly as
+  // unfalsifiable as a slot it can never overtake. `nextStoreGeneration` caps
+  // at MAX_GENERATION, so a counter at or past it is frozen — and when it is
+  // PAST it, `armStoreFloor` refuses too, the slot stays below, `f > gen` is
+  // never true, and every later rollback among the frozen states read CLEAN.
+  // (Reachable only from a crafted AEAD, i.e. a passphrase holder, or a blob
+  // from another build — but "only an attacker who could do worse" is not the
+  // reason this verdict exists: unfalsifiable is unfalsifiable.)
+  if (gen >= MAX_GENERATION) return { ok: false, arm: false, reason: "exhausted", floor: f, generation: gen };
   if (f > gen) return { ok: false, arm: false, reason: "rollback", floor: f, generation: gen };
   return { ok: true, arm: claim !== CLAIM_ARMED };
 }

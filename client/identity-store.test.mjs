@@ -475,6 +475,39 @@ async function testUnknownNegativeFloorFailsClosed() {
 
 // ---- end to end: the alarm F-ATREST-003 exists to raise ------------------------
 
+// The symmetric half of the exhaustion rule (see store-floor.js): a blob whose
+// OWN counter can no longer advance is as unfalsifiable as a slot it can never
+// overtake — and when the counter is PAST the ceiling the bump is refused too,
+// so the slot stays below it and `f > generation` never fires again: clean
+// forever, frozen forever. Found by the sweep the third store-floor review left
+// behind when it stalled.
+async function testExhaustedIdentityCounterIsNeverClean() {
+  const MAXG = 0x7fffffff - 1;
+  const floor = device();
+  floor.slots.set(FLOOR_SLOT, 5); // the slot is LOW, so the rollback test alone says "clean"
+  const id = fakeIdentity();
+  id.generation = MAXG + 1;       // past the ceiling: persistIdentity cannot advance it and arm refuses
+  id.floorClaim = true;
+  localStorage.setItem(LS_IDENTITY, await id.export(PASS));
+  const { identity, verdict } = await idstore.openIdentity(PASS, fakeImport);
+  assert.strictEqual(verdict.ok, false, "a counter that can never advance must never read clean");
+  assert.strictEqual(verdict.reason, "exhausted");
+  assert.strictEqual(idstore.anchorEstablished(identity, "contactsEstablished"), true, "...and the anchors fail closed");
+  // At the ceiling exactly: also frozen, also loud.
+  const at = fakeIdentity();
+  at.generation = MAXG;
+  at.floorClaim = true;
+  localStorage.setItem(LS_IDENTITY, await at.export(PASS));
+  assert.strictEqual((await idstore.openIdentity(PASS, fakeImport)).verdict.reason, "exhausted");
+  // Control: one below is an ordinary state and still clean.
+  const below = fakeIdentity();
+  below.generation = MAXG - 1;
+  below.floorClaim = true;
+  localStorage.setItem(LS_IDENTITY, await below.export(PASS));
+  assert.strictEqual((await idstore.openIdentity(PASS, fakeImport)).verdict.ok, true, "control: an ordinary counter is clean");
+  console.log("OK  F-ATREST-008: an identity counter that can no longer advance is never clean");
+}
+
 async function testRolledBackAnchorTripsTheContactStoreAlarm() {
   const floor = device();
   const id = fakeIdentity();
@@ -822,6 +855,7 @@ await testCrashWindowIsRecoverableOnlyByConsent();
 await testParkedCeilingDoesNotBrickCreation();
 await testPadFileCannotNameTheIdentitySlot();
 await testUnknownNegativeFloorFailsClosed();
+await testExhaustedIdentityCounterIsNeverClean();
 await testRolledBackAnchorTripsTheContactStoreAlarm();
 await testRealIdentityCarriesTheCounter();
 await testOtpFacadeCannotBeTurnedAgainstItsHolders();

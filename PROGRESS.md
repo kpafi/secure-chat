@@ -86,6 +86,24 @@ so the eviction ORDER is pinned by the unit anchor only — noted).
    (the first behavioural test of an app.js decision); chats' durable mark.
    11 more mutants RED (one equivalent: with the exhaustion verdict in place,
    the probe's own threshold no longer decides loudness).
+4a. ✅ **7a — a behavioural test for app.js, and the browser harnesses in a
+   runner.** `client/dom-stub.test.mjs` (a DOM stub: id lookups answered only
+   for ids index.html really defines, a stub relay socket, seeded alg radios /
+   nav items / locked-pane `<p>`s) plus `client/app-behaviour.test.mjs`, which
+   IMPORTS app.js and drives it: init + the id control, the guest seat with no
+   approval queue, the mid-session role change, an unrecognised role, the
+   F-P7-7 latch, and a 600-frame junk flood against the security lines. **7
+   mutants RED, including `wasPending ||= true`** — round 3's mutant, which
+   beat the source allow-list at the time. Two of my own assertions were wrong
+   and the mutants caught them: the transcript's repeat-collapse masks both the
+   latch and the eviction rule, so the latch is now bound through the repeat
+   COUNTER, and the test states plainly that a hostile relay can no longer
+   reach the line cap at all (every line it can force unprompted is a constant
+   string) — eviction is second-line defence, pinned by the source anchor.
+   `e2e/hostile-relay/run-scenarios.mjs` + `npm run e2e:scenarios` run all four
+   role/directory scenarios unattended and pin the expected check COUNT; shown
+   RED by reinstating the deleted item-14 route (exit 1, the harm in the
+   client's own words). That closes F-P7-A2's fix (e).
 4. **⬜ 7a — a behavioural `app.js` test** against a DOM stub; wire
    `proto001.mjs` + `crypto-tamper.mjs` + `room-admission.mjs` into an
    automated runner (`npm run e2e:tamper` exists; the rest still needs a relay).
@@ -167,6 +185,18 @@ deployed.
    F-P7-11 (vouch error strings), F-P7-12 (body size cap), F-P7-13 (loopback
    trusted-proxy warning), F-P7-15 (h11 log lines), F-P7-16 (static gate on
    /api), F-P7-20 (identity blob length oracle), F-P7-21/22 (Info).
+
+**One more ceiling round (2026-09-16, night).** The review agent for `4b9d2c6`
+STALLED mid-run (watchdog, no progress for 600s) and left its sweep harness in
+the tree. Running it was worth more than the report would have been: it found
+that the exhaustion rule covered only the SLOT side. A store whose OWN counter
+is past `MAX_GENERATION` is frozen too — `armStoreFloor` then refuses, the slot
+stays below it, `f > gen` is never true, and every rollback among the frozen
+states reads CLEAN. Fixed symmetrically in `store-floor.js` AND
+`identity-store.js`, and the sweep itself is now a permanent test
+(`testNoStateIsFrozenAndClean`, an exhaustive slot × generation table asserting
+"frozen ⇒ not clean", with three controls so it cannot pass vacuously).
+3 mutants RED. **The delta since `4b9d2c6` has had no agent review yet.**
 
 **Environment trap (2026-09-16, evening):** the backend suite HANGS past 10
 minutes when a relay is listening on 127.0.0.1:8000 (`tests/test_static_hardening.py`

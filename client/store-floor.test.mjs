@@ -32,6 +32,9 @@ globalThis.localStorage = fakeLocalStorage();
 globalThis.__SECURE_CHAT_PAD_FLOOR__ = { read: (id) => current.read(id), bump: (id, v) => current.bump(id, v) };
 const contacts = await import("./contacts.js");
 const chats = await import("./chats.js");
+// Dynamic, like the two above: a static import is hoisted and would capture the
+// floor BEFORE the bridge above exists (store-floor.js reads it once, at load).
+const sf = await import("./store-floor.js");
 const CSLOT = "sc.contacts.v1#gen";
 const HSLOT = "sc.chats.v1#gen";
 const MAX = 0x7fffffff - 1;
@@ -278,6 +281,59 @@ async function testParkedSlotIsLoudForever() {
   console.log("OK  F-P7-6 review H-1: a slot the store can never overtake is a permanent loud verdict, both stores, whole boundary");
 }
 
+// The INVARIANT behind every ceiling round, as an exhaustive sweep rather than
+// a point check — three reviews in a row found a different value that escaped a
+// point check, and the third review's own harness (left behind when it stalled)
+// is what turned this up:
+//
+//   if a write cannot move the store's generation, the verdict may not be clean.
+//
+// A frozen store is unfalsifiable: all its later states share one counter, so a
+// rollback among them cannot be told from a save. The first ceiling fix covered
+// only the SLOT side; a store whose OWN counter is past MAX_GENERATION freezes
+// too — and then armStoreFloor refuses, the slot stays below it, `f > gen` is
+// never true, and every rollback reads CLEAN. Both halves are covered now, and
+// this sweep is what keeps them covered.
+function testNoStateIsFrozenAndClean() {
+  const MAXG = 0x7fffffff - 1;
+  const STORE_MAX = MAXG - 1;
+  const SLOT = "sweep";
+  const bad = [];
+  for (const dv of [-6, -5, -4, -3, -2, -1, 0, 1, 2]) {
+    const V = STORE_MAX + dv;
+    for (const G of [0, 5, STORE_MAX - 3, STORE_MAX - 2, STORE_MAX - 1, STORE_MAX, MAXG, MAXG + 1, 0x7fffffff, 2 ** 31]) {
+      current = fakeFloor();
+      current.slots.set(SLOT, V);
+      const st = { gen: G, claim: true };
+      // Two writes, the way a store persists: probe, advance, arm.
+      let last = null;
+      for (let i = 0; i < 2; i++) {
+        const probe = sf.probeStoreFloor(SLOT, st.claim);
+        st.claim = probe.claim;
+        const before = st.gen;
+        st.gen = sf.nextStoreGeneration(probe, st.gen);
+        sf.armStoreFloor(SLOT, st.gen, st.claim);
+        last = { before, after: st.gen };
+      }
+      const frozen = last.after === last.before;
+      const verdict = sf.judgeStoreFloor(SLOT, st.gen, st.claim);
+      if (frozen && verdict.ok) bad.push({ slot: V, gen: G });
+    }
+  }
+  assert.deepStrictEqual(bad, [],
+    `a store whose generation cannot advance must never read CLEAN — those states are unfalsifiable: ${JSON.stringify(bad)}`);
+  // ...and the sweep must actually be reaching the interesting states, or it
+  // would pass by never exercising anything (the vacuous-control trap).
+  current = fakeFloor();
+  current.slots.set(SLOT, STORE_MAX);
+  assert.strictEqual(sf.judgeStoreFloor(SLOT, 5, true).reason, "exhausted", "control: a slot at the ceiling is exhausted");
+  current = fakeFloor();
+  current.slots.set(SLOT, 5);
+  assert.strictEqual(sf.judgeStoreFloor(SLOT, MAXG, true).reason, "exhausted", "control: a STORE at the ceiling is exhausted");
+  assert.strictEqual(sf.judgeStoreFloor(SLOT, 6, true).ok, true, "control: an ordinary state is still clean");
+  console.log("OK  F-P7-6: no slot/generation combination leaves the store frozen AND clean (exhaustive sweep)");
+}
+
 // Second review, M-1: the chat store's evidence is durable and names the secret.
 async function testChatRollbackEvidenceIsDurable() {
   const floor = device();
@@ -461,6 +517,7 @@ await testFreshStoreAfterWipeCatchesUpWithTheSlot();
 await testExistingStoresArmOnFirstUnlock();
 await testChatStoreVerdicts();
 await testParkedSlotIsLoudForever();
+testNoStateIsFrozenAndClean();
 await testChatRollbackEvidenceIsDurable();
 await testRoomPinsAreMarkedSuspectToo();
 testPoisonedIsIntegerCannotBlindTheFloor();
