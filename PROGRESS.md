@@ -10,7 +10,56 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
 > said it was still open). `git log --oneline -15` is the authority on what has
 > landed; this file is the authority on WHY.
 
-## ⮕ RESUME HERE (2026-09-16 — F-ATREST-008 closed; plan items 1-6 all landed; next is Phase 7)
+## ⮕ RESUME HERE (2026-09-16, later — Phase 7 DONE: whole-branch pentest reported; next is fixing its list, then merge)
+
+**HEAD: `ea0dcba`** plus two UNCOMMITTED files: `docs/pentests/secure-chat-pentest-2026-09-16.md`
+(the Phase 7 report) and this entry + a README table row. Left uncommitted on purpose
+(the pentest brief's ROE: leave the tree for the author unless asked). Tree otherwise
+clean; all lane mutants were restored byte-identically and the branch code is exactly
+`ea0dcba`.
+
+**Phase 7 result, in one line:** no Critical, no High at runtime; the E2EE, admission,
+directory-counter, dual-scheme-login and identity-anti-rollback promises all held under
+five parallel lanes with real traffic. What did not hold: the test estate (1 High + 4
+Medium assurance gaps — deleting the ML-DSA half of `Identity.verify` AND the P-03
+transcript binding AND both ratchet caps AND both OTP spent-keystream guards keeps all 16
+test files and `all-modes` green), four directory/mailbox availability holes (row-counted
+mailbox budget; three host-keyed buckets charged before auth / before the 404), the OTP
+adoption gate keyed on the outer `v` byte (browser two-time pad, pre-existing), the
+contact/chat witnesses without a floor (7b), the new RSA refusal as a DOM flood, an
+inverted skew claim in THIS FILE's earlier entry (an old APK cannot log in to the new
+relay, so it never receives sealed mail), and the mail warning rendered into a hidden
+node off the Live view. 34 findings, 28 reproduced by the lead. Full detail, code paths,
+PoC outputs and the fix list: `docs/pentests/secure-chat-pentest-2026-09-16.md` §3-§4;
+priorities §8.
+
+### ⬜ NEXT — in order (from the report's §8)
+
+1. **⬜ Pin the crypto and the floor verdict (F-P7-A1, A3, A2, A4, A5).** Dual-signature
+   and transcript tests; literal checks for `RATCHET_MAX_SKIP`/`MAX_PEER_CONFIRMS`; both
+   OTP spent-keystream guards; `maxOf` / `padWasUsed` / `probeFloors` create-side;
+   `approvedBundle` writer allow-list; `_respell` on `ecdh`/`mlkem`; Kotlin anchors for
+   the WebView settings, the bridge surface and the two `defineProperty` descriptors.
+   Adopt lane B2's key-tampering relay into `e2e/hostile-relay/`.
+2. **⬜ Two one-liners:** OTP adoption gate on `inner.hwSend` not `o.v` (F-P7-5);
+   `if (!confirmation) return false;` in `onPeerTag` (F-P7-19). Then latch the RSA
+   refusal and cap `#log` (F-P7-7).
+3. **⬜ Directory/mailbox availability (F-P7-1..4):** byte budget with per-account
+   fairness; per-user fetch bucket after auth; per-user lookup bucket; 404 before the
+   global post bucket; surface 429 in `pollMailbox`.
+4. **⬜ Before deploy:** correct the skew note (item 8 below was WRONG: the legacy body
+   sniff is in the NEW client; an old APK gets 401 on `/auth/verify` forever) and decide
+   APK-first order or a sunset flag (F-P7-8); route `hint()` by VIEW (F-P7-9); drop
+   `client/test-source.mjs` + `vendor/README.md` from all three ship lists (F-P7-18).
+5. **⬜ Then merge** — the report's recommendation: merging is defensible now (nothing
+   is worse than master); deploying is not until 2-4 are done.
+6. **⬜ Phase 8 deploy, Phase 9 Android on-device** (unchanged; the device list grows by
+   the identity floor slot, the dialog FLAG_SECURE gaps F-P7-17, and the crash-window
+   premise).
+7. **⬜ 7a/7b as before** (behavioural `app.js` test; contact/chat witness floors — now
+   also F-P7-6).
+
+## ⮕ (2026-09-16 — F-ATREST-008 closed; plan items 1-6 all landed; next is Phase 7)
 
 **HEAD: `bd696b1`** on `pentest-2026-08-07-fixes`. Tree clean. Not pushed, not
 merged, not deployed. Client suite **256 OK / exit 0** (15 of those new this

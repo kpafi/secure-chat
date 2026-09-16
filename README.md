@@ -333,6 +333,7 @@ finding's status is tracked in `PROGRESS.md`.
 | 2026-07-27 | `docs/pentests/secure-chat-pentest-2026-07-27.md` | re-test of the 07-26 fixes; 4 High / 7 Medium (OTP rollback H-3/M-7, trust-pin migration H-2), all fixed |
 | 2026-07-29 | `docs/pentests/secure-chat-pentest-2026-07-29.md` | whole-project review after the onion deployment; 3 High in the at-rest layer (Android pad floor), rate-limit keying M-1..M-3 |
 | 2026-08-07 | `docs/pentests/secure-chat-pentest-2026-08-07.md` | multi-agent red team; no Critical/High, 47 Medium/Low/Info incl. F-PROTO-001 (admission binding). Fixes in progress on `pentest-2026-08-07-fixes` — see `PROGRESS.md` |
+| 2026-09-16 | `docs/pentests/secure-chat-pentest-2026-09-16.md` | Phase 7: the whole `pentest-2026-08-07-fixes` branch, five lanes; 0 Critical / 0 High at runtime, 1 High + 4 Medium assurance gaps, 9 Medium (4 directory/mailbox availability, OTP `v`-byte gate, contact/chat witness floors, RSA-refusal DoM flood, deploy skew, hidden mail warning) |
 
 `docs/PENTEST-PROMPT.md` is the standing brief for a full review;
 `.claude/agents/pentest-new-code.md` is the narrower agent that attacks only
