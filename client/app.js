@@ -453,6 +453,16 @@ function showView(name) {
 // nothing, with no explanation. Routing by visible screen fixes all of those at
 // once, instead of leaving ten call sites to each remember the right target.
 function activeHintEl() {
+  // Phase-7 pentest 2026-09-16, F-P7-9: the three targets below all live inside
+  // #viewLive, and this used to test only the SCREENS' `hidden` — so with the
+  // Users or Chats view on screen (where someone waiting for mail sits) the
+  // "sealed messages will not arrive" warning was written into a zero-size
+  // node. Pick the visible VIEW first; each has its own status line.
+  if (els.viewLive.hidden) {
+    if (!els.viewUsers.hidden) return els.usersStatus;
+    if (!els.viewChats.hidden) return els.chatsStatus;
+    if (!els.viewProfile.hidden) return els.profileStatus;
+  }
   if (!els.scrRoom.hidden) return els.roomHint;
   if (!els.scrIdentity.hidden) return els.idHint;
   return els.hint;

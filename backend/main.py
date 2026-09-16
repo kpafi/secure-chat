@@ -107,7 +107,11 @@ app.include_router(mailbox.router)
 # served to the public (L-02). StaticFiles would otherwise expose them; this
 # guard 404s them regardless of what is on disk (defense in depth alongside the
 # deploy excludes). Exact paths + a suffix rule for test modules.
-_BLOCKED_BASENAMES = {"package.json", "package-lock.json"}
+# Phase-7 pentest 2026-09-16 F-P7-18: client/test-source.mjs (the test-only
+# comment scanner) and vendor/README.md matched none of the three ship lists
+# (this gate, the deploy rsync, the APK Sync task) — served, rsynced and
+# bundled. test_static_hardening.py pins that the three lists agree.
+_BLOCKED_BASENAMES = {"package.json", "package-lock.json", "test-source.mjs", "README.md"}
 # Whole subtrees that must never be reachable, matched on normalized path
 # segments (not string prefixes).
 _BLOCKED_SEGMENTS = {"node_modules"}

@@ -10,7 +10,78 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
 > said it was still open). `git log --oneline -15` is the authority on what has
 > landed; this file is the authority on WHY.
 
-## ⮕ RESUME HERE (2026-09-16, later — Phase 7 DONE: whole-branch pentest reported; next is fixing its list, then merge)
+## ⮕ RESUME HERE (2026-09-16, evening — Phase 7's fix list items 1-4 LANDED; next: review the delta, then merge)
+
+**HEAD:** see `git log --oneline -6` (this file is written before the last
+commit of the batch; the four fix commits are `1d240d0` item 1, `6695cf1`
+item 2, `018652d` item 3, and item 4 lands with this entry). Tree clean apart
+from the untracked session `.claude/launch.json`. Not pushed, not merged, not
+deployed.
+
+**What landed today, after the Phase-7 report `32fabaf`:**
+
+1. ✅ **Item 1 — the assurance gaps (F-P7-A1..A6, A8)** `1d240d0`. Every
+   unpinned control now has a test shown to bind (21 mutants RED): each
+   signature half of `Identity.verify`; the P-03 transcript binding;
+   `RATCHET_MAX_SKIP === 64` and enforced at exactly 64; `MAX_PEER_CONFIRMS
+   === 2` (the cap test had imported the constant it tested); both OTP
+   spent-keystream guards; `maxOf` without `Math.max`; `padWasUsed`'s
+   recv/exported evidence; `probeFloors`' create-side COMMIT_FAILED; an exact
+   six-writer allow-list for `approvedBundle` and a callee allow-list for
+   `renderPeerApproval`; canonical base64 on `ecdh`/`mlkem` in the relay; the
+   Kotlin anchors (unconditional flag, no clearFlags, `secret` pinned, WebView
+   settings, single bridge, debug-only devtools, CSP, both defineProperty
+   descriptors; the Kotlin after the raw string is scanned too). NEW HARNESS:
+   `e2e/hostile-relay/tamper.mjs` + `crypto-tamper.mjs` — a relay that attacks
+   the key material (keysub, idbswap, idbstrip, ctflip, msgreplay, confirmpre,
+   algflood) with two real browsers asserting the shipped client's response.
+   All eight modes pass.
+2. ✅ **Item 2 — the one-liners (F-P7-5, F-P7-19, F-P7-7)** `6695cf1`. The OTP
+   adoption gate and its migration rewrite ask the AEAD (`inner.hwSend`), not
+   the outer `v` byte; `onPeerTag` ignores tags that arrive before the chains
+   exist and the overflow names the relay; the deprecated-alg refusal is said
+   once per connection and `#log` is bounded at 500 lines. 6 mutants RED, three
+   of them also in the browser harness.
+3. ✅ **Item 3 — directory/mailbox availability (F-P7-1..4)** `018652d`. Fetch
+   bucket per authenticated user after auth (+ the client says 429 once);
+   global post ceiling charged after the token gate; lookup bucket per TARGET
+   after the gate (per voucher for POST /vouch); mailbox budget in BYTES
+   (256 MiB / 8 MiB per inbox) with a 24 h TTL for inboxes that have never
+   fetched (new `mailbox_fetches` table). Per-host ceilings remain only as
+   documented backstops. 8 mutants RED; the two XFF tests now probe the /api
+   ceiling.
+4. ✅ **Item 4 — before-deploy (F-P7-8, F-P7-9, F-P7-18)** (this commit). The
+   skew claim in item 8 below is corrected (APK first, then relay); `hint()`
+   routes by VIEW first (`views.test.mjs`, new); `test-source.mjs` and
+   `vendor/README.md` are on all three ship lists and
+   `test_the_three_ship_lists_agree` pins that they stay in step.
+
+### ⬜ NEXT — in order
+
+5. **⬜ Review the delta `32fabaf..HEAD` with `pentest-new-code`** (a fix is
+   new code; four commits of it), fix what it finds, then **merge into master**
+   (local merge only — no push, no deploy). The report's own recommendation:
+   merging is defensible now.
+6. **⬜ Phase 8 — deploy.** See item 8 in the previous entry (corrected) for
+   the order: APK first, then relay + web client together.
+7. **⬜ Phase 9 — Android on-device** (unchanged list, plus F-P7-17: the
+   alert/confirm dialogs still have no FLAG_SECURE of their own — Low, not
+   fixed, needs a device to judge).
+8. **⬜ 7a/7b** — a behavioural `app.js` test (four rounds of regex anchors
+   over `app.js` have each been walked past once); floors for the contact and
+   chat witnesses (F-P7-6, the one remaining runtime Medium, deliberately left
+   for its own commit).
+9. **⬜ Lows not yet fixed from the report:** F-P7-10 (relay timeout snapshot),
+   F-P7-11 (vouch error strings), F-P7-12 (body size cap), F-P7-13 (loopback
+   trusted-proxy warning), F-P7-15 (h11 log lines), F-P7-16 (static gate on
+   /api), F-P7-20 (identity blob length oracle), F-P7-21/22 (Info).
+
+**Environment trap (2026-09-16, evening):** the backend suite HANGS past 10
+minutes when a relay is listening on 127.0.0.1:8000 (`tests/test_static_hardening.py`
+and `smoke_client.py` reference it). Stop any dev relay before `pytest -q tests`;
+with the port free the suite takes ~25 s.
+
+## ⮕ (2026-09-16, later — Phase 7 DONE: whole-branch pentest reported; next is fixing its list, then merge)
 
 **HEAD: `ea0dcba`** plus two UNCOMMITTED files: `docs/pentests/secure-chat-pentest-2026-09-16.md`
 (the Phase 7 report) and this entry + a README table row. Left uncommitted on purpose
@@ -287,11 +358,17 @@ alone it passes in 0.2 s and `backend/` is untouched by this change.
    then merge.** Every commit on the branch has had its own review; nothing has
    yet reviewed the branch as a whole for interactions between fixes (e.g. the
    identity heal write vs. the contacts CAS, or `padWasUsed` after ROUND-3).
-8. **⬜ Phase 8 — deploy.** Relay + client ship together (`register/v3`,
+8. **⬜ Phase 8 — deploy.** Relay + web client ship together (`register/v3`,
    dual-scheme `/auth/verify`, the 409 body all refuse older clients). The
-   Android APK bundles the client and updates independently — `account.js`'s
-   legacy body sniff (Phase 3, L-1) is what keeps an old APK working against
-   the new relay.
+   Android APK bundles the client and updates independently, and **an old APK
+   does NOT keep working against the new relay** (F-P7-8 corrected the earlier
+   claim here: `account.js`'s legacy body sniff is in the NEW client and handles
+   an OLD relay's 409): it registers, but `/auth/verify` is dual-scheme and the
+   old client never sends `mldsa_sig`, so it gets 401 forever, never mints a
+   session, and never receives sealed mail (queued mail expires after 14 d;
+   Live rooms still work). **Order: ship the APK first, then the relay** — or
+   accept `mldsa_sig`-less verify for one release behind an explicit sunset
+   flag. Measured matrix in the 2026-09-16 report §3.9.
 9. **⬜ Phase 9 — Android on-device.** Recents snapshot blank; the password
    prompt not capturable (`5c8dbcf`, UNVERIFIED on hardware); PadFloor proof;
    ROUND-3 F-4's `commit()` semantics; and now the identity floor slot

@@ -22,6 +22,7 @@ echo "==> 1. code (NEVER without the accounts.db excludes — the old recipe"
 echo "        overwrote the live database with the local dev one)"
 rsync -az --itemize-changes \
   --exclude node_modules --exclude 'package*.json' --exclude '*.test.mjs' \
+  --exclude 'test-source.mjs' --exclude 'README.md' \
   --exclude __pycache__ --exclude '.venv' --exclude '.pytest_cache' \
   --exclude 'accounts.db*' --exclude '*.db' --exclude '*.db-shm' --exclude '*.db-wal' \
   --exclude 'tests' \

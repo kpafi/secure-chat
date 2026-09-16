@@ -26,7 +26,8 @@ from main import app  # noqa: E402
 
 client = TestClient(app)
 
-BLOCKED = ["/package.json", "/package-lock.json", "/contacts.test.mjs"]
+BLOCKED = ["/package.json", "/package-lock.json", "/contacts.test.mjs",
+           "/test-source.mjs", "/vendor/README.md"]  # F-P7-18
 
 # Host values that made request.url.path deviate from the routed path on
 # vulnerable Starlette versions (path smuggled into the authority component).
@@ -72,3 +73,21 @@ def test_pathological_range_header_is_cheap():
     elapsed = time.monotonic() - start
     assert resp.status_code in (200, 206, 416)
     assert elapsed < 2.0, f"range parsing took {elapsed:.2f}s"
+
+
+def test_the_three_ship_lists_agree():
+    """Phase-7 pentest 2026-09-16 F-P7-18: what this gate 404s must also be
+    excluded by the deploy rsync and by the APK's Sync task, or a file the relay
+    refuses to serve still ships inside the app and onto the box. client/
+    test-source.mjs matched none of the three lists."""
+    root = Path(__file__).resolve().parents[2]
+    deploy = (root / "deploy" / "deploy-2026-07-30.sh").read_text()
+    gradle = (root / "android" / "app" / "build.gradle.kts").read_text()
+    for pattern in ("*.test.mjs", "package*.json", "node_modules", "test-source.mjs", "README.md"):
+        assert f"--exclude '{pattern}'" in deploy or f"--exclude {pattern}" in deploy, f"deploy script does not exclude {pattern}"
+        assert f'"{pattern}"' in gradle, f"APK Sync task does not exclude {pattern}"
+    import main as _main
+    for basename in ("package.json", "package-lock.json", "test-source.mjs", "README.md"):
+        assert _main._is_blocked_static("/" + basename), basename
+    assert _main._is_blocked_static("/vendor/README.md")
+    assert not _main._is_blocked_static("/app.js")
