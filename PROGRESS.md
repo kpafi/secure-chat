@@ -49,8 +49,24 @@ so the eviction ORDER is pinned by the unit anchor only — noted).
    "verify again", chat modes default) and heals rather than refusing; a fresh
    store after a wipe writes past the surviving slot; existing stores arm on
    their first unlock; warnings reach the transcript and the visible hint.
-   `store-floor.test.mjs` (new), 10 mutants RED. Reviewed by pentest-new-code
-   after the commit (result recorded below when in).
+   `store-floor.test.mjs` (new), 10 mutants RED. **Reviewed by pentest-new-code
+   after the commit: 2 High, 2 Medium, all fixed in the follow-up commit** —
+   a slot parked at the int32 ceiling from the page realm let the catch-up
+   carry the generation PAST it, after which the floor was silently never
+   bumped again (now: the generation stops one below a parked slot, so it
+   reads as a loud rollback on every open, as identity-store does); the
+   verdict went through the writable `Number.isInteger` and failed OPEN (now
+   `typeof` + int32 truncation only, the otp.js idiom, with a
+   poisoned-primordial test); the first cut DROPPED every pin and every AES256
+   secret on a bad verdict — fifty re-verifications and a lost shared
+   passphrase from one process kill in the flush window, and with no tombstone
+   the next arrival rendered as a benign first contact (now: pins are KEPT and
+   marked `suspect`, `enterVerification` refuses to auto-unlock on a suspect
+   pin and shows the loud "rolled back" prompt until an in-person check writes
+   a fresh pin; chats keep modes and secrets and are told what a rollback can
+   have undone). Six of the reviewer's mutants were green (floor raised before
+   the write, claim lowered, chats catch-up/claim/arm-on-read untested,
+   vouchedBy kept) — all RED now, 25 store-floor mutants in total.
 4. **⬜ 7a — a behavioural `app.js` test** against a DOM stub; wire
    `proto001.mjs` + `crypto-tamper.mjs` + `room-admission.mjs` into an
    automated runner (`npm run e2e:tamper` exists; the rest still needs a relay).

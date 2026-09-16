@@ -169,11 +169,18 @@ export function lastFloorWarning() {
 }
 
 // F-P7-6, the fail-closed-on-TRUST response to a bad floor verdict. Every pin
-// is dropped and every contact must be verified again in person, so a
-// rolled-back or deleted-floor store behaves like a first contact with
-// everybody — never like a store whose pins are current.
+// is marked SUSPECT — it stays, but app.js's renderVerify refuses to unlock
+// messaging on a suspect pin and shows the loud re-verify prompt instead; a
+// fresh in-person check (savePin) replaces the pin and clears the mark —
+// and every contact must be verified again in person. The first cut DROPPED
+// the pins (review: fifty re-verifications and a benign first-contact prompt
+// from one process kill); a kept-but-suspect pin is strictly safer than a
+// missing one, because the peer's next arrival is then "your saved contacts
+// were rolled back", never "first contact".
 function resetTrust(verdict) {
-  pins = {};
+  for (const [key, pin] of Object.entries(pins)) {
+    if (pin) pins[key] = { ...pin, suspect: true };
+  }
   for (const c of contacts) {
     c.verified = false;
     c.verifiedAt = null;
@@ -186,7 +193,7 @@ function resetTrust(verdict) {
     tampered: "this device's protected record for your saved contacts is damaged or forged",
     unavailable: "this device says it has protected storage for your saved contacts' rollback guard, but none is usable",
   }[verdict.reason] || "the rollback guard for your saved contacts could not be checked";
-  return why + ". Every saved identity pin has been dropped and every contact must be verified again in person before their messages are trusted";
+  return why + ". Every saved identity pin is now marked SUSPECT and every contact must be verified again in person before their messages unlock";
 }
 
 // Unlock (or create) the store with the identity passphrase. Throws if a blob
@@ -544,6 +551,9 @@ async function persist() {
   floorWarning = probe.warning;
   if (probe.current > generation) generation = probe.current;
   generation += 1; // L-1: every write moves the store forward, monotonically
+  // A parked slot (review F-1): the generation stops one below it, so the slot
+  // reads as a rollback on every open — loud forever, never silently past it.
+  if (probe.ceiling) generation = probe.current;
   const iv = crypto.getRandomValues(new Uint8Array(12));
   // `d` is the H-2 domain tag: it makes this plaintext unmistakably a STORE, so
   // no other record encrypted under the same key can be substituted for it.

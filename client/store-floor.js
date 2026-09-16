@@ -24,16 +24,21 @@
 // store that exists on disk — except through the WebView's asynchronous
 // localStorage flush, which is reported and never fatal.
 //
-// WHAT A BAD VERDICT DOES — deliberately NOT a refusal. The identity blob
+// WHAT A BAD VERDICT DOES — deliberately NOT a refusal, and (after the review
+// of the first cut) deliberately NOT destruction either. The identity blob
 // fails its anchors closed and stays usable; the stores fail their TRUST
-// closed and stay open: contacts.js drops every pin and marks every contact
-// "verify again", chats.js resets every negotiated mode. A rolled-back store
-// then behaves exactly like a first contact with everybody — the safety
-// number must be compared in person again — instead of auto-accepting a key
-// the user had already replaced. Refusing to open would make the crash
-// window (store written, floor bumped, flush lost) a permanent lock-out with
-// "start over" as the only exit, i.e. the same re-verification plus the loss
-// of the contact list itself.
+// closed and stay open: contacts.js marks every pin SUSPECT — the pin stays,
+// but app.js's renderVerify refuses to auto-unlock on a suspect pin and shows
+// the loud "re-verify" prompt instead, until an in-person check writes a
+// fresh pin — and marks every contact "verify again"; chats.js keeps every
+// negotiated mode and secret (a stale secret fails loudly on the wire, and
+// the secret exists nowhere else) and names what a rollback can have undone.
+// The first cut DROPPED every pin and every secret, which turned the crash
+// window below into fifty re-verifications and a lost shared passphrase from
+// one process kill, and — with no tombstone filed — rendered the next
+// arrival as a benign first contact (the M-2 alarm inversion). Refusing to
+// open would be worse still: a permanent lock-out with "start over" as the
+// only exit.
 //
 // Captured at load from otp.js's one bridge; there is no setter (F-9 of the
 // F-ATREST-008 reviews). In a plain browser `floor` is null and every function
@@ -50,12 +55,14 @@ const CLAIM_UNCONFIRMED = "unconfirmed";
 
 const MAX_GENERATION = 0x7fffffff - 1;
 
+// Review of the first cut (F-2): `Number.isInteger` is a writable global, and
+// routing the verdict through it was the H-1 poisoning shape otp.js was fixed
+// for twice — here it failed OPEN (a lie made the slot never leave 0). Only
+// language constructs: `typeof` and the int32 truncation test.
+const isGen = (v) => typeof v === "number" && (v | 0) === v && v >= 0;
+
 const floor = deviceFloor();
 const usable = floor !== null && floor.broken !== true;
-
-export function hasFloor() {
-  return floor !== null;
-}
 
 // Measure the slot before a write. Creates an ABSENT slot at 0 (a no-op on
 // any existing one — bump never lowers) and returns the claim the store may
@@ -86,6 +93,22 @@ export function probeStoreFloor(slot, previousClaim) {
       warning: "this device could not durably record this store's rollback guard (storage full or unwritable?)",
     };
   }
+  if (current >= MAX_GENERATION) {
+    // Review of the first cut (F-1): a slot parked at the ceiling from the
+    // page realm (one `bump` on the frozen bridge) let the catch-up carry the
+    // store's generation past the ceiling, after which armStoreFloor returned
+    // null forever — no bump, no warning, and every verdict clean: the whole
+    // control silently off. The store never advances to the ceiling; the
+    // parked slot therefore reads as a rollback on EVERY open (identity-store
+    // does the same), i.e. a loud, permanent "verify again" — never silence.
+    return {
+      claim: previousClaim === CLAIM_ARMED ? CLAIM_ARMED : CLAIM_UNCONFIRMED,
+      current: MAX_GENERATION - 1,
+      ceiling: true, // the store's generation must stop HERE, one below the slot, forever
+      warning: "this device's protected record for this store is at its ceiling — the rollback guard cannot advance, " +
+        "and every pin will keep asking to be verified again. Clearing the app's data is the only repair",
+    };
+  }
   return { claim: CLAIM_ARMED, current, warning: null };
 }
 
@@ -93,7 +116,10 @@ export function probeStoreFloor(slot, previousClaim) {
 // an armed slot; the return is a warning string or null.
 export function armStoreFloor(slot, generation, claim) {
   if (!usable || claim !== CLAIM_ARMED) return null;
-  if (!Number.isInteger(generation) || generation < 0 || generation > MAX_GENERATION) return null;
+  if (!isGen(generation) || generation > MAX_GENERATION) {
+    // Never silent (review of the first cut): an unarmable write is a warning.
+    return "this store's generation could not be recorded in the rollback guard (out of range)";
+  }
   const r = floor.bump(slot, generation);
   if (r === NATIVE_COMMIT_FAILED) return "this device could not durably record this store's rollback guard (storage full or unwritable?)";
   if (!(r >= generation)) return "this device's protected record for this store is damaged or forged";
@@ -112,7 +138,7 @@ export function judgeStoreFloor(slot, generation, claim) {
     if (claim === CLAIM_ARMED) return { ok: false, arm: false, reason: "deleted" };
     return { ok: true, arm: true };
   }
-  const gen = Number.isInteger(generation) ? generation : 0;
+  const gen = isGen(generation) ? generation : 0;
   if (f > gen) return { ok: false, arm: false, reason: "rollback", floor: f, generation: gen };
   return { ok: true, arm: claim !== CLAIM_ARMED };
 }

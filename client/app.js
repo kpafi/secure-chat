@@ -3118,6 +3118,23 @@ async function enterVerification(room, verifiedBundle) {
   }
 
   const pin = await getPin(currentPinKey);
+  if (pin && pin.suspect === true) {
+    // F-P7-6: the contact store was rolled back (or its rollback guard
+    // deleted/forged) on this device, so this pin may be one the user had
+    // already replaced. It is kept — so this is NOT a first contact — but it
+    // may not unlock anything until the safety number is confirmed in person
+    // again, which writes a fresh pin and clears the mark.
+    els.verify.hidden = false;
+    els.verify.classList.add("changed");
+    els.verifyTitle.textContent = "⚠ Re-verify this contact — your saved contacts were rolled back on this device";
+    els.verifyHint.textContent =
+      "This device's protected record says your saved contacts are older than they should be, so the " +
+      "pin for this contact may be one you had already replaced. Compare the safety number with them " +
+      "in person (or over a call where you recognise their voice) before you continue.";
+    addLine("sys", "", "[pin marked suspect after a rollback of your saved contacts — re-verification required]");
+    hint("Confirm the safety number with your contact before messaging unlocks.");
+    return;
+  }
   if (sameBundle(pin, bundle)) {
     // Seen and verified before — accept without re-prompting.
     addLine("sys", "", expectedPeerName
