@@ -302,6 +302,25 @@ async function testIdentityBlobLengthHidesItsState() {
     lengths.add(JSON.parse(await id.export("pw")).ct.length);
   }
   assert.strictEqual(lengths.size, 1, `F-P7-20: the ciphertext length must not vary with the sealed state (got ${[...lengths].join(", ")})`);
+  // ...and the constancy must not be luck: pin the EXACT ciphertext length at
+  // the largest reachable state. The padded plaintext is one 16 KiB block
+  // (identity.js PAD_TARGET) plus AES-GCM's 16-byte tag, base64'd. A future
+  // field that outgrows the block doubles the blob and fails here loudly
+  // (raise PAD_TARGET deliberately); a target quietly lowered below the
+  // record, or a fallback to a finer grid, lands on some other length and
+  // fails too. (Do not "fix" the +16 by raising the target: it is the tag.)
+  id.deviceFlags = { contactsEstablished: true, chatsEstablished: true };
+  id.generation = 0x7fffffff - 1;
+  id.floorClaim = "unconfirmed";
+  const ctB64Length = JSON.parse(await id.export("pw")).ct.length;
+  const expected = 4 * Math.ceil((16384 + 16) / 3);
+  assert.strictEqual(ctB64Length, expected,
+    `F-P7-20: the sealed blob must be exactly one 16 KiB block + tag (got ${Math.floor(ctB64Length * 3 / 4)} bytes, expected ${16384 + 16})`);
+  assert.ok([...lengths][0] === expected, "fixture: the loop above measured the same padded length");
+  // Restore the loop's last state for the round trip below.
+  id.generation = 999999;
+  id.floorClaim = true;
+
   const back = await Identity.import(await id.export("pw"), "pw");
   assert.strictEqual(back.generation, 999999, "padding does not disturb the fields");
   assert.deepStrictEqual(back.deviceFlags, { contactsEstablished: true, chatsEstablished: true });

@@ -271,17 +271,20 @@ export class Identity {
     // roughly how often the blob had been written (five distinct lengths over
     // seven states), and let them pick the "claims nothing" copy out of an
     // archive by size alone. Pad the plaintext to a 512-byte boundary.
-    // A FIXED target, not a boundary: padding to the next 512-byte block still
-    // leaked the state whenever two states straddled a block edge. The inner
-    // record is ~13 KiB and its variable part under 100 bytes, so 16 KiB is
-    // constant for every reachable state; only a blob that outgrows it (a
-    // future field) steps to the next block.
+    // A FIXED target, not a boundary: padding to the next N-byte block still
+    // leaks the state whenever two states straddle a block edge. The inner
+    // record is ~13.4 KiB (measured: 13 353 bytes with the encryption keys)
+    // and its variable part under 100 bytes, so 16 KiB is constant for every
+    // reachable state with ~3 KiB of headroom. Only a record that outgrows the
+    // target (a future field) steps up — to the NEXT MULTIPLE of the target,
+    // never to a fine grid, and identity.test.mjs pins the exact output length
+    // so that step fails loudly instead of quietly re-opening the leak. (A
+    // second cut of this fix once "found" the record at 16.4 KiB and raised the
+    // target to 20 KiB; the 16 extra bytes were AES-GCM's tag, not the record.)
     let serialized = JSON.stringify(inner);
     const PAD_TARGET = 16384;
     const overhead = '"pad":"",'.length + 1;
-    const target = serialized.length + overhead <= PAD_TARGET
-      ? PAD_TARGET
-      : Math.ceil((serialized.length + overhead) / 512) * 512;
+    const target = Math.ceil((serialized.length + overhead) / PAD_TARGET) * PAD_TARGET;
     inner.pad = " ".repeat(Math.max(0, target - serialized.length - overhead));
     serialized = JSON.stringify(inner);
     const plain = enc.encode(serialized);
