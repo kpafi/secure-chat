@@ -10,7 +10,36 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
 > said it was still open). `git log --oneline -15` is the authority on what has
 > landed; this file is the authority on WHY.
 
-## ⮕ RESUME HERE (2026-09-16, night — the delta was reviewed, its 16 findings fixed, and the branch MERGED into master locally)
+## ⮕ RESUME HERE (2026-09-19 — the F-P7-20 false alarm corrected; the post-`4b9d2c6` delta goes to review)
+
+**HEAD:** see `git log --oneline -4`. **Not pushed. Not deployed.**
+
+**The uncommitted diff this session inherited was wrong.** It raised the
+identity blob's padding target from 16 KiB to 20 KiB on the claim that the
+record was "~16.4 KiB" and had "fallen through to a 512-byte grid". Measured:
+the record is 13 353 bytes at its largest state; the 16 401 that cut saw was
+16 384 of padded plaintext plus AES-GCM's 16-byte tag. `cb84b7c` reverts the
+target to 16 KiB, keeps the two real improvements from that cut (an outgrown
+record steps to the next MULTIPLE of the target, never a fine grid; the test
+pins the EXACT sealed length at the largest reachable state), and records the
+false alarm in the comment. 4 mutants RED (target below the record, 512-grid,
+no padding, and the 20 KiB cut itself). Client exit 0 (303 OK), backend 182
+passed.
+
+### ⬜ NEXT — in order
+
+1. **⬜ Review the delta `4b9d2c6..HEAD` with `pentest-new-code`** — `d09fe41`
+   (7a: app.js executed, `e2e:scenarios`, the symmetric exhaustion rule) and
+   `cb84b7c`. The two reviews launched at the end of 2026-09-16 left no
+   report behind (scratchpads empty), so this delta has had NO agent review.
+   Fix what it finds, re-review the fixes.
+2. **⬜ Decide push + Phase 8 deploy.** APK first, then relay + web client
+   together (F-P7-8). Nothing here pushes.
+3. **⬜ Phase 9 — Android on-device** (unchanged list + F-P7-17).
+4. **⬜ F-P7-21** stays an owner decision (changes every displayed safety
+   number).
+
+## (2026-09-16, night — the delta was reviewed, its 16 findings fixed, and the branch MERGED into master locally)
 
 **HEAD:** `master` == `pentest-2026-08-07-fixes` after a local `--no-ff` merge
 (see `git log --oneline -3`). **Not pushed. Not deployed.** Tree clean.
