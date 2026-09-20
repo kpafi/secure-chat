@@ -471,9 +471,9 @@ function testAppJsHonoursSuspectPinsAndSurfacesWarnings() {
   const src = stripComments(readFileSync(new URL("./app.js", import.meta.url), "utf8"));
   const fn = liftFunction(src, "unlockContacts", assert);
   assert.match(fn, /const warning = await contacts\.unlock\(pass, \{ startFresh: freshStoreConsent\.contacts \}\);/);
-  assert.match(fn, /for \(const w of \[warning, contacts\.lastFloorWarning\(\)\]\) \{\s*if \(w\) \{ addLine\("sys", "", "\[contacts: " \+ w \+ "\]"\); storeWarnings\.push\("Contacts: " \+ w\); \}/,
+  assert.match(fn, /for \(const w of \[warning, contacts\.lastFloorWarning\(\)\]\) \{\s*if \(w\) \{ addLine\("sys", "", "\[contacts: " \+ w \+ "\]", true\); storeWarnings\.push\("Contacts: " \+ w\); \}/,
     "F-P7-6: the contact store's verdict and floor warnings reach the transcript and are collected for the hint");
-  assert.match(fn, /for \(const w of \[warning, chats\.lastFloorWarning\(\)\]\) \{\s*if \(w\) \{ addLine\("sys", "", "\[chats: " \+ w \+ "\]"\); storeWarnings\.push\("Chats: " \+ w\); \}/);
+  assert.match(fn, /for \(const w of \[warning, chats\.lastFloorWarning\(\)\]\) \{\s*if \(w\) \{ addLine\("sys", "", "\[chats: " \+ w \+ "\]", true\); storeWarnings\.push\("Chats: " \+ w\); \}/);
   // renderVerify: a suspect pin is refused BEFORE the auto-unlock comparison,
   // with the loud "changed" prompt, and nothing else may read `suspect`.
   const rv = liftFunction(src, "enterVerification", assert);

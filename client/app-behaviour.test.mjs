@@ -28,6 +28,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { installDom } from "./dom-stub.test.mjs";
 import { fakeLocalStorage } from "./identity-store-helpers.test.mjs";
+import { makeCipher, bufToB64, b64ToBuf } from "./crypto.js";
+import { freshNonce } from "./auth.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOM = "a".repeat(64);
@@ -246,9 +248,10 @@ const tally = (re) => lines().filter((l) => re.test(l)).reduce((n, l) => n + (Nu
     await ws.deliver({ type: "pending" });
     await ws.deliver({ type: "withdrawn", jid: "0123456789abcdef" });
     await ws.deliver({ type: "error", reason: "x" + i });
+    await ws.deliver({ type: "denied" }); // third review: this one was missing, and unguarded
   }
   assert.ok(lines().length <= before + 3,
-    `M-1: 2 400 interleaved relay frames of every unprompted kind cost at most three lines (got ${lines().length - before})`);
+    `M-1: 2 800 interleaved relay frames of every unprompted kind cost at most three lines (got ${lines().length - before})`);
   assert.strictEqual(count(/joined room/), sessionLines, "...and the session line is untouched");
   // The record marker is on the element the eviction tiers read, on the
   // lines the M-5 flood loses first.
@@ -257,6 +260,125 @@ const tally = (re) => lines().filter((l) => re.test(l)).reduce((n, l) => n + (Nu
   assert.ok(isKept(/joined room/) && isKept(/you created this chat/), "the session lines carry the `keep` marker");
   assert.ok(log.children.some((c) => /arrived before you verified/.test(c.textContent) && !c.dataset.keep), "...and a junk refusal does not");
   console.log("OK  7a/M-1: the alternations a relay can drive alone stay far below the cap, the record is marked (executed)");
+}
+
+// ---- third review: the membership rule, `denied`, and the tiers EXECUTED ------
+// The consecutive-collapse rule folds only neighbours, so `denied` alternated
+// with a junk `msg` (two constant lines, never adjacent) reached the cap in
+// 800 frames — the third arm found in three rounds. Two things changed:
+// `denied` is owner-guarded and latched, and a NARRATION (an unkept system
+// line) is folded by membership: if the transcript already holds that exact
+// line, it is counted onto and moved to the end, wherever it was. So the
+// narration lines are bounded by the number of distinct narration strings,
+// whatever a relay interleaves.
+{
+  const count = (re) => lines().filter((l) => re.test(l)).length;
+  const junk = (i) => ({ type: "msg", room: ROOM, alg: "AES256", payload: Buffer.from(JSON.stringify({ iv: "AAAAAAAAAAAAAAAA", ct: "AAAA", n: 9000 + i })).toString("base64") });
+  const ws = await connect();
+  await ws.deliver({ type: "joined", role: "owner" });
+  await ws.deliver(junk(0));
+  await ws.deliver({ alg: "RSA" });   // a different narration in between (latched, so once)
+  await ws.deliver(junk(1));
+  await ws.deliver({ type: "denied" });
+  await ws.deliver(junk(2));
+  assert.strictEqual(count(/arrived before you verified/), 1,
+    "M-1 (third review): an identical narration anywhere in the transcript is folded, not appended — alternation cannot defeat it");
+  assert.match(lines()[lines().length - 1], /arrived before you verified.*×\s*\d+/, "...the folded line moves to the end and carries its count");
+  assert.strictEqual(count(/did not let you in/), 0, "an owner is never denied — the frame is dropped");
+  // A guest IS told, once, and it is part of the record.
+  const ws2 = await connect();
+  await ws2.deliver({ type: "pending" });
+  const denials = count(/did not let you in/);
+  for (let i = 0; i < 300; i++) await ws2.deliver({ type: "denied" });
+  assert.strictEqual(count(/did not let you in/), denials + 1, "a guest is told once per connection");
+  const deniedNode = dom.el("log").children.find((c) => /did not let you in/.test(c.textContent));
+  assert.strictEqual(deniedNode.dataset.keep, "1", "...and the denial is a record line");
+  assert.doesNotMatch(deniedNode.textContent, /×/, "...said once, not narrated 300 times and folded");
+  console.log("OK  7a/M-1: narrations fold by membership; `denied` is owner-guarded, latched, kept (executed)");
+}
+
+// The eviction loop was executed ZERO times by the suite through two rounds
+// of "tiers" — every tier was pinned by the source anchor only. Here it runs
+// for real, all three tiers, through app.js's own paths:
+//   tier 1 — the test becomes the AES256 peer (it knows the passphrase),
+//            completes the hello + key-confirmation exchange, and the user
+//            sends 600 messages: the oldest "me" lines go, every system line
+//            stays;
+//   tier 2 — reconnects (each adds two record lines) push past the cap once
+//            no conversation is left: the unkept narrations go next, oldest
+//            first, and the oldest record line is untouched;
+//   tier 3 — with no narration left, the oldest record line goes, the newest
+//            stays, and the transcript never freezes.
+// PBKDF2 is shortened to one iteration for the reconnect flood only (600k
+// per connect is 85 ms; the flood needs ~500 connects). Nothing under test
+// depends on the work factor; crypto.test.mjs pins it.
+{
+  const count = (re) => lines().filter((l) => re.test(l)).length;
+  const log = () => dom.el("log").children;
+  const pack = (o) => bufToB64(new TextEncoder().encode(JSON.stringify(o)));
+  const unpack = (b) => JSON.parse(new TextDecoder().decode(b64ToBuf(b)));
+  const junk = (i) => ({ type: "msg", room: ROOM, alg: "AES256", payload: Buffer.from(JSON.stringify({ iv: "AAAAAAAAAAAAAAAA", ct: "AAAA", n: 7000 + i })).toString("base64") });
+
+  // -- tier 1: a real AES256 session, then the user talks past the cap --
+  const ws = await connect();
+  await ws.deliver({ type: "joined", role: "owner" });
+  const sessionLines = count(/joined room/);
+  const hello = ws.sent.map((f) => (f.type === "key" ? unpack(f.payload) : null)).find((p) => p && p.hello);
+  assert.ok(hello && hello.n, "fixture: app.js announced its session nonce");
+  const peer = makeCipher("AES256", ROOM, { passphrase: "correct horse battery staple" });
+  await peer.init();
+  const peerNonce = freshNonce();
+  await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: pack({ hello: true, n: peerNonce, reply: true }) });
+  await peer.setNonces(peerNonce, hello.n);
+  await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: pack({ confirm: peer.confirmation.mine }) });
+  assert.strictEqual(dom.el("text").disabled, false, "fixture: key confirmation succeeded and sending is enabled");
+  await ws.deliver(junk(0));
+  assert.ok(said(/undecryptable message/), "fixture: a junk frame after confirmation is an (unkept) narration");
+  const before1 = lines().length;
+  for (let i = 0; i < 600; i++) {
+    dom.el("text").value = "m" + i;
+    await dom.el("sendForm").dispatch("submit");
+  }
+  assert.ok(ws.sent.filter((f) => f.type === "msg").length >= 600, "fixture: 600 messages were encrypted and sent");
+  assert.strictEqual(lines().length, 500, `tier 1: the transcript is capped at 500 (was ${before1} before the messages)`);
+  assert.ok(!lines().includes("mem0") && lines().includes("mem599"), "tier 1: the OLDEST conversation lines are the ones evicted");
+  assert.strictEqual(count(/joined room/), sessionLines, "tier 1: no record line is evicted while conversation lines exist");
+  assert.ok(said(/undecryptable message/) && said(/arrived before you verified/), "tier 1: no narration is evicted while conversation lines exist either");
+
+  // -- tiers 2 and 3: reconnect past the cap --
+  const subtle = crypto.subtle;
+  const origDerive = subtle.deriveBits;
+  subtle.deriveBits = function (alg, key, len) {
+    return origDerive.call(this, alg && alg.name === "PBKDF2" ? { ...alg, iterations: 1 } : alg, key, len);
+  };
+  try {
+    const reconnect = async () => { const w = await connect(); await w.deliver({ type: "joined", role: "owner" }); };
+    const nonSys = () => log().filter((c) => c.className !== "sys").length;
+    const unkept = () => log().filter((c) => c.className === "sys" && !c.dataset.keep);
+    const oldest = () => log()[0];
+    const first = oldest();
+    assert.strictEqual(first.dataset.keep, "1", "fixture: the oldest line in the transcript is a record line");
+    // tier 1 again, from the other side: reconnects evict conversation first
+    while (nonSys() > 0) { await reconnect(); assert.strictEqual(oldest(), first, "tier 1: the oldest record line is untouched while conversation remains"); }
+    assert.strictEqual(lines().length, 500, "still capped");
+    // tier 2: the unkept narrations go next, oldest first, the record untouched
+    const narrations = unkept();
+    assert.ok(narrations.length >= 2, `fixture: ${narrations.length} narrations to lose`);
+    const u0 = narrations[0];
+    while (unkept().includes(u0)) { await reconnect(); assert.strictEqual(oldest(), first, "tier 2: a narration goes before the oldest record line"); }
+    assert.ok(unkept().length < narrations.length && !unkept().includes(u0), "tier 2: the OLDEST narration went first");
+    while (unkept().length > 0) { await reconnect(); assert.strictEqual(oldest(), first, "tier 2: every narration goes before any record line"); }
+    // tier 3: only record lines remain — the oldest goes, the newest stays
+    const newestBefore = log()[log().length - 1];
+    await reconnect();
+    assert.notStrictEqual(oldest(), first, "tier 3: with only record lines left, the OLDEST goes");
+    assert.ok(log().includes(newestBefore), "tier 3: the newest line stays — the transcript does not freeze");
+    assert.strictEqual(lines().length, 500, "tier 3: still capped");
+    assert.ok(log().every((c) => c.className === "sys" && c.dataset.keep === "1"), "tier 3: what remains is the record");
+  } finally {
+    subtle.deriveBits = origDerive;
+  }
+  console.log("OK  7a/M-1: all three eviction tiers EXECUTED — conversation, then narrations, then the oldest record line (never frozen)");
 }
 
 // ---- a guest is not told about the owner's queue ------------------------------

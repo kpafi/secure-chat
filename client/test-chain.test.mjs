@@ -21,14 +21,14 @@ const pkg = JSON.parse(readFileSync(join(HERE, "package.json"), "utf8"));
 const LIBRARIES = new Set(["dom-stub.test.mjs", "identity-store-helpers.test.mjs"]);
 // Need a running relay on :8000 (see each file's header); run by hand.
 const INTEGRATION = new Set(["accounts.integration.test.mjs", "auth.integration.test.mjs", "integration.test.mjs"]);
-// Not test trees.
+// Not test trees: node_modules and vendor/ are third-party code (a vendored test file is not ours to run).
 const SKIP_DIRS = new Set(["node_modules", "vendor", ".git"]);
 
 function scan(dir, out = []) {
   for (const name of readdirSync(dir)) {
     const p = join(dir, name);
     if (statSync(p).isDirectory()) { if (!SKIP_DIRS.has(name)) scan(p, out); continue; }
-    if (/\.test\.m?js$/.test(name)) out.push(relative(HERE, p));
+    if (/\.test\.m?js$/i.test(name)) out.push(relative(HERE, p)); // case-insensitive (third review)
   }
   return out.sort();
 }

@@ -70,7 +70,11 @@ class El {
   get childElementCount() { return this.children.filter((c) => c instanceof El).length; }
   get firstElementChild() { return this.children.find((c) => c instanceof El) || null; }
   get lastElementChild() { return [...this.children].reverse().find((c) => c instanceof El) || null; }
-  appendChild(c) { c.parentNode = this; this.children.push(c); return c; }
+  appendChild(c) {
+    // Like the DOM: appending a node that already has a parent MOVES it.
+    if (c.parentNode) c.parentNode.removeChild(c);
+    c.parentNode = this; this.children.push(c); return c;
+  }
   removeChild(c) {
     const i = this.children.indexOf(c);
     if (i >= 0) this.children.splice(i, 1);

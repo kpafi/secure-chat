@@ -233,6 +233,7 @@ let wasPending = false;    // we sat in the approval queue (M-2, guest side)
 // wedged the renderer for minutes while burying every real transcript line.
 let saidDeprecatedAlg = false;
 let saidTurnedAway = false;   // M-1 (review of 4b9d2c6..a88baa4): the queue-full line is said once per connection
+let saidDenied = false;       // M-1, third review: the denial is said once per connection
 let knockQueue = [];       // [{jid, bundle, anon}] waiting for our verdict
 // The identity a human on THIS device approved for this session, by either
 // route. This is the whole admission control: it is written only by a click.
@@ -514,6 +515,29 @@ function addLine(kind, who, text, keep = false) {
     els.log.scrollTop = els.log.scrollHeight;
     return;
   }
+  // Third review of the M-1 fix: the consecutive rule folds only NEIGHBOURS,
+  // so any TWO alternating narrations defeat it — `denied` × junk `msg` reached
+  // the cap in 800 frames after two rounds of enumerating arms. So the rule for
+  // a narration (a system line that is NOT part of the record) is membership,
+  // not adjacency: if the transcript already holds that exact line, it is
+  // counted onto and MOVED to the end, never appended again. The number of
+  // narration lines is therefore bounded by the number of distinct narration
+  // strings in this file, whatever order a relay sends them in. Record lines
+  // (`keep`) keep the consecutive rule only: each is once per connection by
+  // construction, and folding "joined room" across reconnects would hide the
+  // order of sessions.
+  if (kind === "sys" && !who && !keep) {
+    for (const c of els.log.children) {
+      if (c.className === "sys" && !c.dataset.keep && c.dataset.text === text) {
+        const n = (Number(c.dataset.repeat) || 1) + 1;
+        c.dataset.repeat = String(n);
+        c.textContent = `${text} (×${n})`;
+        els.log.appendChild(c); // moves it: the latest occurrence is where it is read
+        els.log.scrollTop = els.log.scrollHeight;
+        return;
+      }
+    }
+  }
   const li = document.createElement("li");
   li.className = kind;
   if (kind === "sys" && !who) li.dataset.text = text;
@@ -684,7 +708,7 @@ async function createIdentity() {
   try {
     identity = await Identity.generate();
     const saved = await idstore.persistIdentity(identity, pass);
-    if (saved.warning) addLine("sys", "", "[identity: " + saved.warning + "]");
+    if (saved.warning) addLine("sys", "", "[identity: " + saved.warning + "]", true);
     installStoreAnchor(pass);
     await unlockContacts(pass); // contact store shares the identity passphrase
     els.idPass.value = "";
@@ -721,7 +745,7 @@ async function unlockWithPassphrase(pass) {
   els.atRestWarning.textContent = verdict.ok ? "" : "Identity unlocked, but " + verdict.message + ".";
   els.atRestWarning.hidden = verdict.ok;
   if (!verdict.ok) {
-    addLine("sys", "", "[identity at rest: " + verdict.message + "]");
+    addLine("sys", "", "[identity at rest: " + verdict.message + "]", true);
   }
   installStoreAnchor(pass);
   if (identity.upgraded || !verdict.ok || verdict.arm) {
@@ -737,9 +761,9 @@ async function unlockWithPassphrase(pass) {
     // not fatal.
     try {
       const saved = await idstore.persistIdentity(identity, pass);
-      if (saved.warning) addLine("sys", "", "[identity: " + saved.warning + "]");
+      if (saved.warning) addLine("sys", "", "[identity: " + saved.warning + "]", true);
     } catch (e) {
-      addLine("sys", "", "[identity could not be re-saved: " + e.message + "]");
+      addLine("sys", "", "[identity could not be re-saved: " + e.message + "]", true);
     }
   }
   await unlockContacts(pass); // contact store shares the identity passphrase
@@ -967,7 +991,7 @@ async function autoLogin(username) {
     if (autoLoginFailures === 1 || autoLoginFailures === 4) {
       const why = e && e.message ? e.message : "login failed";
       hint(`Not signed in to the directory — sealed messages will not arrive (${why}). Retrying.`, true);
-      addLine("sys", "", `[not signed in to the directory — sealed messages will not arrive (${why})]`);
+      addLine("sys", "", `[not signed in to the directory — sealed messages will not arrive (${why})]`, true);
     }
     return false;
   } finally {
@@ -1038,25 +1062,25 @@ async function unlockContacts(pass) {
   const storeWarnings = [];
   try {
     const warning = await contacts.unlock(pass, { startFresh: freshStoreConsent.contacts });
-    if (freshStoreConsent.contacts) addLine("sys", "", "[contact store started over EMPTY at your request — every contact must be re-verified]");
+    if (freshStoreConsent.contacts) addLine("sys", "", "[contact store started over EMPTY at your request — every contact must be re-verified]", true);
     // F-P7-6: a bad floor verdict opens the store with its trust reset; say so.
     // All store warnings are collected and shown as ONE hint (second review,
     // M-2: four back-to-back hint() calls left only the last one visible).
     for (const w of [warning, contacts.lastFloorWarning()]) {
-      if (w) { addLine("sys", "", "[contacts: " + w + "]"); storeWarnings.push("Contacts: " + w); }
+      if (w) { addLine("sys", "", "[contacts: " + w + "]", true); storeWarnings.push("Contacts: " + w); }
     }
     contactsError = null;
     contactsErrorCode = null;
   } catch (e) {
     contactsError = e.message;
     contactsErrorCode = e.code || null;
-    addLine("sys", "", "[contact store did not unlock — key-change warnings are OFF until it does]");
+    addLine("sys", "", "[contact store did not unlock — key-change warnings are OFF until it does]", true);
   }
   try {
     const warning = await chats.unlock(pass, { startFresh: freshStoreConsent.chats }); // chat history shares the at-rest posture
-    if (freshStoreConsent.chats) addLine("sys", "", "[chat history started over EMPTY at your request]");
+    if (freshStoreConsent.chats) addLine("sys", "", "[chat history started over EMPTY at your request]", true);
     for (const w of [warning, chats.lastFloorWarning()]) {
-      if (w) { addLine("sys", "", "[chats: " + w + "]"); storeWarnings.push("Chats: " + w); }
+      if (w) { addLine("sys", "", "[chats: " + w + "]", true); storeWarnings.push("Chats: " + w); }
     }
     chatsError = null;
     chatsErrorCode = null;
@@ -1069,7 +1093,7 @@ async function unlockContacts(pass) {
     chatsError = e.message;
     chatsErrorCode = e.code || null;
     contactsError = contactsError || e.message;
-    addLine("sys", "", `[chat history did not unlock — ${e.message}]`);
+    addLine("sys", "", `[chat history did not unlock — ${e.message}]`, true);
   }
   if (storeWarnings.length) hint(storeWarnings.join(" — "), true);
 }
@@ -2152,6 +2176,7 @@ async function connectInner() {
   wasPending = false;
   saidDeprecatedAlg = false;
   saidTurnedAway = false;
+  saidDenied = false;
   keyConfirm.reset();
   knockQueue = [];
   hideAdmitPrompt();
@@ -2195,7 +2220,7 @@ async function connectInner() {
 
   ws.onclose = () => {
     setStatus("disconnected", "err");
-    if (joined) addLine("sys", "", "disconnected");
+    if (joined) addLine("sys", "", "disconnected", true);
     joined = false;
     verified = false;
     roomRole = null;
@@ -2208,6 +2233,7 @@ async function connectInner() {
     wasPending = false;
   saidDeprecatedAlg = false;
   saidTurnedAway = false;
+  saidDenied = false;
     keyConfirm.reset();
     knockQueue = [];
     hideAdmitPrompt();
@@ -2534,12 +2560,12 @@ async function decideKnock(allow) {
     approvedBundle = k.bundle;  // the same local-approval fact, owner route
     addLine("sys", "", k.bundle
       ? "you let someone in — their key is now pinned for this session"
-      : "you let someone in — they have no identity to pin");
+      : "you let someone in — they have no identity to pin", true);
   }
   ws.send(JSON.stringify({
     type: allow ? "admit" : "deny", room: sessionRoom, jid: k.jid,
   }));
-  if (!allow) addLine("sys", "", "you denied someone who asked to join");
+  if (!allow) addLine("sys", "", "you denied someone who asked to join", true);
   return showNextKnock();   // awaited by callers; unawaited it races the message path
 }
 
@@ -2636,7 +2662,7 @@ const keyConfirm = makeKeyConfirmation({
   })),
   hint: (msg) => hint(msg),
   fail: (why) => {
-    addLine("sys", "", `[${why} — refusing to continue]`);
+    addLine("sys", "", `[${why} — refusing to continue]`, true);
     hint(
       "Key confirmation failed: you and your contact do not hold the same session key. " +
       "Messages would silently fail to arrive. Disconnecting.",
@@ -2768,8 +2794,16 @@ async function handleMessage(room, raw) {
 
     // The owner declined us (or the relay says so). Either way we are not in.
     case "denied": {
-      addLine("sys", "", "[the other person did not let you in]");
-      hint("They declined. If you expected to be let in, check with them out of band that you are both using the same chat code.", true);
+      // Third review of the M-1 fix: only a guest can be denied, and the honest
+      // relay sends this once and closes the socket — a hostile one sent it
+      // forever, alternated with junk, to reach the transcript cap. Owner-only
+      // and once per connection, like the queue-full line.
+      if (roomRole === "owner") break;
+      if (!saidDenied) {
+        saidDenied = true;
+        addLine("sys", "", "[the other person did not let you in]", true);
+        hint("They declined. If you expected to be let in, check with them out of band that you are both using the same chat code.", true);
+      }
       break;
     }
 
@@ -3153,7 +3187,7 @@ async function enterVerification(room, verifiedBundle) {
     els.verifyHint.textContent =
       `The key presented in this room is different from the one the directory publishes for "${expectedPeerName}". ` +
       "Do NOT proceed unless you confirm this safety number with them in person.";
-    addLine("sys", "", `[directory mismatch for "${expectedPeerName}" — verification required]`);
+    addLine("sys", "", `[directory mismatch for "${expectedPeerName}" — verification required]`, true);
     hint("Directory mismatch — confirm the safety number in person before proceeding.", true);
     return;
   }
@@ -3199,7 +3233,7 @@ async function enterVerification(room, verifiedBundle) {
     // Seen and verified before — accept without re-prompting.
     addLine("sys", "", expectedPeerName
       ? `contact "${expectedPeerName}" matches your saved pin`
-      : "contact identity matches your saved pin");
+      : "contact identity matches your saved pin", true);
     unlockMessaging();
     return;
   }
@@ -3261,7 +3295,7 @@ async function enterVerification(room, verifiedBundle) {
     els.verify.classList.remove("changed");
     els.verifyTitle.textContent = "Verify your contact — in person";
     if (expectedPeerBundle) {
-      addLine("sys", "", `key matches the directory entry for "${expectedPeerName}" — still verify in person`);
+      addLine("sys", "", `key matches the directory entry for "${expectedPeerName}" — still verify in person`, true);
     }
   }
   hint("Confirm the safety number with your contact before messaging unlocks.");
@@ -3285,7 +3319,7 @@ async function onVerifyOk() {
   try {
     await savePin(currentPinKey, peerBundle);
   } catch (e) {
-    addLine("sys", "", "[verified for this session only — the pin could NOT be saved: " + e.message + "]");
+    addLine("sys", "", "[verified for this session only — the pin could NOT be saved: " + e.message + "]", true);
   }
   // An in-person safety-number confirmation is the strongest trust signal we
   // have — mirror it into the Users list (🟢) when the peer is known by name.
@@ -3409,7 +3443,7 @@ function otpPersistFailed(err) {
   // additionally makes the `case "msg"` receive path refuse further frames.
   verified = false;
   enableSend(false);
-  addLine("sys", "", "[could not save one-time-pad progress — stopping to prevent key reuse]");
+  addLine("sys", "", "[could not save one-time-pad progress — stopping to prevent key reuse]", true);
   hint(
     "Could not save pad progress: " + err.message +
     " — disconnecting so the pad cannot be reused. Free up storage, then reconnect.",
@@ -3878,7 +3912,7 @@ els.profileLogout.addEventListener("click", async () => {
   // Say WHERE to sign back in: this button is in Profile, the login field is on
   // the identity screen, and "sign in again" on its own sends people looking.
   accountStatus("Signed out of the directory. Sealed messages will not arrive until you log in again on the identity screen.", "ok");
-  addLine("sys", "", "[signed out of the directory — sealed messages will not arrive until you log in again]");
+  addLine("sys", "", "[signed out of the directory — sealed messages will not arrive until you log in again]", true);
 });
 els.profileForget.addEventListener("click", async () => {
   await forgetIdentity();

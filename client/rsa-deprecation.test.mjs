@@ -228,9 +228,36 @@ console.log(`\nAll RSA deprecation checks passed (${n}).`);
   // The record lines are marked where they are written. Pin the count and the
   // two the behavioural test loses first, so a marker cannot quietly vanish.
   const kept = (appSrc.match(/addLine\("sys", "", [^\n]*, true\);/g) || []);
-  assert.strictEqual(kept.length, 25, `25 record lines carry \`keep\` (got ${kept.length}) — add or remove one deliberately`);
   assert.ok(kept.some((l) => /joined room — encryption/.test(l)), "the session line is a record line");
   assert.ok(kept.some((l) => /you created this chat/.test(l)), "the owner line is a record line");
+  // Third review (L-1): a COUNT binds nothing — a marker moved from a record
+  // line onto a relay-repeatable narration kept the count. Bind the SET from
+  // the other side: every system line is a record line EXCEPT exactly these
+  // four narrations, each of which a relay (or a directory) can repeat, and
+  // each of which is either latched or folded by the membership rule.
+  const sysCalls = appSrc.split("\n").filter((l) => /addLine\("sys", "", /.test(l));
+  const unmarked = sysCalls.filter((l) => !/addLine\("sys", "", .*, true\)/.test(l) && !/(k\.bundle|expectedPeerName)\s*$/.test(l)).map((l) => l.trim()).sort();
+  assert.deepStrictEqual(unmarked, [
+    'addLine("sys", "", "[message arrived before you verified the safety number — dropped]");',
+    'addLine("sys", "", "[the directory is rate-limiting mail fetches — sealed messages are delayed]");',
+    'addLine("sys", "", "[undecryptable message — wrong key or tampered]");',
+    'addLine("sys", "", `[frame refused — the other end is using ${m.alg}, which this version has removed]`);',
+  ], "exactly these four system lines are narrations (unkept); every other system line is part of the record — change this list deliberately");
+  assert.strictEqual(sysCalls.length, kept.length + unmarked.length + 2, "fixture: every system addLine is classified (the +2 are the two multi-line ternary calls, both kept)");
+  assert.match(appSrc, /addLine\("sys", "", k\.bundle\s*\?[^\n]*\n[^\n]*, true\);/, "the owner-route admission line is a record line");
+  assert.match(appSrc, /addLine\("sys", "", expectedPeerName\s*\n[^\n]*\n[^\n]*, true\);/, "the saved-pin match line is a record line");
+  // Third review (L-2): the bound is only as good as addLine being the ONLY
+  // way onto the transcript. Every DOM write into #log lives in addLine.
+  const code = stripComments(appSrc);
+  const logWrites = (code.match(/els\.log\.(appendChild|insertBefore|prepend|append|replaceChildren|innerHTML|insertAdjacent\w*)\b/g) || []).length;
+  const inAddLine = (stripComments(addLine).match(/els\.log\.(appendChild|insertBefore|prepend|append|replaceChildren|innerHTML|insertAdjacent\w*)\b/g) || []).length;
+  assert.ok(inAddLine >= 2 && logWrites === inAddLine, `every write into #log is inside addLine (${logWrites} in app.js, ${inAddLine} in addLine)`);
+  // Third review (M-1): the consecutive rule folds only neighbours, so two
+  // alternating narrations reached the cap. A narration is folded by
+  // MEMBERSHIP: an identical unkept line anywhere in the transcript is counted
+  // onto and moved to the end.
+  assert.match(addLine, /if \(kind === "sys" && !who && !keep\) \{\s*for \(const c of els\.log\.children\) \{\s*if \(c\.className === "sys" && !c\.dataset\.keep && c\.dataset\.text === text\) \{[\s\S]*?els\.log\.appendChild\(c\);[\s\S]*?return;/,
+    "M-1 (third review): an unkept system line already in the transcript is counted onto and moved, never appended again");
   // M-1 (review of 4b9d2c6..a88baa4): the queue-full line was the one unprompted
   // system line a relay could vary (`${n} people were turned away`), which the
   // collapse rule cannot fold. It is a constant string now, latched, and owner-only.
@@ -245,6 +272,18 @@ console.log(`\nAll RSA deprecation checks passed (${n}).`);
   const turnedAwayWrites = appSrc.split("\n").map((l) => l.trim()).filter((l) => /^saidTurnedAway (=|\|\|=|&&=|\?\?=)/.test(l)).sort();
   assert.deepStrictEqual(turnedAwayWrites, ["saidTurnedAway = false;", "saidTurnedAway = false;", "saidTurnedAway = true;"],
     "M-1: the queue-full latch is reset in the two per-connection resets and set in exactly one place");
+  // Third review: `denied` was the next unguarded arm (owner never denied;
+  // the honest relay closes right after it). Owner-only, latched, kept.
+  const deniedArm = handle.slice(handle.indexOf('case "denied": {'), handle.indexOf('case "knock": {'));
+  assert.ok(deniedArm.length > 0, "fixture: the denied arm was found");
+  assert.match(deniedArm, /if \(roomRole === "owner"\) break;/, "M-1 (third review): an owner is never denied — the frame is dropped");
+  assert.match(deniedArm, /if \(!saidDenied\) \{\s*saidDenied = true;\s*addLine\("sys", "", "\[the other person did not let you in\]", true\);\s*hint\(/,
+    "M-1 (third review): the denial is said once per connection, is a record line, and hint() sits inside the latch");
+  assert.strictEqual((deniedArm.match(/addLine\(/g) || []).length, 1, "one addLine in the denied arm");
+  assert.strictEqual((deniedArm.match(/hint\(/g) || []).length, 1, "one hint() in the denied arm");
+  const deniedWrites = appSrc.split("\n").map((l) => l.trim()).filter((l) => /^saidDenied (=|\|\|=|&&=|\?\?=)/.test(l)).sort();
+  assert.deepStrictEqual(deniedWrites, ["saidDenied = false;", "saidDenied = false;", "saidDenied = true;"],
+    "the denial latch is reset in the two per-connection resets and set in exactly one place");
   // Second review of the M-1 fix: a repeated `joined` re-narrated the session
   // start (two distinct lines per frame), the one alternation a relay could
   // drive to the cap alone. The seat is write-once; a repeat is dropped.
