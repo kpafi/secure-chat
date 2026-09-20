@@ -10,7 +10,43 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
 > said it was still open). `git log --oneline -15` is the authority on what has
 > landed; this file is the authority on WHY.
 
-## ⮕ RESUME HERE (2026-09-20 — the post-`4b9d2c6` delta reviewed: 1 Medium (a false claim, and a live flood), 3 Low, 4 Info — all fixed in `d98f220`)
+## ⮕ RESUME HERE (2026-09-20, later — the M-1 fix's own review: "evict the newest" FROZE the transcript, a repeated `joined` reached the cap alone; fixed structurally in `cdcafe4`)
+
+**HEAD:** see `git log --oneline -6`. **Not pushed. Not deployed.**
+
+**The review of `d98f220` found a Medium IN THE FIX.** Flipping the eviction
+fallback to the newest line froze the transcript (every later line, a
+genuine refusal included, was destroyed on arrival), and the test's claim
+that reaching the cap "needs the peer or the user" was false: the collapse
+rule folds only CONSECUTIVE lines, and `joined` had no already-joined guard
+— 300 repeated `joined` frames (two distinct lines each) hit the cap alone.
+Lesson recorded for the next reader: a fix chosen on a premise the test
+did not exercise is the same bug shape as the one it fixes. `cdcafe4`:
+a repeated `joined` for the seat we hold is dropped; the 25 lines that are
+the session's record are marked `keep` where written; eviction goes in
+three tiers (oldest non-system, oldest unkept system, oldest record —
+the last reachable only by the user's reconnects); `turned-away` is
+owner-only; the peer-approval EXACT windows updated with the reason.
+Also: the grid pin (an oversize record lands on 2× the target — a private
+8192 inside export() was GREEN before), test-chain scans recursively and
+names the integration files, persistIdentity stays writable for a valid
+counter past int32 (isCount; it threw, and the ceiling branch would have
+rewound to 0), README says `count` is not shown. 9 mutants RED (tier 2
+unreachable from the stub — stated; the anchor holds it). Client 308 OK,
+backend 182, `e2e:scenarios` 4/4. Report §9.3. **`cdcafe4` has had no
+review yet.**
+
+### ⬜ NEXT — in order
+
+1. **⬜ Review `cdcafe4` with `pentest-new-code`** (the second fix round),
+   fix what it finds.
+2. **⬜ Decide push + Phase 8 deploy.** APK first, then relay + web client
+   together (F-P7-8). Nothing here pushes.
+3. **⬜ Phase 9 — Android on-device** (unchanged list + F-P7-17).
+4. **⬜ F-P7-21** stays an owner decision (changes every displayed safety
+   number).
+
+## (2026-09-20 — the post-`4b9d2c6` delta reviewed: 1 Medium (a false claim, and a live flood), 3 Low, 4 Info — all fixed in `d98f220`)
 
 **HEAD:** see `git log --oneline -4`. **Not pushed. Not deployed.**
 
