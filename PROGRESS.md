@@ -10,7 +10,42 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
 > said it was still open). `git log --oneline -15` is the authority on what has
 > landed; this file is the authority on WHY.
 
-## ⮕ RESUME HERE (2026-09-19 — the F-P7-20 false alarm corrected; the post-`4b9d2c6` delta goes to review)
+## ⮕ RESUME HERE (2026-09-20 — the post-`4b9d2c6` delta reviewed: 1 Medium (a false claim, and a live flood), 3 Low, 4 Info — all fixed in `d98f220`)
+
+**HEAD:** see `git log --oneline -4`. **Not pushed. Not deployed.**
+
+**The review of `4b9d2c6..a88baa4` (`d09fe41` 7a + `cb84b7c`) found no
+Critical/High.** Its Medium was the 7a test's own claim that "a hostile relay
+can no longer reach the transcript cap at all": the `turned-away` arm
+interpolated the relay's `count`, so nothing collapsed, and 1 200 thirty-byte
+frames evicted "joined room" — the fallback took the OLDEST system line once
+only system lines remained. Pre-existing since `dc182d7`; the claim was new.
+Fixed in `d98f220`: the line is constant and latched once per connection; the
+fallback evicts the NEWEST line; the flood is a behavioural test (RED against
+the old code); the positive guest path `pending → knock → joined:guest` is
+executed for the first time. Also fixed there: L-1 (`ONLY=nope` passed with
+zero scenarios), L-2 (a relay that hung on start was never killed and held
+PORT), L-3 (the exact-length pin let `PAD_TARGET` 8192/4096 through and the
+overhead was one byte too many — the target is exported and pinned, the test
+decrypts and measures), Info-1 (pad measured in UTF-8 bytes), Info-2 (judge()
+normalises the counter once; isGen everywhere), Info-3 (the sweep says what
+it proves), Info-4 (`test-chain.test.mjs`: every runnable test is in `npm
+test`). 9 mutants RED, one stated GREEN (the eviction order is unreachable
+from the stub without a peer; the anchor holds it). Client 306 OK, backend
+182, `e2e:scenarios` 4/4. Recorded as §9.2 of the Phase-7 report.
+**`d98f220` itself has had no review yet** — a fix is new code.
+
+### ⬜ NEXT — in order
+
+1. **⬜ Review `d98f220` with `pentest-new-code`** (the fix delta), fix what
+   it finds.
+2. **⬜ Decide push + Phase 8 deploy.** APK first, then relay + web client
+   together (F-P7-8). Nothing here pushes.
+3. **⬜ Phase 9 — Android on-device** (unchanged list + F-P7-17).
+4. **⬜ F-P7-21** stays an owner decision (changes every displayed safety
+   number).
+
+## (2026-09-19 — the F-P7-20 false alarm corrected; the post-`4b9d2c6` delta goes to review)
 
 **HEAD:** see `git log --oneline -4`. **Not pushed. Not deployed.**
 
@@ -128,7 +163,8 @@ so the eviction ORDER is pinned by the unit anchor only — noted).
    latch and the eviction rule, so the latch is now bound through the repeat
    COUNTER, and the test states plainly that a hostile relay can no longer
    reach the line cap at all (every line it can force unprompted is a constant
-   string) — eviction is second-line defence, pinned by the source anchor.
+   string) **[FALSE — corrected 2026-09-20, `d98f220`: the `turned-away`
+   line carried the relay's `count`; see the RESUME entry]** — eviction is second-line defence, pinned by the source anchor.
    `e2e/hostile-relay/run-scenarios.mjs` + `npm run e2e:scenarios` run all four
    role/directory scenarios unattended and pin the expected check COUNT; shown
    RED by reinstating the deleted item-14 route (exit 1, the harm in the
