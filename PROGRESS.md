@@ -10,7 +10,51 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
 > said it was still open). `git log --oneline -15` is the authority on what has
 > landed; this file is the authority on WHY.
 
-## ⮕ RESUME HERE (2026-09-20, later — the M-1 fix's own review: "evict the newest" FROZE the transcript, a repeated `joined` reached the cap alone; fixed structurally in `cdcafe4`)
+## ⮕ RESUME HERE (2026-09-21 — third M-1 round: narrations fold by MEMBERSHIP, `denied` guarded, the record fully marked, and the eviction tiers finally EXECUTED — `3dd23c4`)
+
+**HEAD:** see `git log --oneline -8`. **Not pushed. Not deployed.**
+
+**The review of `cdcafe4` found the claim wrong a third time.** `denied` was
+unguarded and unlatched; alternated with junk `msg` (two constant lines,
+never adjacent, so the CONSECUTIVE collapse never fired) 800 frames reached
+the cap unprompted. The 25 marked lines survived; ~15 unmarked record lines
+(owner-route admission, at-rest verdict, "key-change warnings are OFF",
+key-confirmation failure, directory mismatch, "verified for this session
+only") did not. And the eviction loop had been executed ZERO times by the
+suite through two rounds of tiers. `3dd23c4` is structural: a narration (unkept
+system line) folds by membership — an identical one anywhere in the
+transcript is counted onto and moved to the end — so narration lines are
+bounded by the number of distinct narration STRINGS whatever a relay
+interleaves; `denied` is owner-only, latched, kept; 47 lines are marked and
+the anchor binds the set from the other side (exactly four narrations:
+the two junk refusals, the latched RSA refusal, the directory rate-limit
+notice); every DOM write into #log is inside addLine (anchored); the stub's
+appendChild moves like the DOM. **app-behaviour now executes all three
+tiers**: the test becomes the AES256 peer (hello + key confirmation with the
+known passphrase), the user sends 600 messages (tier 1: oldest "me" lines
+go, every system line stays), reconnects with one-iteration PBKDF2 push
+past the cap (tier 2: narrations go next, oldest first; tier 3: the oldest
+record line goes, the newest stays, never frozen). 10 mutants RED, each
+tier and the membership rule RED behaviourally AND by anchor. Client 310
+OK, backend 182, `e2e:scenarios` 4/4. Report §9.4. **`3dd23c4` has had no
+review yet.**
+
+The lesson, stated once for the file: three rounds in a row the FIX was
+right and the CLAIM around it was wider than the code — "every unprompted
+line", "the record is marked", "unreachable from the stub". The reviewer
+found each by executing the claim. Write the claim as a test first.
+
+### ⬜ NEXT — in order
+
+1. **⬜ Review `3dd23c4` with `pentest-new-code`** (the third fix round), fix
+   what it finds.
+2. **⬜ Decide push + Phase 8 deploy.** APK first, then relay + web client
+   together (F-P7-8). Nothing here pushes.
+3. **⬜ Phase 9 — Android on-device** (unchanged list + F-P7-17).
+4. **⬜ F-P7-21** stays an owner decision (changes every displayed safety
+   number).
+
+## (2026-09-20, later — the M-1 fix's own review: "evict the newest" FROZE the transcript, a repeated `joined` reached the cap alone; fixed structurally in `cdcafe4`)
 
 **HEAD:** see `git log --oneline -6`. **Not pushed. Not deployed.**
 
