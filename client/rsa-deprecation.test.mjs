@@ -221,8 +221,17 @@ console.log(`\nAll RSA deprecation checks passed (${n}).`);
   }
   const addLine = liftFunction(appSrc, "addLine", assert);
   assert.match(appSrc, /^const LOG_MAX_LINES = 500;\s*$/m, "F-P7-7: the transcript bound is the literal 500");
-  assert.match(addLine, /while \(els\.log\.childElementCount > LOG_MAX_LINES\) \{\s*let victim = els\.log\.firstElementChild;\s*for \(const c of els\.log\.children\) \{ if \(c\.className !== "sys"\) \{ victim = c; break; \} \}\s*els\.log\.removeChild\(victim\);/,
-    "F-P7-7 / M-5: eviction takes the oldest NON-system line first, so security lines survive a flood");
+  assert.match(addLine, /while \(els\.log\.childElementCount > LOG_MAX_LINES\) \{\s*let victim = els\.log\.lastElementChild;\s*for \(const c of els\.log\.children\) \{ if \(c\.className !== "sys"\) \{ victim = c; break; \} \}\s*els\.log\.removeChild\(victim\);/,
+    "F-P7-7 / M-5: eviction takes the oldest NON-system line first, and the NEWEST line when only system lines remain, so the session's security record survives a flood");
+  // M-1 (review of 4b9d2c6..a88baa4): the queue-full line was the one unprompted
+  // system line a relay could vary (`${n} people were turned away`), which the
+  // collapse rule cannot fold. It is a constant string now, and latched.
+  assert.match(handle, /if \(!saidTurnedAway\) \{\s*saidTurnedAway = true;\s*addLine\("sys", "", "\[someone was turned away — the waiting queue is full\]"\);/,
+    "M-1: the queue-full narration is a constant string, said once per connection");
+  assert.doesNotMatch(handle, /turned away[^\n]*\$\{/, "M-1: nothing relay-controlled is interpolated into the queue-full line");
+  const turnedAwayWrites = appSrc.split("\n").map((l) => l.trim()).filter((l) => /^saidTurnedAway = /.test(l)).sort();
+  assert.deepStrictEqual(turnedAwayWrites, ["saidTurnedAway = false;", "saidTurnedAway = false;", "saidTurnedAway = true;"],
+    "M-1: the queue-full latch is reset in the two per-connection resets and set in exactly one place");
   assert.match(addLine, /last\.className === "sys" && last\.dataset\.text === text/,
     "M-5: a system line identical to the previous one is counted onto it, not appended");
   assert.ok(addLine.indexOf("LOG_MAX_LINES") < addLine.lastIndexOf("scrollTop"), "...eviction happens before the layout-forcing scroll");

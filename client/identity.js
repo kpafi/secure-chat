@@ -281,11 +281,18 @@ export class Identity {
     // so that step fails loudly instead of quietly re-opening the leak. (A
     // second cut of this fix once "found" the record at 16.4 KiB and raised the
     // target to 20 KiB; the 16 extra bytes were AES-GCM's tag, not the record.)
+    // Review of 4b9d2c6..a88baa4 (L-3, Info-1): the target is measured in
+    // UTF-8 BYTES (what is encrypted), not UTF-16 code units — every field is
+    // ASCII today, but `flags` is copied verbatim from the AEAD on import and
+    // nothing else pins that. And adding `pad` costs exactly 9 characters
+    // (`,"pad":""`), not 10: the old `+1` left the plaintext one byte short of
+    // the block, hidden by base64 rounding. The pad itself is ASCII, so bytes
+    // and characters agree for it.
     let serialized = JSON.stringify(inner);
-    const PAD_TARGET = 16384;
-    const overhead = '"pad":"",'.length + 1;
-    const target = Math.ceil((serialized.length + overhead) / PAD_TARGET) * PAD_TARGET;
-    inner.pad = " ".repeat(Math.max(0, target - serialized.length - overhead));
+    const overhead = ',"pad":""'.length;
+    const rawBytes = enc.encode(serialized).length + overhead;
+    const target = Math.ceil(rawBytes / IDENTITY_PAD_TARGET) * IDENTITY_PAD_TARGET;
+    inner.pad = " ".repeat(target - rawBytes);
     serialized = JSON.stringify(inner);
     const plain = enc.encode(serialized);
     const salt = crypto.getRandomValues(new Uint8Array(16));
@@ -516,6 +523,12 @@ export class Identity {
 
 // PBKDF2-SHA256 work factor for identity-at-rest (OWASP 2023 guidance).
 const KDF_ITERS = 600000;
+// F-P7-20: the sealed identity's plaintext is padded to this many bytes (see
+// `export`). Exported so identity.test.mjs can pin the value itself — the
+// review of 4b9d2c6..a88baa4 showed that pinning only the OUTPUT length let
+// any divisor of it (8192, 4096) through, and a finer grid is exactly the
+// "two states straddle a line" property a fixed target exists to prevent.
+export const IDENTITY_PAD_TARGET = 16384;
 
 // Audit 2026-07-18 L-01: `iters`/`salt` reach deriveKey from imported backup
 // files and persistent storage. Bound them BEFORE WebCrypto runs — a crafted

@@ -205,7 +205,7 @@ export async function persistIdentity(identity, passphrase) {
   // instead of alarming each other — a tab that unlocked at generation N and
   // writes after another tab reached N+2 must write N+3, not N+1.
   let base = current > identity.generation ? current : identity.generation;
-  if (!Number.isInteger(base) || base < 0) {
+  if (!isGen(base)) { // language constructs only, like the verdict (H-1)
     throw new Error("identity write counter is malformed — refusing to write the identity");
   }
   let generation = base + 1;
@@ -226,7 +226,7 @@ export async function persistIdentity(identity, passphrase) {
     // one value along, and with a CLEAN verdict so no banner said why). The
     // rule now: the blob is ALWAYS writable. At the ceiling it is written at
     // its own current counter, never advanced, never refused.
-    generation = Number.isInteger(identity.generation) && identity.generation >= 0
+    generation = isGen(identity.generation)
       ? (identity.generation > MAX_GENERATION ? MAX_GENERATION : identity.generation)
       : 0;
     measured = false;
@@ -325,7 +325,13 @@ export function judge(identity) {
     // nothing to compare against yet, so record one now.
     return { ok: true, arm: true };
   }
-  if (isGen(identity.generation) && identity.generation >= MAX_GENERATION) {
+  // Review of 4b9d2c6..a88baa4 (Info-2): normalise ONCE, as store-floor.js
+  // does, so a malformed counter cannot skip the exhaustion rule and then win
+  // a JS-coerced `f > generation` (`f > Infinity` is false). Not reachable
+  // today — import clamps, persist only ever stores an int — but the verdict
+  // path must not depend on that.
+  const gen = isGen(identity.generation) ? identity.generation : 0;
+  if (gen >= MAX_GENERATION) {
     // The symmetric half of the exhaustion rule (see store-floor.js): a blob
     // whose own counter can no longer advance is as unfalsifiable as a slot it
     // can never overtake, and when the counter is PAST the ceiling the bump is
@@ -338,13 +344,13 @@ export function judge(identity) {
         "so a rollback could no longer be told from a save — treating every saved store as present",
     };
   }
-  if (f > identity.generation) {
+  if (f > gen) {
     return {
       ok: false,
       arm: false,
       reason: "rollback",
       message: `the identity file on this device is OLDER than this device's record of it (generation ` +
-        `${identity.generation}, device recorded ${f}) — it has been restored from an earlier copy, or a save ` +
+        `${gen}, device recorded ${f}) — it has been restored from an earlier copy, or a save ` +
         "did not reach disk. Treating every saved store as present, so a deleted contact store is reported " +
         "rather than replaced; if you have a newer backup, restore it",
     };

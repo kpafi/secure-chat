@@ -150,14 +150,23 @@ const said = (re) => lines().some((l) => re.test(l));
 // NON-system line first. Without them, 600 junk `msg` frames pushed "joined
 // room" and the approval lines out of the transcript entirely.
 //
-// Worth stating, because it is what this test can and cannot prove: with the
-// collapse rule in place a HOSTILE RELAY can no longer reach the cap at all —
-// every line it can make us narrate unprompted ("[message arrived before you
-// verified…]", "[undecryptable message…]") is a constant string, so a flood of
-// them is one line however long it runs. Distinct lines need the peer's
-// cooperation. Eviction is therefore the second line of defence, and its
-// ORDER is pinned by the source anchor in rsa-deprecation.test.mjs rather than
-// here — nothing a relay can send reaches it once the collapse holds.
+// Worth stating, because it is what this test can and cannot prove. The
+// collapse rule folds IDENTICAL consecutive system lines, so a flood of the
+// constant strings a relay can make us narrate unprompted ("[message arrived
+// before you verified…]", "[undecryptable message…]") is one counted line.
+// The first cut of this comment claimed that therefore "a hostile relay can no
+// longer reach the cap at all". The review of 4b9d2c6..a88baa4 (M-1) showed
+// that was false: the queue-full line interpolated the relay's `count`, so
+// consecutive frames differed, nothing collapsed, and 1 200 thirty-byte
+// frames evicted "joined room" — because once only system lines remained,
+// the fallback took the OLDEST. That line is constant and latched now (the
+// second block below floods it), and the fallback takes the NEWEST line.
+// What this file still cannot do is reach the cap with distinct lines: every
+// remaining path to one needs the peer's cooperation or the user's own
+// actions, so the eviction ORDER itself stays pinned by the source anchor in
+// rsa-deprecation.test.mjs. `lines().length <= 500` below is therefore a
+// sanity bound, not the control — the counted line and the surviving session
+// line are.
 {
   const ws = await connect();
   await ws.deliver({ type: "joined", role: "owner" });
@@ -176,6 +185,55 @@ const said = (re) => lines().some((l) => re.test(l));
     "...and the collapsed line carries its repeat count");
   assert.ok(lines().length <= 500, "...and the transcript stays bounded");
   console.log("OK  7a/M-5: 600 junk frames leave the security lines in place (executed)");
+}
+
+// ---- M-1: the queue-full line cannot be varied, and is said once ------------
+// Review of 4b9d2c6..a88baa4. `{type:"turned-away", count:i}` with a fresh
+// `count` per frame was the one unprompted system line a relay could make
+// DISTINCT. Against the old code this test fails: after 1 200 frames "joined
+// room" and "you created this chat" were gone and the socket was still open.
+{
+  // The transcript is never cleared between connections, so count the
+  // session lines rather than asking whether ANY is present.
+  const count = (re) => lines().filter((l) => re.test(l)).length;
+  const ws = await connect();
+  await ws.deliver({ type: "joined", role: "owner" });
+  const sessionLines = count(/joined room/);
+  assert.ok(sessionLines >= 1, "fixture: the session line is there to lose");
+  const before = lines().length;
+  for (let i = 2; i < 1202; i++) await ws.deliver({ type: "turned-away", count: i });
+  assert.strictEqual(count(/joined room/), sessionLines,
+    "M-1: a queue-full flood with a varying count must not evict the session's security lines");
+  const turned = lines().filter((l) => /turned away/.test(l));
+  assert.strictEqual(turned.length, 1, `M-1: the queue-full line is ONE transcript line (got ${turned.length})`);
+  assert.doesNotMatch(turned[0], /×\s*\d+|\d+ people/,
+    `M-1: the line is said once per connection — neither narrated per frame and folded, nor carrying the relay's count: ${turned[0]}`);
+  assert.ok(lines().length <= before + 1, "...so 1 200 frames cost at most one transcript line");
+  assert.notStrictEqual(ws.readyState, 3, "...and the frames are dropped, not fatal");
+  console.log("OK  7a/M-1: 1 200 queue-full frames with a varying count cost exactly one line (executed)");
+}
+
+// ---- the legitimate guest path, executed --------------------------------------
+// Everything above drives REFUSALS. The positive half — pending -> knock ->
+// joined:guest succeeds — was guarded only by the source allow-list, the layer
+// round 3 walked past with `wasPending ||= true`. Without an identity the
+// knock is anonymous (`{anon:true}`), which keeps this free of PBKDF2.
+{
+  const count = (re) => lines().filter((l) => re.test(l)).length;
+  const sessions = count(/joined room/);
+  const refusals = count(/without ever asking to be let in/);
+  const ws = await connect();
+  await ws.deliver({ type: "pending" });
+  assert.ok(said(/waiting — the person who created this chat has to let you in/),
+    "pending: the guest is told they are in the approval queue");
+  const knock = ws.sent.find((f) => f.type === "knock");
+  assert.ok(knock && knock.room === ROOM, "pending: the client knocks for THIS room");
+  await ws.deliver({ type: "joined", role: "guest" });
+  assert.strictEqual(count(/joined room/), sessions + 1,
+    "joined:guest after pending is the legitimate route and starts the session");
+  assert.strictEqual(count(/without ever asking to be let in/), refusals, "...with no refusal");
+  assert.notStrictEqual(ws.readyState, 3, "...and the socket stays open");
+  console.log("OK  7a: pending -> knock -> joined:guest succeeds (executed positive control)");
 }
 
 console.log("All app.js behavioural checks passed.");

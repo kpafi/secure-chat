@@ -294,6 +294,14 @@ async function testParkedSlotIsLoudForever() {
 // too — and then armStoreFloor refuses, the slot stays below it, `f > gen` is
 // never true, and every rollback reads CLEAN. Both halves are covered now, and
 // this sweep is what keeps them covered.
+//
+// What it proves, exactly (review of 4b9d2c6..a88baa4, Info-3): "frozen after
+// two writes ⇒ not clean". It decides "frozen" by comparing the generation
+// before and after the writes, so a state that reads clean on its FIRST open
+// and turns loud only after the arming write is invisible to it. Two such
+// states exist and are benign by design: an ABSENT slot with a counter at or
+// past the ceiling is the documented first-run / pre-fix residual — the probe
+// creates the slot on that write and the very next open says "exhausted".
 function testNoStateIsFrozenAndClean() {
   const MAXG = 0x7fffffff - 1;
   const STORE_MAX = MAXG - 1;

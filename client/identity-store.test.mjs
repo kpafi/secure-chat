@@ -505,6 +505,14 @@ async function testExhaustedIdentityCounterIsNeverClean() {
   below.floorClaim = true;
   localStorage.setItem(LS_IDENTITY, await below.export(PASS));
   assert.strictEqual((await idstore.openIdentity(PASS, fakeImport)).verdict.ok, true, "control: an ordinary counter is clean");
+  // Review of 4b9d2c6..a88baa4 (Info-2): a MALFORMED counter must not slip
+  // past the exhaustion rule and then win a JS-coerced rollback comparison
+  // (`5 > Infinity` is false). Not reachable through import or persist today;
+  // the verdict path must not depend on that. judge() normalises first.
+  for (const weird of [Infinity, -1, 1.5, "9e9", null, undefined, NaN, 2 ** 31]) {
+    const v = idstore.judge({ generation: weird, floorClaim: true });
+    assert.strictEqual(v.ok, false, `a malformed counter (${String(weird)}) never reads clean under a recorded slot`);
+  }
   console.log("OK  F-ATREST-008: an identity counter that can no longer advance is never clean");
 }
 

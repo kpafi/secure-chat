@@ -8,7 +8,7 @@
 //
 // Run: node identity.test.mjs   (server not required)
 import assert from "node:assert";
-import { Identity, b64 } from "./identity.js";
+import { IDENTITY_PAD_TARGET, Identity, b64, unb64 } from "./identity.js";
 import { signHandshake, verifyHandshake, freshNonce } from "./auth.js";
 import { makeCipher, bufToB64 } from "./crypto.js";
 
@@ -286,6 +286,16 @@ async function testTranscriptBindsTheSignersBundle() {
 // device-local reader which anchors were set and roughly how often the blob
 // had been written (five lengths over seven states). The plaintext is padded
 // to a boundary: every state below must produce the SAME ciphertext length.
+// Decrypt a sealed identity blob the way `Identity.import` does, to measure
+// its padded plaintext (F-P7-20). The KDF parameters travel in the blob.
+async function openSealed(o, passphrase) {
+  const salt = unb64(o.salt), iv = unb64(o.iv), ct = unb64(o.ct);
+  const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(passphrase), "PBKDF2", false, ["deriveKey"]);
+  const key = await crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: o.iters, hash: "SHA-256" }, base,
+    { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+  return new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct));
+}
+
 async function testIdentityBlobLengthHidesItsState() {
   const id = await Identity.generate();
   const lengths = new Set();
@@ -302,22 +312,30 @@ async function testIdentityBlobLengthHidesItsState() {
     lengths.add(JSON.parse(await id.export("pw")).ct.length);
   }
   assert.strictEqual(lengths.size, 1, `F-P7-20: the ciphertext length must not vary with the sealed state (got ${[...lengths].join(", ")})`);
-  // ...and the constancy must not be luck: pin the EXACT ciphertext length at
-  // the largest reachable state. The padded plaintext is one 16 KiB block
-  // (identity.js PAD_TARGET) plus AES-GCM's 16-byte tag, base64'd. A future
-  // field that outgrows the block doubles the blob and fails here loudly
-  // (raise PAD_TARGET deliberately); a target quietly lowered below the
-  // record, or a fallback to a finer grid, lands on some other length and
-  // fails too. (Do not "fix" the +16 by raising the target: it is the tag.)
+  // ...and the constancy must not be luck. Review of 4b9d2c6..a88baa4 (L-3):
+  // pinning the base64 OUTPUT let PAD_TARGET = 8192 and 4096 through (both
+  // still round a 13.4 KiB record up to 16384) and hid a one-byte error in
+  // the overhead behind base64 rounding. So: pin the TARGET itself, and
+  // decrypt the blob to measure the padded plaintext exactly.
+  assert.strictEqual(IDENTITY_PAD_TARGET, 16384,
+    "F-P7-20: the padding target is 16 KiB — a finer grid re-opens the straddle leak; change it deliberately");
   id.deviceFlags = { contactsEstablished: true, chatsEstablished: true };
   id.generation = 0x7fffffff - 1;
   id.floorClaim = "unconfirmed";
-  const ctB64Length = JSON.parse(await id.export("pw")).ct.length;
-  const expected = 4 * Math.ceil((16384 + 16) / 3);
-  assert.strictEqual(ctB64Length, expected,
-    `F-P7-20: the sealed blob must be exactly one 16 KiB block + tag (got ${Math.floor(ctB64Length * 3 / 4)} bytes, expected ${16384 + 16})`);
-  assert.ok([...lengths][0] === expected, "fixture: the loop above measured the same padded length");
+  const sealed = JSON.parse(await id.export("pw"));
+  const plainLen = (await openSealed(sealed, "pw")).length;
+  assert.strictEqual(plainLen, IDENTITY_PAD_TARGET,
+    `F-P7-20: the padded plaintext is exactly one target block at the largest reachable state (got ${plainLen})`);
+  // Info-1: the target is measured in UTF-8 bytes. A non-ASCII flag key (only
+  // reachable through the AEAD, but nothing pins the key set) used to be
+  // counted in UTF-16 units, so 40 astral characters grew the ciphertext.
+  id.deviceFlags = { ["\u{1F511}".repeat(40)]: true, contactsEstablished: true };
+  const astral = JSON.parse(await id.export("pw"));
+  assert.strictEqual((await openSealed(astral, "pw")).length, IDENTITY_PAD_TARGET,
+    "F-P7-20: the padding counts bytes, not code units — a non-ASCII field must not move the length");
+  assert.strictEqual(astral.ct.length, sealed.ct.length, "...so the sealed length is the same");
   // Restore the loop's last state for the round trip below.
+  id.deviceFlags = { contactsEstablished: true, chatsEstablished: true };
   id.generation = 999999;
   id.floorClaim = true;
 

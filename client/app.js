@@ -232,6 +232,7 @@ let wasPending = false;    // we sat in the approval queue (M-2, guest side)
 // needed no room state to reach addLine + hint — and 10 000 of them (~140 KB)
 // wedged the renderer for minutes while burying every real transcript line.
 let saidDeprecatedAlg = false;
+let saidTurnedAway = false;   // M-1 (review of 4b9d2c6..a88baa4): the queue-full line is said once per connection
 let knockQueue = [];       // [{jid, bundle, anon}] waiting for our verdict
 // The identity a human on THIS device approved for this session, by either
 // route. This is the whole admission control: it is written only by a click.
@@ -527,8 +528,14 @@ function addLine(kind, who, text) {
   // F-P7-7: the transcript is bounded. Every frame the relay can make us
   // narrate costs a node plus a synchronous layout (scrollTop below), so an
   // unbounded list is O(n^2) work an attacker controls.
+  // Review of 4b9d2c6..a88baa4 (M-1): when ONLY system lines remain, the
+  // fallback used to be the OLDEST one — i.e. the session's security record
+  // ("joined room", the pinned key, the approval prompt) went first. Now the
+  // NEWEST line goes: a transcript of 500 distinct system lines is not a
+  // conversation, it is a flood, and the evidence of how the session started
+  // is worth more than its 501st warning (hint() still shows the newest).
   while (els.log.childElementCount > LOG_MAX_LINES) {
-    let victim = els.log.firstElementChild;
+    let victim = els.log.lastElementChild;
     for (const c of els.log.children) { if (c.className !== "sys") { victim = c; break; } }
     els.log.removeChild(victim);
   }
@@ -2133,6 +2140,7 @@ async function connectInner() {
   resolvePeerApproval(false);
   wasPending = false;
   saidDeprecatedAlg = false;
+  saidTurnedAway = false;
   keyConfirm.reset();
   knockQueue = [];
   hideAdmitPrompt();
@@ -2188,6 +2196,7 @@ async function connectInner() {
     resolvePeerApproval(false);
     wasPending = false;
   saidDeprecatedAlg = false;
+  saidTurnedAway = false;
     keyConfirm.reset();
     knockQueue = [];
     hideAdmitPrompt();
@@ -2725,15 +2734,23 @@ async function handleMessage(room, raw) {
     // for, and a queue held by knocked squatters cannot be cleared from here —
     // agreeing a fresh chat code out of band is the way out.
     case "turned-away": {
-      const n = Number.isInteger(m.count) && m.count > 1 ? m.count : 1;
-      addLine("sys", "", n > 1
-        ? `[${n} people were turned away — the waiting queue is full]`
-        : "[someone was turned away — the waiting queue is full]");
-      hint(
-        "Someone could not even reach the approval queue because it is full. If the person you invited " +
-        "is stuck on \"room full\", agree a NEW chat code with them out of band.",
-        true,
-      );
+      // Review of 4b9d2c6..a88baa4 (M-1): this used to interpolate the relay's
+      // `count` into the line and run hint() per frame — the only line a relay
+      // could make us narrate unprompted that was NOT a constant string, so the
+      // collapse rule never fired and 1 200 thirty-byte frames pushed every
+      // security line out of the transcript (the fallback below evicted the
+      // OLDEST system line once only system lines remained). The count was
+      // relay-controlled and told the owner nothing they can act on; say it
+      // once per connection, like the deprecated-alg refusal.
+      if (!saidTurnedAway) {
+        saidTurnedAway = true;
+        addLine("sys", "", "[someone was turned away — the waiting queue is full]");
+        hint(
+          "Someone could not even reach the approval queue because it is full. If the person you invited " +
+          "is stuck on \"room full\", agree a NEW chat code with them out of band.",
+          true,
+        );
+      }
       break;
     }
 

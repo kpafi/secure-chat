@@ -42,9 +42,14 @@ function startRelay(env) {
     stdio: ["ignore", "pipe", "inherit"],
   });
   return new Promise((resolve, reject) => {
-    child.stdout.on("data", (d) => { if (/listening|hostile relay|http:\/\/127/i.test(String(d))) resolve(child); });
-    child.on("exit", (code) => reject(new Error(`the hostile relay exited early (${code})`)));
-    setTimeout(() => reject(new Error("the hostile relay did not start in 15s")), 15000);
+    // Review of 4b9d2c6..a88baa4 (L-2): a relay that never printed its banner
+    // was rejected but never killed — it kept PORT, every later scenario
+    // failed with EADDRINUSE, and a stray process outlived the run.
+    const timer = setTimeout(() => { child.kill(); reject(new Error("the hostile relay did not start in 15s")); }, 15000);
+    child.stdout.on("data", (d) => {
+      if (/listening|hostile relay|http:\/\/127/i.test(String(d))) { clearTimeout(timer); resolve(child); }
+    });
+    child.on("exit", (code) => { clearTimeout(timer); reject(new Error(`the hostile relay exited early (${code})`)); });
   });
 }
 
@@ -60,9 +65,18 @@ function drive(scenario) {
   });
 }
 
+// Review of 4b9d2c6..a88baa4 (L-1): `ONLY=nope` used to skip every scenario
+// and print the success banner — the "passed with zero checks" shape this
+// file exists to prevent, one level up.
+if (ONLY && !SCENARIOS.some((s) => s.name === ONLY)) {
+  console.log(`no such scenario "${ONLY}" — one of: ${SCENARIOS.map((s) => s.name).join(", ")}`);
+  process.exit(2);
+}
 let failed = 0;
+let ran = 0;
 for (const s of SCENARIOS) {
   if (ONLY && ONLY !== s.name) continue;
+  ran++;
   console.log(`\n=== ${s.name}: ${s.why}`);
   let relay;
   try {
@@ -94,5 +108,6 @@ for (const s of SCENARIOS) {
     await new Promise((r) => setTimeout(r, 300));
   }
 }
-console.log(failed ? `\n${failed} scenario(s) FAILED` : "\nall hostile-relay scenarios passed");
+if (ran === 0) { console.log("\nno scenario ran"); process.exit(2); }
+console.log(failed ? `\n${failed} scenario(s) FAILED` : `\nall ${ran} hostile-relay scenario(s) passed`);
 process.exit(failed ? 1 : 0);
