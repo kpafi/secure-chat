@@ -277,7 +277,8 @@ Client -> server JSON envelope (`backend/validation.py`, `extra="forbid"`):
 Server -> client: `{"type":"joined","role":"owner"|"guest"}`,
 `{"type":"pending"}` (you are queued), `{"type":"knock","jid":…,"payload":…}`
 (owner only), `{"type":"denied"}`, `{"type":"withdrawn","jid":…}` (a knocker
-left), `{"type":"turned-away","count":…}`, relayed envelopes, or
+left), `{"type":"turned-away","count":…}` (the client says "someone was
+turned away" once per connection and does not display `count`), relayed envelopes, or
 `{"type":"error","reason":"..."}`. The admission flow is described under
 "Architecture" above.
 

@@ -221,17 +221,35 @@ console.log(`\nAll RSA deprecation checks passed (${n}).`);
   }
   const addLine = liftFunction(appSrc, "addLine", assert);
   assert.match(appSrc, /^const LOG_MAX_LINES = 500;\s*$/m, "F-P7-7: the transcript bound is the literal 500");
-  assert.match(addLine, /while \(els\.log\.childElementCount > LOG_MAX_LINES\) \{\s*let victim = els\.log\.lastElementChild;\s*for \(const c of els\.log\.children\) \{ if \(c\.className !== "sys"\) \{ victim = c; break; \} \}\s*els\.log\.removeChild\(victim\);/,
-    "F-P7-7 / M-5: eviction takes the oldest NON-system line first, and the NEWEST line when only system lines remain, so the session's security record survives a flood");
+  assert.match(addLine, /while \(els\.log\.childElementCount > LOG_MAX_LINES\) \{\s*let victim = null;\s*for \(const c of els\.log\.children\) \{ if \(c\.className !== "sys"\) \{ victim = c; break; \} \}\s*if \(!victim\) for \(const c of els\.log\.children\) \{ if \(!c\.dataset\.keep\) \{ victim = c; break; \} \}\s*if \(!victim\) victim = els\.log\.firstElementChild;\s*els\.log\.removeChild\(victim\);/,
+    "F-P7-7 / M-5: eviction takes the oldest NON-system line, then the oldest unkept system line, then the oldest record line — the session's record survives a flood and the transcript never freezes");
+  assert.match(addLine, /^function addLine\(kind, who, text, keep = false\)/m, "addLine takes the `keep` marker");
+  assert.match(addLine, /if \(keep\) li\.dataset\.keep = "1";/, "...and stamps it on the element the eviction tiers read");
+  // The record lines are marked where they are written. Pin the count and the
+  // two the behavioural test loses first, so a marker cannot quietly vanish.
+  const kept = (appSrc.match(/addLine\("sys", "", [^\n]*, true\);/g) || []);
+  assert.strictEqual(kept.length, 25, `25 record lines carry \`keep\` (got ${kept.length}) — add or remove one deliberately`);
+  assert.ok(kept.some((l) => /joined room — encryption/.test(l)), "the session line is a record line");
+  assert.ok(kept.some((l) => /you created this chat/.test(l)), "the owner line is a record line");
   // M-1 (review of 4b9d2c6..a88baa4): the queue-full line was the one unprompted
   // system line a relay could vary (`${n} people were turned away`), which the
-  // collapse rule cannot fold. It is a constant string now, and latched.
-  assert.match(handle, /if \(!saidTurnedAway\) \{\s*saidTurnedAway = true;\s*addLine\("sys", "", "\[someone was turned away — the waiting queue is full\]"\);/,
-    "M-1: the queue-full narration is a constant string, said once per connection");
-  assert.doesNotMatch(handle, /turned away[^\n]*\$\{/, "M-1: nothing relay-controlled is interpolated into the queue-full line");
-  const turnedAwayWrites = appSrc.split("\n").map((l) => l.trim()).filter((l) => /^saidTurnedAway = /.test(l)).sort();
+  // collapse rule cannot fold. It is a constant string now, latched, and owner-only.
+  const turnedAwayArm = handle.slice(handle.indexOf('case "turned-away": {'), handle.indexOf('case "denied": {'));
+  assert.ok(turnedAwayArm.length > 0, "fixture: the turned-away arm was found");
+  assert.match(turnedAwayArm, /if \(roomRole !== "owner"\) break;/, "M-1/Info-2: only the owner is told");
+  assert.match(turnedAwayArm, /if \(!saidTurnedAway\) \{\s*saidTurnedAway = true;\s*addLine\("sys", "", "\[someone was turned away — the waiting queue is full\]", true\);\s*hint\(/,
+    "M-1: the queue-full narration is a constant string, said once per connection, and hint() sits INSIDE the latch");
+  assert.strictEqual((turnedAwayArm.match(/addLine\(/g) || []).length, 1, "M-1: one addLine in the arm");
+  assert.strictEqual((turnedAwayArm.match(/hint\(/g) || []).length, 1, "M-1 (second review L-2): one hint() in the arm, and it is the latched one");
+  assert.doesNotMatch(turnedAwayArm, /\$\{/, "M-1: nothing relay-controlled is interpolated into the queue-full line");
+  const turnedAwayWrites = appSrc.split("\n").map((l) => l.trim()).filter((l) => /^saidTurnedAway (=|\|\|=|&&=|\?\?=)/.test(l)).sort();
   assert.deepStrictEqual(turnedAwayWrites, ["saidTurnedAway = false;", "saidTurnedAway = false;", "saidTurnedAway = true;"],
     "M-1: the queue-full latch is reset in the two per-connection resets and set in exactly one place");
+  // Second review of the M-1 fix: a repeated `joined` re-narrated the session
+  // start (two distinct lines per frame), the one alternation a relay could
+  // drive to the cap alone. The seat is write-once; a repeat is dropped.
+  assert.match(handle, /case "joined": \{[\s\S]*?if \(joined && m\.role === roomRole\) break;\s*joined = true;/,
+    "a repeated `joined` for the seat we already hold is dropped before anything is narrated");
   assert.match(addLine, /last\.className === "sys" && last\.dataset\.text === text/,
     "M-5: a system line identical to the previous one is counted onto it, not appended");
   assert.ok(addLine.indexOf("LOG_MAX_LINES") < addLine.lastIndexOf("scrollTop"), "...eviction happens before the layout-forcing scroll");

@@ -82,6 +82,10 @@ async function connect() {
 }
 const lines = () => dom.lines();
 const said = (re) => lines().some((l) => re.test(l));
+// Lines matching `re`, counting a collapsed "(×n)" line as n — identical
+// consecutive system lines fold, and the transcript is never cleared between
+// the connections below, so a plain line count can miss a repeat.
+const tally = (re) => lines().filter((l) => re.test(l)).reduce((n, l) => n + (Number((/×\s*(\d+)/.exec(l) || [])[1]) || 1), 0);
 
 // ---- F-PROTO-001, guest side: a seat nobody asked for ------------------------
 // The only legitimate route to a guest seat is pending -> knock -> joined:guest.
@@ -213,6 +217,62 @@ const said = (re) => lines().some((l) => re.test(l));
   console.log("OK  7a/M-1: 1 200 queue-full frames with a varying count cost exactly one line (executed)");
 }
 
+// ---- second review of the M-1 fix: the alternations a relay CAN drive --------
+// The collapse rule folds only CONSECUTIVE identical lines, so two alternating
+// lines defeat it. `joined` used to re-narrate the session start on every
+// repeat — two distinct lines per 32-byte frame — and 300 of them reached the
+// cap with no peer and no user; then the first M-1 fix's "evict the newest"
+// fallback froze the transcript, so every later line was destroyed on
+// arrival. Now: a repeated `joined` for the seat we hold is dropped, and the
+// eviction tiers keep the record lines. Against the old code the first
+// assertion fails (300 frames -> 500 lines, "joined room" gone).
+{
+  const count = (re) => lines().filter((l) => re.test(l)).length;
+  const ws = await connect();
+  await ws.deliver({ type: "joined", role: "owner" });
+  const sessionLines = count(/joined room/);
+  const before = lines().length;
+  for (let i = 0; i < 300; i++) await ws.deliver({ type: "joined", role: "owner" });
+  assert.strictEqual(count(/joined room/), sessionLines, "a repeated `joined` narrates nothing — and evicts nothing");
+  assert.strictEqual(lines().length, before, "...zero lines for 300 frames");
+  assert.notStrictEqual(ws.readyState, 3, "...and it is not fatal (a changed role still is, above)");
+  // Every unprompted line the relay can force, interleaved so nothing is
+  // consecutive: still far from the cap, and the record lines are still there.
+  const junk = (i) => ({ type: "msg", room: ROOM, alg: "AES256", payload: Buffer.from(JSON.stringify({ iv: "AAAAAAAAAAAAAAAA", ct: "AAAA", n: 5000 + i })).toString("base64") });
+  for (let i = 0; i < 400; i++) {
+    await ws.deliver(junk(i));
+    await ws.deliver({ type: "turned-away", count: i + 2 });
+    await ws.deliver({ type: "joined", role: "owner" });
+    await ws.deliver({ type: "pending" });
+    await ws.deliver({ type: "withdrawn", jid: "0123456789abcdef" });
+    await ws.deliver({ type: "error", reason: "x" + i });
+  }
+  assert.ok(lines().length <= before + 3,
+    `M-1: 2 400 interleaved relay frames of every unprompted kind cost at most three lines (got ${lines().length - before})`);
+  assert.strictEqual(count(/joined room/), sessionLines, "...and the session line is untouched");
+  // The record marker is on the element the eviction tiers read, on the
+  // lines the M-5 flood loses first.
+  const log = dom.el("log");
+  const isKept = (re) => log.children.filter((c) => re.test(c.textContent)).every((c) => c.dataset.keep === "1");
+  assert.ok(isKept(/joined room/) && isKept(/you created this chat/), "the session lines carry the `keep` marker");
+  assert.ok(log.children.some((c) => /arrived before you verified/.test(c.textContent) && !c.dataset.keep), "...and a junk refusal does not");
+  console.log("OK  7a/M-1: the alternations a relay can drive alone stay far below the cap, the record is marked (executed)");
+}
+
+// ---- a guest is not told about the owner's queue ------------------------------
+// Info-2 (second review): the arm's comment said "only the owner is told" and
+// the code did not check. The nudge to "agree a NEW chat code" delivered to
+// the guest in the queue is a lever to abandon a working code.
+{
+  const count = (re) => lines().filter((l) => re.test(l)).length;
+  const turned = count(/turned away/);
+  const ws = await connect();
+  await ws.deliver({ type: "pending" });
+  await ws.deliver({ type: "turned-away", count: 3 });
+  assert.strictEqual(count(/turned away/), turned, "a guest in the queue is not told the queue is full");
+  console.log("OK  7a/Info-2: the queue-full line is owner-only (executed)");
+}
+
 // ---- the legitimate guest path, executed --------------------------------------
 // Everything above drives REFUSALS. The positive half — pending -> knock ->
 // joined:guest succeeds — was guarded only by the source allow-list, the layer
@@ -222,9 +282,10 @@ const said = (re) => lines().some((l) => re.test(l));
   const count = (re) => lines().filter((l) => re.test(l)).length;
   const sessions = count(/joined room/);
   const refusals = count(/without ever asking to be let in/);
+  const waits = tally(/waiting — the person who created this chat has to let you in/);
   const ws = await connect();
   await ws.deliver({ type: "pending" });
-  assert.ok(said(/waiting — the person who created this chat has to let you in/),
+  assert.strictEqual(tally(/waiting — the person who created this chat has to let you in/), waits + 1,
     "pending: the guest is told they are in the approval queue");
   const knock = ws.sent.find((f) => f.type === "knock");
   assert.ok(knock && knock.room === ROOM, "pending: the client knocks for THIS room");

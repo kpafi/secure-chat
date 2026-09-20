@@ -496,7 +496,7 @@ function accountStatus(text, cls = "") {
 }
 
 const LOG_MAX_LINES = 500; // F-P7-7
-function addLine(kind, who, text) {
+function addLine(kind, who, text, keep = false) {
   // Review of the F-P7-7 fix (M-5): a relay that floods junk `msg` frames makes
   // us narrate "[undecryptable message …]" once per frame, and oldest-first
   // eviction then pushed the SECURITY lines ("you approved this peer",
@@ -517,6 +517,7 @@ function addLine(kind, who, text) {
   const li = document.createElement("li");
   li.className = kind;
   if (kind === "sys" && !who) li.dataset.text = text;
+  if (keep) li.dataset.keep = "1"; // the session's record: evicted last (see below)
   if (who) {
     const w = document.createElement("span");
     w.className = "who";
@@ -528,15 +529,24 @@ function addLine(kind, who, text) {
   // F-P7-7: the transcript is bounded. Every frame the relay can make us
   // narrate costs a node plus a synchronous layout (scrollTop below), so an
   // unbounded list is O(n^2) work an attacker controls.
-  // Review of 4b9d2c6..a88baa4 (M-1): when ONLY system lines remain, the
-  // fallback used to be the OLDEST one — i.e. the session's security record
-  // ("joined room", the pinned key, the approval prompt) went first. Now the
-  // NEWEST line goes: a transcript of 500 distinct system lines is not a
-  // conversation, it is a flood, and the evidence of how the session started
-  // is worth more than its 501st warning (hint() still shows the newest).
+  // Eviction order, in three tiers. Review of 4b9d2c6..a88baa4 (M-1) found
+  // that once only system lines remained the fallback evicted the OLDEST —
+  // the session's record ("joined room", the approval prompt) went first.
+  // The first fix flipped it to the NEWEST, and its own review (M-1 again)
+  // showed that freezes the transcript: every later line, including a
+  // genuine refusal, is appended and destroyed. So instead the lines that ARE
+  // the record are marked `keep` where they are written (each is once per
+  // connection by construction: write-once role, a closed socket, a decided
+  // approval) and go last:
+  //   1. the oldest NON-system line (a conversation is the cheapest thing to lose);
+  //   2. the oldest system line that is not part of the record;
+  //   3. the oldest record line — reachable only through the user's own
+  //      reconnects, never through relay frames.
   while (els.log.childElementCount > LOG_MAX_LINES) {
-    let victim = els.log.lastElementChild;
+    let victim = null;
     for (const c of els.log.children) { if (c.className !== "sys") { victim = c; break; } }
+    if (!victim) for (const c of els.log.children) { if (!c.dataset.keep) { victim = c; break; } }
+    if (!victim) victim = els.log.firstElementChild;
     els.log.removeChild(victim);
   }
   els.log.scrollTop = els.log.scrollHeight;
@@ -2133,6 +2143,7 @@ async function connectInner() {
   myNonce = freshNonce();
   peerNonce = null;
   helloAnswered = false;
+  joined = false;   // a repeated `joined` is dropped (see the arm); the flag must not leak across connections
   roomRole = null;
   admittedBundle = null;
   admittedAnon = false;
@@ -2720,7 +2731,7 @@ async function handleMessage(room, raw) {
       els.roomShort.textContent = room.slice(0, 8) + "…" + room.slice(-8);
       showScreen("chat");
       setStatus("waiting for approval");
-      addLine("sys", "", "waiting — the person who created this chat has to let you in");
+      addLine("sys", "", "waiting — the person who created this chat has to let you in", true);
       hint("Waiting for the other person to approve you. They see the fingerprint of your key and decide.");
       ws.send(JSON.stringify({
         type: "knock", room, payload: packKey(await knockIntro(room)),
@@ -2742,9 +2753,10 @@ async function handleMessage(room, raw) {
       // OLDEST system line once only system lines remained). The count was
       // relay-controlled and told the owner nothing they can act on; say it
       // once per connection, like the deprecated-alg refusal.
+      if (roomRole !== "owner") break; // only the owner is asked to admit anyone (second review, Info-2)
       if (!saidTurnedAway) {
         saidTurnedAway = true;
-        addLine("sys", "", "[someone was turned away — the waiting queue is full]");
+        addLine("sys", "", "[someone was turned away — the waiting queue is full]", true);
         hint(
           "Someone could not even reach the approval queue because it is full. If the person you invited " +
           "is stuck on \"room full\", agree a NEW chat code with them out of band.",
@@ -2788,13 +2800,20 @@ async function handleMessage(room, raw) {
     }
 
     case "joined": {
+      // Second review of the M-1 fix: a repeated `joined` re-narrated the
+      // session start — two distinct lines per 32-byte frame, which the
+      // consecutive-collapse rule cannot fold, so 300 frames reached the cap
+      // with no peer and no user. The seat is write-once; a second `joined`
+      // carries nothing new and is dropped (a CHANGED role is still refused
+      // below, because that one is evidence).
+      if (joined && m.role === roomRole) break;
       joined = true;
       // An older relay answers `join` with a bare {"joined"} — no role, no
       // admission control. Refusing beats silently running the protocol this
       // fix removed: the room would again be first-come-first-served and the
       // approval prompt would never appear, with nothing on screen to say so.
       if (m.role !== "owner" && m.role !== "guest") {
-        addLine("sys", "", "[this relay does not support join approval — refusing]");
+        addLine("sys", "", "[this relay does not support join approval — refusing]", true);
         hint("This relay is running an older protocol without the join-approval step. Update the relay (or your app) before using it.", true);
         if (ws) ws.close();
         return;
@@ -2807,7 +2826,7 @@ async function handleMessage(room, raw) {
       if (roomRole === null) {
         roomRole = m.role;
       } else if (roomRole !== m.role) {
-        addLine("sys", "", "[the relay changed our role mid-session — refusing]");
+        addLine("sys", "", "[the relay changed our role mid-session — refusing]", true);
         hint("The relay tried to change your role in this room. Disconnecting.", true);
         if (ws) ws.close();
         return;
@@ -2819,7 +2838,7 @@ async function handleMessage(room, raw) {
       // become a guest is pending -> knock -> joined:guest, so a seat handed to
       // us without ever passing through the queue means no owner approved it.
       if (roomRole === "guest" && !wasPending) {
-        addLine("sys", "", "[we were seated in this room without ever asking to be let in — refusing]");
+        addLine("sys", "", "[we were seated in this room without ever asking to be let in — refusing]", true);
         hint("This relay put you in the room without the owner approving you. Disconnecting.", true);
         if (ws) ws.close();
         return;
@@ -2827,9 +2846,9 @@ async function handleMessage(room, raw) {
       els.roomShort.textContent = room.slice(0, 8) + "…" + room.slice(-8);
       showScreen("chat");
       setStatus("connected", "ok");
-      addLine("sys", "", `joined room — encryption: ${sessionAlg}`);
+      addLine("sys", "", `joined room — encryption: ${sessionAlg}`, true);
       if (roomRole === "owner") {
-        addLine("sys", "", "you created this chat — you decide who is let in");
+        addLine("sys", "", "you created this chat — you decide who is let in", true);
       }
       // Phase 1: announce our fresh session nonce. For handshake modes the
       // signed handshake follows once we also know the peer's nonce; for
@@ -2927,7 +2946,7 @@ async function handleMessage(room, raw) {
         const idbCanon = canonicalBundle(idb);
         const ok = await verifyHandshake(idbCanon, room, [myNonce, peerNonce], pub, sig);
         if (!ok) {
-          addLine("sys", "", "[handshake signature INVALID — refusing to connect; a relay may be tampering with the key exchange]");
+          addLine("sys", "", "[handshake signature INVALID — refusing to connect; a relay may be tampering with the key exchange]", true);
           hint("Authentication failed — disconnecting. This is what a MITM attempt looks like.", true);
           if (ws) ws.close();
           return;
@@ -2943,7 +2962,7 @@ async function handleMessage(room, raw) {
         // the relay, so gating the check on it would let a relay switch the
         // check off by re-sending `joined` with role "guest" (M-2, F-PROTO-001).
         if (admittedBundle && !sameBundle(admittedBundle, idbCanon)) {
-          addLine("sys", "", "[the peer that connected is NOT the one you let in — refusing]");
+          addLine("sys", "", "[the peer that connected is NOT the one you let in — refusing]", true);
           hint("The identity that completed the key exchange differs from the one you approved. Disconnecting.", true);
           if (ws) ws.close();
           return;
@@ -2951,7 +2970,7 @@ async function handleMessage(room, raw) {
         // Admitting someone who showed no identity, then receiving a signed
         // handshake, means the socket changed its story between the two steps.
         if (admittedAnon) {
-          addLine("sys", "", "[the peer you let in had no identity but now sends one — refusing]");
+          addLine("sys", "", "[the peer you let in had no identity but now sends one — refusing]", true);
           hint("This peer introduced itself without an identity and then produced one. Disconnecting.", true);
           if (ws) ws.close();
           return;
@@ -2963,7 +2982,7 @@ async function handleMessage(room, raw) {
         // ever ADD a refusal, never skip the approval below (M-2's owner half,
         // kept because it costs nothing).
         if (roomRole === "owner" && !admittedSomeone()) {
-          addLine("sys", "", "[the relay seated someone in your room without asking you — refusing]");
+          addLine("sys", "", "[the relay seated someone in your room without asking you — refusing]", true);
           hint("You own this chat and approved nobody, yet someone completed the key exchange. The relay is not behaving. Disconnecting.", true);
           if (ws) ws.close();
           return;
@@ -2990,21 +3009,21 @@ async function handleMessage(room, raw) {
             // held in the passphrase-backed contacts store. Item 14 deleted the
             // route that compared against an unsigned directory answer.
             approvedBundle = idbCanon;
-            addLine("sys", "", `peer key ${trusted} — no approval needed`);
+            addLine("sys", "", `peer key ${trusted} — no approval needed`, true);
           } else {
-            addLine("sys", "", "[nobody has approved this connection — asking you before any keys are exchanged]");
+            addLine("sys", "", "[nobody has approved this connection — asking you before any keys are exchanged]", true);
             const allowed = await requestPeerApproval(idbCanon);
             // The socket can close under us while the prompt is open; the pump
             // check at the top of handleMessage does not re-run after an await.
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
             if (!allowed) {
-              addLine("sys", "", "[you refused this peer — disconnecting]");
+              addLine("sys", "", "[you refused this peer — disconnecting]", true);
               hint("You refused the key that was offered. Nothing was exchanged.", true);
               ws.close();
               return;
             }
             approvedBundle = idbCanon;
-            addLine("sys", "", "you approved this peer — their key is now pinned for this session");
+            addLine("sys", "", "you approved this peer — their key is now pinned for this session", true);
             // A knock may have queued behind the prompt (an owner who was told
             // it is a guest still receives them).
             await showNextKnock();
@@ -3013,7 +3032,7 @@ async function handleMessage(room, raw) {
         // A second, different identity after an approval is a relay swapping the
         // seat. C-01 below catches it too, but say the specific thing here.
         if (!sameBundle(approvedBundle, idbCanon)) {
-          addLine("sys", "", "[a different identity than the one approved completed the key exchange — refusing]");
+          addLine("sys", "", "[a different identity than the one approved completed the key exchange — refusing]", true);
           hint("The identity that completed the key exchange is not the one that was approved. Disconnecting.", true);
           if (ws) ws.close();
           return;
@@ -3030,7 +3049,7 @@ async function handleMessage(room, raw) {
         if (peerBundle === null) {
           peerBundle = idbCanon; // write-once for this connection, canonical (H-1)
         } else if (!sameBundle(peerBundle, idbCanon)) {
-          addLine("sys", "", "[a SECOND identity tried to complete the key exchange — refusing; this is a relay MITM attempt]");
+          addLine("sys", "", "[a SECOND identity tried to complete the key exchange — refusing; this is a relay MITM attempt]", true);
           hint("Two different identities attempted this handshake — disconnecting to protect you.", true);
           if (ws) ws.close();
           return;
@@ -3153,7 +3172,7 @@ async function enterVerification(room, verifiedBundle) {
       ", so this app cannot check whether this contact's key changed since last time. " +
       "Treat this as an UNVERIFIED first contact: confirm the safety number below in person " +
       "before you continue. Unlock your contacts on the Profile screen to restore key-change warnings.";
-    addLine("sys", "", "[contact store unreadable — pinned-key change detection is OFF]");
+    addLine("sys", "", "[contact store unreadable — pinned-key change detection is OFF]", true);
     hint("Key-change detection is off — your saved contacts could not be opened.", true);
     return;
   }
@@ -3172,7 +3191,7 @@ async function enterVerification(room, verifiedBundle) {
       "This device's protected record says your saved contacts are older than they should be, so the " +
       "pin for this contact may be one you had already replaced. Compare the safety number with them " +
       "in person (or over a call where you recognise their voice) before you continue.";
-    addLine("sys", "", "[pin marked suspect after a rollback of your saved contacts — re-verification required]");
+    addLine("sys", "", "[pin marked suspect after a rollback of your saved contacts — re-verification required]", true);
     hint("Confirm the safety number with your contact before messaging unlocks.");
     return;
   }
@@ -3198,7 +3217,7 @@ async function enterVerification(room, verifiedBundle) {
       "Your earlier verification did not cover the keys now used to encrypt messages to this contact. " +
       "Compare the safety number with them in person (or over a call where you recognise their voice) " +
       "before proceeding.";
-    addLine("sys", "", "[pin predates encryption-key coverage — re-verification required]");
+    addLine("sys", "", "[pin predates encryption-key coverage — re-verification required]", true);
   } else if (pin) {
     // A pin exists but the key changed: loud warning, require re-verification.
     els.verify.classList.add("changed");
@@ -3207,7 +3226,7 @@ async function enterVerification(room, verifiedBundle) {
       "The identity key you pinned before is different now. This happens if your contact reset their " +
       "device — but it is also what an interceptor looks like. Do NOT proceed until you have confirmed " +
       "this safety number with them over a trusted channel.";
-    addLine("sys", "", "[pinned identity CHANGED — verification required]");
+    addLine("sys", "", "[pinned identity CHANGED — verification required]", true);
     // `pinsReadable()` above is also true when this device has NO contact store
     // at all, and `pinWasSwept()` throws in that state — so the unlock check is
     // not redundant with it.
@@ -3237,7 +3256,7 @@ async function enterVerification(room, verifiedBundle) {
       "There was a verified pin for this key, and it was removed when you revoked or removed a " +
       "contact that used these keys. This is NOT a first contact: compare the safety number " +
       "with them in person before you continue, exactly as you did the first time.";
-    addLine("sys", "", "[pin cleared by an earlier revocation — re-verification required]");
+    addLine("sys", "", "[pin cleared by an earlier revocation — re-verification required]", true);
   } else {
     els.verify.classList.remove("changed");
     els.verifyTitle.textContent = "Verify your contact — in person";
@@ -3252,7 +3271,7 @@ function unlockMessaging() {
   verified = true;
   els.verify.hidden = true;
   enableSend(true);
-  addLine("sys", "", "secure channel established");
+  addLine("sys", "", "secure channel established", true);
   hint("Verified. Messages are end-to-end encrypted.", false);
   els.hint.className = "hint ok";
 }
@@ -3281,12 +3300,12 @@ async function onVerifyOk() {
       verified: true,
     }).catch(() => { /* contact mirroring must never block messaging */ });
   }
-  addLine("sys", "", "contact verified and pinned");
+  addLine("sys", "", "contact verified and pinned", true);
   unlockMessaging();
 }
 
 function onVerifyNo() {
-  addLine("sys", "", "disconnected — contact not verified");
+  addLine("sys", "", "disconnected — contact not verified", true);
   if (ws) ws.close();
 }
 

@@ -227,6 +227,9 @@ const ok = (name) => { n++; console.log("OK  " + name); };
   // A deny-list cannot win this: the attacker picks the spelling. So this is an
   // ALLOW-LIST of every executable line in the window. Nothing may be added here
   // at all, whatever it is made of.
+  // 2026-09-20 (second review of the M-1 fix): the record lines in this window
+  // and in the joined-arm window below carry addLine's `keep` marker, so the
+  // transcript's eviction tiers evict them last. Nothing else changed.
   const EXPECTED_WINDOW = [
     "if (!cipher.needsHandshake) {",
     'throw new Error("unexpected key-exchange message for this mode");',
@@ -241,25 +244,25 @@ const ok = (name) => { n++; console.log("OK  " + name); };
     "const idbCanon = canonicalBundle(idb);",
     "const ok = await verifyHandshake(idbCanon, room, [myNonce, peerNonce], pub, sig);",
     "if (!ok) {",
-    'addLine("sys", "", "[handshake signature INVALID — refusing to connect; a relay may be tampering with the key exchange]");',
+    'addLine("sys", "", "[handshake signature INVALID — refusing to connect; a relay may be tampering with the key exchange]", true);',
     'hint("Authentication failed — disconnecting. This is what a MITM attempt looks like.", true);',
     "if (ws) ws.close();",
     "return;",
     "}",
     "if (admittedBundle && !sameBundle(admittedBundle, idbCanon)) {",
-    'addLine("sys", "", "[the peer that connected is NOT the one you let in — refusing]");',
+    'addLine("sys", "", "[the peer that connected is NOT the one you let in — refusing]", true);',
     'hint("The identity that completed the key exchange differs from the one you approved. Disconnecting.", true);',
     "if (ws) ws.close();",
     "return;",
     "}",
     "if (admittedAnon) {",
-    'addLine("sys", "", "[the peer you let in had no identity but now sends one — refusing]");',
+    'addLine("sys", "", "[the peer you let in had no identity but now sends one — refusing]", true);',
     'hint("This peer introduced itself without an identity and then produced one. Disconnecting.", true);',
     "if (ws) ws.close();",
     "return;",
     "}",
     'if (roomRole === "owner" && !admittedSomeone()) {',
-    'addLine("sys", "", "[the relay seated someone in your room without asking you — refusing]");',
+    'addLine("sys", "", "[the relay seated someone in your room without asking you — refusing]", true);',
     'hint("You own this chat and approved nobody, yet someone completed the key exchange. The relay is not behaving. Disconnecting.", true);',
     "if (ws) ws.close();",
     "return;",
@@ -274,19 +277,19 @@ const ok = (name) => { n++; console.log("OK  " + name); };
     "const trusted = peerAlreadyTrusted(idbCanon);",
     "if (trusted) {",
     "approvedBundle = idbCanon;",
-    'addLine("sys", "", `peer key ${trusted} — no approval needed`);',
+    'addLine("sys", "", `peer key ${trusted} — no approval needed`, true);',
     "} else {",
-    'addLine("sys", "", "[nobody has approved this connection — asking you before any keys are exchanged]");',
+    'addLine("sys", "", "[nobody has approved this connection — asking you before any keys are exchanged]", true);',
     "const allowed = await requestPeerApproval(idbCanon);",
     "if (!ws || ws.readyState !== WebSocket.OPEN) return;",
     "if (!allowed) {",
-    'addLine("sys", "", "[you refused this peer — disconnecting]");',
+    'addLine("sys", "", "[you refused this peer — disconnecting]", true);',
     'hint("You refused the key that was offered. Nothing was exchanged.", true);',
     "ws.close();",
     "return;",
     "}",
     "approvedBundle = idbCanon;",
-    'addLine("sys", "", "you approved this peer — their key is now pinned for this session");',
+    'addLine("sys", "", "you approved this peer — their key is now pinned for this session", true);',
     "await showNextKnock();",
     "}",
     "}",
@@ -505,11 +508,18 @@ const ok = (name) => { n++; console.log("OK  " + name); };
 
   assert.deepStrictEqual(window, [
     'case "joined": {',
+    // 2026-09-20 (second review of the M-1 fix): a REPEATED `joined` for the
+    // seat we already hold is dropped before anything is narrated — it used to
+    // re-narrate the session start, two distinct lines per frame, the one
+    // alternation a relay could drive to the transcript cap alone. It runs
+    // before the gates because it decides nothing: a changed role still
+    // reaches the refusal below, and a first `joined` passes straight through.
+    "if (joined && m.role === roomRole) break;",
     "joined = true;",
     // An older relay's bare {"joined"} is refused rather than silently running
     // the first-come-first-served protocol this fix removed.
     'if (m.role !== "owner" && m.role !== "guest") {',
-    'addLine("sys", "", "[this relay does not support join approval — refusing]");',
+    'addLine("sys", "", "[this relay does not support join approval — refusing]", true);',
     'hint("This relay is running an older protocol without the join-approval step. Update the relay (or your app) before using it.", true);',
     "if (ws) ws.close();",
     "return;",
@@ -519,14 +529,14 @@ const ok = (name) => { n++; console.log("OK  " + name); };
     "if (roomRole === null) {",
     "roomRole = m.role;",
     "} else if (roomRole !== m.role) {",
-    'addLine("sys", "", "[the relay changed our role mid-session — refusing]");',
+    'addLine("sys", "", "[the relay changed our role mid-session — refusing]", true);',
     'hint("The relay tried to change your role in this room. Disconnecting.", true);',
     "if (ws) ws.close();",
     "return;",
     "}",
     // A seat that never went through the queue.
     'if (roomRole === "guest" && !wasPending) {',
-    'addLine("sys", "", "[we were seated in this room without ever asking to be let in — refusing]");',
+    'addLine("sys", "", "[we were seated in this room without ever asking to be let in — refusing]", true);',
     'hint("This relay put you in the room without the owner approving you. Disconnecting.", true);',
     "if (ws) ws.close();",
     "return;",

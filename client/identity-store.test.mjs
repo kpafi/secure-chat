@@ -513,6 +513,15 @@ async function testExhaustedIdentityCounterIsNeverClean() {
     const v = idstore.judge({ generation: weird, floorClaim: true });
     assert.strictEqual(v.ok, false, `a malformed counter (${String(weird)}) never reads clean under a recorded slot`);
   }
+  // Second review (Info-1): a counter that is a valid integer but past int32
+  // (a foreign-build blob; import accepts it) must stay WRITABLE — clamped to
+  // the ceiling with the warning — not thrown on, and never rewound to 0.
+  const foreign = fakeIdentity();
+  foreign.generation = 2 ** 31;
+  foreign.floorClaim = true;
+  const saved = await idstore.persistIdentity(foreign, PASS);
+  assert.strictEqual(saved.generation, MAXG, "a counter past int32 is written AT the ceiling, not thrown on and not rewound");
+  assert.match(saved.warning, /ceiling/, "...with the ceiling warning");
   console.log("OK  F-ATREST-008: an identity counter that can no longer advance is never clean");
 }
 

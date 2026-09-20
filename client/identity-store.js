@@ -118,6 +118,12 @@ const CLAIM_UNCONFIRMED = "unconfirmed";
 const MAX_GENERATION = 0x7fffffff - 1;
 // Only language constructs — `Number.isInteger` is a writable global (H-1).
 const isGen = (v) => typeof v === "number" && (v | 0) === v && v >= 0;
+// A counter that is a non-negative integer but not necessarily int32 — what
+// `Identity.import` accepts. persistIdentity uses this so a foreign-build blob
+// past int32 is still WRITABLE (clamped to the ceiling, with the warning)
+// rather than thrown on; the verdict keeps the stricter isGen (second review
+// of d98f220, Info-1). Language constructs only, like isGen.
+const isCount = (v) => typeof v === "number" && v >= 0 && v % 1 === 0 && v < Infinity;
 
 // Captured once, at load. `null` in a plain browser; `broken` when the app's
 // marker says a floor should exist and none is usable.
@@ -205,7 +211,7 @@ export async function persistIdentity(identity, passphrase) {
   // instead of alarming each other — a tab that unlocked at generation N and
   // writes after another tab reached N+2 must write N+3, not N+1.
   let base = current > identity.generation ? current : identity.generation;
-  if (!isGen(base)) { // language constructs only, like the verdict (H-1)
+  if (!isCount(base)) { // language constructs only, like the verdict (H-1)
     throw new Error("identity write counter is malformed — refusing to write the identity");
   }
   let generation = base + 1;
@@ -226,7 +232,7 @@ export async function persistIdentity(identity, passphrase) {
     // one value along, and with a CLEAN verdict so no banner said why). The
     // rule now: the blob is ALWAYS writable. At the ceiling it is written at
     // its own current counter, never advanced, never refused.
-    generation = isGen(identity.generation)
+    generation = isCount(identity.generation)
       ? (identity.generation > MAX_GENERATION ? MAX_GENERATION : identity.generation)
       : 0;
     measured = false;

@@ -334,6 +334,16 @@ async function testIdentityBlobLengthHidesItsState() {
   assert.strictEqual((await openSealed(astral, "pw")).length, IDENTITY_PAD_TARGET,
     "F-P7-20: the padding counts bytes, not code units — a non-ASCII field must not move the length");
   assert.strictEqual(astral.ct.length, sealed.ct.length, "...so the sealed length is the same");
+  // Second review (L-1): pinning the exported NAME does not pin the grid
+  // export() actually uses — a private 8192 inside export() still rounds a
+  // 13.4 KiB record to 16384. Seal a record that outgrows one block and
+  // assert it lands on exactly TWO (an 8192 grid gives 24576, 4096 gives
+  // 20480): that binds the grid AND the documented "next multiple, never a
+  // finer grid" step.
+  id.deviceFlags = { ["x".repeat(3100)]: true };
+  const oversize = JSON.parse(await id.export("pw"));
+  assert.strictEqual((await openSealed(oversize, "pw")).length, 2 * IDENTITY_PAD_TARGET,
+    "F-P7-20: a record that outgrows the block steps to the NEXT MULTIPLE of the 16 KiB target, never to a finer grid");
   // Restore the loop's last state for the round trip below.
   id.deviceFlags = { contactsEstablished: true, chatsEstablished: true };
   id.generation = 999999;
