@@ -96,6 +96,10 @@ F-PROTO-005, F-ATREST-001 (the script stops at its first failure, so -002 is
 shown by the same mechanism, not separately), F-ATREST-003/004/007 and
 F-ATREST-005 each fail against the stashed pre-fix file.
 
+**Merged to `master` 2026-09-21 (`--no-ff`).** Review guide, deploy order and
+the on-device checks are in `deploy/release-2026-09-21.md`; the deploy script
+is `deploy/deploy-2026-09-21.sh` (APK FIRST, then the script).
+
 **⬜ DELIVERY — nothing deployed.** In order: (1) review the diff (it touches
 the login protocol, at-rest storage, the admission path and the floor module —
 the pentest-new-code pass is in this session's notes); (2) merge; (3) deploy
