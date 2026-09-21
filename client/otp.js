@@ -103,107 +103,32 @@ const WM_DOMAIN = "secure-chat/otp-watermark/v1";
 // residual stands — documented in README. This is why OTP's guarantee is
 // strongest in the app, where pads actually live (they are exchanged in person,
 // device to device).
-const NATIVE_ABSENT = -1;
-const NATIVE_TAMPERED = -2;
+// Pentest 2026-08-07: the floor capture (F-1, H-1, H-A, round-2 H-1) moved to
+// nativefloor.js so the contact and chat stores share it. Nothing about how
+// the bridge is found, validated or refused changed; see that file.
+import {
+  captureNativeFloor, NATIVE_ABSENT, NATIVE_TAMPERED, maxOf, floorUnavailableError,
+} from "./nativefloor.js";
+const nativeFloor = captureNativeFloor();
 
-// Pentest 2026-07-29 H-1. Feature-detecting the bridge alone was a silent
-// downgrade: `SecureChatPadFloor` is an ordinary writable global, so
-// `delete window.SecureChatPadFloor` at document-start made the code below
-// return null, the floor went away, and NOTHING said so — on the platform whose
-// whole point is that the floor is unreachable from JS.
-//
-// The app's document-start script now also defines `__SECURE_CHAT_NATIVE_FLOOR__`
-// as a non-writable, NON-CONFIGURABLE property. That is the load-bearing part:
-// a JS attacker can still delete the bridge, but `delete` on a non-configurable
-// property does not remove it, so they cannot also erase the statement that a
-// floor was supposed to be here. Marker present + bridge missing or unusable is
-// therefore not "plain browser" — it is evidence of tampering, and it fails
-// CLOSED on every pad rather than quietly dropping the control.
-//
-// A plain browser sets neither, so it still gets `null` and the documented
-// residual (see README) — unchanged.
-// Fix review 2026-07-30 (H-A). Hardening the marker alone was not enough: this
-// code used to look the bridge up by the ordinary global `SecureChatPadFloor`
-// and accept anything with `read`/`bump` functions. An attacker never needed to
-// DELETE it — installing a lookalike that answers "no floor", or overwriting
-// just the two methods on the real object, satisfied every check while the real
-// Keystore-backed floor was never consulted. Two assignments, and F-1 was void.
-//
-// The app now captures the bridge at document-start, before any page script can
-// run, and republishes it FROZEN under `__SECURE_CHAT_PAD_FLOOR__` as a
-// non-configurable property, with the methods bound so a later
-// `SecureChatPadFloor.read = fake` cannot reach them. That name is the only one
-// read here. `__SECURE_CHAT_NATIVE_FLOOR__` is the separate, also
-// non-configurable statement that a floor is SUPPOSED to exist, so
-// "expected but not securable" is a distinguishable, fail-closed state rather
-// than something that reads as a plain browser.
-const nativeFloorMarker = globalThis.__SECURE_CHAT_NATIVE_FLOOR__;
-const nativeFloorExpected = nativeFloorMarker === true || nativeFloorMarker === "unavailable";
-
-const nativeFloor = (() => {
-  const b = globalThis.__SECURE_CHAT_PAD_FLOOR__;
-  if (!b || typeof b.read !== "function" || typeof b.bump !== "function") {
-    if (!nativeFloorExpected) return null;   // genuine browser: no floor exists
-    // Marker without a usable protected bridge. Refuse everything rather than
-    // degrade — this is either the app failing to secure the interface, or
-    // someone having set the marker to brick OTP (loud, and fail-closed).
-    return { read: () => NATIVE_TAMPERED, bump: () => NATIVE_TAMPERED, broken: true };
-  }
-  // Fix review round 2 (H-1): validate WITHOUT poisonable globals.
-  //
-  // This used to be `parseInt(v, 10)` guarded by `Number.isFinite`. Freezing the
-  // bridge stopped an attacker replacing the function that produces the answer,
-  // but both of those are ordinary writable globals, so one assignment —
-  // `globalThis.parseInt = () => 0` — made every floor read as 0 while the
-  // frozen bridge, the non-configurable marker and verifyRelayConfig's probe
-  // all stayed intact. The hardened part was bypassed by poisoning the step
-  // AFTER it. Note that capturing primordials at module top would not help
-  // either: a document-start attacker runs first.
-  //
-  // So: the bridge now returns a NUMBER (see PadFloorBridge), and the checks
-  // below use only `typeof` and bitwise ops, which are language constructs with
-  // no interceptable global behind them. `(n | 0) === n` is an integer test
-  // that cannot be redefined, and pad offsets are far below 2^31.
-  const num = (v) => {
-    // An unreadable answer from the bridge is TAMPERED, never "no floor" — a
-    // broken bridge must not read as a clean slate.
-    if (typeof v !== "number") return NATIVE_TAMPERED;
-    if ((v | 0) !== v) return NATIVE_TAMPERED;      // NaN, Infinity, fractions
-    return v;
-  };
-  return {
-    read: (id) => { try { return num(b.read(id)); } catch { return NATIVE_TAMPERED; } },
-    bump: (id, v) => { try { return num(b.bump(id, v | 0)); } catch { return NATIVE_TAMPERED; } },
-  };
-})();
-
-// Max without `Math.max` (H-1). `Math.max` is writable, and the rollback verdict
-// is a single call to it over the four floors — so one assignment overruled the
-// native floor, the authenticated watermark, the in-AEAD `hwSend` and the legacy
-// watermark simultaneously, silently. Comparison operators cannot be redefined.
-function maxOf(...values) {
-  let best = 0;
-  for (const v of values) {
-    const n = typeof v === "number" && (v | 0) === v ? v : 0;
-    if (n > best) best = n;
-  }
-  return best;
-}
+// Floor ids for the per-pad state beside the send offset (which uses the bare
+// padId). F-ATREST-001: the receive high-water mark had no native floor, so a
+// snapshot of the blob AND its watermark, restored after a stretch of
+// receiving, re-accepted every OTP frame the peer had already sent — the M-7
+// shape, but with the watermark restored too, which only a floor can catch.
+// F-ATREST-002: `exported` had none either, so restoring the pre-export blob
+// silently re-armed a second export of the same pristine pad (two importers,
+// a two-time pad). Both are keyed under prefixes a pad id cannot contain.
+const recvFloorId = (id) => "recv:" + id;
+const exportedFloorId = (id) => "exported:" + id;
+// What randomId() produces, and the only shape a pad id may have: 32 hex
+// characters. Enforced on the two paths that take an id from OUTSIDE (a pad
+// file, and the storage key the caller asks for), so a crafted file with
+// padId "recv:<victim>" cannot reach the victim's floors through the bridge.
+const PAD_ID_RE = /^[0-9a-f]{32}$/;
 
 // In-memory high-water marks for pads unlocked this session, so every re-save
 // can take a max without re-deriving the at-rest key.
-// Fix review 2026-07-30 (L-A). When the floor is EXPECTED but not usable, the
-// pad is fine and the platform is not: every message that came out of this state
-// blamed the pad ("damaged or forged", "already been used") and told the user to
-// exchange a fresh one, which does not help and burns real pads. Say what is
-// actually wrong instead. Still fail-closed — only the wording changes.
-function floorUnavailableError() {
-  return new Error(
-    "this device says it has hardware rollback protection for one-time pads, but the app cannot reach it. " +
-    "Your pad is probably fine — do NOT exchange a new one. On Android, reinstall or update the app; " +
-    "in a browser, an extension or script has set this flag and OTP is disabled until it is removed.",
-  );
-}
 
 const wmCache = new Map(); // padId -> {send, recv}
 
@@ -265,6 +190,11 @@ async function writeWatermark(id, key, wm) {
   // side — that is what keystream reuse turns on, and it keeps the bridge to a
   // single integer per pad. The recv side stays AEAD-mirrored inside the blob.
   if (nativeFloor) nativeFloor.bump(id, wm.send);
+  // F-ATREST-001: the receive side gets its own floor. The comment above said
+  // keeping the bridge to "a single integer per pad" was the reason it had
+  // none; the bridge is string-keyed and MACs the key, so a second id per pad
+  // costs nothing and closes the both-restored replay (see recvFloorId).
+  if (nativeFloor) nativeFloor.bump(recvFloorId(id), wm.recv);
   // "Post-fix OTP has run on this device." Deletable like everything else here,
   // so it may only ESCALATE a warning, never authorise anything — see the
   // legacy-adoption gate in unlockPad.
@@ -406,6 +336,9 @@ export async function importPad(fileText, passphrase) {
   }
   const o = JSON.parse(decU.decode(plain));
   plain.fill(0);
+  // The id becomes a storage key AND a native-floor key; only randomId()'s
+  // shape is acceptable (see PAD_ID_RE).
+  if (typeof o.padId !== "string" || !PAD_ID_RE.test(o.padId)) throw new Error("pad file has an invalid pad id");
   const bytes = unb64(o.bytes);
   if (bytes.length !== 2 * o.regionSize) throw new Error("pad file is internally inconsistent");
   if (o.recipientRole !== 0 && o.recipientRole !== 1) throw new Error("pad file has an invalid role");
@@ -599,9 +532,10 @@ export async function saveNewPad(record, passphrase) {
   // zero, so even a bypass of the refusal above cannot lower the watermark.
   // For a genuinely new pad every source is absent and this is {0,0}.
   const survivingNative = nativeFloor ? nativeFloor.read(record.padId) : NATIVE_ABSENT;
+  const survivingRecv = nativeFloor ? nativeFloor.read(recvFloorId(record.padId)) : NATIVE_ABSENT;
   wmCache.set(record.padId, {
     send: maxOf(readLegacyHW(record.padId), survivingNative > NATIVE_ABSENT ? survivingNative : 0),
-    recv: 0,
+    recv: maxOf(survivingRecv > NATIVE_ABSENT ? survivingRecv : 0),
   });
   await writePadBlob(record, key, salt, KDF_ITERS);
   return { key, salt, iters: KDF_ITERS };
@@ -618,6 +552,7 @@ export async function savePadProgress(record, atRest) {
 // chose to adopt a pad whose consumption cannot be verified. Never default it to
 // true: silent adoption IS the vulnerability.
 export async function unlockPad(padId, passphrase, opts = {}) {
+  if (typeof padId !== "string" || !PAD_ID_RE.test(padId)) throw new Error("no such pad on this device");
   const raw = localStorage.getItem(padKey(padId));
   if (!raw) throw new Error("no such pad on this device");
   const o = JSON.parse(raw);
@@ -676,7 +611,13 @@ export async function unlockPad(padId, passphrase, opts = {}) {
   // evidence so a forged bridge answer cannot be masked by a clean-looking store.
   if (nativeFloor && nativeFloor.broken) throw floorUnavailableError();
   const native = nativeFloor ? nativeFloor.read(padId) : NATIVE_ABSENT;
-  if (native === NATIVE_TAMPERED) {
+  // F-ATREST-001/002: the receive and exported floors, read the same way. A
+  // pad written before they existed simply has none (ABSENT contributes 0 /
+  // "unknown"), so no legitimate pad is caught; the first post-fix save
+  // creates them. The send floor stays the sole existence signal below.
+  const nativeRecv = nativeFloor ? nativeFloor.read(recvFloorId(padId)) : NATIVE_ABSENT;
+  const nativeExported = nativeFloor ? nativeFloor.read(exportedFloorId(padId)) : NATIVE_ABSENT;
+  if (native === NATIVE_TAMPERED || nativeRecv === NATIVE_TAMPERED || nativeExported === NATIVE_TAMPERED) {
     throw new Error(
       "this pad's device-protected rollback record is damaged or forged — refusing to use the pad; exchange a fresh one",
     );
@@ -737,7 +678,7 @@ export async function unlockPad(padId, passphrase, opts = {}) {
       readLegacyHW(padId),
       native > NATIVE_ABSENT ? native : 0,
     ),
-    recv: maxOf(outerWm ? outerWm.recv : 0, inner.hwRecv | 0),
+    recv: maxOf(outerWm ? outerWm.recv : 0, inner.hwRecv | 0, nativeRecv > NATIVE_ABSENT ? nativeRecv : 0),
   };
   if (sendOffset < wm.send) {
     throw new Error("pad state was rolled back (consumed key material) — refusing to use it; exchange a fresh pad");
@@ -821,9 +762,15 @@ export async function unlockPad(padId, passphrase, opts = {}) {
     // already exported, which costs a confirm on re-export and closes the
     // laundering path. The user adopting it has just been told, in as many
     // words, that this pad's history cannot be verified.
-    exported: inner.exported !== undefined
+    //
+    // F-ATREST-002: the native `exported:` floor can only turn the flag ON.
+    // A restored pre-export blob carries `exported: false` inside a perfectly
+    // valid AEAD, and its send floor is 0 because exportPad only ever exports
+    // a pristine pad — so the floor is the one record of the export that a
+    // snapshot restore cannot rewind. TAMPERED was refused above.
+    exported: nativeExported >= 1 || (inner.exported !== undefined
       ? !!inner.exported
-      : true,
+      : true),
   };
   const atRest = { key, salt, iters };
   // Rewrite a genuine legacy blob in the v2 (fully authenticated) format
@@ -855,6 +802,9 @@ export async function unlockPad(padId, passphrase, opts = {}) {
 // a render cache for the pad list (which has no passphrase to hand).
 export async function markExported(record, atRest) {
   record.exported = true;
+  // F-ATREST-002: recorded natively FIRST, so a crash between the two writes
+  // leaves the stronger record in place, not the weaker one.
+  if (nativeFloor) nativeFloor.bump(exportedFloorId(record.padId), 1);
   await writePadBlob(record, atRest.key, atRest.salt, atRest.iters);
 }
 

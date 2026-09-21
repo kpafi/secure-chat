@@ -80,14 +80,23 @@ class KeyedRateLimiter:
         self._lock = threading.Lock()
 
     def _prune(self, now: float) -> None:
-        """Drop fully-refilled idle buckets. Caller MUST hold `self._lock`."""
+        """Drop buckets idle long enough to have refilled. Caller MUST hold `self._lock`.
+
+        Fix review 2026-09-21 (of the F-RELAY-003/004 fixes): this used to
+        drop only buckets that were FULL and idle — but `tokens` is only
+        recomputed inside `allow()`, so a bucket touched once sat at
+        capacity-1 forever and was never collected. That was harmless while
+        keys were client hosts (one key behind Caddy/Tor); keyed on
+        attacker-chosen usernames it was ~240 bytes per probe, never freed:
+        ~100 MB/day at the /api limiter's rate. A bucket idle for longer than
+        it takes to refill completely is indistinguishable from a fresh one,
+        so dropping it on idleness alone is exact, not a heuristic.
+        """
         if now - self._last_prune < 60.0:
             return
         self._last_prune = now
-        stale = [
-            k for k, b in list(self._buckets.items())
-            if b.tokens >= b.capacity and now - b.last > 60.0
-        ]
+        idle_ttl = max(60.0, self._capacity / self._refill if self._refill > 0 else 60.0)
+        stale = [k for k, b in list(self._buckets.items()) if now - b.last > idle_ttl]
         for k in stale:
             self._buckets.pop(k, None)
 

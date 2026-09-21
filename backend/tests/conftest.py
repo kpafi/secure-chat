@@ -36,6 +36,7 @@ def _reset_rate_limiters():
         accounts._api_limiter,
         accounts._lookup_limiter,
         accounts._challenge_limiter,
+        accounts._challenge_host_limiter,
         accounts._register_limiter,
         mailbox._post_limiter,
     ):

@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.net.Uri
 import android.os.Bundle
 import android.text.InputType
+import android.view.WindowManager
 import android.webkit.JsPromptResult
 import android.webkit.JsResult
 import android.webkit.WebChromeClient
@@ -75,6 +76,20 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Pentest 2026-08-07 F-ANDROID-003: everything this window shows is
+        // decrypted chat, identity or contact state. Without FLAG_SECURE the OS
+        // keeps a snapshot of it for the recents switcher, and any component
+        // with screen-capture rights (or a screen recorder) can read it off the
+        // display. FLAG_SECURE blanks the recents card and blocks capture of
+        // this window, including the native prompt dialogs raised for
+        // window.prompt (secrets, passphrases). Set BEFORE the content view so
+        // no frame is ever composed without it. Cost, deliberately accepted:
+        // the user cannot screenshot the safety number or an invite QR from
+        // inside the app.
+        window.setFlags(
+            WindowManager.LayoutParams.FLAG_SECURE,
+            WindowManager.LayoutParams.FLAG_SECURE,
+        )
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         // The web client renders its own header (wordmark + drawer button), so

@@ -121,8 +121,12 @@ TURNAWAY_NOTICE_SEC = 5.0
 # nobody, so a misconfigured deployment fails CLOSED (one shared bucket) rather
 # than open (unlimited buckets).
 #
-# Set SECURE_CHAT_TRUSTED_PROXIES=127.0.0.1 when running behind the Caddy
-# reverse proxy. Leave it UNSET for a direct/.onion deployment.
+# Set SECURE_CHAT_TRUSTED_PROXIES=127.0.0.1 ONLY when the listed peer can be
+# nothing but the Caddy reverse proxy. Pentest 2026-08-07 F-RELAY-001: the
+# production box also publishes a Tor onion service that forwards to the SAME
+# loopback port, so there loopback does not mean "came through Caddy" and
+# trusting it would let any onion visitor forge its bucket. It must stay UNSET
+# in that topology (see deploy/README.md and deploy/secure-chat.service).
 TRUSTED_PROXY_IPS = frozenset(
     p.strip() for p in os.environ.get("SECURE_CHAT_TRUSTED_PROXIES", "").split(",") if p.strip()
 )
@@ -137,10 +141,22 @@ API_RATE_REFILL_PER_SEC = 5.0 # sustained requests/second
 
 # Dedicated, stricter bucket for the login CHALLENGE endpoint (M-03). A
 # challenge is cheap for us but seeds pending state, so cap the mint rate well
-# below the general /api limiter. Keyed per client host (one global bucket
-# behind Tor, which is the meaningful control there).
-CHALLENGE_RATE_CAPACITY = 10        # burst allowance (challenges)
-CHALLENGE_RATE_REFILL_PER_SEC = 0.5 # sustained challenges/second
+# below the general /api limiter.
+#
+# Pentest 2026-08-07 F-RELAY-003: this used to be ONE bucket keyed per client
+# host, which behind Tor (and since the M-1 fix, on the shared clearnet path
+# too) is one bucket for the whole relay — so a single unauthenticated client
+# sending 0.5 challenges/s held login shut for EVERY account. It is now two
+# buckets: a strict one keyed on the USERNAME being logged into, and a much
+# wider per-host one that only bounds total pending-challenge churn. A flood
+# now has to reach the wide bucket's rate to lock everyone out, and a
+# targeted flood on one name locks out only that name (the attacker could
+# already do that before, via the shared bucket — the blast radius shrank,
+# it did not grow). Pending state itself is bounded by MAX_PENDING_CHALLENGES.
+CHALLENGE_RATE_CAPACITY = 10        # burst allowance per USERNAME (challenges)
+CHALLENGE_RATE_REFILL_PER_SEC = 0.5 # sustained challenges/second per username
+CHALLENGE_HOST_RATE_CAPACITY = 200        # burst allowance per host, all names
+CHALLENGE_HOST_RATE_REFILL_PER_SEC = 20.0 # sustained challenges/second per host
 
 # Dedicated bucket for REGISTRATION (pentest 2026-07-26 P-09). Registration is
 # the one endpoint that must distinguish a taken username (409) from a free one
@@ -285,8 +301,16 @@ MAX_ENVELOPE_BYTES = 64 * 1024        # one sealed envelope (matches WS frame ca
 MAX_MAILBOX_PER_RECIPIENT = 200       # queued envelopes per inbox
 MAX_MAILBOX_TOTAL = 100_000           # queued envelopes server-wide
 MAILBOX_TTL_SEC = 14 * 24 * 3600      # unfetched mail expires
-MAILBOX_RATE_CAPACITY = 30            # burst posts per host
-MAILBOX_RATE_REFILL_PER_SEC = 1.0     # sustained posts/second per host
+# Pentest 2026-08-07 F-RELAY-004: the POST bucket was keyed per host and ran
+# BEFORE the recipient-token gate, so an unauthenticated client (no handle, no
+# token) drained the one shared bucket and denied mail delivery service-wide.
+# It is now keyed per RECIPIENT inbox and consumed only AFTER the token gate:
+# a request without the recipient's lookup token is an identical 404 that
+# touches no bucket at all, and a flood at one inbox throttles only that inbox.
+# Service-wide volume is bounded by the general /api limiter and the storage
+# caps below, not by this bucket.
+MAILBOX_RATE_CAPACITY = 30            # burst posts per recipient inbox
+MAILBOX_RATE_REFILL_PER_SEC = 1.0     # sustained posts/second per inbox
 
 # Dedicated bucket for FETCHING mail (pentest 2026-07-26 P-11). GET used to have
 # no limiter at all; putting it on the shared /api bucket closed that but created

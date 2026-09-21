@@ -54,14 +54,19 @@ def _register(username):
         "sig": _b64(ed_priv.sign(msg)), "mldsa_sig": _b64(ML_DSA_65.sign(mldsa_secret, msg)),
     })
     assert r.status_code == 200
-    return {"username": username, "token": r.json()["lookup_token"], "ed_priv": ed_priv}
+    return {"username": username, "token": r.json()["lookup_token"], "ed_priv": ed_priv,
+            "mldsa_secret": mldsa_secret}
 
 
 def _login(ident):
     ch = client.post("/api/auth/challenge", json={"username": ident["username"]}).json()["challenge"]
-    sig = ident["ed_priv"].sign(b"secure-chat/login/v1\n" + base64.b64decode(ch))
-    r = client.post("/api/auth/verify", json={"username": ident["username"], "challenge": ch, "sig": _b64(sig)})
-    assert r.status_code == 200
+    msg = b"secure-chat/login/v1\n" + base64.b64decode(ch)
+    r = client.post("/api/auth/verify", json={
+        "username": ident["username"], "challenge": ch,
+        "sig": _b64(ident["ed_priv"].sign(msg)),
+        "mldsa_sig": _b64(ML_DSA_65.sign(ident["mldsa_secret"], msg)),
+    })
+    assert r.status_code == 200, r.text
     return r.json()["token"]
 
 
@@ -142,3 +147,42 @@ def test_ttl_prune():
         conn.execute("UPDATE mailbox SET created_at = ?",
                      (int(time.time()) - config.MAILBOX_TTL_SEC - 5,))
     assert client.get("/api/mailbox", headers=_auth(tok)).json()["messages"] == []
+
+
+# ---- Pentest 2026-08-07 F-RELAY-004: POST bucket is per inbox, behind the gate --
+
+def test_unauthenticated_posts_cannot_burn_the_mailbox_bucket():
+    """A caller without the recipient's lookup token must not consume ANY bucket.
+
+    Pre-fix the limiter ran as a `Depends` before the token gate and was keyed
+    per host, so a flood of token-less POSTs (identical 404s) from one client
+    exhausted the single shared bucket and every honest sender got 429 for
+    every inbox. The TestClient is one host, so this reproduces that topology.
+    """
+    mailbox._post_limiter._buckets.clear()
+    bob = _register("burn-bob")
+    for _ in range(config.MAILBOX_RATE_CAPACITY + 5):
+        r = client.post("/api/mailbox/burn-bob", params={"t": "wrong"}, json={"envelope": "x"})
+        assert r.status_code == 404, r.text  # identical 404, never 429
+    for _ in range(config.MAILBOX_RATE_CAPACITY + 5):
+        r = client.post("/api/mailbox/nobody-here", params={"t": "wrong"}, json={"envelope": "x"})
+        assert r.status_code == 404, r.text
+    # The honest sender, from the SAME host, is not throttled.
+    r = client.post("/api/mailbox/burn-bob", params={"t": bob["token"]}, json={"envelope": "hello"})
+    assert r.status_code == 200, r.text
+
+
+def test_mailbox_post_bucket_is_per_recipient():
+    """Flooding one inbox (with its token) throttles that inbox only."""
+    mailbox._post_limiter._buckets.clear()
+    bob = _register("flood-bob")
+    carol = _register("flood-carol")
+    codes = [
+        client.post("/api/mailbox/flood-bob", params={"t": bob["token"]}, json={"envelope": "x"}).status_code
+        for _ in range(config.MAILBOX_RATE_CAPACITY + 3)
+    ]
+    assert codes.count(200) == config.MAILBOX_RATE_CAPACITY, codes
+    assert codes[-1] == 429, codes
+    # carol's inbox, same host, is untouched.
+    r = client.post("/api/mailbox/flood-carol", params={"t": carol["token"]}, json={"envelope": "hi"})
+    assert r.status_code == 200, r.text

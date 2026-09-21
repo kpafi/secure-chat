@@ -37,6 +37,25 @@ const GEN_DOMAIN = "secure-chat/contacts-generation/v1";
 const STORE_DOMAIN = "secure-chat/contacts-store/v4";
 const KDF_ITERS = 600000; // same OWASP-2023 work factor as identity.js
 
+// Pentest 2026-08-07 F-ATREST-003/004: the device-native floor, where the app
+// runs. The witness above lives in localStorage beside the store, so deleting
+// BOTH (two removeItem calls) yielded a fresh, empty, pin-less store with no
+// warning anywhere — key-change detection simply off (F-ATREST-003, confirmed).
+// And a store with no generation inside its AEAD (any pre-L-1 blob, decrypting
+// under the same passphrase because the outer salt travels with it) was
+// adopted whenever the witness was gone, so an archived blob + one removeItem
+// resurrected revoked pins and auto-unlocked messaging (F-ATREST-004,
+// confirmed). Both are the "coordinated snapshot" the L-1 note above calls
+// residual; on Android it no longer is. The floor id is per IDENTITY (app.js
+// passes a hash of the identity's public signing key), bumped with the store
+// generation on every persist, and consulted BEFORE any localStorage evidence.
+// See nativefloor.js for the namespace and how the bridge is trusted.
+import { captureNativeFloor, NATIVE_ABSENT, NATIVE_TAMPERED, floorUnavailableError } from "./nativefloor.js";
+const nativeFloor = captureNativeFloor();
+// "Post-fix contacts have run on this device." Deletable like everything in
+// localStorage, so it may only ESCALATE a warning, never authorise anything.
+const EPOCH_KEY = "sc.contacts.epoch.v1";
+
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
@@ -87,19 +106,59 @@ export function isUnlocked() {
   return dataKey !== null;
 }
 
+// The native floor key for the identity this store belongs to, set per unlock.
+let floorKey = null;
+// True once an unlock has seen evidence (witness or native floor) that a store
+// is supposed to exist here, even if the blob itself is gone. hasStore() folds
+// it in so app.js takes the loud "pins unreadable" path rather than the benign
+// first-contact one while the store is refused (F-ATREST-003).
+let expectedStore = false;
+
 export function lock() {
   dataKey = null;
   salt = null;
   contacts = null;
   pins = null;
   generation = 0;
+  floorKey = null;
+}
+
+function readFloor() {
+  if (!nativeFloor || !floorKey) return NATIVE_ABSENT;
+  if (nativeFloor.broken) throw floorUnavailableError("your saved contacts");
+  return nativeFloor.read(floorKey);
+}
+
+function adoptionError(message, code) {
+  lock();
+  const err = new Error(message);
+  err.code = code;
+  err.suspicious = localStorage.getItem(EPOCH_KEY) !== null;
+  return err;
 }
 
 // Unlock (or create) the store with the identity passphrase. Throws if a blob
 // exists but does not decrypt with this passphrase (foreign/tampered blob —
 // the caller decides whether to offer `wipe()`).
-export async function unlock(passphrase) {
+//
+// `opts.floorId`      — hash of the identity this store belongs to; enables the
+//                       native floor where the app provides one.
+// `opts.adoptLegacy`  — the user has seen the F-ATREST-004 warning and chooses
+//                       to open a store whose history cannot be verified.
+// `opts.adoptDeleted` — the user has seen the F-ATREST-003 warning ("a store
+//                       existed here and is gone") and chooses to start over.
+// Never default either to true: silent adoption IS the vulnerability. Returns
+// `{ created }` so the caller can tell a first run from an existing store.
+export async function unlock(passphrase, opts = {}) {
   if (!passphrase) throw new Error("passphrase required to unlock the contact store");
+  floorKey = opts.floorId ? "contacts:" + opts.floorId : null;
+  // The floor is the one input a JS-context attacker cannot delete or lower,
+  // so it is read FIRST, before any localStorage evidence can shape the verdict.
+  const floor = readFloor();
+  if (floor === NATIVE_TAMPERED) {
+    lock();
+    throw new Error("the device-protected record for your saved contacts is damaged or forged — refusing to open the store");
+  }
   const raw = localStorage.getItem(LS_CONTACTS);
   if (!raw) {
     // No store. Before creating a fresh (empty, pin-less) one, make sure this
@@ -107,15 +166,34 @@ export async function unlock(passphrase) {
     // witness carries its OWN salt precisely so it stays readable when the
     // store that would otherwise hold the salt has been removed.
     await assertStoreNotDeleted(passphrase);
+    // F-ATREST-003: on Android the floor outlives both blobs. "Floor says
+    // generation N, nothing in storage" is either an attacker's two
+    // removeItem calls or the user's own Forget-then-restore of the same
+    // identity; the two are indistinguishable, so it is a loud, explicit
+    // choice — never a silent fresh start. The floor can never be lowered, so
+    // the recreated store simply continues its numbering from it.
+    if (floor > NATIVE_ABSENT) {
+      expectedStore = true;
+      if (!opts.adoptDeleted) {
+        throw adoptionError(
+          `your saved contacts (generation ${floor}) have been DELETED from this device — refusing to ` +
+          "start over with an empty store, because that would silently turn off key-change warnings. " +
+          "If you did not Forget this identity yourself, treat every contact as unverified.",
+          "DELETED_CONTACTS_ADOPTION",
+        );
+      }
+    }
     salt = crypto.getRandomValues(new Uint8Array(16));
     dataKey = await deriveKey(passphrase, salt, KDF_ITERS);
     contacts = [];
     pins = {};
-    generation = 0;
+    generation = floor > NATIVE_ABSENT ? floor : 0;
     dropLegacyPins();
     await persist();
-    return;
+    expectedStore = false;
+    return { created: true };
   }
+  expectedStore = true;
   const blob = JSON.parse(raw);
   salt = unb64(blob.salt);
   dataKey = await deriveKey(passphrase, salt, blob.iters || KDF_ITERS);
@@ -151,11 +229,12 @@ export async function unlock(passphrase) {
   };
   if (tagged && data.d !== STORE_DOMAIN) throw notAStore();
   // Defence in depth for the untagged path: a genuine pre-v4 store is either
-  // the bare v1 array or an object carrying contacts/pins. A record with
-  // neither is not a store, whatever it claims.
+  // the bare v1 array or an object carrying a contacts ARRAY and a pins OBJECT.
+  // A record with neither is not a store, whatever it claims. (F-ATREST-004
+  // tightened this from "has a contacts or pins property": a chat-store blob
+  // holding a chat literally named "pins" or "contacts" used to pass.)
   const looksLikeStore = Array.isArray(data) ||
-    Object.prototype.hasOwnProperty.call(data, "contacts") ||
-    Object.prototype.hasOwnProperty.call(data, "pins");
+    (Array.isArray(data.contacts) && typeof data.pins === "object" && data.pins !== null && !Array.isArray(data.pins));
   if (!tagged && !looksLikeStore) throw notAStore();
 
   // v1 blobs stored the bare contacts array; v2 wraps {contacts, pins}.
@@ -168,6 +247,55 @@ export async function unlock(passphrase) {
   }
   generation = Number.isInteger(data.gen) ? data.gen : 0;
   await assertNotRolledBack(data.gen);
+  // F-ATREST-003/004, the floor half. Runs AFTER the witness checks so the
+  // more specific localStorage verdicts keep their wording, but it is the
+  // decision the witness could not make: a witness restored together with the
+  // store agrees with it, the floor does not.
+  if (floor > NATIVE_ABSENT && generation < floor) {
+    lock();
+    throw new Error(
+      `your saved contacts are OLDER than this device recorded (generation ${generation}, device record ${floor}) — ` +
+      "an earlier copy has been restored, which would silently undo recent verifications and pins",
+    );
+  }
+  // ...and the converse (the OTP H-1 flag, ported): a store written while a
+  // floor was in force, with the floor now gone. Only file-level access can
+  // produce this on Android, and it used to be silent because ABSENT reads as
+  // "no floor". `nativeFloor` is inside the AEAD, so it cannot be stripped.
+  if (data.nativeFloor === true && floorKey && floor === NATIVE_ABSENT) {
+    lock();
+    throw new Error(
+      "the device-protected record for your saved contacts has been deleted — refusing to open the store, " +
+      "because a rollback could no longer be detected",
+    );
+  }
+  const legacyShape = !tagged || !Number.isInteger(data.gen);
+  if (legacyShape) {
+    // F-ATREST-004: a store with no generation inside its AEAD has no history
+    // anything here can verify. That used to be adopted on sight whenever the
+    // witness was gone — one removeItem — which is precisely how an archived
+    // pre-L-1 blob (identical passphrase, identical salt) resurrected revoked
+    // pins. On Android a floor for this identity proves a post-fix store
+    // existed, so a gen-less blob is a restore by definition: refused, no
+    // adoption possible (adoption is consent to accept state that cannot be
+    // VERIFIED, never permission to override a rollback that has been
+    // DETECTED — the OTP F-1 rule). Elsewhere it is an explicit user choice.
+    if (floor > NATIVE_ABSENT) {
+      lock();
+      throw new Error(
+        "your saved contacts have no rollback record but this device says they had one (generation " +
+        `${floor}) — an earlier copy has been restored; refusing to open it`,
+      );
+    }
+    if (!opts.adoptLegacy) {
+      throw adoptionError(
+        "your saved contacts have no rollback record on this device. If you have used this device with " +
+        "these contacts before, an older copy has been restored and your saved pins may be stale — " +
+        "treat every contact as unverified.",
+        "LEGACY_CONTACTS_ADOPTION",
+      );
+    }
+  }
   let dirty = dropLegacyPins();
   if ((blob.v || 1) < 3 && migrateH01Verification()) dirty = true;
   // An adopted pre-v4 store is rewritten tagged, so it only ever happens once.
@@ -175,7 +303,10 @@ export async function unlock(passphrase) {
   // A pre-L-1 store carries no generation and no witness: adopt it at its
   // current state (there is nothing to roll back TO yet) and start counting.
   if (!Number.isInteger(data.gen)) dirty = true;
+  // A store from before the floor existed is re-persisted so it gains one.
+  if (floorKey && nativeFloor && data.nativeFloor !== true) dirty = true;
   if (dirty) await persist();
+  return { created: false };
 }
 
 // Pentest 2026-07-27 H-2: this used to be migrateLegacyPins(), which COPIED any
@@ -351,7 +482,11 @@ async function persist() {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   // `d` is the H-2 domain tag: it makes this plaintext unmistakably a STORE, so
   // no other record encrypted under the same key can be substituted for it.
-  const plain = enc.encode(JSON.stringify({ d: STORE_DOMAIN, contacts, pins, gen: generation }));
+  // `nativeFloor` (F-ATREST-003): "a floor was in force when this was written",
+  // inside the AEAD so it cannot be cleared to hide a later floor deletion.
+  const plain = enc.encode(JSON.stringify({
+    d: STORE_DOMAIN, contacts, pins, gen: generation, nativeFloor: !!(nativeFloor && floorKey),
+  }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, dataKey, plain));
   localStorage.setItem(
     LS_CONTACTS,
@@ -361,6 +496,10 @@ async function persist() {
   // one generation ahead of its witness, which reads as "newer than recorded"
   // — not a rollback, so an ordinary crash never locks the user out.
   await writeWitness();
+  // Native floor after both, for the same reason: a crash before this line
+  // leaves the store one ahead of the floor, never behind it.
+  if (nativeFloor && floorKey) nativeFloor.bump(floorKey, generation);
+  localStorage.setItem(EPOCH_KEY, "1");
 }
 
 // ---- identity pins (TOFU, now inside the authenticated store) -------------
@@ -390,6 +529,11 @@ export function wipe() {
   localStorage.removeItem(LS_CONTACTS);
   localStorage.removeItem(LS_GEN);
   lock();
+  expectedStore = false;
+  // The native floor (Android) deliberately stays: it cannot be lowered, and
+  // the next unlock of the SAME identity on this device is a loud, explicit
+  // "start over" (DELETED_CONTACTS_ADOPTION) rather than a silent clean slate —
+  // because an attacker's two removeItem calls look exactly like this.
 }
 
 // True when a contact store is EXPECTED on this device — which includes the
@@ -398,7 +542,14 @@ export function wipe() {
 // "key changes cannot be detected" path instead of rendering every contact as a
 // benign first contact.
 export function hasStore() {
-  return localStorage.getItem(LS_CONTACTS) !== null || localStorage.getItem(LS_GEN) !== null;
+  return expectedStore ||
+    localStorage.getItem(LS_CONTACTS) !== null || localStorage.getItem(LS_GEN) !== null;
+}
+
+// The pin key for a contact's live sessions. Lived in app.js as an inline
+// `"user:" + name`; here so setVerified/remove can find the pin they revoke.
+export function pinKeyFor(username) {
+  return "user:" + username;
 }
 
 // ---- contact records ------------------------------------------------------
@@ -487,24 +638,60 @@ export async function setVerified(username, on) {
   cur.verified = !!on;
   cur.verifiedAt = on ? Date.now() : null;
   if (on) delete cur.reverify; // fresh in-person check supersedes the H-01 reset
+  if (!on) revokePin(username);
   await persist();
   return get(username);
+}
+
+// Pentest 2026-08-07 F-ATREST-007: "Unverify" and "Remove" flipped the record
+// and left the PIN untouched, so the next live session with that user still
+// auto-unlocked messaging on "matches your saved pin" — the explicit
+// revocation was not honoured anywhere it mattered (the thief of a contact's
+// phone walks straight in). The pin is NOT deleted: a removed contact re-added
+// later with a different key is exactly the MITM shape the CHANGED alarm
+// exists for, and deleting the pin would downgrade that to the benign
+// first-contact prompt. It is marked, and app.js refuses to auto-accept a
+// revoked pin; a fresh in-person verification (savePin) clears the mark.
+function revokePin(username) {
+  const pin = pins && pins[pinKeyFor(username)];
+  if (pin) pin.revoked = true;
 }
 
 // Cache the locally VERIFIED voucher names for a contact (the 🟡 mark). Only
 // ever store names the caller has checked signatures for — this is a render
 // cache, not a trust source.
-export async function setVouches(username, names) {
+//
+// Pentest 2026-08-07 F-PROTO-005: `forKeys` is the bundle the caller VERIFIED
+// the vouches against. The fetch that produced `names` is a network round trip
+// the directory controls the length of, and the record can be re-added or
+// re-looked-up (with different keys, which clears `vouchedBy` and stamps
+// `keyChangedAt`) while it is in flight. Writing by username alone then
+// re-attached "vouched by <friend>" to keys the friend never signed — shown in
+// the admission prompt with no key-changed warning. So the write is
+// conditional on the keys still being the ones the vouch covers; a stale
+// result is discarded (returns false) and the next refresh redoes it against
+// the current keys. The check and the mutation are synchronous, so there is
+// no second window between them.
+export async function setVouches(username, names, forKeys = null) {
   if (!contacts) throw new Error("contact store is locked");
   const cur = contacts.find((c) => c.username === username);
-  if (!cur) return;
+  if (!cur) return false;
+  if (forKeys && (
+    cur.ed !== forKeys.ed || cur.mldsa !== forKeys.mldsa ||
+    (cur.ecdh ?? null) !== (forKeys.ecdh ?? null) ||
+    (cur.mlkem ?? null) !== (forKeys.mlkem ?? null)
+  )) {
+    return false;
+  }
   cur.vouchedBy = names;
   cur.vouchCheckedAt = Date.now();
   await persist();
+  return true;
 }
 
 export async function remove(username) {
   if (!contacts) throw new Error("contact store is locked");
   contacts = contacts.filter((c) => c.username !== username);
+  revokePin(username); // F-ATREST-007
   await persist();
 }

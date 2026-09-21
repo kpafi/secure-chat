@@ -3,7 +3,114 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (2026-07-28, Tor onion service LIVE)
+## ⮕ RESUME HERE (2026-09-21, the 2026-08-07 pentest: all 14 Medium fixed, NOT deployed)
+
+**Every Medium in `secure-chat-pentest-2026-08-07.md` is fixed on branch
+`claude/loving-cannon-ba5tbt`, with a regression test each, verified to FAIL
+against the pre-fix code by stashing and re-running (not asserted).** Three
+commits, one per cluster (relay, admission/vouch/Android, at-rest). Local gate:
+backend full suite green (one pre-existing timing flake in `test_ws.py`
+`test_waiters_are_closed_when_the_owner_leaves` — fails under the full run,
+passes isolated, unrelated to the diff), client **13 suites**, all five e2e
+runs green against a live local relay (`two-user-flow` 8/8, `room-admission`
+13/13, `no-dead-ends` 12/12, `all-modes` 32/32, new `hostile-relay` 11/11).
+The 18 Low and 15 Info findings in that report were NOT worked (the report
+only summarises them; the per-finding files it cites are not in the repo).
+
+**What changed, and the honest calls made:**
+
+1. **Relay (F-RELAY-001/003/004/005/006).** Login is now DUAL-SCHEME:
+   `/api/auth/verify` requires an ML-DSA-65 signature beside the Ed25519 one
+   (**an Ed25519-only client cannot log in — the APK must ship with the relay**).
+   Challenge bucket keyed per USERNAME with a wide per-host bound beside it;
+   mailbox POST bucket keyed per RECIPIENT and consumed only after the token
+   gate; same-identity re-registration can replace but never remove published
+   encryption keys; the `TRUSTED_PROXIES=127.0.0.1` recommendation in
+   `config.py` is corrected (the deployed topology already had it unset since
+   2026-07-28 — F-RELAY-001 was a stale comment, not a live hole). Not done:
+   a signed monotonic counter on registration; the client never rotates its
+   encryption keys, so a replayed older *v2* registration is a no-op today.
+2. **Admission / vouch / Android (F-PROTO-001/005, F-ANDROID-003).** The room
+   CREATOR no longer takes her role from the relay: the client remembers
+   whether this page minted the code, and refuses `pending` / `joined:guest`.
+   **UX change, deliberate:** a creator whose invitee connected first is now
+   refused and told to connect first or make a new code (before, she was
+   silently made the guest and nobody approved anybody). Refusal hints now
+   survive the socket close (they used to vanish with the chat screen — three
+   existing refusals had that bug too). `setVouches` discards a result whose
+   keys moved while the fetch was in flight. `FLAG_SECURE` set in
+   `MainActivity.onCreate` (**not built here — no SDK in this environment**);
+   lock-on-background deliberately NOT done (it ends live sessions; needs a
+   timed design and a `lockAll()` first — see android/README.md).
+3. **At rest (F-ATREST-001/002/003/004/005/007).** The native floor capture
+   moved to `client/nativefloor.js` and now serves, under distinct id
+   prefixes, the OTP receive mark, the OTP `exported` flag, and — per identity
+   (`sha256(ed public key)`, passed by app.js) — the contact and chat stores.
+   The chat store gained the contact store's domain tag / generation / witness
+   (two departures, documented in `chats.js`: no CAS refusal on persist because
+   two tabs poll the mailbox, and an untagged pre-v2 blob is adopted once
+   without a prompt on a device that never ran this code). A gen-less contact
+   store is no longer adopted silently (`LEGACY_CONTACTS_ADOPTION`); on Android
+   a floor makes it a refusal outright. "Store + witness both deleted" on
+   Android is `DELETED_*_ADOPTION`: an explicit **Open anyway** in the Users
+   view (new button), because the user's own Forget-then-restore of the same
+   identity is the same state as the attack and the floor can never be
+   lowered. Pins are marked `revoked` by Unverify/Remove (kept, not deleted, so
+   a re-add with new keys still alarms) and the verification gate no longer
+   auto-accepts a revoked pin. **Browser residual unchanged and pinned by
+   tests:** no floor ⇒ both-restored rewinds undetected, both-deleted is a first
+   run (app.js warns when an existing identity finds no store).
+   Pad ids are validated to 32 hex chars at import/unlock so a pad file cannot
+   address another floor namespace.
+
+**🔧 FIX REVIEW (2026-09-21, pentest-new-code pass over the three commits) — 7
+findings, all fixed in a fourth commit.** (1) **Medium, real hole:** chats.js
+adopted an untagged blob silently whenever the plaintext epoch marker was
+absent — one extra `removeItem` restored the whole of F-ATREST-005 in a
+browser (PoC reproduced by the reviewer). Now every untagged chat blob is an
+explicit adoption, like contacts; **every existing user sees that prompt once
+on upgrade** (Chats view → *Open anyway*). (2) **Dead end:** a chat store that
+refused while contacts opened had no visible error and no override (the
+button lived in the Users locked panel). The Chats locked panel now shows the
+error and its own *Open anyway*, and the per-view unlock status says
+"Unlocked, but: …" instead of blank. (3) **New from my fix:** per-username
+challenge buckets were an attacker-chosen key space `KeyedRateLimiter` never
+pruned (it only dropped FULL idle buckets, and `tokens` is only recomputed in
+`allow()`), ~100 MB/day. Buckets are now dropped on idleness alone (idle
+longer than a full refill ⇒ indistinguishable from fresh). (4) **New from my
+fix:** the ML-DSA verify made `/api/auth/verify` a ~4× louder existence oracle
+(15 ms vs 4 ms). The unknown-user path now runs both verifications against a
+per-process decoy bundle. (5) `roomCodeMine` was page-instance state and failed
+open after a reload + re-paste; minted codes are now also remembered in
+localStorage (last 8; attacker-writable, but asymmetric: removal restores
+pre-fix behaviour for one code, addition only makes this page refuse). e2e
+`hostile-relay.mjs` gained the reload step (11/11). (6) `_USERNAME_RE` used
+`match`, and Python `$` matches before a trailing newline: `"alice\n"`
+registered as a second row. `fullmatch` now. (7) One *Open anyway* click passed
+both flags to both stores; each store now gets exactly the override for the
+code it raised, and the browser both-deleted warning is a persistent Users-view
+notice, not one transcript line. Tests for 1, 3, 6 and the decoy in 4.
+
+**Pre-fix proofs:** all six relay tests, `hostile-relay.mjs` (3 checks),
+F-PROTO-005, F-ATREST-001 (the script stops at its first failure, so -002 is
+shown by the same mechanism, not separately), F-ATREST-003/004/007 and
+F-ATREST-005 each fail against the stashed pre-fix file.
+
+**Merged to `master` 2026-09-21 (`--no-ff`).** Review guide, deploy order and
+the on-device checks are in `deploy/release-2026-09-21.md`; the deploy script
+is `deploy/deploy-2026-09-21.sh` (APK FIRST, then the script).
+
+**⬜ DELIVERY — nothing deployed.** In order: (1) review the diff (it touches
+the login protocol, at-rest storage, the admission path and the floor module —
+the pentest-new-code pass is in this session's notes); (2) merge; (3) deploy
+relay + client **together with the APK**: the relay refuses Ed25519-only
+logins, so an old APK cannot log in, and the Android client is what gains the
+contacts/chats floors; (4) on the phone, no prompt is expected: the existing
+contact store is v4-tagged with a generation and gets its floor on the first
+persist, and the chat store is untagged and adopts once silently. Only a
+pre-2026-07-30 archived contact blob would prompt. (5) Re-run
+`android/native-floor-ondevice.mjs` and bump one id per new prefix.
+
 
 **The last never-started checklist item is done.** The relay is reachable at
 `http://626vkwn6znrko2xhorirvv5ttrbzcr3xkdjmk65cks26qkvadplyk5id.onion`

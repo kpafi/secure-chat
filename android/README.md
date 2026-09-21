@@ -36,6 +36,19 @@ ciphertext.
 - Identity keys and pins live in the WebView's `localStorage` (managed by the
   bundled client), exactly as on the web. The app persists only the relay URL.
 
+## Screen capture is blocked (FLAG_SECURE)
+Pentest 2026-08-07 F-ANDROID-003: the activity window sets `FLAG_SECURE`
+before its first frame, so the recents-switcher snapshot is blank and
+screenshots / screen recording of the app (including the native secret and
+passphrase prompts) are refused by the OS. The accepted cost is that a user
+cannot screenshot the safety number or an invite QR from inside the app.
+**Not done, deliberately:** lock-on-background. The unlocked identity, the
+decrypted contact/chat stores and any live session keys are process memory;
+a lock on `onStop` would end every live chat (session keys cannot be
+re-derived from the passphrase) and needs a timed design and a `lockAll()`
+in the client first. Verify on a device by backgrounding the app and opening
+recents (blank card), and with `adb shell screencap` (refused or black).
+
 ## Relay-side requirement
 Because the app's origin differs from the relay's, the relay must allow-list it
 (it is a single fixed origin, not a wildcard). This is already wired:

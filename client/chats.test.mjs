@@ -107,11 +107,157 @@ const poisoned = {
 }
 
 chats.lock();
-await chats.unlock(PASS);
+// (F-ATREST-005: the hand-made blob is the untagged pre-v2 shape with no
+// witness, on a device that has run this code — an explicit adoption now.)
+localStorage.removeItem("sc.chats.gen.v1");
+await assert.rejects(chats.unlock(PASS), (e) => e.code === "LEGACY_CHATS_ADOPTION");
+await chats.unlock(PASS, { adoptLegacy: true });
 const healed = chats.get("mallory");
 assert.strictEqual(healed.mode, "SEALED", "poisoned mode is reset to SEALED on unlock");
 assert.ok(!healed.secret && !healed.salt, "the phantom AES256 secret/salt are dropped");
 assert.ok(!healed.pending, "the bogus pending proposal is dropped");
 console.log("OK  a store poisoned before the fix heals on unlock");
+
+// ---- Pentest 2026-08-07 F-ATREST-005: the chat store fails closed at rest -----
+// One removeItem used to empty the envelope-replay ring and every negotiated
+// mode; an older blob rewound the ring. Same mechanism as the contact store.
+{
+  mem.clear();
+  await chats.unlock(PASS);
+  await chats.ensure("bob");
+  assert.strictEqual(await chats.markSeen("bob", "env-1"), true);
+  assert.strictEqual(await chats.markSeen("bob", "env-1"), false, "the ring works");
+  // The plaintext is tagged and versioned inside the AEAD.
+  {
+    const enc = new TextEncoder(), dec = new TextDecoder();
+    const blob = JSON.parse(localStorage.getItem("sc.chats.v1"));
+    const unb64 = (x) => Uint8Array.from(Buffer.from(x, "base64"));
+    const base = await crypto.subtle.importKey("raw", enc.encode(PASS), "PBKDF2", false, ["deriveKey"]);
+    const key = await crypto.subtle.deriveKey(
+      { name: "PBKDF2", salt: unb64(blob.salt), iterations: blob.iters, hash: "SHA-256" },
+      base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"],
+    );
+    const inner = JSON.parse(dec.decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(blob.iv) }, key, unb64(blob.ct))));
+    assert.strictEqual(inner.d, "secure-chat/chats-store/v2", "domain-tagged inside the AEAD");
+    assert.ok(Number.isInteger(inner.gen) && inner.gen >= 1, "carries a generation");
+    assert.ok(localStorage.getItem("sc.chats.gen.v1"), "and a witness beside it");
+  }
+  chats.lock();
+
+  // Deletion: the store is gone, the witness says one existed.
+  const storeSnap = localStorage.getItem("sc.chats.v1");
+  const witSnap = localStorage.getItem("sc.chats.gen.v1");
+  localStorage.removeItem("sc.chats.v1");
+  await assert.rejects(chats.unlock(PASS), (e) => e.code === "DELETED_CHATS_ADOPTION" && /DELETED/.test(e.message),
+    "F-ATREST-005: a deleted chat store is refused, not silently recreated");
+  assert.ok(!chats.isUnlocked());
+  localStorage.setItem("sc.chats.v1", storeSnap);
+
+  // Witness gone, store present: tampering (a tagged store always has one).
+  localStorage.removeItem("sc.chats.gen.v1");
+  await assert.rejects(chats.unlock(PASS), /generation record .* is missing/);
+  localStorage.setItem("sc.chats.gen.v1", witSnap);
+
+  // Rollback: mark another envelope seen, then restore the older blob.
+  await chats.unlock(PASS);
+  assert.strictEqual(await chats.markSeen("bob", "env-2"), true);
+  chats.lock();
+  localStorage.setItem("sc.chats.v1", storeSnap);
+  await assert.rejects(chats.unlock(PASS), /OLDER than this device recorded/,
+    "an older chat store is refused — env-2 would otherwise be accepted again");
+  // The whole point, stated as the consequence: post-fix, no unlock path exists
+  // in which markSeen("bob", "env-2") returns true a second time.
+
+  // Both restored (the coordinated snapshot): opens in a browser, documented
+  // residual — the floor below is what removes it on device.
+  localStorage.setItem("sc.chats.gen.v1", witSnap);
+  await chats.unlock(PASS);
+  assert.strictEqual(await chats.markSeen("bob", "env-2"), true, "browser residual: both-restored rewinds the ring");
+  chats.lock();
+
+  // A stale second tab: writes must never leave the store BEHIND the witness.
+  const tabB = await import("./chats.js?tab=b");
+  await chats.unlock(PASS);
+  await tabB.unlock(PASS);
+  await chats.ensure("carol");   // tab A writes N+1
+  await tabB.ensure("dave");     // tab B still holds N in memory, writes anyway
+  chats.lock(); tabB.lock();
+  await chats.unlock(PASS);      // must not read as a rollback (the M-C shape)
+  assert.ok(chats.get("dave"), "the later write wins (accepted lost update, not a lockout)");
+  chats.lock();
+
+  // wipe() clears both, so a deliberate reset is a clean first run.
+  chats.wipe();
+  assert.ok(!chats.hasStore());
+  assert.deepStrictEqual(await chats.unlock(PASS), { created: true });
+  chats.lock();
+
+  // A genuine pre-v2 blob (every deployed chat store is this shape) with NO
+  // epoch marker — the state an attacker can produce with one removeItem, and
+  // the state of a device that just upgraded. Both get the prompt: the fix
+  // review showed that adopting silently here reopened the whole finding.
+  mem.clear();
+  {
+    const enc = new TextEncoder();
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const base = await crypto.subtle.importKey("raw", enc.encode(PASS), "PBKDF2", false, ["deriveKey"]);
+    const key = await crypto.subtle.deriveKey(
+      { name: "PBKDF2", salt, iterations: 600000, hash: "SHA-256" },
+      base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"],
+    );
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const legacy = { erin: { username: "erin", mode: "SEALED", messages: [], seenIds: ["old-1"], updatedAt: 1 } };
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(JSON.stringify(legacy))));
+    const b64 = (u) => Buffer.from(u).toString("base64");
+    localStorage.setItem("sc.chats.v1", JSON.stringify({ v: 1, iters: 600000, salt: b64(salt), iv: b64(iv), ct: b64(ct) }));
+  }
+  await assert.rejects(chats.unlock(PASS),
+    (e) => e.code === "LEGACY_CHATS_ADOPTION" && e.suspicious === false,
+    "an untagged blob with no epoch marker must still prompt (deletable markers never authorise)");
+  assert.deepStrictEqual(await chats.unlock(PASS, { adoptLegacy: true }), { created: false },
+    "the upgrade adopts the pre-v2 blob on request");
+  assert.strictEqual(await chats.markSeen("erin", "old-1"), false, "its ring survives");
+  assert.ok(localStorage.getItem("sc.chats.gen.v1"), "and it is witnessed from now on");
+  chats.lock();
+}
+console.log("OK  F-ATREST-005: chat store is tagged, versioned and witnessed; delete/rollback fail closed");
+
+// ---- F-ATREST-005 on device: the native floor ------------------------------
+{
+  mem.clear();
+  const floors = new Map();
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = {
+    read: (id) => (floors.has(id) ? floors.get(id) : -1),
+    bump: (id, val) => {
+      const cur = floors.has(id) ? floors.get(id) : -1;
+      const n = val > cur ? val : cur;
+      floors.set(id, n);
+      return n;
+    },
+  };
+  const cN = await import("./chats.js?native=1");
+  const ID = "c".repeat(64);
+  await cN.unlock(PASS, { floorId: ID });
+  await cN.ensure("bob");
+  await cN.markSeen("bob", "env-1");
+  const storeSnap = localStorage.getItem("sc.chats.v1");
+  const witSnap = localStorage.getItem("sc.chats.gen.v1");
+  await cN.markSeen("bob", "env-2");
+  assert.ok(floors.get("chats:" + ID) >= 3, "every persist bumps the identity's chat floor");
+  cN.lock();
+  // The coordinated snapshot: refused on device.
+  localStorage.setItem("sc.chats.v1", storeSnap);
+  localStorage.setItem("sc.chats.gen.v1", witSnap);
+  await assert.rejects(cN.unlock(PASS, { floorId: ID }), /OLDER than this device recorded/,
+    "F-ATREST-005 on device: both-restored is caught by the floor");
+  // Both deleted: refused (explicit adoption), then continues the numbering.
+  localStorage.removeItem("sc.chats.v1");
+  localStorage.removeItem("sc.chats.gen.v1");
+  await assert.rejects(cN.unlock(PASS, { floorId: ID }), (e) => e.code === "DELETED_CHATS_ADOPTION");
+  assert.deepStrictEqual(await cN.unlock(PASS, { floorId: ID, adoptDeleted: true }), { created: true });
+  cN.lock();
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+}
+console.log("OK  F-ATREST-005 on device: the chat store has a native floor");
 
 console.log("\nAll chat-mode allow-list checks passed.");

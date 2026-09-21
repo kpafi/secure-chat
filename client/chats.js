@@ -20,6 +20,31 @@
 // twice).
 
 const LS_CHATS = "sc.chats.v1";
+// Pentest 2026-08-07 F-ATREST-005: the chat store had no domain tag, no
+// generation and no witness — one `removeItem` emptied the envelope-replay
+// ring (`seenIds`, P-13) and every negotiated AES256 mode, and restoring an
+// older blob rewound the ring so every envelope since the snapshot replayed.
+// It now carries the contact store's mechanism: a tagged plaintext with a
+// generation, an AEAD witness beside it (own salt, own domain tag so neither
+// witness can be swapped for the other — the H-2 lesson), and on Android the
+// per-identity native floor. Two deliberate departures from contacts.js:
+//   * no compare-and-swap refusal on persist — this store is written on every
+//     inbound envelope, and two tabs of one account polling the mailbox is a
+//     real scenario (the M-C self-DoS); a stale tab's write is accepted and
+//     numbered past the witness instead, so the store is never BEHIND it;
+//   * an untagged pre-v2 blob is NEVER adopted silently — an explicit choice
+//     (every deployed chat store is untagged, so every user sees the prompt
+//     exactly once on upgrade), and with a floor present it is refused
+//     outright. The first cut adopted silently when the plaintext epoch
+//     marker was absent; the fix review (2026-09-21) showed one extra
+//     removeItem of that marker restored the entire finding in a browser.
+//     A deletable marker may escalate a warning, never authorise anything.
+const LS_CHATS_GEN = "sc.chats.gen.v1";
+const CHATS_DOMAIN = "secure-chat/chats-store/v2";
+const CHATS_GEN_DOMAIN = "secure-chat/chats-generation/v1";
+const EPOCH_KEY = "sc.chats.epoch.v1";
+import { captureNativeFloor, NATIVE_ABSENT, NATIVE_TAMPERED, floorUnavailableError } from "./nativefloor.js";
+const nativeFloor = captureNativeFloor();
 const KDF_ITERS = 600000;
 const MAX_MESSAGES_PER_CHAT = 500; // keep the newest; bound the blob size
 
@@ -64,6 +89,56 @@ async function deriveKey(passphrase, salt, iters) {
 let dataKey = null;
 let salt = null;
 let chats = null; // { username: chat } while unlocked
+let generation = 0;
+let floorKey = null;
+let expectedStore = false;
+
+function readFloor() {
+  if (!nativeFloor || !floorKey) return NATIVE_ABSENT;
+  if (nativeFloor.broken) throw floorUnavailableError("your chat history");
+  return nativeFloor.read(floorKey);
+}
+
+function adoptionError(message, code) {
+  lock();
+  const err = new Error(message);
+  err.code = code;
+  err.suspicious = localStorage.getItem(EPOCH_KEY) !== null;
+  return err;
+}
+
+// The witness: {d: CHATS_GEN_DOMAIN, gen} under the data key with its OWN salt,
+// so it stays readable when the store that would hold the salt is gone.
+async function readWitness(passphrase = null) {
+  const raw = localStorage.getItem(LS_CHATS_GEN);
+  if (!raw) return null;
+  let rec;
+  try {
+    rec = JSON.parse(raw);
+  } catch {
+    return { corrupt: true };
+  }
+  try {
+    const key = passphrase === null
+      ? dataKey
+      : await deriveKey(passphrase, unb64(rec.salt), rec.iters || KDF_ITERS);
+    const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(rec.iv) }, key, unb64(rec.ct));
+    const w = JSON.parse(dec.decode(plain));
+    if (w.d !== CHATS_GEN_DOMAIN || !Number.isInteger(w.gen)) return { corrupt: true };
+    return w;
+  } catch {
+    return { corrupt: true };
+  }
+}
+
+async function writeWitness() {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plain = enc.encode(JSON.stringify({ d: CHATS_GEN_DOMAIN, gen: generation }));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, dataKey, plain));
+  localStorage.setItem(LS_CHATS_GEN, JSON.stringify({
+    salt: b64(salt), iters: KDF_ITERS, iv: b64(iv), ct: b64(ct),
+  }));
+}
 
 // Pentest 2026-07-26 P-20: the store is keyed by a directory username, and the
 // server's charset (^[a-z0-9_.-]+$, 3-32) makes `__proto__` and `constructor`
@@ -88,18 +163,53 @@ export function lock() {
   dataKey = null;
   salt = null;
   chats = null;
+  generation = 0;
+  floorKey = null;
 }
 
-export async function unlock(passphrase) {
+// True when a chat store is expected on this device (blob, witness, or a
+// native floor seen by the last unlock), like contacts.hasStore().
+export function hasStore() {
+  return expectedStore ||
+    localStorage.getItem(LS_CHATS) !== null || localStorage.getItem(LS_CHATS_GEN) !== null;
+}
+
+// Same options as contacts.unlock: `floorId`, `adoptLegacy`, `adoptDeleted`.
+export async function unlock(passphrase, opts = {}) {
   if (!passphrase) throw new Error("passphrase required to unlock the chat store");
+  floorKey = opts.floorId ? "chats:" + opts.floorId : null;
+  const floor = readFloor();
+  if (floor === NATIVE_TAMPERED) {
+    lock();
+    throw new Error("the device-protected record for your chat history is damaged or forged — refusing to open it");
+  }
   const raw = localStorage.getItem(LS_CHATS);
   if (!raw) {
+    const w = await readWitness(passphrase);
+    if (w !== null || floor > NATIVE_ABSENT) {
+      // A store existed here (witness, or on Android the floor) and is gone:
+      // the replay ring and negotiated modes with it. Explicit choice, never a
+      // silent fresh start — the same rule as the contact store.
+      expectedStore = true;
+      if (!opts.adoptDeleted) {
+        const gen = w && !w.corrupt ? w.gen : floor;
+        throw adoptionError(
+          `your chat history (generation ${gen}) has been DELETED from this device — refusing to start over ` +
+          "silently, because already-delivered messages could then be replayed and per-chat encryption " +
+          "settings are gone. If you did not Forget this identity yourself, treat this device as tampered.",
+          "DELETED_CHATS_ADOPTION",
+        );
+      }
+    }
     salt = crypto.getRandomValues(new Uint8Array(16));
     dataKey = await deriveKey(passphrase, salt, KDF_ITERS);
     chats = newStore();
+    generation = floor > NATIVE_ABSENT ? floor : 0;
     await persist();
-    return;
+    expectedStore = false;
+    return { created: true };
   }
+  expectedStore = true;
   const blob = JSON.parse(raw);
   salt = unb64(blob.salt);
   dataKey = await deriveKey(passphrase, salt, blob.iters || KDF_ITERS);
@@ -110,10 +220,80 @@ export async function unlock(passphrase) {
     lock();
     throw new Error("chat store does not decrypt with this passphrase (different identity, or tampered)");
   }
+  const data = JSON.parse(dec.decode(plain));
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    lock();
+    throw new Error("the chat store on this device is not a chat store — refusing to open it");
+  }
+  // The discriminator is the tag INSIDE the AEAD, never the outer `v` byte
+  // (H-2 / P-01). Untagged = the pre-v2 shape: a bare {username: chat} map.
+  const tagged = Object.prototype.hasOwnProperty.call(data, "d");
+  if (tagged && data.d !== CHATS_DOMAIN) {
+    lock();
+    throw new Error("the chat store on this device is not a chat store — refusing to open it");
+  }
+  const map = tagged ? data.chats : data;
+  if (!map || typeof map !== "object" || Array.isArray(map) ||
+      Object.values(map).some((c) => !c || typeof c !== "object" || !Array.isArray(c.messages))) {
+    lock();
+    throw new Error("the chat store on this device is not a chat store — refusing to open it");
+  }
+  generation = tagged && Number.isInteger(data.gen) ? data.gen : 0;
+
+  // Rollback / deletion detection, in the contact store's order: witness
+  // verdicts first (specific wording), then the floor, then adoption.
+  const w = await readWitness();
+  if (w === null) {
+    if (tagged) {
+      lock();
+      throw new Error("the generation record for your chat history is missing — refusing to open it, because a rollback could no longer be detected");
+    }
+  } else if (w.corrupt) {
+    lock();
+    throw new Error("the generation record for your chat history is damaged or forged");
+  } else if (generation < w.gen) {
+    lock();
+    throw new Error(
+      `your chat history is OLDER than this device recorded (generation ${generation}, expected ${w.gen}) — ` +
+      "an earlier copy has been restored, which would let already-delivered messages replay",
+    );
+  }
+  if (floor > NATIVE_ABSENT && generation < floor) {
+    lock();
+    throw new Error(
+      `your chat history is OLDER than this device recorded (generation ${generation}, device record ${floor}) — ` +
+      "an earlier copy has been restored, which would let already-delivered messages replay",
+    );
+  }
+  if (data.nativeFloor === true && floorKey && floor === NATIVE_ABSENT) {
+    lock();
+    throw new Error("the device-protected record for your chat history has been deleted — refusing to open it, because a rollback could no longer be detected");
+  }
+  if (!tagged) {
+    // Pre-v2 blob (no witness, or it would have been refused above). On a
+    // device that has run this code before, that is a restore; adoption is
+    // the user's call. On a fresh upgrade it is simply the old format.
+    if (floor > NATIVE_ABSENT) {
+      lock();
+      throw new Error("your chat history has no rollback record but this device says it had one — an earlier copy has been restored; refusing to open it");
+    }
+    if (!opts.adoptLegacy) {
+      throw adoptionError(
+        "your chat history has no rollback record on this device. If you have used this device with " +
+        "these chats before, an older copy may have been restored, which would let already-delivered " +
+        "messages replay; if you just upgraded, this is expected once.",
+        "LEGACY_CHATS_ADOPTION",
+      );
+    }
+  }
   // P-20: JSON.parse yields a normal object (with a prototype); re-key it into a
   // null-prototype store before anything indexes it by a username.
-  chats = newStore(JSON.parse(dec.decode(plain)));
-  if (sanitizeModes()) await persist();
+  chats = newStore(map);
+  let dirty = sanitizeModes();
+  if (!tagged) dirty = true; // upgraded in place so adoption happens once
+  if (floorKey && nativeFloor && data.nativeFloor !== true) dirty = true;
+  if (dirty) await persist();
+  return { created: false };
 }
 
 // Repair a store written before the F-02 allow-list existed: a chat whose mode
@@ -139,18 +319,32 @@ function sanitizeModes() {
 
 async function persist() {
   if (!dataKey) throw new Error("chat store is locked");
+  // Number past whatever the witness holds (another tab may have written): the
+  // store must never end up BEHIND its own witness, or the next unlock reads
+  // an honest concurrent write as a rollback. Deliberately not a refusal — see
+  // the note at the top of the file.
+  const w = await readWitness();
+  if (w && !w.corrupt && w.gen > generation) generation = w.gen;
+  generation += 1;
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const plain = enc.encode(JSON.stringify(chats));
+  const plain = enc.encode(JSON.stringify({
+    d: CHATS_DOMAIN, chats, gen: generation, nativeFloor: !!(nativeFloor && floorKey),
+  }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, dataKey, plain));
   localStorage.setItem(
     LS_CHATS,
-    JSON.stringify({ v: 1, iters: KDF_ITERS, salt: b64(salt), iv: b64(iv), ct: b64(ct) }),
+    JSON.stringify({ v: 2, iters: KDF_ITERS, salt: b64(salt), iv: b64(iv), ct: b64(ct) }),
   );
+  await writeWitness();
+  if (nativeFloor && floorKey) nativeFloor.bump(floorKey, generation);
+  localStorage.setItem(EPOCH_KEY, "1");
 }
 
 export function wipe() {
   localStorage.removeItem(LS_CHATS);
+  localStorage.removeItem(LS_CHATS_GEN);
   lock();
+  expectedStore = false;
 }
 
 // ---- AES256 inner layer ---------------------------------------------------

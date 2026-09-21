@@ -372,6 +372,19 @@ each has been addressed (see PROGRESS.md for the code):
   (root): such an attacker can destroy a floor, which fails closed, but cannot
   rewind one. Closing the browser case would need OS-level trusted monotonic
   storage, which the web platform does not offer.
+  * **Pentest 2026-08-07 (F-ATREST-001..005, -007):** the same floor now also
+    covers the OTP **receive** high-water mark and the **`exported`** flag, and
+    — under a per-identity id — the **contact store** (identity pins) and the
+    **chat store** (envelope-replay ring, negotiated modes), which gained the
+    contact store's domain tag / generation / witness mechanism. On Android,
+    "store + witness both deleted" and "both restored" are refused; a deleted
+    store is an explicit *Open anyway* in the Users view, never a silent fresh
+    start. Pins are marked revoked by *Unverify* / *Remove* and no longer
+    auto-unlock a session. **The same browser residual applies to all of it:**
+    with no floor, a coordinated snapshot restore of blob + witness rewinds
+    undetected, and "both deleted" is indistinguishable from a first run (the
+    app warns when an existing identity finds no store, which is all a browser
+    can do).
 - **M-03 / L-01 / L-02.** Dedicated stricter rate bucket on `/api/auth/challenge`;
   `Strict-Transport-Security` sent over HTTPS; dev files (`package.json`,
   `*.test.mjs`) are 404'd and removed from the deployed client.
