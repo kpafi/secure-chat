@@ -50,6 +50,16 @@ build-tools 34.0.0.
    Note: the Chats locked panel only re-renders when the Chats view is shown
    (`refreshChats` is gated on `!viewChats.hidden`), so it reads stale while
    another view is up — not a bug, the view is hidden.
+   **Open anyway pressed in Chats (user):** chat store opened —
+   `sc.chats.v1` is now **v2** (6,240 chars, was v1/6,148), `sc.chats.gen.v1`
+   (166 chars) and `sc.chats.epoch.v1`=1 written, the one existing chat
+   (`ankerni`, last line intact) listed, 0 *Open anyway* buttons visible
+   afterwards. The plain *Unlock* button in the Chats view did NOT open it
+   (user: "with unlock it wouldn't work") — expected: it re-runs the unlock
+   without the adopt flag and re-raises the same refusal, adding one more
+   "[chat store did not unlock — …]" transcript line per press (3 such lines
+   seen). Not re-verified: that a fresh page load now unlocks without any
+   prompt (the v2 tag + gen record make that the tested path).
    **⚠️ Seen in passing — the relay is NOT down.** The app's configured relay
    `https://138-199-144-35.sslip.io` answers `/healthz` with
    `{"status":"ok"}` (HTTP 200, **no `version` field ⇒ the OLD code**). With
