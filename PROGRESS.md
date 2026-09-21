@@ -35,15 +35,36 @@ build-tools 34.0.0.
    those two strips) — the WebView content is not captured. Recents card
    after HOME + APP_SWITCH: blank dark card, no content. Behaviour is "black
    image", not "refusal".
-5. **First unlock — NOT DONE, needs the phone's passphrase** (not on record;
-   the session had no user present). Pre-unlock localStorage on the device:
-   `sc.identity.v1` (v3, 17,780 chars), `sc.contacts.v1` (**v4**, 12,212
-   chars) with `sc.contacts.gen.v1` present (170 chars), `sc.chats.v1`
+5. **First unlock — DONE, as expected.** Pre-unlock localStorage on the
+   device: `sc.identity.v1` (v3, 17,780 chars), `sc.contacts.v1` (**v4**,
+   12,212 chars) with `sc.contacts.gen.v1` present (170 chars), `sc.chats.v1`
    (**v1, untagged**, 6,148 chars), `sc.username.v1`, `sc.lookuptoken.v1`,
-   `sc.room.mine.v1` (one code). From that state the expected outcome is
-   exactly one *Open anyway* in Chats and none in Users. The app is left on
-   its unlock screen. To finish: unlock on the phone, count prompts per
-   view, confirm the Users list is intact; a Users-view prompt = bug, stop.
+   `sc.room.mine.v1`. The user unlocked the identity, then entered the
+   passphrase in the Users view (one entry unlocks both stores). Read over
+   CDP: Users view **unlocked, NO prompt** (`usersAdopt` hidden, `usersLocked`
+   hidden), list intact — 1 contact, `ankerni`, 🟢 verified, fingerprint
+   FDBD 2636 …; `sc.contacts.epoch.v1`=1 written on the first persist. Chats
+   view: locked with "Chat store error: your chat history has no rollback
+   record on this device … if you just upgraded, this is expected once" and
+   its own *Open anyway* — **exactly 1 visible Open anyway on the whole page**.
+   Note: the Chats locked panel only re-renders when the Chats view is shown
+   (`refreshChats` is gated on `!viewChats.hidden`), so it reads stale while
+   another view is up — not a bug, the view is hidden.
+   **⚠️ Seen in passing — the relay is NOT down.** The app's configured relay
+   `https://138-199-144-35.sslip.io` answers `/healthz` with
+   `{"status":"ok"}` (HTTP 200, **no `version` field ⇒ the OLD code**). With
+   the identity unlocked the app auto-logs in on its own (username + lookup
+   token from localStorage, backoff 12 s → 2 min), so "do not log in until
+   the relay is deployed" cannot be honoured by the user; the old relay
+   answers the new client's `/api/auth/verify` with **422** (`extra_forbidden`
+   on `mldsa_sig`, verified by a bogus POST from the laptop). Harmless — the
+   login is refused before any state changes — but it is exactly the
+   old-APK/new-relay mismatch inverted, and it will loop until the relay is
+   deployed. (b) Display bug: `account.js` `asError` returns `body.detail`
+   as-is, and a FastAPI 422 `detail` is an ARRAY, so the identity view and
+   the transcript show `verify failed: [object Object]`. One-line fix:
+   stringify non-string details (`Array.isArray(d) ? d.map(x=>x.msg+" at "+
+   x.loc.join(".")).join("; ") : JSON.stringify(d)`). Not fixed here.
 6. `v0.1.0` tag created locally at `3e55bff` and pushed to origin (the cloud
    session could not). **Local `master` (`a4e5063`) has DIVERGED from
    `origin/master` (`3e55bff`)**: ~50 local-only commits (Phase 7 etc., from
