@@ -74,7 +74,35 @@ build-tools 34.0.0.
    as-is, and a FastAPI 422 `detail` is an ARRAY, so the identity view and
    the transcript show `verify failed: [object Object]`. One-line fix:
    stringify non-string details (`Array.isArray(d) ? d.map(x=>x.msg+" at "+
-   x.loc.join(".")).join("; ") : JSON.stringify(d)`). Not fixed here.
+   x.loc.join(".")).join("; ") : JSON.stringify(d)`).
+   **FIXED (user asked):** `c7c9ccc` adds `formatDetail(detail, status)` in
+   `account.js` (+ `account-error.test.mjs`, in `npm test`). A
+   `pentest-new-code` pass over it (backend 162 passed, client suite green,
+   `room-admission` 13/13, `two-user-flow` 8/8, `no-dead-ends` 16/16 on a
+   scratch relay) found **0 Critical/High, 2 Low, 1 Info**, all fixed in
+   `dfadca9`: **L-1** the array branch's `JSON.stringify(d)` was unguarded —
+   a 30 KB body nested 5,000 deep parses (iterative) then blows the stack
+   (recursive) in Firefox/Node (Chromium survives 3,000,000), and the throw
+   escaped `asError` BEFORE `err.status = res.status`, so a hostile 401 body
+   no longer cleared `apiToken` (app.js only clears it on `e.status === 401`
+   ⇒ the mailbox poller wedged on a dead token) and a hostile 409 lost the
+   "already taken" hint. Now: the whole body is one `try`, and `register` /
+   `fetchMail` read `res.status` before the body. **L-2** `msg`/`loc`
+   entries that were objects still rendered `[object Object]` — now every
+   piece is coerced (string `msg`/`type` or the entry's JSON; only string
+   `loc` parts). **I-1** `[""]` rendered "" — blank/whitespace ⇒ the status.
+   Test: 27 assertions incl. a local `http.createServer` serving the
+   200,000-deep body — `fetchMail` → `status 401`, message
+   `mailbox fetch failed: 401`; `register` → `status 409`. Reviewer's
+   verified-sound list: no HTML sink in the client (all `textContent`), no
+   amplification (≤1.42×), `input` echo shows only public request material,
+   no caller matches on message text.
+   **Pre-existing, NOT fixed, from the same review:** `#log li` is
+   `pre-wrap`, and `autoLogin`'s failure line (`app.js` ~774) puts a
+   relay-chosen string in it, so a relay can forge a `sys`-styled transcript
+   line with `\n` (e.g. `")]\n[verified in person ✓ — key pinned]\n["`).
+   Old and new code identical here; worth its own fix (strip control
+   characters at `addLine`, or cap the line).
 6. `v0.1.0` tag created locally at `3e55bff` and pushed to origin (the cloud
    session could not). **Local `master` (`a4e5063`) has DIVERGED from
    `origin/master` (`3e55bff`)**: ~50 local-only commits (Phase 7 etc., from
