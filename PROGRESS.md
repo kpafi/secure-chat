@@ -5,6 +5,52 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
 
 ## ⮕ RESUME HERE (2026-09-21, the 2026-08-07 pentest: all 14 Medium fixed, NOT deployed)
 
+**📱 ANDROID ON-DEVICE PASS (2026-09-21 evening, branch
+`android-ondevice-2026-09-21` from `3e55bff`; relay DOWN, nothing deployed).**
+Phone: Nothing A063, Android 15 (SDK 35). Toolchain: JDK 21
+(`/usr/lib/jvm/java-21-openjdk-amd64`, jlink present), SDK platform 34,
+build-tools 34.0.0.
+
+1. **Build:** `./gradlew assembleDebug` — BUILD SUCCESSFUL, 40 tasks (8
+   executed incl. `syncWebClient` and `compileDebugKotlin`), 0 Kotlin changes
+   needed. APK 6,049,054 bytes; `assets/web/` holds 30 files including
+   `nativefloor.js` (7,929 bytes); `classes.dex` references `FLAG_SECURE`.
+2. **Install:** `adb install -r` → Success. `versionName` 0.1.0 both before
+   and after (the previous install was 2026-07-30, also 0.1.0 — the version
+   was not bumped for this release; `lastUpdateTime` moved to 2026-09-21
+   22:04:55). Not logged in from the app (relay down / old relay would 422 the
+   `mldsa_sig` field).
+3. **Native floor, real Keystore:** `android/native-floor-ondevice.mjs`
+   extended (committed) with one fresh random id per new prefix — `recv:<32
+   hex>`, `exported:<32 hex>`, `contacts:<64 hex>`, `chats:<64 hex>` — each
+   read −1 → bump(7)=7 (typeof number) → bump(3)=7 → read 7; plus three
+   cross-namespace reads (bare 32-hex, bare 64-hex, `recv:<the 64 hex>`) all
+   still −1 after the bumps, so the `:` is part of the HMAC'd key, not
+   stripped. **33/33 checks passed** (14 original + 19 new). Real
+   `sc.otp.*` keys on device: 0.
+4. **FLAG_SECURE:** `dumpsys window` shows `fl=… SECURE …` on the
+   MainActivity window. `adb shell screencap -p` with the app in front
+   EXITS 0 and writes a 32,775-byte 1080×2400 PNG that is black except the
+   OS status bar and nav pill (14,177 of 2,592,000 pixels non-black, all in
+   those two strips) — the WebView content is not captured. Recents card
+   after HOME + APP_SWITCH: blank dark card, no content. Behaviour is "black
+   image", not "refusal".
+5. **First unlock — NOT DONE, needs the phone's passphrase** (not on record;
+   the session had no user present). Pre-unlock localStorage on the device:
+   `sc.identity.v1` (v3, 17,780 chars), `sc.contacts.v1` (**v4**, 12,212
+   chars) with `sc.contacts.gen.v1` present (170 chars), `sc.chats.v1`
+   (**v1, untagged**, 6,148 chars), `sc.username.v1`, `sc.lookuptoken.v1`,
+   `sc.room.mine.v1` (one code). From that state the expected outcome is
+   exactly one *Open anyway* in Chats and none in Users. The app is left on
+   its unlock screen. To finish: unlock on the phone, count prompts per
+   view, confirm the Users list is intact; a Users-view prompt = bug, stop.
+6. `v0.1.0` tag created locally at `3e55bff` and pushed to origin (the cloud
+   session could not). **Local `master` (`a4e5063`) has DIVERGED from
+   `origin/master` (`3e55bff`)**: ~50 local-only commits (Phase 7 etc., from
+   `80a002d`) versus the cloud's 10 (`claude/loving-cannon-ba5tbt`). Neither
+   line was merged into the other here; this branch is on the cloud line as
+   instructed. Reconcile before any deploy.
+
 **Every Medium in `secure-chat-pentest-2026-08-07.md` is fixed on branch
 `claude/loving-cannon-ba5tbt`, with a regression test each, verified to FAIL
 against the pre-fix code by stashing and re-running (not asserted).** Three
