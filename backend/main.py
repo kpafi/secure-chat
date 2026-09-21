@@ -184,7 +184,7 @@ async def security_headers(request: Request, call_next):
 
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "version": config.VERSION}
 
 
 async def _safe_send(ws: WebSocket, text: str) -> None:

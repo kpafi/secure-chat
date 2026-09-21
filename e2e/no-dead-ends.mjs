@@ -147,6 +147,56 @@ const drawerState = await page.evaluate(() => ({
 check("open drawer marks the current view",
   drawerState.expanded === "true" && drawerState.current === "live", JSON.stringify(drawerState));
 
+// --- a store that refuses to open must offer a way out (fix review 2026-09-21)
+// The at-rest stores now refuse a deleted/unverifiable blob instead of silently
+// recreating it. The reviewer found that when only the CHAT store refused, the
+// user saw an empty, success-looking unlock status and no override anywhere —
+// the only exit was Forget identity. This drives that exact state through the
+// real UI: identity created, chat store deleted, reload, unlock in the Chats
+// view, expect a visible error AND a working "Open anyway".
+{
+  const p2 = await browser.newPage();
+  await p2.goto(APP, { waitUntil: "networkidle0" });
+  await p2.type("#idPass", PASS);
+  await p2.click("#idCreate");
+  await p2.waitForFunction(() => !document.querySelector("#idExport").hidden, { timeout: 60000 });
+  await p2.evaluate(() => localStorage.removeItem("sc.chats.v1")); // the one removeItem
+  await p2.reload({ waitUntil: "networkidle0" });
+  await p2.click("#menuBtn");
+  await p2.click('.navitem[data-view="chats"]');
+  await p2.waitForFunction(() => !document.querySelector("#viewChats").hidden, { timeout: 10000 });
+  await p2.type("#chatsUnlockPass", PASS);
+  await p2.click("#chatsUnlock");
+  // Pre-fix this wait never resolves: the status was blank and the panel text
+  // generic. Swallow the timeout so it reports as a FAIL line, not a crash.
+  await p2.waitForFunction(
+    () => /unlocked, but|error/i.test(document.querySelector("#chatsUnlockStatus").textContent +
+      document.querySelector("#chatsLocked p").textContent), { timeout: 60000 }).catch(() => {});
+  const lockedText = await p2.evaluate(() =>
+    document.querySelector("#chatsLocked p").textContent + " | " + document.querySelector("#chatsUnlockStatus").textContent);
+  check("a refused chat store says so where the user is", /DELETED|error/i.test(lockedText),
+    JSON.stringify(lockedText.slice(0, 120)));
+  const adoptVisible = await p2.evaluate(() => {
+    const b = document.querySelector("#chatsAdopt");
+    return !!b && !b.hidden && b.getBoundingClientRect().height > 0;
+  });
+  check("…and offers 'Open anyway' right there", adoptVisible);
+  await p2.type("#chatsUnlockPass", PASS);
+  await p2.click("#chatsAdopt");
+  await p2.waitForFunction(() => !document.querySelector("#chatsUnlocked").hidden, { timeout: 60000 })
+    .catch(() => {});
+  check("the override actually opens the chats view",
+    await p2.evaluate(() => !document.querySelector("#chatsUnlocked").hidden));
+  // Users view: nothing refused there, so no override is offered — the control
+  // is per store, not a global "ignore all warnings".
+  await p2.click("#menuBtn");
+  await p2.click('.navitem[data-view="users"]');
+  await p2.waitForFunction(() => !document.querySelector("#viewUsers").hidden, { timeout: 10000 });
+  check("the Users view, which did not refuse, shows no override",
+    await p2.evaluate(() => document.querySelector("#usersAdopt").hidden && !document.querySelector("#usersUnlocked").hidden));
+  await p2.close();
+}
+
 await browser.close();
 const failed = results.filter((r) => !r.ok);
 console.log(`\n  ${results.length - failed.length}/${results.length} checks passed`);

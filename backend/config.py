@@ -187,6 +187,11 @@ MAX_ACTIVE_TOKENS = 50_000       # outstanding session tokens
 # on-demand remedy.
 MAX_SESSIONS_PER_ACCOUNT = 5
 
+# --- Release version ---------------------------------------------------------
+# Reported by /healthz so "which build is running" is answered by one curl,
+# not by diffing files over ssh. Bump with the git tag (vX.Y.Z on master).
+VERSION = "0.1.0"
+
 # --- Static web client -----------------------------------------------------
 # Served same-origin so the page, the WebSocket, and the (future) .onion all
 # share one origin. Set to None to run as a pure relay with no static files.

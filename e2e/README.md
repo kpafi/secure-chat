@@ -49,6 +49,11 @@ peer who *pasted* the code and gets the identical `pending` must still go
 through the honest queue, so the refusal keys on "we minted this code", not
 on `pending`; and a fresh code still seats the creator as the owner.
 
+`no-dead-ends.mjs` also drives the one dead end the 2026-09-21 fix review
+found: a chat store that refuses to open (one `removeItem`) must show its
+error in the Chats view and offer a working *Open anyway* there, while the
+Users view, which did not refuse, offers none.
+
 ## What `two-user-flow.mjs` asserts
 
 1. **Registering is enough to receive.** Async chat only delivers while the
