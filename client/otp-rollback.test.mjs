@@ -84,12 +84,15 @@ const afterDowngrade = await otp.unlockPad(p.padId, PASS);
 assert.strictEqual(afterDowngrade.record.role, 1, "P-01: outer 'role' must be ignored even with 'v' stripped");
 console.log("OK  P-01: a v2 blob cannot be downgraded to the legacy path");
 
-// Re-keying that same blob under a fresh id must still be refused.
+// Re-keying that same blob under a fresh id must still be refused. (The id is
+// well-formed on purpose: since F-ATREST-001 a malformed one is refused one
+// step earlier, and this test is about the storage-key binding, not the shape.)
+const FORGED_ID = "0123456789abcdef0123456789abcdef";
 const copy = JSON.parse(localStorage.getItem(pKey));
-delete copy.v; copy.padId = "forgedid"; copy.regionSize = p.regionSize; copy.role = 0;
-localStorage.setItem("sc.otp.pad.v1.forgedid", JSON.stringify(copy));
+delete copy.v; copy.padId = FORGED_ID; copy.regionSize = p.regionSize; copy.role = 0;
+localStorage.setItem("sc.otp.pad.v1." + FORGED_ID + "", JSON.stringify(copy));
 await assert.rejects(
-  otp.unlockPad("forgedid", PASS), /does not match its storage key/,
+  otp.unlockPad(FORGED_ID, PASS), /does not match its storage key/,
   "P-01: a blob re-keyed under a fresh padId must be refused",
 );
 console.log("OK  P-01: padId re-key (M-01 watermark bypass) is refused");
@@ -769,6 +772,14 @@ console.log("OK  H-A: a bridge that LIES is refused, not just one that is delete
   for (const bad of [/\bMath\.max\(/, /\bparseInt\(/, /\bNumber\.isFinite\(/]) {
     assert.ok(!bad.test(rollback), `H-1: ${bad} is poisonable and must not decide a rollback`);
   }
+  // …nor may the shared floor module (pentest 2026-08-07: the capture and the
+  // value validation moved to nativefloor.js, and every store's verdict now
+  // passes through it).
+  const floorSrc = await readFile(new URL("./nativefloor.js", import.meta.url), "utf8");
+  const floorCode = floorSrc.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  for (const bad of [/\bMath\.max\(/, /\bparseInt\(/, /\bNumber\.isFinite\(/, /globalThis\.SecureChatPadFloor/]) {
+    assert.ok(!bad.test(floorCode), `H-1/H-A: nativefloor.js must not contain ${bad}`);
+  }
 
   delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
   delete globalThis.__SECURE_CHAT_NATIVE_FLOOR__;
@@ -890,5 +901,129 @@ console.log("    re-import still succeeds — documented residual, not covered b
     "and it is authenticated from then on");
 }
 console.log("OK  F-2: `exported` cannot be cleared through the legacy migration");
+
+// --- F-ATREST-001 (2026-08-07): the RECEIVE side gets a native floor ---------
+// M-7 above catches a receive rollback through the authenticated watermark —
+// which is one `setItem` away from being restored alongside the blob. On
+// Android the send side had a floor the JS context cannot rewind; the receive
+// side did not, so a snapshot of blob + watermark taken after sending, restored
+// after receiving, passed every check and re-accepted every OTP frame the peer
+// had already sent.
+{
+  const floors = new Map();
+  const bridge = () => ({
+    read: (id) => (floors.has(id) ? floors.get(id) : -1),
+    bump: (id, val) => {
+      const cur = floors.has(id) ? floors.get(id) : -1;
+      const n = val > cur ? val : cur;
+      floors.set(id, n);
+      return n;
+    },
+  });
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = bridge();
+  const otpR = await import("./otp.js?atrest=recv");
+  const r = await otpR.generatePad({ label: "recv-floor", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const rAtRest = await otpR.saveNewPad(r, PASS);
+  r.sendOffset = 200;
+  await otpR.savePadProgress(r, rAtRest);
+  // The attacker's coordinated snapshot: blob AND watermark, both after sending.
+  const padSnap = localStorage.getItem("sc.otp.pad.v1." + r.padId);
+  const wmSnap = localStorage.getItem("sc.otp.wm.v1." + r.padId);
+  // Then a stretch of receiving.
+  r.recvHighWater = 119;
+  await otpR.savePadProgress(r, rAtRest);
+  assert.strictEqual(floors.get("recv:" + r.padId), 119, "the receive high-water mark reaches the native floor");
+  assert.strictEqual(floors.get(r.padId), 200, "and the send floor is untouched by it");
+  // Restore both. Send floor == blob's sendOffset, watermark says recv 0: pre-fix
+  // this unlocked at recv 0 and every already-delivered frame replayed.
+  localStorage.setItem("sc.otp.pad.v1." + r.padId, padSnap);
+  localStorage.setItem("sc.otp.wm.v1." + r.padId, wmSnap);
+  await assert.rejects(otpR.unlockPad(r.padId, PASS), /receive state was rolled back/,
+    "F-ATREST-001: a both-restored receive rollback is refused where a floor exists");
+  // A forged recv floor is TAMPERED, never "no floor".
+  floors.set("recv:" + r.padId, "junk");
+  await assert.rejects(otpR.unlockPad(r.padId, PASS), /damaged or forged/,
+    "an unreadable recv floor fails closed");
+  floors.delete("recv:" + r.padId);
+  // A pad from before this fix has no recv floor and is not caught by it: the
+  // restore above is then only the documented pre-fix state (the watermark
+  // agrees with the blob), so it opens — that is the M-7 residual the floor
+  // exists to remove, and the reason ABSENT must contribute 0, not refuse.
+  const older = await otpR.unlockPad(r.padId, PASS);
+  assert.strictEqual(older.record.recvHighWater, 0, "ABSENT recv floor contributes nothing (pre-fix pads still open)");
+
+  // The `:` namespace cannot be reached from a pad file: an id that is not 32
+  // hex characters is refused at import and at unlock.
+  const XFER = "xfer";
+  const bad = { ...r, padId: "recv:" + r.padId, sendOffset: 0, recvHighWater: 0 };
+  const badFile = await otpR.exportPad(bad, XFER);
+  await assert.rejects(otpR.importPad(badFile, XFER), /invalid pad id/,
+    "a pad file cannot carry an id in another floor namespace");
+  await assert.rejects(otpR.unlockPad("recv:" + r.padId, PASS), /no such pad/,
+    "nor can unlockPad be pointed at one");
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+
+  // Browser twin: no floor, so the both-restored rollback still opens. This is
+  // the documented residual, pinned here so the fix cannot quietly become
+  // "fail closed everywhere" and break the plain browser.
+  const otpB = await import("./otp.js?atrest=recv-browser");
+  const b = await otpB.generatePad({ label: "recv-browser", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const bAtRest = await otpB.saveNewPad(b, PASS);
+  const bPad = localStorage.getItem("sc.otp.pad.v1." + b.padId);
+  const bWm = localStorage.getItem("sc.otp.wm.v1." + b.padId);
+  b.recvHighWater = 50;
+  await otpB.savePadProgress(b, bAtRest);
+  localStorage.setItem("sc.otp.pad.v1." + b.padId, bPad);
+  localStorage.setItem("sc.otp.wm.v1." + b.padId, bWm);
+  assert.strictEqual((await otpB.unlockPad(b.padId, PASS)).record.recvHighWater, 0,
+    "browser: both-restored receive rollback is the documented residual");
+}
+console.log("OK  F-ATREST-001: the receive high-water mark has a native floor on device");
+
+// --- F-ATREST-002 (2026-08-07): `exported` gets a native floor ---------------
+// L-3 put the flag inside the AEAD; F-2 stopped the migration laundering it.
+// Neither survives restoring the pre-export blob + watermark: both are valid,
+// the send floor is 0 because only a pristine pad can be exported, and the
+// flag reads false — one pristine pad to two importers with no warning.
+{
+  const floors = new Map();
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = {
+    read: (id) => (floors.has(id) ? floors.get(id) : -1),
+    bump: (id, val) => {
+      const cur = floors.has(id) ? floors.get(id) : -1;
+      const n = val > cur ? val : cur;
+      floors.set(id, n);
+      return n;
+    },
+  };
+  const otpE = await import("./otp.js?atrest=exported");
+  const e = await otpE.generatePad({ label: "exported-floor", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  await otpE.saveNewPad(e, PASS);
+  const padSnap = localStorage.getItem("sc.otp.pad.v1." + e.padId);
+  const wmSnap = localStorage.getItem("sc.otp.wm.v1." + e.padId);
+  const u = await otpE.unlockPad(e.padId, PASS);
+  assert.strictEqual(u.record.exported, false);
+  await otpE.markExported(u.record, u.atRest);
+  assert.strictEqual(floors.get("exported:" + e.padId), 1, "the export is recorded natively");
+  localStorage.setItem("sc.otp.pad.v1." + e.padId, padSnap);
+  localStorage.setItem("sc.otp.wm.v1." + e.padId, wmSnap);
+  assert.strictEqual((await otpE.unlockPad(e.padId, PASS)).record.exported, true,
+    "F-ATREST-002: a restored pre-export blob must not re-arm export where a floor exists");
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+
+  // Browser twin: the same restore reads `false` — documented residual.
+  const otpB = await import("./otp.js?atrest=exported-browser");
+  const b = await otpB.generatePad({ label: "exported-browser", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  await otpB.saveNewPad(b, PASS);
+  const bPad = localStorage.getItem("sc.otp.pad.v1." + b.padId);
+  const bWm = localStorage.getItem("sc.otp.wm.v1." + b.padId);
+  const ub = await otpB.unlockPad(b.padId, PASS);
+  await otpB.markExported(ub.record, ub.atRest);
+  localStorage.setItem("sc.otp.pad.v1." + b.padId, bPad);
+  localStorage.setItem("sc.otp.wm.v1." + b.padId, bWm);
+  assert.strictEqual((await otpB.unlockPad(b.padId, PASS)).record.exported, false,
+    "browser: the pre-export restore re-arms export — documented residual");
+}
+console.log("OK  F-ATREST-002: `exported` has a native floor on device");
 
 console.log("\nAll OTP rollback checks passed.");

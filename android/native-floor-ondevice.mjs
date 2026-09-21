@@ -1,5 +1,12 @@
 // On-device proof of the native OTP pad floor, against the REAL AndroidKeyStore
-// path in the installed APK. Everything else that tests this runs in Node with a
+// path in the installed APK.
+//
+// Pentest 2026-08-07: the client now keys further floors under the same bridge
+// (`recv:<padId>`, `exported:<padId>`, `contacts:<idHash>`, `chats:<idHash>`,
+// see client/nativefloor.js). The bridge contract this harness proves is
+// unchanged — string id in, monotone Long out — so those ids are covered by
+// the same assertions; the next on-device run should bump one of each prefix
+// to show the `:` survives the HMAC path (it is only ever a string to Kotlin). Everything else that tests this runs in Node with a
 // simulated bridge, which is exactly how 2026-07-29 H-1 and its two fix-review
 // rounds slipped through: a mock cannot be substituted, poisoned, or frozen, so
 // it cannot show you that yours can be.

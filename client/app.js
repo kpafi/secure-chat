@@ -79,6 +79,7 @@ const els = {
   profileUnlockStatus: $("profileUnlockStatus"),
   usersUnlockPass: $("usersUnlockPass"), usersUnlock: $("usersUnlock"),
   usersUnlockStatus: $("usersUnlockStatus"),
+  usersAdopt: $("usersAdopt"), usersAdoptHint: $("usersAdoptHint"),
   chatsUnlockPass: $("chatsUnlockPass"), chatsUnlock: $("chatsUnlock"),
   chatsUnlockStatus: $("chatsUnlockStatus"),
   profileName: $("profileName"), profileAvatar: $("profileAvatar"),
@@ -547,7 +548,7 @@ async function createIdentity() {
     identity = await Identity.generate();
     const blob = await identity.export(pass);
     localStorage.setItem(LS_IDENTITY, blob);
-    await unlockContacts(pass); // contact store shares the identity passphrase
+    await unlockContacts(pass, { expectStore: false }); // contact store shares the identity passphrase
     els.idPass.value = "";
     await showIdentityUnlocked();
   } catch (e) {
@@ -571,7 +572,7 @@ async function unlockWithPassphrase(pass) {
       // upgrade happens exactly once, then re-publish the bundle below.
       localStorage.setItem(LS_IDENTITY, await identity.export(pass));
     }
-    await unlockContacts(pass); // contact store shares the identity passphrase
+    await unlockContacts(pass, { expectStore: true }); // contact store shares the identity passphrase
     await showIdentityUnlocked();
     return null;
   } catch (e) {
@@ -773,6 +774,22 @@ async function loginAccount() {
 // ---- users view (contact list + safety marks) -----------------------------
 
 let contactsError = null; // unlock failure message, shown in the Users view
+// Pentest 2026-08-07 F-ATREST-003/004/005: set when the store refused to open
+// for a reason the USER may legitimately override (an unverifiable legacy
+// store, or a store this device says existed and is now gone). The Users view
+// then offers "Open anyway"; nothing opens the store silently.
+let contactsAdoptable = false;
+
+// The per-identity id under which the native floor (Android) keeps the contact
+// and chat store generations: the hash of the identity's public signing key.
+// Only the signing key, deliberately — the bundle grows encryption keys on the
+// one-time legacy upgrade, and a floor id that changed then would read as
+// "floor deleted" on the store written before it.
+async function storeFloorId() {
+  if (!identity) return null;
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", identity.edPubRaw));
+  return Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
+}
 let apiToken = null;      // directory session token (from Log in), memory only
 
 // Unlock the contact store with the identity passphrase. Called wherever the
@@ -782,18 +799,41 @@ let apiToken = null;      // directory session token (from Log in), memory only
 // may legitimately have a foreign blob and want to wipe it), but it must be
 // visible wherever it matters — so besides `contactsError` for the Users view,
 // the room screen warns and the verification gate refuses to auto-accept.
-async function unlockContacts(pass) {
+//
+// `opts.expectStore` — an EXISTING identity is being unlocked (not created), so
+// a store that has to be created from nothing is worth a warning: in a browser
+// there is no floor, and "store + witness both deleted" is indistinguishable
+// from a first run (F-ATREST-003). The identity restored onto a new device gets
+// the same line; the wording covers both. `opts.adoptLegacy` / `adoptDeleted`
+// come from the Users view's explicit "Open anyway".
+const ADOPTABLE = new Set([
+  "LEGACY_CONTACTS_ADOPTION", "DELETED_CONTACTS_ADOPTION",
+  "LEGACY_CHATS_ADOPTION", "DELETED_CHATS_ADOPTION",
+]);
+async function unlockContacts(pass, opts = {}) {
+  const floorId = await storeFloorId();
+  const storeOpts = { floorId, adoptLegacy: !!opts.adoptLegacy, adoptDeleted: !!opts.adoptDeleted };
+  contactsAdoptable = false;
   try {
-    await contacts.unlock(pass);
+    const r = await contacts.unlock(pass, storeOpts);
     contactsError = null;
+    if (r && r.created && opts.expectStore) {
+      addLine("sys", "", "[no saved contacts were found for this identity — if you have used this device before, " +
+        "they were deleted and key-change warnings for earlier contacts are gone; treat every contact as unverified]");
+    }
   } catch (e) {
     contactsError = e.message;
+    if (ADOPTABLE.has(e.code)) contactsAdoptable = true;
     addLine("sys", "", "[contact store did not unlock — key-change warnings are OFF until it does]");
   }
   try {
-    await chats.unlock(pass); // chat history shares the at-rest posture
+    const r = await chats.unlock(pass, storeOpts); // chat history shares the at-rest posture
+    if (r && r.created && opts.expectStore && !contactsError) {
+      addLine("sys", "", "[no chat history was found for this identity on this device]");
+    }
   } catch (e) {
     contactsError = contactsError || e.message;
+    if (ADOPTABLE.has(e.code)) contactsAdoptable = true;
   }
 }
 
@@ -809,9 +849,13 @@ function refreshUsers() {
   if (!unlocked) {
     els.usersLocked.querySelector("p").textContent = contactsError
       ? "Contact store error: " + contactsError +
-        " (Forget + recreate the identity resets it — contacts are bound to the identity passphrase.)"
+        (contactsAdoptable ? "" :
+          " (Forget + recreate the identity resets it — contacts are bound to the identity passphrase.)")
       : "Contacts are stored encrypted under your identity passphrase. " +
         "Enter it to unlock them here.";
+    // F-ATREST-003/004/005: the override is offered, never taken for the user.
+    els.usersAdopt.hidden = !contactsAdoptable;
+    els.usersAdoptHint.hidden = !contactsAdoptable;
     return;
   }
   renderMyHandle();
@@ -1212,8 +1256,11 @@ function chatHint(text, isErr = false) {
 function contactMark(c) {
   if (!c) return "⚪ not in your users list";
   if (c.verified) return "🟢 verified by you";
-  if (c.vouchedBy && c.vouchedBy.length) return "🟡 vouched by " + c.vouchedBy.join(", ");
-  return "⚪ unverified";
+  // F-PROTO-005 (adjacent): a record whose keys changed since it was last
+  // verified says so wherever the mark is shown, not only in the Users list.
+  const changed = c.keyChangedAt ? " — key CHANGED since you last verified" : "";
+  if (c.vouchedBy && c.vouchedBy.length) return "🟡 vouched by " + c.vouchedBy.join(", ") + changed;
+  return "⚪ unverified" + changed;
 }
 
 function refreshChats() {
@@ -2546,7 +2593,7 @@ async function enterVerification(room, verifiedBundle) {
   const peerFp = await Identity.fingerprintOf(bundle);
   els.safetyNumber.textContent = sn;
   els.peerFingerprint.textContent = "Contact fingerprint: " + peerFp;
-  currentPinKey = expectedPeerName ? "user:" + expectedPeerName : "room:" + room;
+  currentPinKey = expectedPeerName ? contacts.pinKeyFor(expectedPeerName) : "room:" + room;
 
   // If we looked the contact up by username, the live key must match what the
   // directory published. A mismatch is a strong red flag (though note the
@@ -2583,12 +2630,28 @@ async function enterVerification(room, verifiedBundle) {
   }
 
   const pin = await getPin(currentPinKey);
-  if (sameBundle(pin, bundle)) {
+  if (sameBundle(pin, bundle) && !pin.revoked) {
     // Seen and verified before — accept without re-prompting.
     addLine("sys", "", expectedPeerName
       ? `contact "${expectedPeerName}" matches your saved pin`
       : "contact identity matches your saved pin");
     unlockMessaging();
+    return;
+  }
+  if (sameBundle(pin, bundle) && pin.revoked) {
+    // Pentest 2026-08-07 F-ATREST-007: the keys match a pin the user has since
+    // WITHDRAWN (Unverify / Remove). Not a key change — no CHANGED alarm — but
+    // no auto-accept either: the revocation has to mean something here, which
+    // is the one place it did not.
+    els.verify.hidden = false;
+    els.verify.classList.remove("changed");
+    els.verifyTitle.textContent = "You withdrew your verification of this contact — confirm the safety number again";
+    els.verifyHint.textContent =
+      "This key matches what you verified before, but you later removed or unverified this contact. " +
+      "Compare the safety number with them in person (or over a call where you recognise their voice) " +
+      "before proceeding.";
+    addLine("sys", "", "[pin matches, but your verification of this contact was withdrawn — re-verify]");
+    hint("You unverified this contact earlier — confirm the safety number again.", true);
     return;
   }
 
@@ -3076,6 +3139,22 @@ wireViewUnlock(els.profileUnlockPass, els.profileUnlock,
   setUnlockStatus(els.profileUnlockStatus), renderProfile);
 wireViewUnlock(els.usersUnlockPass, els.usersUnlock,
   setUnlockStatus(els.usersUnlockStatus), refreshUsers);
+// F-ATREST-003/004/005 "Open anyway": the explicit adoption the stores refuse
+// to perform on their own. Needs the passphrase again (the unlock row clears
+// it), and the identity must already be unlocked (it is — only the stores
+// refused).
+els.usersAdopt.addEventListener("click", async () => {
+  const pass = els.usersUnlockPass.value;
+  const status = setUnlockStatus(els.usersUnlockStatus);
+  if (!identity) { status("Unlock your identity first.", true); return; }
+  if (!pass) { status("Enter your identity passphrase, then press Open anyway.", true); return; }
+  status("Opening…");
+  await unlockContacts(pass, { expectStore: true, adoptLegacy: true, adoptDeleted: true });
+  els.usersUnlockPass.value = "";
+  status(contactsError ? contactsError : "", !!contactsError);
+  if (!contactsError) addLine("sys", "", "[contact store opened WITHOUT a verifiable history — treat every contact as unverified until you re-check the safety number]");
+  refreshUsers();
+});
 wireViewUnlock(els.chatsUnlockPass, els.chatsUnlock,
   setUnlockStatus(els.chatsUnlockStatus), refreshChats);
 

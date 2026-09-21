@@ -363,6 +363,14 @@
             <button id="usersUnlock" type="button" class="primary">Unlock</button>
           </div>
           <p class="hint" id="usersUnlockStatus"></p>
+          <p class="hint err" id="usersAdoptHint" hidden>
+            This store cannot be opened safely on its own. If you know why (you
+            forgot this identity on this device yourself, or you just upgraded
+            from an old version), enter your passphrase and open it anyway —
+            then treat every contact as unverified until you re-check their
+            safety number.
+          </p>
+          <button id="usersAdopt" type="button" hidden>Open anyway (I understand the risk)</button>
         </div>
         <div id="usersUnlocked" hidden>
           <div class="row myhandle" id="myHandleRow">
