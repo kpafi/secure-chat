@@ -176,6 +176,22 @@ let roomRole = null;       // "owner" | "guest" for this connection
 let admittedBundle = null; // the identity WE let in (owner side), or null
 let admittedAnon = false;  // we let in someone with no identity at all
 let wasPending = false;    // we sat in the approval queue (M-2, guest side)
+// Pentest 2026-08-07 F-PROTO-001: the one fact about room ownership the relay
+// does NOT get to supply. `roomRole` above is whatever the relay answers to
+// `join`, and a hostile relay can answer the room's CREATOR with `pending` —
+// then `joined:guest` — which the M-2 guest-half check accepts, because it
+// only proves we passed through the queue, not that an owner existed. The
+// creator then never sees a knock, approves nobody, and whoever the relay
+// routes in completes the handshake with no admission binding. So the client
+// remembers whether THIS page minted the code in the box, and a creator
+// refuses to be seated as a guest at all.
+let roomCodeMine = false;   // the code in #room came from newRoomCode() here
+let sessionRoomMine = false; // frozen copy for the live connection (like sessionRoom)
+// Why a client-side refusal closed the socket. `ws.onclose` returns to the room
+// screen, and changing screens clears every hint — so a refusal's explanation
+// vanished with the chat screen and the user was left on the room screen with
+// no idea why. The refusal parks its message here and onclose re-shows it.
+let closeHint = null;
 let knockQueue = [];       // [{jid, bundle, anon}] waiting for our verdict
 let currentRoom = null;    // the room this connection is in (keyconfirm effects)
 // L-1: a backstop on the approval queue, NOT the control.
@@ -1127,8 +1143,11 @@ async function refreshVouchMarks() {
         ).catch(() => false);
         if (ok) names.push(v.voucher);
       }
-      await contacts.setVouches(c.username, names);
-      changed = true;
+      // F-PROTO-005: `c` is the snapshot the signatures were checked against;
+      // the store refuses the write if the record's keys moved meanwhile.
+      if (await contacts.setVouches(c.username, names, {
+        ed: c.ed, mldsa: c.mldsa, ecdh: c.ecdh ?? null, mlkem: c.mlkem ?? null,
+      })) changed = true;
     }
   } finally {
     vouchRefreshRunning = false;
@@ -1792,6 +1811,7 @@ async function connectInner() {
   // live DOM.
   sessionRoom = room;
   sessionAlg = alg;
+  sessionRoomMine = roomCodeMine;
   setStatus("connecting…");
   els.connect.disabled = true;
   try {
@@ -1841,6 +1861,7 @@ async function connectInner() {
     enableSend(false);
     els.verify.hidden = true;
     showScreen("room");
+    if (closeHint) { hint(closeHint, true); closeHint = null; }
     els.connect.disabled = false;
     releaseOtpLock();
   };
@@ -2164,6 +2185,18 @@ async function handleMessage(room, raw) {
       // re-cast us mid-session (an owner told "you are a guest" would stop
       // being asked to approve anyone).
       if (roomRole !== null) break;
+      if (sessionRoomMine) {
+        // F-PROTO-001: we minted this code, so nobody can legitimately own the
+        // room before us — "wait for the owner" from the relay means either a
+        // hostile relay demoting the creator, or an invitee who connected
+        // first. Both end the same way: refuse, and let the creator start over
+        // in the order the design promises (creator connects, then approves).
+        addLine("sys", "", "[we created this chat code but the relay says someone else owns the room — refusing]");
+        closeHint = "You created this code, so you should be the one approving people. " +
+          "Connect first, then send the code — or press New code and connect before sharing it.";
+        if (ws) ws.close();
+        return;
+      }
       roomRole = "guest";
       wasPending = true; // M-2: proof we went through the approval queue
       els.roomShort.textContent = room.slice(0, 8) + "…" + room.slice(-8);
@@ -2249,7 +2282,7 @@ async function handleMessage(room, raw) {
         roomRole = m.role;
       } else if (roomRole !== m.role) {
         addLine("sys", "", "[the relay changed our role mid-session — refusing]");
-        hint("The relay tried to change your role in this room. Disconnecting.", true);
+        closeHint = "The relay tried to change your role in this room. Disconnected.";
         if (ws) ws.close();
         return;
       }
@@ -2259,9 +2292,19 @@ async function handleMessage(room, raw) {
       // one is ever asked to approve anybody. But the only legitimate way to
       // become a guest is pending -> knock -> joined:guest, so a seat handed to
       // us without ever passing through the queue means no owner approved it.
+      if (roomRole === "guest" && sessionRoomMine) {
+        // F-PROTO-001, belt and braces: a relay that skips `pending` and seats
+        // the creator straight in as a guest (already refused below via
+        // `wasPending`, kept explicit so the invariant survives a refactor).
+        addLine("sys", "", "[we created this chat code but the relay seated us as a guest — refusing]");
+        closeHint = "You created this code, so you should be the one approving people. " +
+          "The relay tried to seat you as a guest. Connect first, then send the code.";
+        if (ws) ws.close();
+        return;
+      }
       if (roomRole === "guest" && !wasPending) {
         addLine("sys", "", "[we were seated in this room without ever asking to be let in — refusing]");
-        hint("This relay put you in the room without the owner approving you. Disconnecting.", true);
+        closeHint = "This relay put you in the room without the owner approving you. Disconnected.";
         if (ws) ws.close();
         return;
       }
@@ -3038,6 +3081,7 @@ wireViewUnlock(els.chatsUnlockPass, els.chatsUnlock,
 
 els.gen.addEventListener("click", () => {
   els.room.value = newRoomCode();
+  roomCodeMine = true; // F-PROTO-001
   hint("New chat code created. Send it to the one person you want to talk to.");
 });
 
@@ -3195,7 +3239,9 @@ refreshIdentityUI();
 // so the button appeared to do nothing at all. A code costs nothing until you
 // connect, and someone JOINING simply pastes over it — so the failure mode is
 // removed rather than merely explained.
-if (!els.room.value) els.room.value = newRoomCode();
+if (!els.room.value) { els.room.value = newRoomCode(); roomCodeMine = true; }
+// F-PROTO-001: anything typed or pasted over the box is somebody else's code.
+els.room.addEventListener("input", () => { roomCodeMine = false; });
 
 // Invite-link handling: an inbound `#add=<handle>` opens the Users view and
 // stages the handle for review (never auto-adds). The fragment is cleared from

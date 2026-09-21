@@ -12,6 +12,7 @@ cd backend && ./run.sh          # terminal 1
 node e2e/two-user-flow.mjs      # terminal 2 — async chat + web of trust
 node e2e/room-admission.mjs     #            — live room join approval
 node e2e/no-dead-ends.mjs       #            — every failure path says something
+node e2e/hostile-relay.mjs      #            — a relay cannot demote the room creator
 ```
 
 Needs Node 20+, system Chromium (`/usr/bin/chromium`, override with `$CHROMIUM`)
@@ -36,6 +37,17 @@ something: the owner is shown the knocker's **actual key fingerprint** (compared
 against that agent's own identity) plus its trust mark, a waiting peer receives
 no key exchange and cannot send, the squatter is denied, and the invited peer
 still completes the handshake and messages both ways.
+
+## What `hostile-relay.mjs` asserts (pentest 2026-08-07 F-PROTO-001)
+
+The relay is real; the hostility is a document-start `WebSocket` wrapper that
+answers the room creator's `join` with `pending`, swallows her knock and seats
+her as a guest — the frame sequence that used to pass the M-2 guest-half check
+and leave a room with no owner to approve anyone. The creator (whose page
+minted the code) must refuse and be told why on the screen she lands on; a
+peer who *pasted* the code and gets the identical `pending` must still go
+through the honest queue, so the refusal keys on "we minted this code", not
+on `pending`; and a fresh code still seats the creator as the owner.
 
 ## What `two-user-flow.mjs` asserts
 

@@ -494,13 +494,33 @@ export async function setVerified(username, on) {
 // Cache the locally VERIFIED voucher names for a contact (the 🟡 mark). Only
 // ever store names the caller has checked signatures for — this is a render
 // cache, not a trust source.
-export async function setVouches(username, names) {
+//
+// Pentest 2026-08-07 F-PROTO-005: `forKeys` is the bundle the caller VERIFIED
+// the vouches against. The fetch that produced `names` is a network round trip
+// the directory controls the length of, and the record can be re-added or
+// re-looked-up (with different keys, which clears `vouchedBy` and stamps
+// `keyChangedAt`) while it is in flight. Writing by username alone then
+// re-attached "vouched by <friend>" to keys the friend never signed — shown in
+// the admission prompt with no key-changed warning. So the write is
+// conditional on the keys still being the ones the vouch covers; a stale
+// result is discarded (returns false) and the next refresh redoes it against
+// the current keys. The check and the mutation are synchronous, so there is
+// no second window between them.
+export async function setVouches(username, names, forKeys = null) {
   if (!contacts) throw new Error("contact store is locked");
   const cur = contacts.find((c) => c.username === username);
-  if (!cur) return;
+  if (!cur) return false;
+  if (forKeys && (
+    cur.ed !== forKeys.ed || cur.mldsa !== forKeys.mldsa ||
+    (cur.ecdh ?? null) !== (forKeys.ecdh ?? null) ||
+    (cur.mlkem ?? null) !== (forKeys.mlkem ?? null)
+  )) {
+    return false;
+  }
   cur.vouchedBy = names;
   cur.vouchCheckedAt = Date.now();
   await persist();
+  return true;
 }
 
 export async function remove(username) {

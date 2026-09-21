@@ -424,4 +424,32 @@ console.log("OK  H-2: pre-v4 stores are adopted and tagged; a foreign tag is ref
 }
 console.log("OK  L-3: a concurrent second-tab write is refused, not silently lost");
 
+// ---- Pentest 2026-08-07 F-PROTO-005: a vouch verified for superseded keys ----
+// must not be attached to the keys that replaced them.
+{
+  localStorage.clear();
+  await contacts.unlock(PASS);
+  await contacts.upsert({ username: "carol", token: "t", ed: "E1==", mldsa: "M1==", ecdh: "C1==", mlkem: "K1==" });
+  const old = contacts.get("carol");
+  // The keys change while a vouch fetched + verified for the OLD keys is still
+  // in flight (a stalling directory chooses how long that window is).
+  await contacts.upsert({ username: "carol", token: "t", ed: "E2==", mldsa: "M2==", ecdh: "C2==", mlkem: "K2==" });
+  const landed = await contacts.setVouches("carol", ["bob"],
+    { ed: old.ed, mldsa: old.mldsa, ecdh: old.ecdh ?? null, mlkem: old.mlkem ?? null });
+  assert.strictEqual(landed, false, "a stale vouch result must be discarded, not written");
+  assert.ok(!(contacts.get("carol").vouchedBy || []).length,
+    "a vouch verified for superseded keys must not mark the new keys");
+  // An enc-key-only change is a key change too (H-01 says all four keys count).
+  await contacts.upsert({ username: "carol", token: "t", ed: "E2==", mldsa: "M2==", ecdh: "C3==", mlkem: "K3==" });
+  assert.strictEqual(
+    await contacts.setVouches("carol", ["bob"], { ed: "E2==", mldsa: "M2==", ecdh: "C2==", mlkem: "K2==" }),
+    false, "an encryption-key change alone must also invalidate the in-flight vouch");
+  // The honest case still lands.
+  assert.strictEqual(
+    await contacts.setVouches("carol", ["bob"], { ed: "E2==", mldsa: "M2==", ecdh: "C3==", mlkem: "K3==" }),
+    true);
+  assert.deepStrictEqual(contacts.get("carol").vouchedBy, ["bob"]);
+}
+console.log("OK  F-PROTO-005: a vouch result for superseded keys is discarded");
+
 console.log("\nAll contact-store checks passed.");
