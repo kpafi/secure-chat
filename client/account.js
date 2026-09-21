@@ -56,18 +56,32 @@ function registerMessageBytes(username, bundle) {
 // screen as "verify failed: [object Object]" (seen on the phone when the new
 // dual-signature client met the old relay). Never let a non-string through.
 export function formatDetail(detail, status) {
-  if (typeof detail === "string" && detail) return detail;
-  if (Array.isArray(detail)) {
-    const parts = detail.map((d) => {
-      if (!d || typeof d !== "object") return String(d);
-      const loc = Array.isArray(d.loc) ? d.loc.filter((x) => x !== "body").join(".") : "";
-      return (d.msg || d.type || JSON.stringify(d)) + (loc ? " (" + loc + ")" : "");
-    });
-    if (parts.length) return parts.join("; ");
-  } else if (detail && typeof detail === "object") {
-    try { return JSON.stringify(detail); } catch { /* fall through */ }
+  // Total: whatever shape the relay chooses, this returns a string and never
+  // throws (fix review 2026-09-21 L-1: an unguarded JSON.stringify on a deeply
+  // nested entry blew the stack, and the throw escaped asError BEFORE
+  // `err.status` was set — so a hostile 401 body stopped clearing apiToken).
+  // Every piece is coerced (L-2: `msg` or `loc` entries that are objects
+  // rendered "[object Object]" — the very bug this function exists to kill).
+  let text = "";
+  try {
+    if (typeof detail === "string") {
+      text = detail;
+    } else if (Array.isArray(detail)) {
+      text = detail.map((d) => {
+        if (!d || typeof d !== "object") return String(d);
+        const loc = Array.isArray(d.loc)
+          ? d.loc.filter((x) => typeof x === "string" && x !== "body").join(".")
+          : "";
+        const msg = ["msg", "type"].map((k) => d[k]).find((v) => typeof v === "string" && v);
+        return (msg || JSON.stringify(d)) + (loc ? " (" + loc + ")" : "");
+      }).filter((x) => x).join("; ");
+    } else if (detail && typeof detail === "object") {
+      text = JSON.stringify(detail);
+    }
+  } catch {
+    text = "";
   }
-  return status + "";
+  return typeof text === "string" && text.trim() ? text : status + "";
 }
 
 async function asError(res) {
@@ -98,8 +112,9 @@ export async function register(base, identity, username) {
     body: JSON.stringify(body),
   });
   if (!res.ok) {
+    const status = res.status; // taken BEFORE the body is read — nothing in asError may lose it
     const err = new Error(await asError(res));
-    err.status = res.status;
+    err.status = status;
     throw err;
   }
   return res.json();
@@ -300,10 +315,11 @@ export async function fetchMail(base, sessionToken) {
     headers: { authorization: "Bearer " + sessionToken },
   });
   if (!res.ok) {
+    const status = res.status; // taken BEFORE the body is read — nothing in asError may lose it
     const err = new Error("mailbox fetch failed: " + (await asError(res)));
     // Session tokens expire (TOKEN_TTL_SEC). Surface the status so the caller
     // can re-login instead of silently never receiving mail again.
-    err.status = res.status;
+    err.status = status;
     throw err;
   }
   return (await res.json()).messages;
