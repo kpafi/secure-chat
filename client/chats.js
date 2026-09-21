@@ -32,10 +32,13 @@ const LS_CHATS = "sc.chats.v1";
 //     inbound envelope, and two tabs of one account polling the mailbox is a
 //     real scenario (the M-C self-DoS); a stale tab's write is accepted and
 //     numbered past the witness instead, so the store is never BEHIND it;
-//   * an untagged pre-v2 blob is adopted once without a prompt on a device
-//     that has never run this code (every deployed chat store is untagged, and
-//     there is nothing to roll back TO); with the epoch marker present it is
-//     an explicit choice, and with a floor present it is refused outright.
+//   * an untagged pre-v2 blob is NEVER adopted silently — an explicit choice
+//     (every deployed chat store is untagged, so every user sees the prompt
+//     exactly once on upgrade), and with a floor present it is refused
+//     outright. The first cut adopted silently when the plaintext epoch
+//     marker was absent; the fix review (2026-09-21) showed one extra
+//     removeItem of that marker restored the entire finding in a browser.
+//     A deletable marker may escalate a warning, never authorise anything.
 const LS_CHATS_GEN = "sc.chats.gen.v1";
 const CHATS_DOMAIN = "secure-chat/chats-store/v2";
 const CHATS_GEN_DOMAIN = "secure-chat/chats-generation/v1";
@@ -274,10 +277,11 @@ export async function unlock(passphrase, opts = {}) {
       lock();
       throw new Error("your chat history has no rollback record but this device says it had one — an earlier copy has been restored; refusing to open it");
     }
-    if (localStorage.getItem(EPOCH_KEY) !== null && !opts.adoptLegacy) {
+    if (!opts.adoptLegacy) {
       throw adoptionError(
-        "your chat history has no rollback record, but this device has kept one before — an older copy " +
-        "may have been restored, which would let already-delivered messages replay.",
+        "your chat history has no rollback record on this device. If you have used this device with " +
+        "these chats before, an older copy may have been restored, which would let already-delivered " +
+        "messages replay; if you just upgraded, this is expected once.",
         "LEGACY_CHATS_ADOPTION",
       );
     }

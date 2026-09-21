@@ -192,9 +192,10 @@ console.log("OK  a store poisoned before the fix heals on unlock");
   assert.deepStrictEqual(await chats.unlock(PASS), { created: true });
   chats.lock();
 
-  // A genuine pre-v2 blob on a device that never ran this code: adopted once,
-  // no prompt (every deployed chat store is this shape). Same blob with the
-  // epoch marker present: explicit adoption.
+  // A genuine pre-v2 blob (every deployed chat store is this shape) with NO
+  // epoch marker — the state an attacker can produce with one removeItem, and
+  // the state of a device that just upgraded. Both get the prompt: the fix
+  // review showed that adopting silently here reopened the whole finding.
   mem.clear();
   {
     const enc = new TextEncoder();
@@ -210,7 +211,11 @@ console.log("OK  a store poisoned before the fix heals on unlock");
     const b64 = (u) => Buffer.from(u).toString("base64");
     localStorage.setItem("sc.chats.v1", JSON.stringify({ v: 1, iters: 600000, salt: b64(salt), iv: b64(iv), ct: b64(ct) }));
   }
-  assert.deepStrictEqual(await chats.unlock(PASS), { created: false }, "a fresh upgrade adopts the pre-v2 blob");
+  await assert.rejects(chats.unlock(PASS),
+    (e) => e.code === "LEGACY_CHATS_ADOPTION" && e.suspicious === false,
+    "an untagged blob with no epoch marker must still prompt (deletable markers never authorise)");
+  assert.deepStrictEqual(await chats.unlock(PASS, { adoptLegacy: true }), { created: false },
+    "the upgrade adopts the pre-v2 blob on request");
   assert.strictEqual(await chats.markSeen("erin", "old-1"), false, "its ring survives");
   assert.ok(localStorage.getItem("sc.chats.gen.v1"), "and it is witnessed from now on");
   chats.lock();

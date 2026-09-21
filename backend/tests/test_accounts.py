@@ -527,3 +527,44 @@ def test_register_rejects_non_canonical_base64():
 
     # …and the canonical original is still accepted, unchanged.
     assert client.post("/api/register", json=_register_body("canon-ok", ident)).status_code == 200
+
+
+# ---- Fix review 2026-09-21 of the F-RELAY-003/006 fixes ------------------------
+
+def test_username_regex_rejects_trailing_newline():
+    # Python's `$` matches before a final newline; fullmatch does not.
+    assert client.post("/api/auth/challenge", json={"username": "alice\n"}).status_code == 422
+    ident = _new_identity()
+    body = _register_body("newline\n", ident)
+    body["username"] = "newline\n"
+    assert client.post("/api/register", json=body).status_code == 422
+
+
+def test_challenge_buckets_are_pruned_when_idle(monkeypatch):
+    """Per-username keys are attacker-chosen: an idle bucket must be collected
+    even though it is not full (tokens are only recomputed inside allow())."""
+    from relay import KeyedRateLimiter
+    lim = KeyedRateLimiter(10, 0.5)
+    for i in range(500):
+        assert lim.allow(f"u:probe-{i}")
+    assert len(lim._buckets) == 500
+    # Nothing is idle yet: a prune keeps them.
+    lim._last_prune = 0.0
+    lim.allow("u:keeper")
+    assert len(lim._buckets) == 501
+    # Make every bucket look idle for longer than a full refill (capacity/refill = 20 s, floor 60 s).
+    for b in lim._buckets.values():
+        b.last -= 61.0
+    lim._last_prune = 0.0
+    lim.allow("u:after")
+    assert len(lim._buckets) == 1, "idle buckets must be dropped regardless of fill level"
+
+
+def test_verify_unknown_user_does_the_same_work_as_known_user():
+    # Timing-oracle guard: the unknown-user path must run both verifications
+    # against a decoy, not return early. Asserted structurally (the decoys exist
+    # and are well-formed) and behaviourally (still 401, never 404/200).
+    assert len(base64.b64decode(accounts._DECOY_ED_PUB_B64)) == config.ED25519_PUB_BYTES
+    assert len(base64.b64decode(accounts._DECOY_MLDSA_PUB_B64)) == config.MLDSA65_PUB_BYTES
+    ch = client.post("/api/auth/challenge", json={"username": "ghost-timing"}).json()["challenge"]
+    assert client.post("/api/auth/verify", json=_login_body("ghost-timing", _new_identity(), ch)).status_code == 401

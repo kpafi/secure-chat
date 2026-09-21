@@ -328,6 +328,23 @@ def _mldsa65_verify(pub_raw: bytes, sig: bytes, msg: bytes) -> bool:
         return False
 
 
+# Decoy public keys for the unknown-user login path (see auth_verify): real
+# keys, generated once per process, whose private halves are discarded, so the
+# verification work is identical to the known-user path and never succeeds.
+def _decoy_keys() -> tuple[str, str]:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from dilithium_py.ml_dsa import ML_DSA_65
+    ed_pub = Ed25519PrivateKey.generate().public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    )
+    mldsa_pub, _secret = ML_DSA_65.keygen()
+    return base64.b64encode(ed_pub).decode("ascii"), base64.b64encode(mldsa_pub).decode("ascii")
+
+
+_DECOY_ED_PUB_B64, _DECOY_MLDSA_PUB_B64 = _decoy_keys()
+
+
 def _register_message(username: str, ed: str, mldsa: str) -> bytes:
     return b"\n".join(
         [_REGISTER_DOMAIN, username.encode("ascii"), ed.encode("ascii"), mldsa.encode("ascii")]
@@ -482,7 +499,10 @@ class VerifyReq(BaseModel):
 
 
 def _check_username(u: str) -> None:
-    if not _USERNAME_RE.match(u):
+    # fullmatch, not match: Python's `$` also matches before a trailing newline,
+    # so "alice\n" used to pass, register as a second row beside "alice" and
+    # get its own rate-limit bucket (fix review 2026-09-21).
+    if not _USERNAME_RE.fullmatch(u):
         raise HTTPException(status_code=422, detail="username must be [a-z0-9_.-]")
 
 
@@ -635,9 +655,14 @@ def auth_verify(req: VerifyReq) -> dict:
             "SELECT ed_pub, mldsa_pub FROM accounts WHERE username = ?", (req.username,)
         ).fetchone()
     # Unknown user and bad signature are indistinguishable (both 401), so verify
-    # is not an existence oracle either (I1).
-    if row is None:
-        raise HTTPException(status_code=401, detail="challenge signature invalid")
+    # is not an existence oracle either (I1). Fix review 2026-09-21: with the
+    # ML-DSA check below (~10 ms of pure Python) an early return here made an
+    # existing name ~4x slower than a ghost — measurable through Tor. So the
+    # unknown-user path now does the same two verifications against a decoy
+    # bundle and fails on the result, never on the lookup.
+    unknown = row is None
+    ed_pub_b64 = _DECOY_ED_PUB_B64 if unknown else row["ed_pub"]
+    mldsa_pub_b64 = _DECOY_MLDSA_PUB_B64 if unknown else row["mldsa_pub"]
     # Pentest 2026-08-07 F-RELAY-006: login used to prove control of the
     # Ed25519 key ALONE, so the directory session — which drains and deletes
     # the mailbox and deletes vouches — was the one place the identity's
@@ -646,12 +671,12 @@ def auth_verify(req: VerifyReq) -> dict:
     # must sign the challenge, matching registration, vouches and the handshake.
     # Both checks always run, so a wrong Ed25519 signature and a wrong ML-DSA
     # signature take the same path (no scheme-level oracle in the status code).
-    ed_raw = base64.b64decode(row["ed_pub"], validate=True)
-    mldsa_raw = base64.b64decode(row["mldsa_pub"], validate=True)
+    ed_raw = base64.b64decode(ed_pub_b64, validate=True)
+    mldsa_raw = base64.b64decode(mldsa_pub_b64, validate=True)
     msg = _login_message(challenge_raw)
     ed_ok = _ed25519_verify(ed_raw, sig_raw, msg)
     pq_ok = _mldsa65_verify(mldsa_raw, mldsa_sig_raw, msg)
-    if not (ed_ok and pq_ok):
+    if unknown or not (ed_ok and pq_ok):
         raise HTTPException(status_code=401, detail="challenge signature invalid")
 
     token = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")

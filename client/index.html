@@ -416,6 +416,13 @@
             <button id="chatsUnlock" type="button" class="primary">Unlock</button>
           </div>
           <p class="hint" id="chatsUnlockStatus"></p>
+          <p class="hint err" id="chatsAdoptHint" hidden>
+            This store cannot be opened safely on its own. If you know why (you
+            forgot this identity on this device yourself, or you just upgraded
+            from an old version), enter your passphrase and open it anyway —
+            already-delivered messages may then be shown again.
+          </p>
+          <button id="chatsAdopt" type="button" hidden>Open anyway (I understand the risk)</button>
         </div>
 
         <div id="chatsUnlocked" hidden>

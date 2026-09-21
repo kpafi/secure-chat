@@ -82,6 +82,7 @@ const els = {
   usersAdopt: $("usersAdopt"), usersAdoptHint: $("usersAdoptHint"),
   chatsUnlockPass: $("chatsUnlockPass"), chatsUnlock: $("chatsUnlock"),
   chatsUnlockStatus: $("chatsUnlockStatus"),
+  chatsAdopt: $("chatsAdopt"), chatsAdoptHint: $("chatsAdoptHint"),
   profileName: $("profileName"), profileAvatar: $("profileAvatar"),
   profileHandleText: $("profileHandleText"),
   profileHandleActions: $("profileHandleActions"),
@@ -188,6 +189,30 @@ let wasPending = false;    // we sat in the approval queue (M-2, guest side)
 // refuses to be seated as a guest at all.
 let roomCodeMine = false;   // the code in #room came from newRoomCode() here
 let sessionRoomMine = false; // frozen copy for the live connection (like sessionRoom)
+// Fix review 2026-09-21: page-instance state alone failed open on the most
+// likely recovery path — after a reload the box is empty (autocomplete=off),
+// the creator pastes the code she already sent, and `input` cleared the flag.
+// Minted codes are therefore also remembered in localStorage (last few). That
+// key is attacker-writable, but the failure directions are asymmetric: a
+// removed entry only restores the pre-fix behaviour for that code, an added
+// one only makes THIS page refuse a room (loud, local). Never a trust source
+// for anything else.
+const LS_MINTED_CODES = "sc.room.mine.v1";
+function rememberMinted(code) {
+  try {
+    const cur = JSON.parse(localStorage.getItem(LS_MINTED_CODES) || "[]");
+    const next = [code, ...(Array.isArray(cur) ? cur.filter((c) => c !== code) : [])].slice(0, 8);
+    localStorage.setItem(LS_MINTED_CODES, JSON.stringify(next));
+  } catch { /* storage unavailable: the in-memory flag still covers this page */ }
+}
+function isMinted(code) {
+  try {
+    const cur = JSON.parse(localStorage.getItem(LS_MINTED_CODES) || "[]");
+    return Array.isArray(cur) && cur.includes(code);
+  } catch {
+    return false;
+  }
+}
 // Why a client-side refusal closed the socket. `ws.onclose` returns to the room
 // screen, and changing screens clears every hint — so a refusal's explanation
 // vanished with the chat screen and the user was left on the room screen with
@@ -611,7 +636,9 @@ function wireViewUnlock(passEl, btnEl, statusFn, render) {
       return;
     }
     passEl.value = "";
-    statusFn("");
+    // The identity opened; a store may still have refused (fix review
+    // 2026-09-21: this used to print an empty, success-looking status).
+    statusFn(contactsError ? "Unlocked, but: " + contactsError : "", !!contactsError);
     // An invite link may have been waiting on the identity (Users view).
     applyPendingInvite();
     render();
@@ -779,6 +806,11 @@ let contactsError = null; // unlock failure message, shown in the Users view
 // store, or a store this device says existed and is now gone). The Users view
 // then offers "Open anyway"; nothing opens the store silently.
 let contactsAdoptable = false;
+const adoptCodes = new Set(); // which store raised which code, for the override
+// A notice about the stores that must outlive the room transcript (fix review
+// 2026-09-21: the browser both-deleted warning was one line in the Live room,
+// and the Users view rendered a normal empty list with nothing at all).
+let storeNotice = null;
 
 // The per-identity id under which the native floor (Android) keeps the contact
 // and chat store generations: the hash of the identity's public signing key.
@@ -810,30 +842,48 @@ const ADOPTABLE = new Set([
   "LEGACY_CONTACTS_ADOPTION", "DELETED_CONTACTS_ADOPTION",
   "LEGACY_CHATS_ADOPTION", "DELETED_CHATS_ADOPTION",
 ]);
+// `opts.adopt` — true when the user pressed "Open anyway": each store gets
+// exactly the override for the code IT raised last time (fix review
+// 2026-09-21: one click used to adopt both stores with both flags, so a user
+// who read the contacts warning also adopted an unverifiable chat store).
 async function unlockContacts(pass, opts = {}) {
   const floorId = await storeFloorId();
-  const storeOpts = { floorId, adoptLegacy: !!opts.adoptLegacy, adoptDeleted: !!opts.adoptDeleted };
+  const flags = (legacy, deleted) => ({
+    floorId,
+    adoptLegacy: !!opts.adopt && adoptCodes.has(legacy),
+    adoptDeleted: !!opts.adopt && adoptCodes.has(deleted),
+  });
+  const contactOpts = flags("LEGACY_CONTACTS_ADOPTION", "DELETED_CONTACTS_ADOPTION");
+  const chatOpts = flags("LEGACY_CHATS_ADOPTION", "DELETED_CHATS_ADOPTION");
   contactsAdoptable = false;
+  adoptCodes.clear();
+  storeNotice = null;
+  if (contacts.isUnlocked()) contacts.lock(); // re-run from scratch (the override path)
   try {
-    const r = await contacts.unlock(pass, storeOpts);
+    const r = await contacts.unlock(pass, contactOpts);
     contactsError = null;
-    if (r && r.created && opts.expectStore) {
-      addLine("sys", "", "[no saved contacts were found for this identity — if you have used this device before, " +
-        "they were deleted and key-change warnings for earlier contacts are gone; treat every contact as unverified]");
+    if (contactOpts.adoptLegacy || contactOpts.adoptDeleted) {
+      storeNotice = "Contacts opened WITHOUT a verifiable history — treat every contact as unverified until you re-check the safety number.";
+    } else if (r && r.created && opts.expectStore) {
+      storeNotice = "No saved contacts were found for this identity. If you have used this device before, " +
+        "they were deleted and key-change warnings for earlier contacts are gone — treat every contact as unverified.";
     }
+    if (storeNotice) addLine("sys", "", "[" + storeNotice + "]");
   } catch (e) {
     contactsError = e.message;
-    if (ADOPTABLE.has(e.code)) contactsAdoptable = true;
+    if (ADOPTABLE.has(e.code)) { contactsAdoptable = true; adoptCodes.add(e.code); }
     addLine("sys", "", "[contact store did not unlock — key-change warnings are OFF until it does]");
   }
+  if (chats.isUnlocked()) chats.lock();
   try {
-    const r = await chats.unlock(pass, storeOpts); // chat history shares the at-rest posture
+    const r = await chats.unlock(pass, chatOpts); // chat history shares the at-rest posture
     if (r && r.created && opts.expectStore && !contactsError) {
       addLine("sys", "", "[no chat history was found for this identity on this device]");
     }
   } catch (e) {
     contactsError = contactsError || e.message;
-    if (ADOPTABLE.has(e.code)) contactsAdoptable = true;
+    if (ADOPTABLE.has(e.code)) { contactsAdoptable = true; adoptCodes.add(e.code); }
+    addLine("sys", "", "[chat store did not unlock — " + e.message + "]");
   }
 }
 
@@ -861,6 +911,7 @@ function refreshUsers() {
   renderMyHandle();
   applyPendingInvite();
   renderUserList();
+  if (storeNotice) usersStatus(storeNotice, true);
 }
 
 // My shareable handle (username#token) — only exists after registering, since
@@ -1267,7 +1318,17 @@ function refreshChats() {
   const unlocked = chats.isUnlocked() && contacts.isUnlocked();
   els.chatsLocked.hidden = unlocked;
   els.chatsUnlocked.hidden = !unlocked;
-  if (!unlocked) return;
+  if (!unlocked) {
+    // Fix review 2026-09-21: a chat store that refused while contacts opened
+    // had no visible error and no override anywhere — a dead end whose only
+    // exit was Forget identity. The Chats view now carries both.
+    els.chatsLocked.querySelector("p").textContent = contactsError && identity
+      ? "Chat store error: " + contactsError
+      : "Chats are stored encrypted under your identity passphrase. Enter it to unlock them here.";
+    els.chatsAdopt.hidden = !contactsAdoptable;
+    els.chatsAdoptHint.hidden = !contactsAdoptable;
+    return;
+  }
   if (!apiToken) {
     chatsStatus("You can send now; to RECEIVE messages, log in (Live room → step 1) so the mailbox can be fetched.");
   } else {
@@ -3143,24 +3204,30 @@ wireViewUnlock(els.usersUnlockPass, els.usersUnlock,
 // to perform on their own. Needs the passphrase again (the unlock row clears
 // it), and the identity must already be unlocked (it is — only the stores
 // refused).
-els.usersAdopt.addEventListener("click", async () => {
-  const pass = els.usersUnlockPass.value;
-  const status = setUnlockStatus(els.usersUnlockStatus);
-  if (!identity) { status("Unlock your identity first.", true); return; }
-  if (!pass) { status("Enter your identity passphrase, then press Open anyway.", true); return; }
-  status("Opening…");
-  await unlockContacts(pass, { expectStore: true, adoptLegacy: true, adoptDeleted: true });
-  els.usersUnlockPass.value = "";
-  status(contactsError ? contactsError : "", !!contactsError);
-  if (!contactsError) addLine("sys", "", "[contact store opened WITHOUT a verifiable history — treat every contact as unverified until you re-check the safety number]");
-  refreshUsers();
-});
+function wireAdopt(btnEl, passEl, statusEl, render) {
+  btnEl.addEventListener("click", async () => {
+    const pass = passEl.value;
+    const status = setUnlockStatus(statusEl);
+    if (!identity) { status("Unlock your identity first.", true); return; }
+    if (!pass) { status("Enter your identity passphrase, then press Open anyway.", true); return; }
+    status("Opening…");
+    await unlockContacts(pass, { expectStore: true, adopt: true });
+    passEl.value = "";
+    status(contactsError ? contactsError : "", !!contactsError);
+    refreshUsers();
+    refreshChats();
+    render();
+  });
+}
+wireAdopt(els.usersAdopt, els.usersUnlockPass, els.usersUnlockStatus, refreshUsers);
+wireAdopt(els.chatsAdopt, els.chatsUnlockPass, els.chatsUnlockStatus, refreshChats);
 wireViewUnlock(els.chatsUnlockPass, els.chatsUnlock,
   setUnlockStatus(els.chatsUnlockStatus), refreshChats);
 
 els.gen.addEventListener("click", () => {
   els.room.value = newRoomCode();
   roomCodeMine = true; // F-PROTO-001
+  rememberMinted(els.room.value);
   hint("New chat code created. Send it to the one person you want to talk to.");
 });
 
@@ -3318,9 +3385,11 @@ refreshIdentityUI();
 // so the button appeared to do nothing at all. A code costs nothing until you
 // connect, and someone JOINING simply pastes over it — so the failure mode is
 // removed rather than merely explained.
-if (!els.room.value) { els.room.value = newRoomCode(); roomCodeMine = true; }
-// F-PROTO-001: anything typed or pasted over the box is somebody else's code.
-els.room.addEventListener("input", () => { roomCodeMine = false; });
+if (!els.room.value) { els.room.value = newRoomCode(); roomCodeMine = true; rememberMinted(els.room.value); }
+else roomCodeMine = isMinted(els.room.value.trim());
+// F-PROTO-001: anything typed or pasted over the box is somebody else's code —
+// unless it is one this device minted earlier (a reload, then re-paste).
+els.room.addEventListener("input", () => { roomCodeMine = isMinted(els.room.value.trim()); });
 
 // Invite-link handling: an inbound `#add=<handle>` opens the Users view and
 // stages the handle for review (never auto-adds). The fragment is cleared from

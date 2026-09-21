@@ -13,7 +13,7 @@ backend full suite green (one pre-existing timing flake in `test_ws.py`
 `test_waiters_are_closed_when_the_owner_leaves` — fails under the full run,
 passes isolated, unrelated to the diff), client **13 suites**, all five e2e
 runs green against a live local relay (`two-user-flow` 8/8, `room-admission`
-13/13, `no-dead-ends` 12/12, `all-modes` 32/32, new `hostile-relay` 10/10).
+13/13, `no-dead-ends` 12/12, `all-modes` 32/32, new `hostile-relay` 11/11).
 The 18 Low and 15 Info findings in that report were NOT worked (the report
 only summarises them; the per-finding files it cites are not in the repo).
 
@@ -62,6 +62,34 @@ only summarises them; the per-finding files it cites are not in the repo).
    run (app.js warns when an existing identity finds no store).
    Pad ids are validated to 32 hex chars at import/unlock so a pad file cannot
    address another floor namespace.
+
+**🔧 FIX REVIEW (2026-09-21, pentest-new-code pass over the three commits) — 7
+findings, all fixed in a fourth commit.** (1) **Medium, real hole:** chats.js
+adopted an untagged blob silently whenever the plaintext epoch marker was
+absent — one extra `removeItem` restored the whole of F-ATREST-005 in a
+browser (PoC reproduced by the reviewer). Now every untagged chat blob is an
+explicit adoption, like contacts; **every existing user sees that prompt once
+on upgrade** (Chats view → *Open anyway*). (2) **Dead end:** a chat store that
+refused while contacts opened had no visible error and no override (the
+button lived in the Users locked panel). The Chats locked panel now shows the
+error and its own *Open anyway*, and the per-view unlock status says
+"Unlocked, but: …" instead of blank. (3) **New from my fix:** per-username
+challenge buckets were an attacker-chosen key space `KeyedRateLimiter` never
+pruned (it only dropped FULL idle buckets, and `tokens` is only recomputed in
+`allow()`), ~100 MB/day. Buckets are now dropped on idleness alone (idle
+longer than a full refill ⇒ indistinguishable from fresh). (4) **New from my
+fix:** the ML-DSA verify made `/api/auth/verify` a ~4× louder existence oracle
+(15 ms vs 4 ms). The unknown-user path now runs both verifications against a
+per-process decoy bundle. (5) `roomCodeMine` was page-instance state and failed
+open after a reload + re-paste; minted codes are now also remembered in
+localStorage (last 8; attacker-writable, but asymmetric: removal restores
+pre-fix behaviour for one code, addition only makes this page refuse). e2e
+`hostile-relay.mjs` gained the reload step (11/11). (6) `_USERNAME_RE` used
+`match`, and Python `$` matches before a trailing newline: `"alice\n"`
+registered as a second row. `fullmatch` now. (7) One *Open anyway* click passed
+both flags to both stores; each store now gets exactly the override for the
+code it raised, and the browser both-deleted warning is a persistent Users-view
+notice, not one transcript line. Tests for 1, 3, 6 and the decoy in 4.
 
 **Pre-fix proofs:** all six relay tests, `hostile-relay.mjs` (3 checks),
 F-PROTO-005, F-ATREST-001 (the script stops at its first failure, so -002 is

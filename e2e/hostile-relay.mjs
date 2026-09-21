@@ -174,6 +174,28 @@ check("a fresh code connects the creator as the owner",
   (await status(alice.page)) === "connected" && /you decide who is let in/i.test(await text(alice.page, "#log")),
   JSON.stringify((await text(alice.page, "#log")).slice(-90)));
 
+// --- 4. reload, re-paste her own code: the invariant must survive the reload --
+// (fix review 2026-09-21: page-instance state alone failed open here — the box
+// is empty after a reload, she pastes the code she already sent, and the
+// `input` event used to clear the flag.)
+console.log("\n4. alice reloads, pastes the code SHE minted in step 1, and the relay tries again");
+await alice.page.reload({ waitUntil: "networkidle0" });
+await alice.page.type("#idPass", PASS);
+await alice.page.click("#idUnlock");
+await alice.page.waitForFunction(() => !document.querySelector("#idExport").hidden, { timeout: 60000 });
+await alice.page.click("#toRoom");
+await alice.page.waitForFunction(() => !document.querySelector("#scrRoom").hidden, { timeout: 20000 });
+await alice.page.evaluate(() => { document.querySelector("#room").value = ""; });
+await alice.page.type("#room", code);
+await alice.page.click("#connect");
+await alice.page.waitForFunction(() => {
+  const s = document.querySelector("#chatStatus").textContent.trim().toLowerCase();
+  return s === "connected" || s === "disconnected";
+}, { timeout: 30000 });
+check("after a reload, a re-pasted code this device minted is still refused when demoted",
+  (await status(alice.page)) === "disconnected" && /we created this chat code/i.test(await text(alice.page, "#log")),
+  JSON.stringify((await text(alice.page, "#log")).slice(-100)));
+
 await browser.close();
 
 console.log("\n=== summary ===");
