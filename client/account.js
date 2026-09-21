@@ -50,15 +50,35 @@ function registerMessageBytes(username, bundle) {
   return enc.encode([REGISTER_DOMAIN, username, bundle.ed, bundle.mldsa].join("\n"));
 }
 
+// Turn an error response into one line of text. The relay's own errors put a
+// string in `detail`; a FastAPI validation error (422) puts an ARRAY of
+// `{type, loc, msg}` objects there, and before 2026-09-21 that reached the
+// screen as "verify failed: [object Object]" (seen on the phone when the new
+// dual-signature client met the old relay). Never let a non-string through.
+export function formatDetail(detail, status) {
+  if (typeof detail === "string" && detail) return detail;
+  if (Array.isArray(detail)) {
+    const parts = detail.map((d) => {
+      if (!d || typeof d !== "object") return String(d);
+      const loc = Array.isArray(d.loc) ? d.loc.filter((x) => x !== "body").join(".") : "";
+      return (d.msg || d.type || JSON.stringify(d)) + (loc ? " (" + loc + ")" : "");
+    });
+    if (parts.length) return parts.join("; ");
+  } else if (detail && typeof detail === "object") {
+    try { return JSON.stringify(detail); } catch { /* fall through */ }
+  }
+  return status + "";
+}
+
 async function asError(res) {
-  let detail = res.status + "";
+  let detail = null;
   try {
     const body = await res.json();
     if (body && body.detail) detail = body.detail;
   } catch {
     /* non-JSON error body */
   }
-  return detail;
+  return formatDetail(detail, res.status);
 }
 
 // Claim a username and bind it to this identity's public bundle. The DUAL
