@@ -181,11 +181,17 @@ export async function login(base, identity, username) {
 
   // Sign under the login domain prefix (matches accounts._login_message) so the
   // signature is bound to the login protocol and can't be cross-used elsewhere.
-  const sig = await identity.signEd(concat(enc.encode(LOGIN_DOMAIN + "\n"), unb64(challenge)));
+  // Pentest 2026-08-07 F-RELAY-006: BOTH identity keys sign the challenge, as
+  // they do for registration, vouches and the handshake. Login used to be the
+  // one Ed25519-only proof, so the directory session (which drains and deletes
+  // the mailbox and deletes vouches) fell to a classical-key-only compromise.
+  const { ed: sig, mldsa: mldsaSig } = await identity.sign(
+    concat(enc.encode(LOGIN_DOMAIN + "\n"), unb64(challenge)),
+  );
   const vRes = await fetch(base + "/api/auth/verify", {
     method: "POST",
     headers: JSON_HEADERS,
-    body: JSON.stringify({ username, challenge, sig }),
+    body: JSON.stringify({ username, challenge, sig, mldsa_sig: mldsaSig }),
   });
   if (!vRes.ok) throw new Error("verify failed: " + (await asError(vRes)));
   return vRes.json(); // { token, ttl }

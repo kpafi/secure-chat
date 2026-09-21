@@ -141,3 +141,36 @@ def test_v1_registration_still_works():
     r = client.get("/api/users/v1-eve", params={"t": r.json()["lookup_token"]})
     assert r.status_code == 200
     assert "ecdh" not in r.json()  # no enc keys published
+
+
+# ---- Pentest 2026-08-07 F-RELAY-005: re-registration cannot strip enc keys --
+
+def test_replayed_v1_registration_cannot_strip_published_enc_keys():
+    """The account's original v1 registration stays a valid dual-signed message
+    forever. Pre-fix, replaying it after the v2 upgrade wiped `ecdh`/`mlkem`
+    from the directory row — a downgrade from "can receive sealed mail" to
+    "cannot", by anyone holding the captured request (the relay included).
+    """
+    ident = _new_identity()
+    # 1. The original v1 registration (no encryption keys), kept by the attacker.
+    msg = b"\n".join([b"secure-chat/register/v1", b"strip-frank", ident["ed"].encode(), ident["mldsa"].encode()])
+    v1_body = {
+        "username": "strip-frank", "ed": ident["ed"], "mldsa": ident["mldsa"],
+        "sig": _b64(ident["ed_priv"].sign(msg)),
+        "mldsa_sig": _b64(ML_DSA_65.sign(ident["mldsa_secret"], msg)),
+    }
+    r1 = client.post("/api/register", json=v1_body)
+    assert r1.status_code == 200, r1.text
+    token = r1.json()["lookup_token"]
+    # 2. The legacy upgrade publishes encryption keys.
+    enc = _enc_keys()
+    r2 = client.post("/api/register", json=_v2_body("strip-frank", ident, enc))
+    assert r2.status_code == 200 and r2.json()["status"] == "updated"
+    # 3. Replay of step 1: refused, and the published keys survive.
+    r3 = client.post("/api/register", json=v1_body)
+    assert r3.status_code == 409, r3.text
+    got = client.get("/api/users/strip-frank", params={"t": token}).json()
+    assert got["ecdh"] == enc["ecdh"] and got["mlkem"] == enc["mlkem"]
+    # A replay of the v2 registration itself is a harmless no-op refresh.
+    r4 = client.post("/api/register", json=_v2_body("strip-frank", ident, enc))
+    assert r4.status_code == 200 and r4.json()["lookup_token"] == token

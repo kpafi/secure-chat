@@ -8,7 +8,8 @@ server is assumed untrusted for key authenticity. What the server enforces:
   * registration carries a valid Ed25519 signature binding (username, ed, mldsa)
     -> proves the registrant holds the classical private key (anti-squatting,
     key-binding integrity);
-  * login = sign a fresh random server challenge with the Ed25519 key
+  * login = sign a fresh random server challenge with BOTH identity keys
+    (Ed25519 + ML-DSA-65; F-RELAY-006 — was Ed25519-only)
     -> proves account control without any stored secret.
 
 It never stores passwords, private keys, or message content. A full DB leak
@@ -63,8 +64,13 @@ _api_limiter = KeyedRateLimiter(config.API_RATE_CAPACITY, config.API_RATE_REFILL
 # valid token, this bounds how fast the namespace can be probed.
 _lookup_limiter = KeyedRateLimiter(config.LOOKUP_RATE_CAPACITY, config.LOOKUP_RATE_REFILL_PER_SEC)
 
-# Dedicated, stricter bucket for minting login challenges (M-03).
+# Dedicated, stricter bucket for minting login challenges (M-03). Keyed on the
+# USERNAME (F-RELAY-003, see config), so one client cannot hold login shut for
+# every account; the per-host bucket beside it only bounds total churn.
 _challenge_limiter = KeyedRateLimiter(config.CHALLENGE_RATE_CAPACITY, config.CHALLENGE_RATE_REFILL_PER_SEC)
+_challenge_host_limiter = KeyedRateLimiter(
+    config.CHALLENGE_HOST_RATE_CAPACITY, config.CHALLENGE_HOST_RATE_REFILL_PER_SEC
+)
 
 # Dedicated bucket for registration (P-09): it is the one namespace-existence
 # oracle we cannot remove, so it is throttled like the other sensitive paths —
@@ -209,8 +215,19 @@ def rate_limit(request: Request) -> None:
         raise HTTPException(status_code=429, detail="rate limited")
 
 
-def challenge_rate_limit(request: Request) -> None:
-    if not _challenge_limiter.allow(client_key(request)):
+def challenge_rate_limit(request: Request, username: str) -> None:
+    """Called from the handler (not a `Depends`) because the key is in the body.
+
+    Per-username bucket first (the strict one), then the wide per-host bound.
+    Order matters for the accounting: a request refused by the per-name bucket
+    must not also burn the shared one, or a flood at one name would still
+    drain the bound every other name depends on. A well-formed-but-nonexistent
+    name gets a challenge too (I1), so keying on it leaks nothing the handler
+    does not already say; the caller validates the name before this runs.
+    """
+    if not _challenge_limiter.allow("u:" + username):
+        raise HTTPException(status_code=429, detail="rate limited")
+    if not _challenge_host_limiter.allow(client_key(request)):
         raise HTTPException(status_code=429, detail="rate limited")
 
 
@@ -460,7 +477,8 @@ class VerifyReq(BaseModel):
     model_config = ConfigDict(extra="forbid")
     username: str = Field(min_length=config.USERNAME_MIN, max_length=config.USERNAME_MAX)
     challenge: str
-    sig: str
+    sig: str        # Ed25519 signature over the login message
+    mldsa_sig: str  # ML-DSA-65 signature over the same message (F-RELAY-006)
 
 
 def _check_username(u: str) -> None:
@@ -527,11 +545,28 @@ def register(req: RegisterReq) -> dict:
             # match the stored row exactly, update the encryption keys and
             # return the EXISTING lookup token. Anyone else: taken.
             row = conn.execute(
-                "SELECT ed_pub, mldsa_pub, lookup_token FROM accounts WHERE username = ?",
+                "SELECT ed_pub, mldsa_pub, lookup_token, ecdh_pub, mlkem_pub FROM accounts WHERE username = ?",
                 (req.username,),
             ).fetchone()
             if row is None or row["ed_pub"] != req.ed or row["mldsa_pub"] != req.mldsa:
                 raise HTTPException(status_code=409, detail="username already taken")
+            # Pentest 2026-08-07 F-RELAY-005: a v1 registration (no encryption
+            # keys) is a valid dual-signed message forever, so replaying the
+            # account's ORIGINAL registration used to wipe the encryption keys
+            # it published later — a downgrade from sealed mail to "cannot
+            # receive sealed mail", by anyone who captured that request (the
+            # relay itself, most obviously). Published encryption keys can be
+            # replaced by the same identity, never removed. The client never
+            # rotates its encryption keys (the only re-registration it makes
+            # is the one-time legacy upgrade that ADDS them), so a replay of
+            # an older v2 registration is a no-op; the honest residual is that
+            # this is not a signed monotonic counter, and a stale-but-distinct
+            # v2 bundle could still be replayed if the keys ever did change.
+            if row["ecdh_pub"] and row["mlkem_pub"] and req.ecdh is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="published encryption keys cannot be removed by re-registration",
+                )
             conn.execute(
                 "UPDATE accounts SET ecdh_pub = ?, mlkem_pub = ? WHERE username = ?",
                 (req.ecdh or "", req.mlkem or "", req.username),
@@ -566,12 +601,13 @@ def get_user(username: str, t: str = Query(default="", max_length=64)) -> dict:
     return out
 
 
-@router.post("/auth/challenge", dependencies=[Depends(challenge_rate_limit)])
-def auth_challenge(req: ChallengeReq) -> dict:
+@router.post("/auth/challenge")
+def auth_challenge(req: ChallengeReq, request: Request) -> dict:
+    _check_username(req.username)
+    challenge_rate_limit(request, req.username)
     # Anti-enumeration (I1): issue a challenge for ANY well-formed username,
     # whether or not it exists. A nonexistent account simply cannot produce a
     # valid signature at verify time, so this endpoint reveals nothing.
-    _check_username(req.username)
     challenge = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
     # Prune + cap-check + insert must be one atomic step (P-12).
     with _store_lock:
@@ -593,16 +629,29 @@ def auth_verify(req: VerifyReq) -> dict:
 
     challenge_raw = _b64decode_fixed(req.challenge, 32)
     sig_raw = _b64decode_fixed(req.sig, config.ED25519_SIG_BYTES)
+    mldsa_sig_raw = _b64decode_fixed(req.mldsa_sig, config.MLDSA65_SIG_BYTES)
     with _db() as conn:
         row = conn.execute(
-            "SELECT ed_pub FROM accounts WHERE username = ?", (req.username,)
+            "SELECT ed_pub, mldsa_pub FROM accounts WHERE username = ?", (req.username,)
         ).fetchone()
     # Unknown user and bad signature are indistinguishable (both 401), so verify
     # is not an existence oracle either (I1).
     if row is None:
         raise HTTPException(status_code=401, detail="challenge signature invalid")
+    # Pentest 2026-08-07 F-RELAY-006: login used to prove control of the
+    # Ed25519 key ALONE, so the directory session — which drains and deletes
+    # the mailbox and deletes vouches — was the one place the identity's
+    # dual-scheme (AND-composed) promise did not hold: a classical break, or a
+    # leaked Ed25519 key with the ML-DSA key intact, was enough. Now both keys
+    # must sign the challenge, matching registration, vouches and the handshake.
+    # Both checks always run, so a wrong Ed25519 signature and a wrong ML-DSA
+    # signature take the same path (no scheme-level oracle in the status code).
     ed_raw = base64.b64decode(row["ed_pub"], validate=True)
-    if not _ed25519_verify(ed_raw, sig_raw, _login_message(challenge_raw)):
+    mldsa_raw = base64.b64decode(row["mldsa_pub"], validate=True)
+    msg = _login_message(challenge_raw)
+    ed_ok = _ed25519_verify(ed_raw, sig_raw, msg)
+    pq_ok = _mldsa65_verify(mldsa_raw, mldsa_sig_raw, msg)
+    if not (ed_ok and pq_ok):
         raise HTTPException(status_code=401, detail="challenge signature invalid")
 
     token = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")

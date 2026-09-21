@@ -9,7 +9,7 @@ only who RECEIVES mail and roughly when, never who wrote it or what it says.
 Abuse bounds:
   * POST is gated by the recipient's lookup token (the same capability that
     gates the bundle lookup) — no existence oracle, and spamming an inbox
-    requires knowing its handle. Plus a dedicated per-host rate bucket.
+    requires knowing its handle. Plus a per-inbox rate bucket behind that gate.
   * Envelope size, per-inbox count, and global count are hard-capped; old
     mail expires (TTL) and is pruned opportunistically.
   * GET requires the recipient's session token (login) and DELETES what it
@@ -52,9 +52,12 @@ def _fetch_rate_limit(request: Request) -> None:
         raise HTTPException(status_code=429, detail="rate limited")
 
 
-def _post_rate_limit(request: Request) -> None:
-    # Same trusted-proxy-aware keying as the /api limiters (pentest F-03).
-    if not _post_limiter.allow(client_key(request)):
+def _post_rate_limit(recipient: str) -> None:
+    # Pentest 2026-08-07 F-RELAY-004: keyed per RECIPIENT inbox, and called by
+    # the handler only AFTER the recipient's lookup token has been checked, so
+    # a caller who does not hold the handle cannot touch any bucket (see config
+    # MAILBOX_RATE_*). Was: per-host, as a `Depends` ahead of the token gate.
+    if not _post_limiter.allow("inbox:" + recipient):
         raise HTTPException(status_code=429, detail="rate limited")
 
 
@@ -82,7 +85,7 @@ class PostReq(BaseModel):
     envelope: str = Field(min_length=1, max_length=config.MAX_ENVELOPE_BYTES)
 
 
-@router.post("/{recipient}", dependencies=[Depends(_post_rate_limit)])
+@router.post("/{recipient}")
 def post_mail(recipient: str, req: PostReq, t: str = Query(default="", max_length=64)) -> dict:
     _check_username(recipient)
     if not _ASCII_RE.match(req.envelope):
@@ -98,6 +101,7 @@ def post_mail(recipient: str, req: PostReq, t: str = Query(default="", max_lengt
         stored = row["lookup_token"] if row is not None else secrets.token_urlsafe(config.LOOKUP_TOKEN_BYTES)
         if not token_matches(t, stored) or row is None:
             raise HTTPException(status_code=404, detail="no such user")
+        _post_rate_limit(recipient)
         total = conn.execute("SELECT COUNT(*) FROM mailbox").fetchone()[0]
         if total >= config.MAX_MAILBOX_TOTAL:
             raise HTTPException(status_code=503, detail="mailbox storage full")
