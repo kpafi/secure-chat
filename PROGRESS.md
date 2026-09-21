@@ -96,6 +96,13 @@ F-PROTO-005, F-ATREST-001 (the script stops at its first failure, so -002 is
 shown by the same mechanism, not separately), F-ATREST-003/004/007 and
 F-ATREST-005 each fail against the stashed pre-fix file.
 
+**Tagged `v0.1.0` on `master` 2026-09-21.** `/healthz` now reports
+`config.VERSION` ("0.1.0"), so the running build is one curl away; bump both
+together. `e2e/no-dead-ends.mjs` gained the "Open anyway is reachable" check
+(16/16; times out against the pre-review client, which is the reviewer's exact
+finding). Review decisions confirmed by the user in chat: creator is REFUSED
+on demotion (not warned), and the one-time Chats prompt stays.
+
 **Merged to `master` 2026-09-21 (`--no-ff`).** Review guide, deploy order and
 the on-device checks are in `deploy/release-2026-09-21.md`; the deploy script
 is `deploy/deploy-2026-09-21.sh` (APK FIRST, then the script).

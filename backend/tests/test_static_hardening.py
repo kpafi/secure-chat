@@ -72,3 +72,11 @@ def test_pathological_range_header_is_cheap():
     elapsed = time.monotonic() - start
     assert resp.status_code in (200, 206, 416)
     assert elapsed < 2.0, f"range parsing took {elapsed:.2f}s"
+
+
+def test_healthz_reports_the_release_version():
+    import re
+    r = client.get("/healthz")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
+    assert re.fullmatch(r"\d+\.\d+\.\d+", r.json()["version"]), r.json()
