@@ -8,6 +8,8 @@
 # FIRST (see deploy/release-2026-09-21.md), then run this.
 #
 # Run from the repo root, on master:  bash deploy/deploy-2026-09-21.sh
+# (the box's python3 is used for the row counts — no sqlite3 CLI needed; a
+# failure AFTER the stop in step 0 would otherwise leave the relay down)
 set -euo pipefail
 
 BOX=root@138.199.144.35
@@ -19,7 +21,7 @@ echo "==> 0. backup, with the service STOPPED so the WAL is checkpointed first"
 ssh "$BOX" "systemctl stop secure-chat \
   && cp -a /var/lib/secure-chat/accounts.db /root/accounts.db.bak-$STAMP \
   && ls -la /root/accounts.db.bak-$STAMP \
-  && sqlite3 /var/lib/secure-chat/accounts.db 'select count(*) from accounts' | sed 's/^/    accounts before: /'"
+  && python3 -c \"import sqlite3;print('    accounts before:',sqlite3.connect('file:/var/lib/secure-chat/accounts.db?mode=ro',uri=True).execute('select count(*) from accounts').fetchone()[0])\""
 
 echo "==> 1. code (NEVER without the accounts.db excludes)"
 rsync -az --itemize-changes \
@@ -47,7 +49,7 @@ ssh "$BOX" 'curl -s -o /dev/null -w "healthz=%{http_code}\n" http://127.0.0.1:80
        -H "content-type: application/json" -d "{\"username\":\"nobody\",\"challenge\":\"x\",\"sig\":\"x\"}" \
        http://127.0.0.1:8000/api/auth/verify \
   && echo "--- accounts after (must equal before):" \
-  && sqlite3 /var/lib/secure-chat/accounts.db "select count(*) from accounts" | sed "s/^/    /" \
+  && python3 -c "import sqlite3;print(\"    \",sqlite3.connect(\"file:/var/lib/secure-chat/accounts.db?mode=ro\",uri=True).execute(\"select count(*) from accounts\").fetchone()[0])" \
   && echo "--- process environment: TRUSTED_PROXIES must be absent, --no-proxy-headers present" \
   && (tr "\0" "\n" < /proc/$(systemctl show -p MainPID --value secure-chat)/environ | grep -c SECURE_CHAT_TRUSTED_PROXIES || true) | sed "s/^/    TRUSTED_PROXIES vars (want 0): /" \
   && tr "\0" " " < /proc/$(systemctl show -p MainPID --value secure-chat)/cmdline | grep -o -- "--no-proxy-headers"'

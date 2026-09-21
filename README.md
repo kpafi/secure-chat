@@ -215,7 +215,10 @@ per-account lookup token; a contact fetches your bundle with the **handle**
 `username#token`, not the bare username. A lookup with a missing user or a
 wrong token returns an identical `404`, and the login challenge/verify
 endpoints no longer reveal whether a username exists — so the directory cannot
-be walked to harvest who has an account. A dedicated, stricter rate limit
+be walked to harvest who has an account. Login itself is a challenge signed by
+**both** identity keys (Ed25519 + ML-DSA-65, pentest 2026-08-07 F-RELAY-006);
+an unknown username runs the same two verifications against a decoy so the
+timing does not tell it apart either. A dedicated, stricter rate limit
 bounds the lookup path on top of the shared `/api` limiter. (Registering a
 name that is taken still returns `409` — inherent to a unique namespace — but
 each probe costs a full dual-signed proof and is rate-limited.)
