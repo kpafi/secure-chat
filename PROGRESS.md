@@ -3,7 +3,41 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (2026-09-21, the 2026-08-07 pentest: all 14 Medium fixed, NOT deployed)
+## ⮕ RESUME HERE (2026-09-22, relay DEPLOYED from `5e69f6e`; the box now also runs MailDigest in Docker)
+
+**🚀 RELAY DEPLOYED (2026-09-22 22:30 CEST), branch `android-ondevice-2026-09-21`
+at `5e69f6e` (= `origin/master` 3e55bff / v0.1.0 + the two `[object Object]`
+client fixes).** The user brought the box back and chose this line over the
+unmerged local `master` (Phase 7, `a4e5063`) because it is what the installed
+APK was built from. `bash deploy/deploy-2026-09-21.sh` ran clean: backup
+`/root/accounts.db.bak-2026-09-22-2230`, accounts 31 before = 31 after, rsync
+of `backend` + `client` (`client/nativefloor.js` new on the box), unit
+restarted, `healthz=200`, `account.js` mldsa_sig lines 5, `chats.js` v2 tag
+1, Ed25519-only verify body → **422**, `TRUSTED_PROXIES` vars 0,
+`--no-proxy-headers` present, uvicorn still `127.0.0.1:8000` only. Public
+check from the laptop: `https://138-199-144-35.sslip.io/healthz` →
+`{"status":"ok","version":"0.1.0"}` (the version field ⇒ new code). The
+server venv already had every pin of the new `requirements.txt` (dilithium-py
+1.4.0 etc.), so no pip step was needed. Nothing was merged, nothing pushed;
+the divergence local `master` ↔ `origin/master` is unchanged.
+**NOT yet done:** the phone. The app auto-logs in once the identity is
+unlocked; with the new relay that login should now be a 200 (item 5 of the
+2026-09-21 entry). The phone was not connected over adb tonight, so
+`adb logcat | grep -i "401\|verify"` staying quiet is still to be seen.
+
+**📦 The box is now shared (2026-09-22).** `docker.io` 26.1.5 +
+`docker-cli` + `docker-compose` 2.26 (Debian packages) were installed and
+MailDigest (`ghcr.io/kpafi/maildigest:latest` = 0.3.1) runs as container
+`maildigest-kpafi` under `/opt/maildigest/instances/kpafi/` (helper
+`maildigest-instance`, one directory + container per instance; documented in
+`emailzusammenfassung/deploy/server/README.md`). It publishes no port and
+only makes outbound IMAPS/HTTPS connections, so the relay's one rule
+(`ss -ltnp | grep 8000` → `127.0.0.1` only) still holds and was re-checked
+after the install; `containerd` listens on a loopback port (46451), nothing
+else changed in `ss -ltnp`. Caddy, Tor and the relay unit are untouched.
+Memory: 604 MB used of 3.8 GB, disk 3.7 GB of 38 GB.
+
+## (2026-09-21, the 2026-08-07 pentest: all 14 Medium fixed, NOT deployed)
 
 **📱 ANDROID ON-DEVICE PASS (2026-09-21 evening, branch
 `android-ondevice-2026-09-21` from `3e55bff`; relay DOWN, nothing deployed).**
