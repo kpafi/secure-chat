@@ -20,10 +20,17 @@ check from the laptop: `https://138-199-144-35.sslip.io/healthz` →
 server venv already had every pin of the new `requirements.txt` (dilithium-py
 1.4.0 etc.), so no pip step was needed. Nothing was merged, nothing pushed;
 the divergence local `master` ↔ `origin/master` is unchanged.
-**NOT yet done:** the phone. The app auto-logs in once the identity is
-unlocked; with the new relay that login should now be a 200 (item 5 of the
-2026-09-21 entry). The phone was not connected over adb tonight, so
-`adb logcat | grep -i "401\|verify"` staying quiet is still to be seen.
+**Phone: DONE (2026-09-22 22:49 CEST).** App launched over adb (0.1.0,
+installed 2026-09-21 22:55), the user unlocked; **no "Open anyway"** in any
+view (the Chats store was re-tagged v2 yesterday). Logcat over the whole
+unlock + login window: **0 CONSOLE lines, no 401/422/verify** from the
+WebView. Read over CDP (`webview_devtools_remote_<pid>`): profile view says
+**"Logged in as "samuhandy1" (session valid ~60 min). You control this
+account."**, `#log` has no failure line at all, `sc.username.v1` +
+`sc.lookuptoken.v1` present, identity fingerprint 8FF4 9539 …, the one chat
+(`ankerni`, 🟢 verified) intact. `#status` reads "disconnected" — that is the
+live-room WebSocket, no room was opened; expected. The old-relay 422 loop
+from yesterday is gone: relay, web client and APK are one unit again.
 
 **📦 The box is now shared (2026-09-22).** `docker.io` 26.1.5 +
 `docker-cli` + `docker-compose` 2.26 (Debian packages) were installed and
