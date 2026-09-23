@@ -62,11 +62,29 @@ Pre-existing issues the pentest noticed, NOT changed here:
 - The "Start a chat with a saved user" picker says "add users in the Users view first" also when
   every saved user already has an open chat.
 
+## Phase 2a — pre-existing bugs and the small app.js items
+
+Scope: the four bugs the pentest had noticed and the six small behaviour items from the critics
+(see the commit "client: phase 2a"). Reviewed by the same three reviewers. Design critic: all four
+visual items read right, two nits taken (mono name in the sheet, "connected" neutral beside the
+"verified" pill). Correctness/a11y critic: one major — focus dropped to body when the sheet
+closed — fixed with focus restore and e2e checks; minors taken (focus after opening a row / Back,
+`role="none"` on the chat list, e2e checks for the pill and the caption, two duplicate rules).
+Pentest, three passes: nothing Critical/High/Medium; four Lows found and fixed with tests — two
+more refusals were still erased on close; a relay-parked reason could relabel a close the client
+started (closeWs()/clientClosing); "Leave chat" sat over the phone composer without the 500 ms
+rule; frames processed after onclose could drop a refusal or carry a relay sentence into the
+next session (handling is now tied to the frame's socket). Final verdict: no open findings;
+the admission guard is byte-identical to the rework commit. Cosmetic, noted: a handler still
+running for a closed socket can add its log line to the next session's log (harden with
+`if (sock !== ws) return` after each await in handleMessage).
+
+Still open for a later round: the store-refusal "Open anyway" path loses the invite-link notice
+(handle still prefilled); B5's caption is not shown in the Users list because the row carries its
+own key-changed sentence.
+
 ## Phase 2 (behaviour changes; each needs its own design, e2e coverage and a pentest pass)
 
-- Trust pill in the admission sheet and a verified state in the live-room header (one line of
-  app.js each); focus trap for the sheet; keyboard access for chat rows; the key-changed suffix as
-  a caption span; hide the empty fingerprint well when a knocker has no identity.
 - One global unlock screen and Chats as the home view (see `direction-contract.md` for why not
   now); Start | Join control for the chat code; the encryption picker as a sheet; a 2-line code
   well; a contact detail screen; "re-verify or send anyway" on key change; typed confirmation for
