@@ -1261,7 +1261,6 @@ li:has(> .u-open .u-mark.changed) > .hint.err::before,
 .contact-handle { min-width: 0; font-size: var(--fs-2); overflow-wrap: anywhere; }
 .contact-handle.ok { font-family: var(--font-mono); color: var(--fg); word-break: break-all; }
 .contact-handle.dup { display: none; }
-.contact-handle.dup + #contactCopyHandle { margin-left: calc(-1 * var(--sp-3)); }
 #contactCopyHandle { --icon: var(--i-copy); flex: none; }
 #contactCopyHandle::before { width: 16px; height: 16px; }
 #contactCopyHandle.copied { color: var(--ok); }
