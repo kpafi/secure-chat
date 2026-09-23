@@ -236,7 +236,7 @@ h1, h2, p, ul, dl, dd { margin: 0; }
 .chatmode::before,
 .facts li::before,
 .hint.err::before,
-.hint.ok:not(#myHandleText)::before,
+.hint.ok:not(#myHandleText, #contactHandle)::before,
 .u-claim::before,
 .disclosure > summary::after,
 .composer button::before,
@@ -604,7 +604,7 @@ select option { background: var(--panel); color: var(--fg); }
 }
 /* Errors carry an icon so they do not rely on colour. */
 .hint.err:not(:empty),
-.hint.ok:not(:empty):not(#myHandleText) { display: flex; gap: var(--sp-2); }
+.hint.ok:not(:empty):not(#myHandleText, #contactHandle) { display: flex; gap: var(--sp-2); }
 .hint:empty::before { content: none; }
 .hint.err::before {
   --icon: var(--i-alert);
@@ -612,7 +612,7 @@ select option { background: var(--panel); color: var(--fg); }
   height: 16px;
   margin-top: 2px;
 }
-.hint.ok:not(#myHandleText)::before {
+.hint.ok:not(#myHandleText, #contactHandle)::before {
   --icon: var(--i-check);
   width: 14px;
   height: 14px;
@@ -2329,7 +2329,7 @@ button.peer-open:disabled:hover { opacity: 1; cursor: default; background: trans
   .chatmode::before,
   .facts li::before,
   .hint.err::before,
-  .hint.ok:not(#myHandleText)::before,
+  .hint.ok:not(#myHandleText, #contactHandle)::before,
   .u-claim::before,
   .disclosure > summary::after,
   .locked > .lead::before,
