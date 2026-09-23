@@ -131,6 +131,7 @@ const focusInfo = (page) => page.evaluate(() => {
   return { cls: a.className, id: a.id, user: a.closest("li")?.dataset.user || null };
 });
 const rowOf = (u) => `#userList > li[data-user="${u}"]`;
+const VERIFY_LABEL = "Verified in person\u00a0✓"; // the ✓ never wraps alone
 
 console.log(`\n=== contact profile (${APP}) ===\n`);
 const [aliceSpec, bobSpec, carolSpec] = cfg.users.length >= 3 ? cfg.users
@@ -171,7 +172,7 @@ check("the facts say only what the pill does not: the date saved (no \"not yet\"
 const handleIcon = await alice.page.evaluate(() => getComputedStyle(document.querySelector("#contactHandle"), "::before").content);
 check("no check icon beside the contact's handle (17ee937)", handleIcon === "none" || handleIcon === "normal", JSON.stringify(handleIcon));
 check("one primary: Message; Verify is secondary and enabled once the fingerprint is on screen",
-  s.message && s.verify.text === "Verified in person ✓" && !s.verify.disabled &&
+  s.message && s.verify.text === VERIFY_LABEL && !s.verify.disabled &&
   (await alice.page.evaluate(() => document.querySelectorAll("#contactSheet button.primary:not([hidden])").length)) === 1,
   JSON.stringify(s.verify));
 check("the rest of the page is inert while it is up", s.inert.tabbar && s.inert.users && s.inert.chats, JSON.stringify(s.inert));
@@ -268,12 +269,12 @@ check("the conversation's name is a button that opens the profile — without Me
   JSON.stringify({ open: s.open, message: s.message }));
 // Pentest L-2 / cold M1: Unverify from here — the header's mark follows.
 await alice.page.click("#contactVerify"); // Unverify (confirm accepted)
-await alice.page.waitForFunction(() => document.querySelector("#contactVerify").textContent === "Verified in person ✓", { timeout: 10000 }).catch(() => {});
+await alice.page.waitForFunction(() => document.querySelector("#contactVerify").textContent === "Verified in person\u00a0✓", { timeout: 10000 }).catch(() => {});
 const headerMark = await alice.page.evaluate(() => ({
   mark: document.querySelector("#chatPeerMark").textContent, verify: document.querySelector("#contactVerify").textContent,
 }));
 check("Unverify from the conversation's profile updates the header's mark and the sheet at once",
-  headerMark.mark === "unverified" && headerMark.verify === "Verified in person ✓", JSON.stringify(headerMark));
+  headerMark.mark === "unverified" && headerMark.verify === VERIFY_LABEL, JSON.stringify(headerMark));
 await alice.page.keyboard.press("Escape");
 await waitSheet(alice.page, false);
 f = await focusInfo(alice.page);
@@ -444,7 +445,7 @@ await alice.page.click("#contactVerify"); // still reads "Unverify"
 await sleep(300);
 const redraw = await alice.page.evaluate(() => document.querySelector("#contactVerify").textContent);
 check("a click on a button whose state the store no longer has redraws it and asks nothing",
-  alice.page.dialogs.length === nD2 && redraw === "Verified in person ✓" && (await isVerified(bob.username)) === false,
+  alice.page.dialogs.length === nD2 && redraw === VERIFY_LABEL && (await isVerified(bob.username)) === false,
   JSON.stringify({ redraw, dialogs: alice.page.dialogs.length - nD2 }));
 
 // Busy: a vouch the relay never answers. A second click is refused and says
@@ -467,9 +468,9 @@ const busy = await alice.page.evaluate(() => ({
   status: document.querySelector("#contactStatus").textContent, label: document.querySelector("#contactVerify").textContent,
 }));
 check("while the vouch is in flight the store shows verified at once, and a second click is refused with a reason",
-  busy.label === "Unverify" && /Still publishing the vouch/.test(busy.status) && alice.page.dialogs.length === nD3 &&
+  busy.label === "Unverify" && /Still saving the last change/.test(busy.status) && alice.page.dialogs.length === nD3 &&
   (await isVerified(bob.username)) === true && held.length === 1, JSON.stringify({ busy, held: held.length }));
-await alice.page.waitForFunction(() => /Could not publish the vouch/.test(document.querySelector("#contactStatus").textContent),
+await alice.page.waitForFunction(() => /No answer from the relay about the vouch/.test(document.querySelector("#contactStatus").textContent),
   { timeout: 25000 }).catch(() => {});
 const timedOut = await alice.page.evaluate(() => document.querySelector("#contactStatus").textContent);
 alice.page.off("request", onReq);
@@ -477,8 +478,25 @@ await alice.page.setRequestInterception(false);
 await sleep(600);
 await alice.page.click("#contactVerify"); // Unverify, accepted
 await sleep(800);
-check("a vouch that never returns times out, says so, and Unverify works again",
-  /Could not publish the vouch/.test(timedOut) && (await isVerified(bob.username)) === false, JSON.stringify(timedOut));
+check("a vouch that never returns times out, says it may still be published (and for whom), and Unverify works again",
+  timedOut.startsWith(`No answer from the relay about the vouch for "${bob.username}" — it may still have been published.`) &&
+  (await isVerified(bob.username)) === false, JSON.stringify(timedOut));
+// That Unverify put Verify first again (bob's key once changed): the focused
+// button keeps focus through the reorder (cold r3 MAJOR-A, pentest p3 L-3).
+const afterReorder = await alice.page.evaluate(() => ({
+  focus: document.activeElement.id || document.activeElement.tagName,
+  first: document.querySelector(".contact-actions").firstElementChild.id,
+}));
+check("the reorder of the two actions keeps focus on the button that had it",
+  afterReorder.focus === "contactVerify" && afterReorder.first === "contactVerify", JSON.stringify(afterReorder));
+// A "?" opened here is shut when a profile opens again.
+await alice.page.click("#contactSheet .why-row summary");
+await alice.page.keyboard.press("Escape");
+await waitSheet(alice.page, false);
+await alice.page.click(`${rowOf(bob.username)} > .u-open`);
+await waitSheet(alice.page);
+check("a \"?\" opened on a profile is shut the next time it opens",
+  await alice.page.evaluate(() => !document.querySelector("#contactSheet .why-row details").open));
 await alice.page.keyboard.press("Escape");
 await waitSheet(alice.page, false);
 
@@ -515,6 +533,26 @@ check("a copy result on one contact never shows on the next one's Copy",
   copied !== "Copy" && onBob === "Copy", JSON.stringify({ copied, onBob }));
 await alice.page.keyboard.press("Escape");
 await waitSheet(alice.page, false);
+// ...also when the clipboard is slow: the write finishes while the NEXT
+// contact's sheet is up, and must not label it (pentest p2 #3).
+await alice.page.evaluate(() => {
+  const orig = navigator.clipboard.writeText.bind(navigator.clipboard);
+  navigator.clipboard.writeText = async (t) => { await new Promise((r) => setTimeout(r, 1000)); return orig(t).catch(() => {}); };
+});
+await alice.page.click(`${rowOf("e2e-adopt")} > .u-open`);
+await waitSheet(alice.page);
+await alice.page.click("#contactCopyHandle");
+await alice.page.keyboard.press("Escape");
+await waitSheet(alice.page, false);
+await alice.page.click(`${rowOf(bob.username)} > .u-open`);
+const labels = new Set();
+for (let i = 0; i < 16; i++) {
+  labels.add(await alice.page.evaluate(() => document.querySelector("#contactCopyHandle").textContent));
+  await sleep(100);
+}
+check("a slow clipboard write never labels the next contact's Copy", labels.size === 1 && labels.has("Copy"), JSON.stringify([...labels]));
+await alice.page.keyboard.press("Escape");
+await waitSheet(alice.page, false);
 // Remove from Users: the sheet closes, the row goes, focus on the add field.
 await alice.page.click(`${rowOf("e2e-adopt")} > .u-open`);
 await waitSheet(alice.page);
@@ -544,13 +582,15 @@ for (let i = 0; i < 15 && !auto; i++) {
   auto = await alice.page.evaluate(async () => (await import("./contacts.js")).list().find((c) => c.auto)?.username || null);
 }
 if (auto) {
-  // From the Chats avatar this time (alice is in Chats after the polls).
+  await view(alice.page, "users");
+  const rowClaim = await alice.page.evaluate((sel) => document.querySelector(`${sel} > .u-claim`)?.textContent, rowOf(auto));
+  await view(alice.page, "chats");
+  // From the Chats avatar this time.
   await alice.page.waitForFunction((u) => !!document.querySelector(`#chatList > li[data-user="${u}"] > button.u-avatar`), { timeout: 10000 }, auto).catch(() => {});
   await alice.page.click(`#chatList > li[data-user="${auto}"] > .u-avatar`);
   await waitSheet(alice.page);
   s = await sheet(alice.page);
   const shown = await alice.page.evaluate(() => getComputedStyle(document.querySelector("#contactHandle")).display);
-  const rowClaim = await alice.page.evaluate((sel) => document.querySelector(`${sel} > .u-claim`)?.textContent, rowOf(auto));
   check("an automatic contact's handle is labelled a claim, printed once: the sheet's claim line points at it (hot M8, M-B)",
     s.handleLabel === "Handle they claim" && s.handle === carol.handle && shown !== "none" &&
     s.warn === "claims the handle below — unverified, they chose this name themselves" &&
@@ -578,6 +618,48 @@ if (auto) {
   check("carol's mail made an automatic contact on alice's device", false, "no auto contact after 15 polls");
 }
 
+// --- 5b. a store write refused because another tab wrote first ---------------------
+console.log("\n5b. store refused");
+{
+  const tab2 = await alice.ctx.newPage();
+  tab2.on("dialog", (d) => d.accept());
+  await tab2.setViewport({ width: 1000, height: 900 });
+  await tab2.goto(APP, { waitUntil: "networkidle0" });
+  await tab2.click('.navitem[data-view="users"]');
+  await tab2.type("#usersUnlockPass", aliceSpec.passphrase);
+  await tab2.click("#usersUnlock");
+  await tab2.waitForFunction(() => !document.querySelector("#usersUnlocked").hidden, { timeout: 40000 });
+  // tab 2 writes: the store's generation moves past what tab 1 holds.
+  await tab2.evaluate(async (u) => { await (await import("./contacts.js")).setVerified(u, true); }, bob.username);
+  await tab2.close();
+  await alice.page.bringToFront();
+  await view(alice.page, "users");
+  await alice.page.click(`${rowOf(bob.username)} > .u-open`);
+  await waitSheet(alice.page);
+  await waitFp(alice.page);
+  await alice.page.click("#contactVerify"); // tab 1 still shows bob unverified
+  await sleep(1200);
+  const lost = await alice.page.evaluate(() => {
+    const p = document.querySelector("#usersLocked p");
+    const r = p.getBoundingClientRect();
+    return { sheet: !document.querySelector("#contactSheet").hidden, locked: !document.querySelector("#usersLocked").hidden,
+      text: p.textContent, visible: r.width > 0 && r.height > 0, focus: document.activeElement.id,
+      inert: document.querySelector("#tabbar").inert || document.querySelector("#viewUsers").inert };
+  });
+  check("a write the store refuses closes the sheet and says why on the visible locked panel, focus in its passphrase field",
+    !lost.sheet && lost.locked && lost.visible && /^Contact store error: /.test(lost.text) && lost.text.length > 24 &&
+    lost.focus === "usersUnlockPass" && !lost.inert, JSON.stringify(lost));
+  await alice.page.type("#usersUnlockPass", aliceSpec.passphrase);
+  await alice.page.click("#usersUnlock");
+  await alice.page.waitForFunction(() => !document.querySelector("#usersUnlocked").hidden, { timeout: 40000 }).catch(() => {});
+  await sleep(800);
+  check("unlocking again reads the other tab's version", (await isVerified(bob.username)) === true);
+  // Back to unverified for the phone checks (the key-changed layout).
+  await store(alice.page, async (u) => { await (await import("./contacts.js")).setVerified(u, false); }, bob.username);
+  await view(alice.page, "chats");
+  await view(alice.page, "users");
+}
+
 // --- 6. phone: docks above the tab bar -------------------------------------------
 console.log("\n6. phone");
 // Width only: switching isMobile/hasTouch would reload the page (and lock it).
@@ -599,6 +681,35 @@ check("on a phone the sheet docks above the tab bar, every button ≥44px",
 await alice.page.mouse.click(195, 20);
 await waitSheet(alice.page, false);
 check("a tap on the scrim closes it on a phone", !(await sheet(alice.page)).open);
+
+// A changed key on a small phone: the fingerprint is never under the Verify
+// bar (pentest p3 L-4) — the row is in the flow after it.
+await alice.page.setViewport({ width: 320, height: 568 });
+await sleep(300);
+const dbgSmall = await alice.page.evaluate((sel) => {
+  const el = document.querySelector(sel);
+  if (!el) return { row: false };
+  el.scrollIntoView({ block: "center" });
+  const r = el.getBoundingClientRect();
+  const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+  return { row: true, hit: hit ? hit.id || hit.className : null, inert: document.querySelector("#viewUsers").inert };
+}, `${rowOf(bob.username)} > .u-open`);
+await alice.page.click(`${rowOf(bob.username)} > .u-open`);
+await waitSheet(alice.page);
+const small = await alice.page.evaluate(() => {
+  const fp = document.querySelector("#contactFingerprint").getBoundingClientRect();
+  const bar = document.querySelector(".contact-actions");
+  const b = bar.getBoundingClientRect();
+  return { open: !document.querySelector("#contactSheet").hidden, fpBottom: Math.round(fp.bottom), barTop: Math.round(b.top),
+    pos: getComputedStyle(bar).position, primary: document.querySelector(".contact-actions > .primary")?.id };
+});
+check("key changed at 320×568: Verify is the primary, its row sits after the fingerprint, never over it",
+  small.open && small.fpBottom > 0 && small.primary === "contactVerify" && small.pos === "static" && small.fpBottom <= small.barTop,
+  JSON.stringify({ small, dbgSmall }));
+if (small.open) await alice.page.click("#contactClose");
+await waitSheet(alice.page, false);
+await alice.page.setViewport({ width: 390, height: 844 });
+await sleep(300);
 
 // Pentest L-3 / cold m2: the second half of a double tap lands on the sheet
 // (or the scrim) as it appears — reduced motion, so no CSS guard helps. It

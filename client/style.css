@@ -1265,7 +1265,11 @@ li:has(> .u-open .u-mark.changed) > .hint.err::before,
   gap: var(--sp-3);
 }
 .contact-handle { min-width: 0; font-size: var(--fs-2); overflow-wrap: anywhere; }
-.contact-handle.ok { font-family: var(--font-mono); color: var(--fg); word-break: break-all; text-wrap: balance; }
+/* A handle breaks at its "#" first; only the token, when it is wider than
+   the column, breaks inside itself (hot r3 n1 — the token is what people
+   read out, so it is not cut to balance two lines). */
+.contact-handle.ok { font-family: var(--font-mono); color: var(--fg); overflow-wrap: anywhere; }
+.contact-handle.ok > .tok { display: inline-block; max-width: 100%; word-break: break-all; }
 #contactHandleLabel { margin-bottom: var(--sp-2); }
 #contactCopyHandle { --icon: var(--i-copy); flex: none; }
 #contactCopyHandle::before { width: 16px; height: 16px; }
@@ -1289,12 +1293,15 @@ li:has(> .u-open .u-mark.changed) > .hint.err::before,
    puts it first in the DOM). Unverify keeps a hairline, so it never reads
    like Remove. Remove: last, on its own line, right-aligned, a muted word
    until hover or focus — red on this sheet means the changed key (hot M5). */
-.contact-actions { flex-wrap: nowrap; gap: var(--sp-2); }
+/* One line at normal text size (the pair needs 270 of 288px at 320); at
+   200% text the pair wraps, and a button is never narrower than its longest
+   word — a label never spills out of its button (cold r3 MAJOR-B). */
+.contact-actions { flex-wrap: wrap; gap: var(--sp-2); }
 .contact-actions > button {
   flex: 0 1 auto;
-  min-width: 0;
+  min-width: min-content;
   height: auto;
-  white-space: normal;       /* 200% text or 320px: the words wrap, the button stays in the sheet */
+  white-space: normal;
 }
 .contact-actions > .primary { flex: 1 1 auto; }
 .contact-actions > #contactVerify.ghost { border-color: var(--border); }
@@ -1329,6 +1336,16 @@ li:has(> .u-open .u-mark.changed) > .hint.err::before,
     border-top: 1px solid var(--border-soft);
   }
   .contact-remove-row { margin-top: calc(-1 * var(--gap)); }
+  /* A changed key: Verify is the primary, and the fingerprint it asks you to
+     compare must never sit under it (pentest p3 L-4, 320px). The row stays
+     in the flow, after the fingerprint: reaching Verify means reading past
+     the number first. */
+  .contact-actions:has(> #contactVerify.primary) {
+    position: static;
+    margin-bottom: calc(var(--sp-3) - var(--gap));
+    padding-bottom: 0;
+    border-top: 0;
+  }
   #contactName { font-size: var(--fs-4); }
 }
 /* The conversation's name opens the profile: it looks like the name, and

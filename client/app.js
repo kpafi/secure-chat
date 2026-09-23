@@ -1265,6 +1265,19 @@ let contactKeys = null;    // the keys the fingerprint on screen is (being) comp
 let contactFpReady = false;
 let contactBusy = false;   // a Verify/Unverify (and its vouch) is running: further clicks are refused (pentest L-1)
 const VOUCH_TIMEOUT_MS = 15000; // a relay that never answers must not hold contactBusy (pentest pass 2)
+// Contacts whose vouch timed out in this session: the relay may still have
+// published it (pentest p3 L-1), so an Unverify or Remove retracts twice —
+// now and once more after the bound. refreshVouchMarks() also retracts any
+// vouch of ours it finds for a contact we no longer trust.
+const vouchUnsure = new Set();
+function retractVouch(c) {
+  if (!apiToken) return;
+  const name = dirName(c), token = apiToken;
+  account.unvouch(API_BASE, token, name).catch(() => { /* none published */ });
+  if (vouchUnsure.delete(c.username)) {
+    setTimeout(() => { account.unvouch(API_BASE, token, name).catch(() => {}); }, VOUCH_TIMEOUT_MS + 5000);
+  }
+}
 let contactShownAt = 0;    // when the sheet appeared (the 500 ms rule below)
 
 // The sheet appears under the user's own tap, so a double tap's second half
@@ -1341,7 +1354,13 @@ function renderContact() {
   // sender's mail it is the name THEY put in the envelope: labelled a claim.
   els.contactHandleLabel.textContent = c.auto || c.claimedName ? "Handle they claim" : "Handle";
   if (c.token) {
-    els.contactHandle.textContent = mailHandle(c);
+    // Two spans, so the line breaks at the "#" before it cuts the token.
+    const user = document.createElement("span");
+    user.textContent = dirName(c);
+    const tok = document.createElement("span");
+    tok.className = "tok";
+    tok.textContent = "#" + c.token;
+    els.contactHandle.replaceChildren(user, tok);
     els.contactHandle.className = "hint contact-handle ok";
     els.contactCopyHandle.hidden = false;
   } else {
@@ -1410,17 +1429,23 @@ function renderContactActions(c) {
   els.contactVerify.className = c.verified ? "ghost" : changed ? "primary" : "";
   // The primary comes first — in the DOM, so Tab and reading order match
   // what is on screen (hot M-C, cold m1).
+  // Moving a focused node blurs it (cold r3 MAJOR-A, pentest L-3): move the
+  // one that is not focused. A reorder under the pointer also restarts the
+  // 500 ms rule, so a tap aimed at one button never lands on the other.
+  const focused = document.activeElement;
   const [first, second] = changed ? [els.contactVerify, els.contactMessage] : [els.contactMessage, els.contactVerify];
-  if (first.nextElementSibling !== second) first.parentNode.insertBefore(first, second);
-  els.contactVerify.textContent = c.verified ? "Unverify" : "Verified in person ✓";
+  if (first.nextElementSibling !== second) {
+    if (focused === first) first.after(second); else first.parentNode.insertBefore(first, second);
+    contactShownAt = performance.now();
+  }
+  els.contactVerify.textContent = c.verified ? "Unverify" : "Verified in person\u00a0✓";
   // Pentest L-1: the click acts as it was rendered, never as a fresh read
   // of the store says — a second click must not undo the first.
   els.contactVerify.dataset.action = c.verified ? "unverify" : "verify";
   // Disabling the focused button would drop focus to <body>: keep it in the
   // sheet. (A running action is refused by contactBusy, not by disabling.)
-  const hadFocus = document.activeElement === els.contactVerify;
   els.contactVerify.disabled = !c.verified && !contactFpReady;
-  if (hadFocus && els.contactVerify.disabled) els.contactSheet.focus();
+  if (focused === els.contactVerify && els.contactVerify.disabled) els.contactSheet.focus();
 }
 
 function contactStatus(text, isErr = false) {
@@ -1482,7 +1507,7 @@ els.contactMessage.addEventListener("click", async (e) => {
 
 els.contactVerify.addEventListener("click", async (e) => {
   if (contactTooSoon(e)) return;
-  if (contactBusy) { contactStatus("Still publishing the vouch — one moment."); return; }
+  if (contactBusy) { contactStatus("Still saving the last change — one moment."); return; }
   const user = contactShown;
   const c = user !== null ? contacts.get(user) : null;
   if (!c) return;
@@ -1517,9 +1542,11 @@ els.contactVerify.addEventListener("click", async (e) => {
       await contacts.setVerified(c.username, wantVerified);
     } catch (err) {
       // Pentest pass 2: e.g. the store refused a stale write (another tab)
-      // and locked itself — say so instead of failing silently.
+      // and locked itself — say so instead of failing silently; a locked
+      // store says it on its locked panel (the lists are hidden then).
       statusMsg = "Could not save: " + err.message;
       statusErr = true;
+      if (!contacts.isUnlocked()) contactsError = err.message;
       return;
     }
     // The store has changed: show it now, not after the vouch round trip.
@@ -1542,15 +1569,22 @@ els.contactVerify.addEventListener("click", async (e) => {
           await account.vouch(API_BASE, identity, apiToken, dirName(c), keysOf(c), AbortSignal.timeout(VOUCH_TIMEOUT_MS));
           statusMsg = `Vouch for "${c.username}" published.`;
         } catch (err) {
-          statusMsg = "Could not publish the vouch: " + err.message;
           statusErr = true;
+          if (err && err.name === "TimeoutError") {
+            // We stopped waiting; the relay may still have acted (L-1).
+            vouchUnsure.add(c.username);
+            statusMsg = `No answer from the relay about the vouch for "${c.username}" — it may still have been ` +
+              "published. Unverify retracts it.";
+          } else {
+            statusMsg = `Could not publish the vouch for "${c.username}": ` + err.message;
+          }
         }
       } else if (!apiToken) {
         statusMsg = "Tip: Log in (Live room → step 1) to also publish a signed vouch for people you verify.";
       }
-    } else if (apiToken) {
+    } else {
       // Turned back to unverified — retract a published vouch if any.
-      account.unvouch(API_BASE, apiToken, dirName(c)).catch(() => { /* none published */ });
+      retractVouch(c);
     }
   } finally {
     contactBusy = false;
@@ -1558,25 +1592,45 @@ els.contactVerify.addEventListener("click", async (e) => {
     // locked itself (the refusal above) has nothing to show: the sheet closes
     // and the view underneath shows its locked state, with the reason.
     if (!contacts.isUnlocked()) {
-      closeContact(false);
-      if (!els.viewUsers.hidden) refreshUsers();
-      else if (!els.viewChats.hidden) refreshChats();
+      contactStoreLost();
     } else {
       contactsChanged();
+      // The result belongs to this contact: another one's sheet opened
+      // meanwhile never shows it (pentest p3 I-1); the list's line names it.
+      if (contactShown === user) contactStatus(statusMsg || "", statusErr);
+      if (!els.viewUsers.hidden) usersStatus(statusMsg || "", statusErr); // this action's result replaces the last one's
+      else if (!els.viewChats.hidden && statusErr) chatsStatus(statusMsg, true);
     }
-    contactStatus(statusMsg || "", statusErr);
-    if (!els.viewUsers.hidden) usersStatus(statusMsg || "", statusErr); // this action's result replaces the last one's
-    else if (!els.viewChats.hidden && statusErr) chatsStatus(statusMsg, true);
   }
 });
+
+// The store locked itself under the sheet (it refused a write another tab
+// made stale): close the sheet, show the view's locked panel — which carries
+// the reason (contactsError) — and put focus in its passphrase field.
+function contactStoreLost() {
+  closeContact(false);
+  if (!els.viewUsers.hidden) { refreshUsers(); els.usersUnlockPass.focus(); }
+  else if (!els.viewChats.hidden) { refreshChats(); els.chatsUnlockPass.focus(); }
+}
 
 els.contactRemove.addEventListener("click", async (e) => {
   if (contactTooSoon(e)) return;
   const user = contactShown;
   const c = user !== null ? contacts.get(user) : null;
   if (!c) return;
+  if (contactBusy) { contactStatus("Still saving the last change — one moment."); return; }
   if (!confirm(`Remove "${c.username}" (and your verification of them) from this device?`)) return;
-  await contacts.remove(c.username);
+  try {
+    await contacts.remove(c.username);
+  } catch (err) {
+    if (!contacts.isUnlocked()) { contactsError = err.message; contactStoreLost(); return; }
+    contactStatus("Could not remove: " + err.message, true);
+    return;
+  }
+  // A vouch of ours for them would outlive the contact (pentest p3 I-2).
+  // Only where one can exist (verified, or a vouch we are unsure about): a
+  // DELETE for anyone else would tell the relay who we had saved.
+  if (c.verified || vouchUnsure.has(c.username)) retractVouch(c);
   // Re-render first: the render finds the contact gone and closes the sheet,
   // and focus then goes where the removed row's neighbours are, not into a
   // row that is about to be replaced.
@@ -1613,6 +1667,13 @@ async function refreshVouchMarks() {
       }
       const names = [];
       for (const v of raw || []) {
+        // Our own vouch for someone we no longer trust (this loop only sees
+        // unverified contacts) — e.g. one the relay took after we stopped
+        // waiting (pentest p3 L-1): retract it.
+        if (apiToken && v.voucher === localStorage.getItem(LS_USERNAME)) {
+          account.unvouch(API_BASE, apiToken, dirName(c)).catch(() => {});
+          continue;
+        }
         const voucher = contacts.get(v.voucher);
         if (!voucher || !voucher.verified) continue;
         if (voucher.ed !== v.voucher_ed || voucher.mldsa !== v.voucher_mldsa) continue;
