@@ -83,6 +83,21 @@ Still open for a later round: the store-refusal "Open anyway" path loses the inv
 (handle still prefilled); B5's caption is not shown in the Users list because the row carries its
 own key-changed sentence.
 
+## Phase 2b — less text, "?" disclosures, one next step per screen
+
+Scope: the owner's feedback after seeing the shipped rework ("still too much text; hide
+explanations behind a ? and make the design lead to the right button"). Decisions in
+`reviews/phase2b-brief.md`; visible words across the 20 captured states 1274 → 923. Design
+critic: no blocker; five majors fixed (a lede that serves the guest too, help panels below the
+field, the username row hidden once registered, two empty-state variants for Chats, Profile's
+Forget as a quiet word) and the "?" wrap balanced. A11y critic: no blocker; one major fixed
+(Forget must stay visible on the locked step 1), 44px "?" targets, a specific name per "?".
+Pentest, two passes: every refusal, warning, relay and error text byte-identical; the admission
+guard, trap and closeWs byte-identical; every decision point keeps its rule visible without
+opening anything; Forget stays confirm-gated; one pre-existing Low fixed (a stale key-changed
+sentence in #verifyHint on the next clean session). Final verdict: no findings; the new
+username and Expecting toggles hide nothing a user needs.
+
 ## Phase 2 (behaviour changes; each needs its own design, e2e coverage and a pentest pass)
 
 - One global unlock screen and Chats as the home view (see `direction-contract.md` for why not
