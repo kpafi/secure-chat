@@ -168,7 +168,8 @@ check("a waiting peer gets no key exchange and cannot send",
 
 // Phase 2a, B3 (a11y review): the sheet is modal for the keyboard as well.
 // Everything behind it is inert, and Tab / Shift+Tab wrap inside it: from
-// Deny (last) to the fingerprint block (first), through Let them in, and back.
+// Leave chat (last) to the "?" beside the hint (first; phase 2b), through the
+// fingerprint block, Let them in and Deny, and back.
 const inertNow = (page) => page.evaluate(() =>
   ["#tabbar", "#scrChat > .topbar", "#verify", "#chat"].map((s) => document.querySelector(s).inert));
 const behindSheet = await inertNow(alice.page);
@@ -176,14 +177,18 @@ check("B3: with the sheet up, the tab bar, chat bar, gate and log are inert",
   behindSheet.every((x) => x === true), JSON.stringify(behindSheet));
 await alice.page.focus("#admitNo");
 const tabWalk = [];
-for (const shift of [false, false, true, false, false, false]) {
+for (const shift of [false, false, true, false, false, false, false]) {
   if (shift) await alice.page.keyboard.down("Shift");
   await alice.page.keyboard.press("Tab");
   if (shift) await alice.page.keyboard.up("Shift");
-  tabWalk.push(await alice.page.evaluate(() => document.activeElement.id || document.activeElement.tagName));
+  // An element without an id (the "?" summary) is named with where it is.
+  tabWalk.push(await alice.page.evaluate(() => {
+    const a = document.activeElement;
+    return a.id || (a.closest("#admit") ? "admit:" : "") + a.tagName;
+  }));
 }
-check("B3: Tab and Shift+Tab stay inside the sheet (Deny -> Leave chat -> fingerprint, Shift+Tab back to Leave, on to Deny)",
-  JSON.stringify(tabWalk) === JSON.stringify(["admitLeave", "admitFingerprint", "admitLeave", "admitFingerprint", "admitOk", "admitNo"]),
+check("B3: Tab and Shift+Tab stay inside the sheet (Deny -> Leave chat -> the \"?\" -> fingerprint, Shift+Tab back to Leave, on to Deny)",
+  JSON.stringify(tabWalk) === JSON.stringify(["admitLeave", "admit:SUMMARY", "admitLeave", "admit:SUMMARY", "admitFingerprint", "admitOk", "admitNo"]),
   JSON.stringify(tabWalk));
 
 // --- 3. the invited peer knocks too, and is let in -------------------------
@@ -689,6 +694,47 @@ const dfDecided = await decided(df.page);
 check("T1: Enter on Deny, then Enter again, passes no gate (focus on the safety number, no verified pill)",
   dfFocus0 === "admitNo" && dfDecided.denies === 1 && dfAfter.gate && !dfAfter.sheet && !dfAfter.pill &&
   dfAfter.focus === "safetyNumber", JSON.stringify({ dfFocus0, ...dfAfter, ...dfDecided }));
+
+// --- 11. phase 2b fix round, pentest S1: a warning must not outlive its gate --
+// The key-changed variants rewrite #verifyHint; the clean first-contact branch
+// used to set only the title, so the NEXT clean session in the same page still
+// showed the old warning. Owner "sw" meets peer A under a pin that is not A's
+// key (planted through the page's own store, as section 3 does), says "It
+// differs", then opens a new chat code with peer B: a clean first contact.
+console.log("\n11. a key-changed gate, then a clean first contact in the same page");
+const sw = await agent("owner-stalehint"), sA = await agent("peer-stale-a"), sB = await agent("peer-stale-b");
+const defaultHint = await text(sw.page, "#verifyHint"); // index.html's sentence, untouched so far
+const swCode1 = await sw.page.evaluate(() => document.querySelector("#room").value.trim());
+await sw.page.evaluate(async (code, pass) => {
+  const { Identity } = await import("./identity.js");
+  const contacts = await import("./contacts.js");
+  const own = (await Identity.import(localStorage.getItem("sc.identity.v1"), pass)).publicBundle();
+  await contacts.savePin("room:" + code, own); // any key but A's
+}, swCode1, PASS);
+const gateNow = (page) => page.evaluate(() => ({
+  changed: document.querySelector("#verify").classList.contains("changed"),
+  hint: document.querySelector("#verifyHint").textContent.trim(),
+}));
+async function admitAtGate(owner, peer, code) {
+  await joinRoom(peer.page, code);
+  await owner.page.waitForFunction(() => !document.querySelector("#admit").hidden, { timeout: 30000 });
+  await sleep(DECIDE_PAUSE);
+  await owner.page.click("#admitOk");
+  await owner.page.waitForFunction(() => !document.querySelector("#verify").hidden, { timeout: 60000 });
+}
+await ownerConnected(sw);
+await admitAtGate(sw, sA, swCode1);
+const gateChanged = await gateNow(sw.page);
+await sw.page.click("#verifyNo");
+await sw.page.waitForFunction(() => !document.querySelector("#scrRoom").hidden, { timeout: 15000 });
+await sw.page.click("#gen");
+const swCode2 = await ownerConnected(sw);
+await admitAtGate(sw, sB, swCode2);
+const gateClean = await gateNow(sw.page);
+check("S1: after a key-changed gate, the next clean first contact shows the default sentence, not the old warning",
+  gateChanged.changed && gateChanged.hint !== defaultHint && swCode2 !== swCode1 &&
+  !gateClean.changed && gateClean.hint === defaultHint && defaultHint.length > 0,
+  JSON.stringify({ changed: { ...gateChanged, hint: gateChanged.hint.slice(0, 40) }, clean: gateClean }));
 
 await browser.close();
 

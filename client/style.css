@@ -239,12 +239,12 @@ h1, h2, p, ul, dl, dd { margin: 0; }
 .hint.ok:not(#myHandleText)::before,
 .u-claim::before,
 .disclosure > summary::after,
-.why > summary::after,
 .composer button::before,
 #chatBack::before,
 #copyRoom::before,
+#copyHandle::before,
 #disconnect::before,
-.locked > .hint:first-of-type::before,
+.locked > .lead::before,
 .wordmark::after,
 .gate::before {
   content: "";
@@ -404,16 +404,6 @@ main:has(> #viewChats:not([hidden]) #chatsUnlocked:not([hidden]) #chatConvo:not(
   color: var(--muted);
 }
 label.overline { margin-bottom: var(--sp-2); }
-/* An overline names a section in a word or two; the sentence that explains
-   it is a sentence-case caption under it, not more uppercase. */
-.overline > .caption {
-  display: block;
-  margin-top: 2px;
-  font-size: var(--fs-2);
-  font-weight: 400;
-  letter-spacing: 0;
-  text-transform: none;
-}
 .title {
   font-size: var(--fs-6);
   font-weight: 650;
@@ -433,8 +423,6 @@ label.overline { margin-bottom: var(--sp-2); }
   text-wrap: balance;
 }
 .lede { color: var(--muted); text-wrap: pretty; }
-/* First run: the welcome leads; the step line follows it. */
-.welcome > .step { order: 1; margin-top: var(--sp-3); }
 
 /* The live flow's step line: the text stays, and a three-segment progress
    line above it shows where you are. Done steps are dimmed accent, the
@@ -459,7 +447,6 @@ label.overline { margin-bottom: var(--sp-2); }
 }
 #stepIdentity { --s1: var(--accent); }
 #stepRoom { --s1: var(--select-border); --s2: var(--accent); }
-.step strong { color: var(--fg); font-weight: 650; }
 /* The step line takes focus on navigation (so a screen reader lands on the
    new screen); a mouse user should not see a ring for it. */
 .step[tabindex]:focus:not(:focus-visible) { outline: none; }
@@ -940,7 +927,7 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
   color: var(--fg);
 }
 
-/* Trust legend: the three marks and what they mean, quiet, under the list. */
+/* Trust legend: the three marks and what they mean, in the list's "?". */
 .legend {
   display: grid;
   gap: var(--sp-2);
@@ -1212,10 +1199,10 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
   -webkit-mask-position: left center;
   mask-position: left center;
 }
-/* The explanation is read, not scanned: left-aligned under the centred
+/* The line under the title (and its "?"): left-aligned under the centred
    title, at the hint size, in a measure a phone can hold. */
-.gate .row > .hint {
-  max-width: 46ch;
+.gate .row > .qline {
+  max-width: 60ch;
   margin-inline: 0;
   text-align: left;
 }
@@ -1312,35 +1299,108 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
 .disclosure > summary:focus-visible { outline-offset: -2px; border-radius: var(--r-m); }
 .disclosure[open] > summary { border-bottom: 1px solid var(--border-soft); }
 .disclosure[open] > summary::after { transform: rotate(90deg); }
-.disclosure > .hint { padding: var(--sp-3) var(--sp-4) 0; }
+.disclosure > .qline { padding: var(--sp-3) var(--sp-4) 0; }
 
-/* "Why?": the second sentence of a hint, one tap away. A small muted
-   summary (a full-size target) with a chevron; the text opens under it. */
+/* "?": an explanation one tap away (no script — a <details class="why">).
+   A line (`.qline`) is a title, a label or ONE sentence; the "?" follows its
+   last word as a 24px ring, and the explanation opens as a quiet panel under
+   the whole line. The details is inline, so its panel (a block) drops below
+   the line box; its line stays where it was. The summary's words ("Why?")
+   are for assistive tech; the glyph is decoration. */
+.qline { text-wrap: balance; }   /* the "?" never ends up alone on a line */
+.qline > :not(.why) { display: inline; }
+.qline > label { margin: 0; }
+.why { display: inline; }
+/* A closed panel leaves no box behind: where the "?" is an item of a grid or
+   flex row, an empty (content-visibility: hidden) box would add a gap. */
+.why:not([open])::details-content { display: none; }
 .why > summary {
-  --icon: var(--i-chevron);
+  position: relative;
   display: inline-flex;
   align-items: center;
-  gap: var(--sp-1);
-  min-height: var(--control-h);
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin: -4px 0 -4px var(--sp-2);   /* never taller than the line it sits in */
+  vertical-align: middle;
   list-style: none;
   cursor: pointer;
+  font-family: var(--font-ui);
   font-size: var(--fs-2);
-  font-weight: 500;
+  font-weight: 650;
+  line-height: 1;
+  letter-spacing: 0;
+  text-transform: none;
   color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 50%;
 }
 .why > summary::-webkit-details-marker { display: none; }
-.why > summary::after { width: 14px; height: 14px; }
-.why > summary:hover { color: var(--fg); }
-.why[open] > summary::after { transform: rotate(90deg); }
-.why > .hint { max-width: 60ch; padding-bottom: var(--sp-2); }
-/* A hint line and its "Why?" share one line while it is closed. */
-.help {
+.why > summary::before { content: "?"; content: "?" / ""; }
+.why > summary:hover,
+.why > summary:focus-visible,
+.why[open] > summary { color: var(--accent-2); border-color: var(--accent); }
+/* The panel: 13px, muted, a hairline above it. Everything it could inherit
+   from the line (a title's size, an overline's capitals) is reset. */
+.why > :not(summary) {
+  display: block;
+  max-width: 60ch;
+  margin: var(--sp-2) 0 0;
+  padding: var(--sp-2) 0 0;
+  font-family: var(--font-ui);
+  font-size: var(--fs-2);
+  font-weight: 400;
+  line-height: 1.5;
+  letter-spacing: 0;
+  text-transform: none;
+  text-align: left;
+  color: var(--muted);
+  text-wrap: pretty;
+  border-top: 1px solid var(--border-soft);
+}
+.why > div > * + * { margin-top: var(--sp-2); }
+.why > .legend { display: grid; }
+.why > .legend > * { margin: 0; }
+/* In a row of controls (the chat head, an action row) the "?" is one more
+   item of the row, and its panel takes a line of its own under the row. */
+:is(.inline, .topbar) > .why { display: contents; }
+:is(.inline, .topbar) > .why > summary { align-self: center; flex: none; margin: 0 0 0 var(--sp-1); }
+:is(.inline, .topbar) > .why > :not(summary) { margin-top: 0; }
+:is(.inline, .topbar) > .why::details-content { flex-basis: 100%; }
+/* A labelled row with a "?" (`.why-row`): in the markup the details comes
+   AFTER the field, so wherever the layout below is not supported the panel
+   still opens under the field. Here the ring moves up beside the label
+   (negative order) and the panel stays under the field — never between a
+   label and what it labels. Only the label and the summary are placed;
+   the panel (the ::details-content box, or in older engines the slot around
+   it) keeps its place after the field in any engine. */
+.row.why-row {
   display: flex;
+  flex-direction: row;
   flex-wrap: wrap;
   align-items: center;
-  column-gap: var(--sp-2);
+  gap: var(--sp-2) 0;
 }
-.help > .why[open] { flex-basis: 100%; }
+.row.why-row > * { margin: 0; }
+.why-row > label { order: -2; }
+.why-row > .why { display: contents; }
+.why-row > .why > summary { order: -1; margin: 0 0 0 var(--sp-2); }
+.why-row > :not(label):not(.why) { flex: 1 1 100%; min-width: 0; }
+.why-row > .why::details-content { flex: 1 1 100%; }
+.why-row > .why > :not(summary) { flex: 1 1 100%; margin-top: 0; }
+/* On a phone the ring keeps its size and the target grows to 44px. Where
+   that reaches a control beside or under the line, the control stays on top
+   (z-index), so the larger target never takes a tap meant for it. */
+@media (max-width: 600px) {
+  /* 24px ring (22px inside its border) + 11px on each side = 44px */
+  .why > summary::after { content: ""; position: absolute; inset: -11px; }
+  /* ...and a labelled row leaves it the room: 12px from the ring to the field. */
+  .row.why-row { row-gap: var(--sp-3); }
+  :is(.why-row > input, .why-row > .inline > input, #contactRow > input) {
+    position: relative;
+    z-index: 1;
+  }
+}
 
 /* Encryption options: rows in the disclosure, one anatomy — name (+badge),
    the cipher spec in mono, a radio mark on the right. */
@@ -1396,24 +1456,29 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
 .alg-desc { font-size: var(--fs-1); color: var(--muted); }
 
 /* 5.11 Locked card: the same gate on Profile, Users and Chats, as wide as
-   the column — the sentence behind an inline padlock, passphrase + Unlock
+   the column — one line behind a padlock (and its "?"), passphrase + Unlock
    on one line, a status line. */
 .locked { padding: var(--sp-5); }
-.locked > .hint:first-of-type {
-  display: flex;
-  gap: var(--sp-3);
-  margin-top: 0;
+.locked > .lead {
+  position: relative;
+  padding-left: calc(20px + var(--sp-3));
   font-size: var(--fs-3);
+  line-height: 1.5;
   color: var(--fg);
 }
-.locked > .hint:first-of-type::before {
+.locked > .lead > .hint { font-size: inherit; color: inherit; }
+.locked > .lead::before {
   --icon: var(--i-lock);
+  position: absolute;
+  top: 2px;
+  left: 0;
   width: 20px;
   height: 20px;
-  margin-top: 1px;
   color: var(--muted);
 }
 .locked > button { align-self: flex-start; }
+/* "Open anyway" and its "?" (the benign reasons); gone with the button. */
+.adopt-row:has(> button[hidden]) { display: none; }
 
 /* 5.12 Key/value grid: a sans label column against monospace values, ruled
    like a table. */
@@ -1470,47 +1535,63 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
 
 /* ---- 6. Views ------------------------------------------------------------ */
 
-/* Live room, step 1: the first-run welcome (the app bar carries the mark). */
-.facts {
-  display: grid;
-  gap: var(--sp-2);
-  margin-top: var(--sp-2);
-  padding: 0;
-  list-style: none;
-  color: var(--muted);
-}
+
+/* Live room, step 1. The first-run line (and its "?" with the three facts)
+   shows only while there is no identity yet: once one exists the status
+   line under the title says where you are. */
+#scrIdentity:not(:has(#idCreate:not([hidden]))) .id-pitch { display: none; }
+.facts { display: grid; gap: var(--sp-2); padding: 0; list-style: none; }
 .facts li { display: flex; align-items: center; gap: var(--sp-3); }
 .facts li::before { width: 16px; height: 16px; color: var(--fg); }
 .fact-key { --icon: var(--i-key); }
 .fact-relay { --icon: var(--i-relay); }
 .fact-person { --icon: var(--i-people); }
-/* Once the identity is unlocked the pitch has done its job: the title and
-   the facts give way, and the section's overline becomes the screen title. */
-#scrIdentity:has(#idExport:not([hidden])) :is(.welcome > .title, .facts) { display: none; }
-#scrIdentity:has(#idExport:not([hidden])) #identity > .row:first-child > .overline {
-  margin-bottom: var(--sp-2);
-  font-size: var(--fs-6);
-  font-weight: 650;
-  line-height: 1.2;
-  letter-spacing: -0.02em;
-  text-transform: none;
-  color: var(--fg);
+/* The status line is the screen's one line under the title: "Unlocked."
+   quietly, behind a green dot (errors keep their icon, 5.2). */
+#identity > #idStatus:not(:empty) { margin-top: calc(-1 * var(--sp-3)); }
+#identity > #idStatus.ok::before {
+  width: 8px;
+  height: 8px;
+  margin: 7px 2px 0;
+  border-radius: 50%;
+  -webkit-mask: none;
+  mask: none;
+  background: var(--ok);
 }
-
-/* The fingerprint is a `.safety` well (5.4); its "Your fingerprint:" label
-   wraps onto its own line and is set in the muted tone. */
-#idFingerprint::first-line { color: var(--muted); }
+/* The fingerprint row (label + "?" + well) exists only with an identity. */
+.fp-row:has(> #idFingerprint[hidden]) { display: none; }
 #identity .actions { flex-wrap: wrap; }
 #identity .actions > button { flex: 1 1 auto; }
-/* Forget is confirm-gated and rare: last, quiet, not the width of a peer. */
-#idForget {
-  order: 9;
-  flex: none;
-  margin-left: auto;
+/* Copy backup is a quiet ghost on the column's edge, never full width. */
+#identity .actions > .ghost { flex: none; margin-left: calc(-1 * var(--sp-3)); padding: 0 var(--sp-3); }
+/* Forget (a locked identity whose passphrase is lost): the quiet last line
+   of the locked screen, a text-style danger ghost. Unlocked, it lives on
+   Profile, so this one steps aside even where app.js un-hides it. */
+#identity > #idForget {
+  order: 2;
+  align-self: flex-start;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: 0 var(--sp-1);
+  margin: calc(-1 * var(--sp-2)) 0 0 calc(-1 * var(--sp-3));
+  padding: 0 var(--sp-3);
+  white-space: normal;
+  text-align: left;
+  font-weight: 500;
+  color: var(--err-fg);
   background: transparent;
   border-color: transparent;
 }
+#identity > #idForget:hover { background: color-mix(in srgb, var(--err) 8%, transparent); }
+#idForget > .forget-q { color: var(--muted); }
+#scrIdentity:has(#idUnlock[hidden]) #idForget { display: none; }
+/* An error on this step (a wrong passphrase above all) is written where the
+   user acted: under Create / Unlock, right above the Forget line it may lead
+   to. The neutral status keeps its place under the title. */
+#identity > #idStatus.err:not(:empty) { order: 1; margin-top: calc(var(--sp-2) - var(--gap)); }
 #account > .hint:not(:empty) { margin-top: calc(var(--sp-2) - var(--gap)); }
+#account > .row[hidden] + .hint:not(:empty) { margin-top: 0; }
+#login { margin-left: calc(-1 * var(--sp-1)); }
 
 /* Forward navigation sits at the end of the screen. Without an identity the
    "continue anyway" button is a fallback, so it drops to a ghost. A label
@@ -1548,6 +1629,19 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
   }
 }
 .code-row > button { flex: 0 1 auto; }
+/* "Expecting a specific person?" is optional, so it is a collapsed row; with
+   a mode that needs no identity app.js hides #contactRow, and the row goes. */
+#expectRow:has(> #contactRow[hidden]) { display: none; }
+/* Closed again with a handle in it, the row still says a value is set. */
+#expectRow:not([open]):has(#contact:not(:placeholder-shown)) > summary::before {
+  content: "Set ·";
+  flex: none;
+  white-space: nowrap;
+  color: var(--ok);
+  font-weight: 600;
+}
+#contactRow { display: grid; gap: var(--sp-2); padding: var(--sp-4); }
+#contactRow > .qline { margin: 0; }
 .connect-row { flex-wrap: wrap; gap: var(--sp-3); }
 .connect-row > .primary { flex: 1 1 auto; }
 /* A refusal written to step 1 or 2 must be seen where it is written: if the
@@ -1586,7 +1680,7 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
   padding: var(--sp-4);
 }
 .otp-sub + .otp-sub { border-top: 1px solid var(--border-soft); }
-.otp-sub > label { margin-bottom: 0; }
+.otp-sub > label { margin-bottom: calc(var(--sp-2) - var(--sp-3)); }
 .otp-entropy {
   display: block;
   width: 100%;
@@ -1705,12 +1799,26 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
 #admitFingerprint { margin: 0; }
 #admitWho { font-size: var(--fs-2); color: var(--muted); }
 
-/* Users: your handle as a section, add-by-handle as one line, the list. */
-.myhandle { --gap: var(--sp-3); }
-.myhandle > label { margin-bottom: 0; }
+/* Users: your handle as a section (the handle, a Copy icon, "Invite link"),
+   add-by-handle as one line, then the list under its own label, whose "?"
+   holds what the marks mean. */
 #myHandleText { font-size: var(--fs-3); overflow-wrap: anywhere; }
 #myHandleText.ok { color: var(--fg); }
 .myhandle > .hint:not(:empty) { margin-top: 0; }
+/* The handle, then ONE row with its two quiet actions: Copy handle (icon +
+   words — an icon alone beside "Invite link" read as that link's icon) and
+   Invite link. The copy result also shows in the icon: a check, or the alert. */
+#myHandleActions { gap: var(--sp-1); margin: var(--sp-1) 0 0 calc(-1 * var(--sp-3)); }
+#myHandleActions > button { padding: 0 var(--sp-3); color: var(--muted); border-color: transparent; }
+#myHandleActions > button:hover { color: var(--fg); background: var(--panel-2); border-color: transparent; }
+#copyHandle { --icon: var(--i-copy); }
+#copyHandle::before { width: 16px; height: 16px; }
+#copyHandle.copied { color: var(--ok); }   /* its words say "Copied ✓" */
+#copyHandle.copy-failed { --icon: var(--i-alert); color: var(--err); }
+/* Add stays the primary but reads as not-yet while there is nothing to add;
+   it is still clickable (app.js says what a handle looks like). */
+.inline:has(> #addHandle:placeholder-shown) > #addContact { opacity: 0.45; box-shadow: none; }
+.list > #userList { margin-top: var(--sp-1); }
 
 /* Chats: rows open a conversation. */
 .chatrow { cursor: pointer; }
@@ -1812,15 +1920,30 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
 
 /* Profile. */
 #profileHandleActions { margin-top: calc(var(--sp-2) - var(--gap)); }
-.qr-row { display: grid; justify-items: start; gap: var(--sp-3); }
-.qr-row > label { margin-bottom: 0; }
-.qr-row > .why { margin-top: calc(-1 * var(--sp-3)); }
+.row.why-row.qr-row { row-gap: var(--sp-3); }
+/* The key details are for the curious: a collapsed row. */
+.tech > .kv { padding: 0 var(--sp-4) var(--sp-1); }
+.tech > .kv > dt:first-of-type,
+.tech > .kv > dt:first-of-type + dd { border-top: 0; }
 #profileUnlocked .actions { padding-top: var(--sp-5); border-top: 1px solid var(--border-soft); }
 #profileUnlocked .actions > button { flex: 1 1 auto; }
-/* The sign-out note explains Sign out, so it follows that row; Forget
-   (danger) comes last, on its own. */
-#profileSessionHint { margin-top: calc(var(--sp-2) - var(--gap)); }
-.forget-row { display: flex; }
+/* Sign out is a ghost with its "?" (#profileSessionHint) right after it;
+   Forget (danger) comes last, on its own. */
+#profileUnlocked .actions > #profileLogout { flex: none; }
+@media (max-width: 600px) {
+  #profileUnlocked .actions > #profileExport { flex-basis: 100%; }
+  #profileLogout { margin-left: calc(-1 * var(--sp-4)); }
+}
+/* Forget identity: last, separated, a quiet red word (confirm-gated). */
+.forget-row { display: flex; padding-top: var(--sp-2); }
+#profileForget {
+  margin-left: calc(-1 * var(--sp-3));
+  padding: 0 var(--sp-3);
+  color: var(--err-fg);
+  background: transparent;
+  border-color: transparent;
+}
+#profileForget:hover { background: color-mix(in srgb, var(--err) 8%, transparent); border-color: transparent; }
 
 /* ---- 7. Media ------------------------------------------------------------ */
 
@@ -1862,7 +1985,7 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
     text-overflow: ellipsis;
   }
 
-  .qr-row > .profile-qr { justify-self: center; width: 224px; }
+  .qr-well > .profile-qr { width: 224px; margin-inline: auto; }
 }
 
 /* A short phone viewport (the soft keyboard is up, or a landscape phone):
@@ -2026,7 +2149,7 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
     -webkit-mask-position: left center;
     mask-position: left center;
   }
-  .gate .row > .hint { max-width: none; margin-inline: 0; }
+  .gate .row > .qline { max-width: none; margin-inline: 0; }
 
   /* The live bar on one line: room chip, Copy, the status pill, Disconnect
      in words. Nothing in it shrinks or double-truncates; a narrow window
@@ -2067,9 +2190,6 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
     border-radius: var(--r-l);
   }
 
-  .qr-row { grid-template-columns: auto minmax(0, 1fr); align-items: center; column-gap: var(--sp-5); }
-  .qr-row > label { grid-column: 1 / -1; }
-  .qr-row > .why { margin-top: 0; }
 }
 
 /* A translucent bar needs the blur; without it, fall back to solid. */
@@ -2091,8 +2211,7 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
   .hint.ok:not(#myHandleText)::before,
   .u-claim::before,
   .disclosure > summary::after,
-  .why > summary::after,
-  .locked > .hint:first-of-type::before,
+  .locked > .lead::before,
   .wordmark::after,
   .gate::before,
   .status::before {
@@ -2102,6 +2221,7 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
   .composer button::before,
   #chatBack::before,
   #copyRoom::before,
+  #copyHandle::before,
   #disconnect::before {
     forced-color-adjust: none;
     background: ButtonText;
@@ -2143,8 +2263,7 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
       border-color var(--t-fast) ease-out,
       box-shadow var(--t-fast) ease-out;
   }
-  .disclosure > summary::after,
-  .why > summary::after { transition: transform var(--t-move) var(--ease); }
+  .disclosure > summary::after { transition: transform var(--t-move) var(--ease); }
   .view:not(#viewLive):not([hidden]),
   .screen:not(.window):not([hidden]) { animation: rise var(--t-move) var(--ease); }
   .sheet:not([hidden]) { animation: sheet-in var(--t-move) var(--ease); }

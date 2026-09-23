@@ -106,7 +106,7 @@ const els = {
   chatPeerMark: $("chatPeerMark"), chatLog: $("chatLog"),
   chatForm: $("chatForm"), chatText: $("chatText"), chatSend: $("chatSend"),
   chatHint: $("chatHint"), chatMode: $("chatMode"), chatModeSel: $("chatModeSel"),
-  chatPending: $("chatPending"),
+  chatPending: $("chatPending"), chatModeWhy: $("chatModeWhy"), expectRow: $("expectRow"),
 };
 
 const enc = new TextEncoder();
@@ -506,6 +506,15 @@ function accountStatus(text, cls = "") {
   els.accountStatus.className = "hint" + (cls ? " " + cls : "");
 }
 
+// Phase 2b fix round, D3: once registered, the username field with Register
+// and Log in steps aside (it competed with Continue); the status line keeps
+// the handle. It comes back whenever it is the way forward again: not
+// registered, signed out, or the automatic directory login failing (Log in is
+// then the manual retry).
+function showUsernameRow(show) {
+  els.username.closest(".row").hidden = !show;
+}
+
 function addLine(kind, who, text) {
   const li = document.createElement("li");
   li.className = kind;
@@ -552,9 +561,9 @@ function setIdentityStatus(text, cls = "") {
 async function showIdentityUnlocked() {
   myBundle = identity.publicBundle();
   const fp = await identity.fingerprint();
-  setIdentityStatus("Identity unlocked. Your contact verifies this in person.", "ok");
+  setIdentityStatus("Unlocked.", "ok");
   els.idFingerprint.hidden = false;
-  els.idFingerprint.textContent = "Your fingerprint: " + fp;
+  els.idFingerprint.textContent = fp; // its label is static markup (with a "?")
   els.idPassRow.hidden = true;
   els.idCreate.hidden = true;
   els.idUnlock.hidden = true;
@@ -577,7 +586,8 @@ async function showIdentityUnlocked() {
   }
   if (savedName && savedToken) {
     els.username.value = savedName;
-    accountStatus(`Your contact handle: ${savedName}#${savedToken} — share it so contacts can look you up.`);
+    accountStatus(`Registered as ${savedName}#${savedToken} — share this handle.`);
+    showUsernameRow(false);
     // Async chats only DELIVER once we hold a directory session: pollMailbox
     // needs it, and it is the only way mail is ever fetched. Requiring a
     // separate "Log in" click meant a registered user could send messages that
@@ -586,8 +596,10 @@ async function showIdentityUnlocked() {
   } else if (savedName) {
     els.username.value = savedName;
     accountStatus(`Saved username: ${savedName}. Register (once) to get your shareable handle, or log in to prove control.`);
+    showUsernameRow(true);
   } else {
-    accountStatus("Optional: claim a username so contacts can look up this identity.");
+    accountStatus(""); // the "?" beside the username label explains it
+    showUsernameRow(true);
   }
 }
 
@@ -611,9 +623,9 @@ function refreshIdentityUI() {
   els.idUnlock.hidden = !stored;
   els.idForget.hidden = !stored;
   if (stored) {
-    setIdentityStatus("Your identity is locked. Enter your passphrase to unlock it.");
+    setIdentityStatus("Locked — enter your passphrase.");
   } else {
-    setIdentityStatus("No identity on this device yet. Create one so contacts can confirm it is really you.");
+    setIdentityStatus("No identity on this device yet.");
   }
 }
 
@@ -627,7 +639,7 @@ async function createIdentity() {
     setIdentityStatus("An identity already exists here. Unlock it, or Forget it first.", "err");
     return;
   }
-  setIdentityStatus("Generating identity keys (Ed25519 + ML-DSA-65)…");
+  setIdentityStatus("Generating keys…");
   try {
     identity = await Identity.generate();
     const blob = await identity.export(pass);
@@ -715,7 +727,7 @@ async function exportIdentity() {
   if (!blob) return;
   try {
     await navigator.clipboard.writeText(blob);
-    setIdentityStatus("Encrypted backup copied to clipboard. Keep it safe — it is useless without your passphrase.", "ok");
+    setIdentityStatus("Backup copied. It is useless without your passphrase.", "ok");
   } catch {
     setIdentityStatus("Could not access the clipboard. Backup not copied.", "err");
   }
@@ -771,7 +783,8 @@ async function registerAccount() {
     const { lookup_token } = await account.register(API_BASE, identity, username);
     localStorage.setItem(LS_USERNAME, username);
     localStorage.setItem(LS_LOOKUP_TOKEN, lookup_token);
-    accountStatus(`Registered. Your contact handle is ${username}#${lookup_token} — share it (username alone will not resolve).`, "ok");
+    accountStatus(`Registered as ${username}#${lookup_token} — share this handle.`, "ok");
+    showUsernameRow(false);
     // Registering is when a first-time user gets their handle, and it is the
     // moment they expect chats to work. Take the directory session now, or they
     // would send messages fine while silently receiving nothing until they
@@ -822,6 +835,7 @@ async function autoLogin(username) {
     const wait = Math.min(120000, 6000 * 2 ** Math.min(autoLoginFailures, 5));
     autoLoginBackoffUntil = Date.now() + wait;
     renderProfile();
+    showUsernameRow(true); // D3: the manual Log in is the fallback
     // Visible, once per failure streak, so the user is not silently offline.
     // Routed through hint(), which writes to whichever screen is actually in
     // front of the user — addLine() alone put this in the CHAT TRANSCRIPT, a
@@ -965,8 +979,7 @@ function refreshUsers() {
       ? "Contact store error: " + contactsError +
         (contactsAdoptable ? "" :
           " (Forget + recreate the identity resets it — contacts are bound to the identity passphrase.)")
-      : "Contacts are stored encrypted under your identity passphrase. " +
-        "Enter it to unlock them here.";
+      : "Locked. Enter your passphrase.";
     // F-ATREST-003/004/005: the override is offered, never taken for the user.
     els.usersAdopt.hidden = !contactsAdoptable;
     els.usersAdoptHint.hidden = !contactsAdoptable;
@@ -1110,7 +1123,7 @@ function applyPendingInvite() {
     return;
   }
   els.addHandle.value = handle;
-  usersStatus("Someone shared this handle with you — review it and click Add (you still verify them in person to trust the key).");
+  usersStatus("Handle received — review it and press Add.");
 }
 
 // A deliberate empty state in the well the list will occupy, instead of the
@@ -1396,13 +1409,13 @@ function refreshChats() {
     // exit was Forget identity. The Chats view now carries both.
     els.chatsLocked.querySelector("p").textContent = contactsError && identity
       ? "Chat store error: " + contactsError
-      : "Chats are stored encrypted under your identity passphrase. Enter it to unlock them here.";
+      : "Locked. Enter your passphrase.";
     els.chatsAdopt.hidden = !contactsAdoptable;
     els.chatsAdoptHint.hidden = !contactsAdoptable;
     return;
   }
   if (!apiToken) {
-    chatsStatus("You can send now; to RECEIVE messages, log in (Live room → step 1) so the mailbox can be fetched.");
+    chatsStatus("Not logged in — messages cannot arrive. Log in on step 1 of the Live room.");
   } else {
     chatsStatus("");
   }
@@ -1441,10 +1454,9 @@ function renderChatList() {
   els.chatList.textContent = "";
   const open = chats.list();
   if (open.length === 0) {
-    els.chatList.appendChild(emptyRow(
-      "No chats yet",
-      "Pick a saved user above and open a chat — messages are sealed end-to-end and wait on the relay until they fetch them.",
-    ));
+    els.chatList.appendChild(contacts.list().length
+      ? emptyRow("No chats yet", "Pick a user above.")
+      : emptyRow("No users yet", "Add someone in Users."));
   }
   for (const chat of open) {
     const c = contacts.get(chat.username);
@@ -1520,16 +1532,19 @@ function renderConversation() {
   // Pending mode negotiation banner.
   renderPending(chat);
 
+  // What the mode means sits behind the "?" beside the mode picker; the
+  // composer's hint line keeps only what the user must act on.
+  els.chatModeWhy.textContent = chat.mode === "AES256"
+    ? "AES256 — extra AES-256-GCM under your shared chat passphrase, inside the sealed PQ envelope."
+    : "SEALED — hybrid ECDH P-256 + ML-KEM-768, sender sealed inside. " + (c && c.verified ? "" : "Verify this contact in person for the strongest trust.");
   if (!c) {
     chatHint("This sender is not in your Users list — you cannot reply until they share their handle.", true);
   } else if (!c.token) {
     chatHint("No handle token saved for this user — re-add them by their full username#token handle to reply.", true);
   } else if (!c.ecdh || !c.mlkem) {
     chatHint("This user has not published encryption keys yet (older app) — they must unlock once with the updated app; then re-add them.", true);
-  } else if (chat.mode === "AES256") {
-    chatHint("AES256 — extra AES-256-GCM under your shared chat passphrase, inside the sealed PQ envelope.");
   } else {
-    chatHint("SEALED — hybrid ECDH P-256 + ML-KEM-768, sender sealed inside. " + (c.verified ? "" : "Verify this contact in person for the strongest trust."));
+    chatHint("");
   }
 }
 
@@ -2923,6 +2938,9 @@ async function enterVerification(room, verifiedBundle) {
   } else {
     els.verify.classList.remove("changed");
     els.verifyTitle.textContent = "Verify your contact — in person";
+    // Phase 2b fix round, pentest S1: a warning variant above rewrote the
+    // hint; a clean first contact must not inherit it (same words as index.html).
+    els.verifyHint.textContent = "Read it aloud to your contact. It must match exactly.";
     if (expectedPeerBundle) {
       addLine("sys", "", `key matches the directory entry for "${expectedPeerName}" — still verify in person`);
     }
@@ -3210,7 +3228,7 @@ let otpEntropySamples = [];
 function updateEntropyStatus() {
   const n = otpEntropySamples.length / 3;
   els.otpEntropyStatus.textContent = n === 0
-    ? "Entropy from drawing: none yet (the OS random generator is used regardless)."
+    ? "Entropy from drawing: none yet." // the "?" says the OS generator is used regardless
     : `Entropy from drawing: ${n} motion samples captured.`;
 }
 function entropyBytes() {
@@ -3451,6 +3469,10 @@ function syncAlgUI() {
   if (alg !== "DHKE") els.algDetails.open = true;
 }
 els.algCards.addEventListener("change", syncAlgUI); // radio changes bubble here
+// Phase 2b fix round: a filled "Expecting…" value never hides in the collapsed
+// row. Opened when it holds a value; never closed under the user's typing.
+if (els.contact.value) els.expectRow.open = true;
+els.contact.addEventListener("input", () => { if (els.contact.value) els.expectRow.open = true; });
 
 els.connect.addEventListener("click", connect);
 els.form.addEventListener("submit", sendText);
@@ -3472,15 +3494,19 @@ els.addContact.addEventListener("click", addContactFromHandle);
 // "Your handle" share controls (Users view). Copy the raw handle, or an invite
 // link that pre-fills the add field for the recipient. Both are convenience
 // only — neither conveys trust (the recipient still verifies in person).
+// The result is also a class, so a button drawn as an icon alone (Users:
+// Copy handle) can show it: its words are clipped there.
 async function copyToClipboard(btn, text, okLabel = "Copied ✓") {
   const orig = btn.textContent;
   try {
     await navigator.clipboard.writeText(text);
     btn.textContent = okLabel;
+    btn.classList.add("copied");
   } catch {
     btn.textContent = "Copy failed";
+    btn.classList.add("copy-failed");
   }
-  setTimeout(() => { btn.textContent = orig; }, 1500);
+  setTimeout(() => { btn.textContent = orig; btn.classList.remove("copied", "copy-failed"); }, 1500);
 }
 els.copyHandle.addEventListener("click", () => {
   const h = myHandle();
@@ -3518,6 +3544,7 @@ els.profileLogout.addEventListener("click", async () => {
   // Say WHERE to sign back in: this button is in Profile, the login field is on
   // the identity screen, and "sign in again" on its own sends people looking.
   accountStatus("Signed out of the directory. Sealed messages will not arrive until you log in again on the identity screen.", "ok");
+  showUsernameRow(true); // D3: Log in is on that screen again
   addLine("sys", "", "[signed out of the directory — sealed messages will not arrive until you log in again]");
 });
 els.profileForget.addEventListener("click", async () => {

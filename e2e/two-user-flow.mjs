@@ -128,8 +128,8 @@ const statusLine = (page) => page.evaluate(() => {
   return { text: el.textContent.trim(), shown: r.width > 0 && r.height > 0 };
 });
 const inviteLine = await statusLine(inviteTab.page);
-check("A1: the invite tab says someone shared this handle (not erased by the render)",
-  /Someone shared this handle with you/.test(inviteLine.text) && inviteLine.shown, JSON.stringify(inviteLine));
+check("A1: the invite tab says a handle was received (not erased by the render)",
+  /^Handle received — review it and press Add\.$/.test(inviteLine.text) && inviteLine.shown, JSON.stringify(inviteLine));
 
 // Add bob from that tab.
 await inviteTab.page.click("#addContact");
