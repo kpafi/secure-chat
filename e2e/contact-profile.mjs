@@ -596,8 +596,33 @@ if (auto) {
     s.warn === "claims the handle below — unverified, they chose this name themselves" &&
     rowClaim === `claims to be "${carol.handle}" — unverified, they chose this name themselves`,
     JSON.stringify({ label: s.handleLabel, handle: s.handle, shown, warn: s.warn, rowClaim }));
+  // A real vouch (carol's own keys), then Unverify: the relay must hold none
+  // of alice's vouches for her afterwards.
+  const vouchesAbout = () => alice.page.evaluate(async (h) => {
+    const account = await import("./account.js");
+    return (await account.fetchVouches("", h)).map((v) => v.voucher);
+  }, carol.handle);
+  await waitFp(alice.page);
+  await alice.page.click("#contactVerify"); // verify + vouch, both accepted
+  await alice.page.waitForFunction(() => /published/.test(document.querySelector("#contactStatus").textContent), { timeout: 15000 }).catch(() => {});
+  const vouchedNow = await vouchesAbout();
+  await sleep(600);
+  await alice.page.click("#contactVerify"); // Unverify, accepted
+  await sleep(1500);
+  const vouchedAfter = await vouchesAbout();
+  check("a vouch published from the sheet is on the relay, and Unverify retracts it",
+    vouchedNow.includes(alice.username) && !vouchedAfter.includes(alice.username), JSON.stringify({ vouchedNow, vouchedAfter }));
+  // Remove of a contact that is not verified sends no vouch DELETE: it would
+  // tell the relay whom we had saved (pentest p3 I-2 / p4 L-3).
+  const deletes = [];
+  const onDel = (r) => { if (r.method() === "DELETE" && r.url().includes("/api/vouch")) deletes.push(r.url()); };
+  alice.page.on("request", onDel);
+  await sleep(600);
   await alice.page.click("#contactRemove");
   await waitSheet(alice.page, false);
+  await sleep(800);
+  alice.page.off("request", onDel);
+  check("Remove of an unverified contact sends no vouch DELETE to the relay", deletes.length === 0, JSON.stringify(deletes));
   f = await focusInfo(alice.page);
   check("Remove from a Chats avatar closes the sheet; focus lands on that row's opener (cold M2)",
     !(await sheet(alice.page)).open && f.user === auto && /chatrow-open/.test(f.cls), JSON.stringify(f));
@@ -621,42 +646,80 @@ if (auto) {
 // --- 5b. a store write refused because another tab wrote first ---------------------
 console.log("\n5b. store refused");
 {
-  const tab2 = await alice.ctx.newPage();
-  tab2.on("dialog", (d) => d.accept());
-  await tab2.setViewport({ width: 1000, height: 900 });
-  await tab2.goto(APP, { waitUntil: "networkidle0" });
-  await tab2.click('.navitem[data-view="users"]');
-  await tab2.type("#usersUnlockPass", aliceSpec.passphrase);
-  await tab2.click("#usersUnlock");
-  await tab2.waitForFunction(() => !document.querySelector("#usersUnlocked").hidden, { timeout: 40000 });
-  // tab 2 writes: the store's generation moves past what tab 1 holds.
-  await tab2.evaluate(async (u) => { await (await import("./contacts.js")).setVerified(u, true); }, bob.username);
-  await tab2.close();
-  await alice.page.bringToFront();
+  const STALE = "Your contacts were changed in another tab — enter your passphrase to load that version.";
+  // A second tab of the same device unlocks and writes: the store's
+  // generation moves past what alice's tab holds.
+  const staleWrite = async (verified) => {
+    const tab2 = await alice.ctx.newPage();
+    tab2.on("dialog", (d) => d.accept());
+    await tab2.setViewport({ width: 1000, height: 900 });
+    await tab2.goto(APP, { waitUntil: "networkidle0" });
+    await tab2.click('.navitem[data-view="users"]');
+    await tab2.type("#usersUnlockPass", aliceSpec.passphrase);
+    await tab2.click("#usersUnlock");
+    await tab2.waitForFunction(() => !document.querySelector("#usersUnlocked").hidden, { timeout: 40000 });
+    await tab2.evaluate(async (u, v) => { await (await import("./contacts.js")).setVerified(u, v); }, bob.username, verified);
+    await tab2.close();
+    await alice.page.bringToFront();
+  };
+  const lostState = (panel) => alice.page.evaluate((pn) => {
+    const p = document.querySelector(`#${pn}Locked p`);
+    const r = p.getBoundingClientRect();
+    const input = document.querySelector(`#${pn}UnlockPass`);
+    const desc = document.getElementById(input.getAttribute("aria-describedby") || "");
+    return { sheet: !document.querySelector("#contactSheet").hidden, locked: !document.querySelector(`#${pn}Locked`).hidden,
+      text: p.textContent, visible: r.width > 0 && r.height > 0, focus: document.activeElement.id,
+      described: desc === p, inert: document.querySelector("#tabbar").inert || document.querySelector(`#view${pn[0].toUpperCase() + pn.slice(1)}`).inert };
+  }, panel);
+  const relock = async (panel) => {
+    await alice.page.type(`#${panel}UnlockPass`, aliceSpec.passphrase);
+    await alice.page.click(`#${panel}Unlock`);
+    await alice.page.waitForFunction((pn) => !document.querySelector(`#${pn}Unlocked`).hidden, { timeout: 40000 }, panel).catch(() => {});
+    await sleep(800);
+  };
+
+  // A. Verify from a Users row.
+  await staleWrite(true);
   await view(alice.page, "users");
   await alice.page.click(`${rowOf(bob.username)} > .u-open`);
   await waitSheet(alice.page);
   await waitFp(alice.page);
-  await alice.page.click("#contactVerify"); // tab 1 still shows bob unverified
+  await alice.page.click("#contactVerify"); // alice's tab still shows bob unverified
   await sleep(1200);
-  const lost = await alice.page.evaluate(() => {
-    const p = document.querySelector("#usersLocked p");
-    const r = p.getBoundingClientRect();
-    return { sheet: !document.querySelector("#contactSheet").hidden, locked: !document.querySelector("#usersLocked").hidden,
-      text: p.textContent, visible: r.width > 0 && r.height > 0, focus: document.activeElement.id,
-      inert: document.querySelector("#tabbar").inert || document.querySelector("#viewUsers").inert };
-  });
-  check("a write the store refuses closes the sheet and says why on the visible locked panel, focus in its passphrase field",
-    !lost.sheet && lost.locked && lost.visible && /^Contact store error: /.test(lost.text) && lost.text.length > 24 &&
-    lost.focus === "usersUnlockPass" && !lost.inert, JSON.stringify(lost));
-  await alice.page.type("#usersUnlockPass", aliceSpec.passphrase);
-  await alice.page.click("#usersUnlock");
-  await alice.page.waitForFunction(() => !document.querySelector("#usersUnlocked").hidden, { timeout: 40000 }).catch(() => {});
-  await sleep(800);
+  let lost = await lostState("users");
+  check("a Verify the store refuses (another tab wrote first) closes the sheet and says so on the visible locked panel — no Forget advice — focus in the passphrase field, which is described by it",
+    !lost.sheet && lost.locked && lost.visible && lost.text === STALE && lost.focus === "usersUnlockPass" && lost.described && !lost.inert,
+    JSON.stringify(lost));
+  await relock("users");
   check("unlocking again reads the other tab's version", (await isVerified(bob.username)) === true);
+
+  // B. Remove from a Users row.
+  await staleWrite(false);
+  await alice.page.click(`${rowOf(bob.username)} > .u-open`);
+  await waitSheet(alice.page);
+  await alice.page.click("#contactRemove");
+  await sleep(1200);
+  lost = await lostState("users");
+  check("a Remove the store refuses is handled the same way (sheet closed, reason shown, focus in the field)",
+    !lost.sheet && lost.locked && lost.text === STALE && lost.focus === "usersUnlockPass" && !lost.inert, JSON.stringify(lost));
+  await relock("users");
+  check("…and the refused Remove removed nothing", (await isVerified(bob.username)) === false);
+
+  // C. Verify from a Chats avatar: the Chats panel says it.
+  await staleWrite(true);
+  await view(alice.page, "chats");
+  await alice.page.click(`#chatList > li[data-user="${bob.username}"] > .u-avatar`);
+  await waitSheet(alice.page);
+  await waitFp(alice.page);
+  await alice.page.click("#contactVerify");
+  await sleep(1200);
+  lost = await lostState("chats");
+  check("a refused Verify from Chats: the Chats panel says so, focus in its passphrase field",
+    !lost.sheet && lost.locked && lost.text === STALE && lost.focus === "chatsUnlockPass" && lost.described && !lost.inert,
+    JSON.stringify(lost));
+  await relock("chats");
   // Back to unverified for the phone checks (the key-changed layout).
   await store(alice.page, async (u) => { await (await import("./contacts.js")).setVerified(u, false); }, bob.username);
-  await view(alice.page, "chats");
   await view(alice.page, "users");
 }
 
@@ -706,6 +769,28 @@ const small = await alice.page.evaluate(() => {
 check("key changed at 320×568: Verify is the primary, its row sits after the fingerprint, never over it",
   small.open && small.fpBottom > 0 && small.primary === "contactVerify" && small.pos === "static" && small.fpBottom <= small.barTop,
   JSON.stringify({ small, dbgSmall }));
+const oneRow = await alice.page.evaluate(() => {
+  const [a, b] = [...document.querySelectorAll(".contact-actions > button:not([hidden])")].map((x) => x.getBoundingClientRect().top);
+  return Math.abs(a - b) < 2;
+});
+check("at 320px and normal text the two actions share one row", oneRow);
+// 200% text (the font tokens doubled, as a user's text size would): no label
+// spills out of its button, nothing leaves the sheet.
+await alice.page.evaluate(() => {
+  const big = new CSSStyleSheet();
+  big.replaceSync(":root{--fs-1:24px;--fs-2:26px;--fs-3:30px;--fs-4:34px;--fs-5:40px;--fs-6:48px;--control-fs:32px}");
+  document.adoptedStyleSheets = [...document.adoptedStyleSheets, big];
+  window.__big = big;
+});
+await sleep(300);
+const fit = await alice.page.evaluate(() => {
+  const sheet = document.querySelector("#contactSheet");
+  const spills = [...sheet.querySelectorAll("button:not([hidden])")].filter((b) => b.scrollWidth > b.clientWidth + 1).map((b) => b.id);
+  return { sheetOverflow: sheet.scrollWidth - sheet.clientWidth, spills };
+});
+await alice.page.evaluate(() => { document.adoptedStyleSheets = document.adoptedStyleSheets.filter((x) => x !== window.__big); });
+check("at 200% text no action label spills out of its button and the sheet does not overflow sideways",
+  fit.sheetOverflow <= 0 && fit.spills.length === 0, JSON.stringify(fit));
 if (small.open) await alice.page.click("#contactClose");
 await waitSheet(alice.page, false);
 await alice.page.setViewport({ width: 390, height: 844 });

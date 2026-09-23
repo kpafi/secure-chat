@@ -1269,7 +1269,7 @@ li:has(> .u-open .u-mark.changed) > .hint.err::before,
    the column, breaks inside itself (hot r3 n1 — the token is what people
    read out, so it is not cut to balance two lines). */
 .contact-handle.ok { font-family: var(--font-mono); color: var(--fg); overflow-wrap: anywhere; }
-.contact-handle.ok > .tok { display: inline-block; max-width: 100%; word-break: break-all; }
+.contact-handle.ok > .tok { display: inline-block; max-width: 100%; word-break: break-all; text-wrap: balance; }
 #contactHandleLabel { margin-bottom: var(--sp-2); }
 #contactCopyHandle { --icon: var(--i-copy); flex: none; }
 #contactCopyHandle::before { width: 16px; height: 16px; }
@@ -1304,6 +1304,16 @@ li:has(> .u-open .u-mark.changed) > .hint.err::before,
   white-space: normal;
 }
 .contact-actions > .primary { flex: 1 1 auto; }
+/* The secondary counts only its longest word toward the line break, so at
+   320px its label wraps inside the button before the pair wraps into two
+   rows; it never grows past its own text (hot r4, cold r4 MINOR-4). */
+.contact-actions > button:not(.primary) { flex: 1000 1 min-content; max-width: max-content; }
+/* Below 360px "Verified in person ✓" — primary or not — also counts only
+   its longest word, so its label wraps inside the button and the pair keeps
+   one row (hot r4: at 320 the primary Verify's full width broke the row). */
+@media (max-width: 359px) {
+  .contact-actions > #contactVerify { flex: 10 1 min-content; }
+}
 .contact-actions > #contactVerify.ghost { border-color: var(--border); }
 .contact-remove-row { display: flex; justify-content: flex-end; margin-top: calc(var(--sp-1) - var(--gap)); }
 #contactRemove {
@@ -1342,10 +1352,12 @@ li:has(> .u-open .u-mark.changed) > .hint.err::before,
      the number first. */
   .contact-actions:has(> #contactVerify.primary) {
     position: static;
-    margin-bottom: calc(var(--sp-3) - var(--gap));
     padding-bottom: 0;
     border-top: 0;
   }
+  /* ...and Remove keeps the sheet's own gap under it (no overlap with the
+     row's hit area, pentest p4 I-2; hot r4 n5). */
+  .contact-actions:has(> #contactVerify.primary) + .contact-remove-row { margin-top: 0; }
   #contactName { font-size: var(--fs-4); }
 }
 /* The conversation's name opens the profile: it looks like the name, and

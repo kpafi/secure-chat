@@ -472,7 +472,7 @@
       <section>
         <div id="usersLocked" class="panel locked">
           <div class="qline lead">
-            <p class="hint">Locked. Enter your passphrase.</p>
+            <p class="hint" id="usersLockedMsg">Locked. Enter your passphrase.</p>
             <details class="why">
               <summary><span class="vh">Why is it locked?</span></summary>
               <div>Your users are stored on this device, encrypted under your identity
@@ -481,7 +481,7 @@
           </div>
           <div class="row inline unlock-row">
             <input id="usersUnlockPass" type="password" autocomplete="off"
-                   aria-label="Identity passphrase" placeholder="identity passphrase" />
+                   aria-label="Identity passphrase" aria-describedby="usersLockedMsg" placeholder="identity passphrase" />
             <button id="usersUnlock" type="button" class="primary">Unlock</button>
           </div>
           <p class="hint" id="usersUnlockStatus"></p>
@@ -550,7 +550,7 @@
       <section id="chatsPanel">
         <div id="chatsLocked" class="panel locked">
           <div class="qline lead">
-            <p class="hint">Locked. Enter your passphrase.</p>
+            <p class="hint" id="chatsLockedMsg">Locked. Enter your passphrase.</p>
             <details class="why">
               <summary><span class="vh">Why is it locked?</span></summary>
               <div>Your chats are stored on this device, encrypted under your identity
@@ -559,7 +559,7 @@
           </div>
           <div class="row inline unlock-row">
             <input id="chatsUnlockPass" type="password" autocomplete="off"
-                   aria-label="Identity passphrase" placeholder="identity passphrase" />
+                   aria-label="Identity passphrase" aria-describedby="chatsLockedMsg" placeholder="identity passphrase" />
             <button id="chatsUnlock" type="button" class="primary">Unlock</button>
           </div>
           <p class="hint" id="chatsUnlockStatus"></p>
