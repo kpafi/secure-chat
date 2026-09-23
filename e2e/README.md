@@ -13,6 +13,7 @@ node e2e/two-user-flow.mjs      # terminal 2 — async chat + web of trust
 node e2e/room-admission.mjs     #            — live room join approval
 node e2e/no-dead-ends.mjs       #            — every failure path says something
 node e2e/hostile-relay.mjs      #            — a relay cannot demote the room creator
+node e2e/contact-profile.mjs    #            — a saved user's short profile (sheet)
 ```
 
 Needs Node 20+, system Chromium (`/usr/bin/chromium`, override with `$CHROMIUM`)
@@ -53,6 +54,22 @@ on `pending`; and a fresh code still seats the creator as the owner.
 found: a chat store that refuses to open (one `removeItem`) must show its
 error in the Chats view and offer a working *Open anyway* there, while the
 Users view, which did not refuse, offers none.
+
+## What `contact-profile.mjs` asserts
+
+Three agents (alice, bob, and carol as a stranger whose mail makes an
+automatic contact). The profile sheet opens from a Users row, a Chats row's
+avatar and the conversation's name, by pointer and keyboard; it shows bob's
+real handle and the fingerprint bob's OWN device shows; it is a real modal
+(focus in, Tab wraps, the rest inert, Escape / × / scrim close and give focus
+back). The trust actions are pinned hardest: Verify waits for the fingerprint,
+refuses when the keys moved under the open sheet, acts once on a double click,
+is the primary for a changed key; Unverify is confirm-gated; a vouch the relay
+never answers times out instead of blocking every later Verify; a slow
+fingerprint never lands on another contact's sheet; a double tap's second half
+(reduced motion) neither acts nor closes. Seeded records cover an adopted
+claim and malformed stored keys. Dialogs are counted and answered per check
+(`page.answers`), so a gate that stops asking fails the run.
 
 ## What `two-user-flow.mjs` asserts
 
