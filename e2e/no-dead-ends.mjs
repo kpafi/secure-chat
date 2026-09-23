@@ -128,24 +128,39 @@ const a11y = await page.evaluate(() => {
     const el = document.getElementById(i);
     return !labelled.has(i) && !el.getAttribute("aria-label");
   });
+  // Navigation is a persistent tab bar: every tab must be on screen (not
+  // `hidden`, not zero-sized) so no view is ever behind a menu.
+  const tabs = [...document.querySelectorAll(".navitem")].map((b) => {
+    const r = b.getBoundingClientRect();
+    return { view: b.dataset.view, reachable: !b.closest("[hidden]") && r.width > 0 && r.height > 0 };
+  });
   return {
     unlabelled,
     liveRegions: document.querySelectorAll("[aria-live]").length,
-    menuExpanded: document.querySelector("#menuBtn").getAttribute("aria-expanded"),
+    tabs,
+    current: [...document.querySelectorAll('.navitem[aria-current="page"]')].map((b) => b.dataset.view),
   };
 });
 check("every form control is labelled", a11y.unlabelled.length === 0, JSON.stringify(a11y.unlabelled));
 check("status regions are announced", a11y.liveRegions >= 8, "aria-live count: " + a11y.liveRegions);
-check("menu button exposes its state", a11y.menuExpanded === "false", String(a11y.menuExpanded));
-
-await page.click("#menuBtn");
-await sleep(300);
-const drawerState = await page.evaluate(() => ({
-  expanded: document.querySelector("#menuBtn").getAttribute("aria-expanded"),
-  current: document.querySelector('.navitem[aria-current="page"]')?.dataset.view || null,
-}));
-check("open drawer marks the current view",
-  drawerState.expanded === "true" && drawerState.current === "live", JSON.stringify(drawerState));
+check("all four views are reachable from the tab bar",
+  a11y.tabs.length === 4 && a11y.tabs.every((t) => t.reachable), JSON.stringify(a11y.tabs));
+check("the tab bar marks the current view",
+  a11y.current.length === 1 && a11y.current[0] === "live", JSON.stringify(a11y.current));
+// The mark must FOLLOW the view: index.html no longer hard-codes it on the
+// first tab, so switching away and back proves showView() sets it (pentest
+// coverage note: a load-time check alone could not fail).
+const currentTab = () => page.evaluate(() =>
+  [...document.querySelectorAll('.navitem[aria-current="page"]')].map((b) => b.dataset.view));
+await page.click('.navitem[data-view="users"]');
+await page.waitForFunction(() => !document.querySelector("#viewUsers").hidden, { timeout: 10000 });
+const onUsers = await currentTab();
+await page.click('.navitem[data-view="live"]');
+await page.waitForFunction(() => !document.querySelector("#viewLive").hidden, { timeout: 10000 });
+const backOnLive = await currentTab();
+check("the current-view mark moves with the view",
+  onUsers.length === 1 && onUsers[0] === "users" && backOnLive.length === 1 && backOnLive[0] === "live",
+  JSON.stringify({ onUsers, backOnLive }));
 
 // --- a store that refuses to open must offer a way out (fix review 2026-09-21)
 // The at-rest stores now refuse a deleted/unverifiable blob instead of silently
@@ -162,7 +177,6 @@ check("open drawer marks the current view",
   await p2.waitForFunction(() => !document.querySelector("#idExport").hidden, { timeout: 60000 });
   await p2.evaluate(() => localStorage.removeItem("sc.chats.v1")); // the one removeItem
   await p2.reload({ waitUntil: "networkidle0" });
-  await p2.click("#menuBtn");
   await p2.click('.navitem[data-view="chats"]');
   await p2.waitForFunction(() => !document.querySelector("#viewChats").hidden, { timeout: 10000 });
   await p2.type("#chatsUnlockPass", PASS);
@@ -189,7 +203,6 @@ check("open drawer marks the current view",
     await p2.evaluate(() => !document.querySelector("#chatsUnlocked").hidden));
   // Users view: nothing refused there, so no override is offered — the control
   // is per store, not a global "ignore all warnings".
-  await p2.click("#menuBtn");
   await p2.click('.navitem[data-view="users"]');
   await p2.waitForFunction(() => !document.querySelector("#viewUsers").hidden, { timeout: 10000 });
   check("the Users view, which did not refuse, shows no override",

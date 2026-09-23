@@ -1,632 +1,2277 @@
+/* secure-chat — the one stylesheet.
+   Served under CSP `style-src 'self'` (no inline styles anywhere) and
+   `img-src 'self' data:` (the only images are the data-URI icon masks below).
+   The same file ships inside the Android WebView app.
+
+   1. Tokens         palette, type, space, shape, motion, icons
+   2. Base           reset, page ground, the mono rule
+   3. App shell      top bar, tab bar, main column
+   4. Screen header  overline / title / lede, the step progress line
+   5. Components     buttons, fields, cards, wells, pills, lists, bubbles,
+                     composer, sheet, gate, disclosure, locked card, …
+   6. Views          per-screen layout that the components do not cover
+   7. Media          wider screens, motion
+
+   The rules this file follows (design/README.md has the long form): one
+   accent with one job (act here / you are here), six type sizes, an 8px
+   rhythm, space between sections instead of boxes around them, a surface
+   ladder with hairlines instead of shadows, mono only for key material. */
+
+/* ---- 1. Tokens ----------------------------------------------------------- */
+
 :root {
-  /* Palette — same hue language (dark GitHub-ish), gentler layering. */
+  color-scheme: dark;
+
+  /* Palette. The ground and text colours are mirrored in
+     android/app/src/main/res/values/colors.xml (app_bg / app_fg). */
   --bg: #0d1117;
-  --panel: #161c23;
-  --panel-2: #1c232c;   /* raised / hover surface */
-  --inset: #0a0e13;     /* wells: inputs, logs, code-like blocks */
+  --bg-top: #11161d;           /* the page gradient starts here */
+  --panel: #161c23;            /* cards, windows, sheets */
+  --panel-2: #1c232c;          /* raised / hover surface, peer bubbles */
+  --inset: #0a0e13;            /* wells: inputs, logs, key material */
   --fg: #d8dfe7;
-  --muted: #8b949e;
-  --accent: #2f81f7;
-  --accent-2: #4a90f8;  /* hover/brightened accent */
+  --muted: #8b949e;            /* 5.6:1 on --panel: secondary text */
+  --faint: #6e7681;            /* 3.7:1 on --panel: non-text only (radio rings), never text */
+  --accent: #2f81f7;           /* icons, rings, indicators; text only on --bg / --inset */
+  --accent-2: #4a90f8;         /* accent TEXT on raised or tinted grounds (≥4.9:1) */
+  --accent-fill: #1f6feb;      /* primary fill: 4.6:1 with white (#2f81f7 was 3.8:1) */
+  --accent-fill-hover: #1c64d6;
   --accent-soft: rgba(47, 129, 247, 0.12);
   --ring: rgba(47, 129, 247, 0.35);
+  --on-accent: #ffffff;
   --ok: #3fb950;
   --warn: #d29922;
+  --warn-fg: #e3b341;          /* warn text on a warn tint */
   --err: #f85149;
-  --border: #2a313a;
-  --border-soft: #222831;
+  --err-fg: #ff9c93;           /* err text on an err tint (7.7:1; --err is 4.6:1 there) */
+  --paper: #ffffff;            /* the QR code's quiet zone — scanners need white */
+  --border: #3d444d;           /* button outlines, the scrollbar */
+  --field: #5f6873;            /* input outlines: ≥3:1 on --bg, --panel and --inset */
+  --border-soft: rgba(240, 246, 252, 0.08); /* hairlines: cards, dividers */
+  --track: rgba(240, 246, 252, 0.1);        /* unfilled progress */
+  --bar-bg: rgba(13, 17, 23, 0.8);          /* translucent top bar (desktop) */
+  --scrim: rgba(1, 4, 9, 0.6);
+  --glow-bg: rgba(47, 129, 247, 0.1);       /* the light at the top of the page */
+  --select-border: rgba(47, 129, 247, 0.5);
+  --select-top: rgba(47, 129, 247, 0.08);
+  --select-bottom: rgba(47, 129, 247, 0.02);
+  --mask-solid: #000;          /* mask alpha only — never painted */
 
-  /* Shape + elevation. */
-  --r-s: 6px;
-  --r-m: 10px;
-  --r-l: 14px;
-  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4);
+  /* Shape + elevation. Flat things get a 1px top highlight, not a shadow;
+     --shadow-2 is for what floats (the admission sheet). */
+  --r-s: 8px;                  /* controls, wells */
+  --r-m: 12px;                 /* cards, lists */
+  --r-l: 16px;                 /* windows, sheets, bubbles */
+  --r-pill: 999px;
+  --shadow-1: inset 0 1px 0 rgba(255, 255, 255, 0.03);
   --shadow-2: 0 2px 4px rgba(0, 0, 0, 0.35), 0 12px 32px rgba(0, 0, 0, 0.4);
+  --highlight-fill: inset 0 1px 0 rgba(255, 255, 255, 0.12);
 
-  /* Spacing scale. */
-  --sp-1: 0.25rem;
-  --sp-2: 0.5rem;
-  --sp-3: 0.75rem;
-  --sp-4: 1rem;
-  --sp-5: 1.5rem;
+  /* Spacing: 4px base, 8px rhythm. */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --sp-7: 48px;
 
-  /* Type: a dual stack. System sans carries the interface (labels, prose,
-     controls, nav); monospace is reserved for material the user must read or
-     compare character-by-character — fingerprints, safety numbers, room ids,
-     handles, algorithm names. Both stacks are system fonts: `font-src` is
-     effectively 'none' under our CSP, so a web font is out of scope here. */
+  /* Type: six sizes. Titles 24, headings 20, emphasis 17, body 15,
+     secondary 13, captions/overlines 12. */
+  --fs-1: 12px;
+  --fs-2: 13px;
+  --fs-3: 15px;
+  --fs-4: 17px;
+  --fs-5: 20px;
+  --fs-6: 24px;
+  /* A dual stack. System sans carries the interface; monospace is reserved
+     for material the user must read or compare character-by-character —
+     fingerprints, safety numbers, room ids, handles, algorithm names. Both
+     are system fonts: `font-src` is effectively 'none' under our CSP. */
   --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
-  font-family: var(--font-ui);
+  /* Layout (phone first; section 7 widens it). */
+  --content: 680px;            /* forms */
+  --content-wide: 880px;       /* chat windows (desktop) */
+  --gutter: var(--sp-4);
+  --bar-h: 48px;
+  --sticky-top: 0px;           /* the phone's wordmark bar scrolls away; desktop's is sticky */
+  --tab-h: 64px;
+  --tabbar-space: calc(var(--tab-h) + env(safe-area-inset-bottom, 0px));
+  --main-pt: var(--sp-5);
+  --main-pb: calc(var(--tabbar-space) + var(--sp-5));
+  --control-h: 44px;           /* touch target (40px on desktop) */
+  --control-fs: 16px;          /* ≥16px: mobile browsers do not zoom on focus */
+  --row-h: 56px;               /* list rows, disclosure rows, chat bars */
+  --pill-h: 24px;              /* every pill; 20px only for inline badges */
+  --avatar: 40px;              /* list avatars (56px on Profile) */
+  --vh: 100vh;
+  /* A chat window's height: on a phone the chat IS the screen, edge to edge
+     between the app bar and the tab bar (main drops its padding for it);
+     wider, it is a window inside the page's padding (section 7). */
+  --stage-pt: 0px;
+  --stage-pb: var(--tabbar-space);
+  --stage-h: calc(var(--vh) - var(--bar-h) - var(--stage-pt) - var(--stage-pb));
+
+  /* Motion. */
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --t-fast: 140ms;
+  --t-move: 220ms;
+
+  /* Icons: one stroke family (16px grid, 1.5 stroke, round caps), drawn as
+     CSS masks filled with currentColor so every icon takes its text colour.
+     Nothing in the UI depends on emoji. */
+  --i-shield: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 1.8l5 2v4.2c0 3-2.2 5.2-5 6.2-2.8-1-5-3.2-5-6.2V3.8z'/%3E%3C/svg%3E");
+  --i-shield-check: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 1.8l5 2v4.2c0 3-2.2 5.2-5 6.2-2.8-1-5-3.2-5-6.2V3.8z'/%3E%3Cpath d='M5.6 8.1l1.7 1.7 3.2-3.4'/%3E%3C/svg%3E");
+  --i-shield-dot: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 1.8l5 2v4.2c0 3-2.2 5.2-5 6.2-2.8-1-5-3.2-5-6.2V3.8z'/%3E%3Ccircle cx='8' cy='8' r='1.6' fill='black' stroke='none'/%3E%3C/svg%3E");
+  --i-alert: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 2.2 14.2 13.2H1.8z'/%3E%3Cpath d='M8 6.6v3M8 11.4v.1'/%3E%3C/svg%3E");
+  --i-lock: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3.2' y='7' width='9.6' height='6.5' rx='1.6'/%3E%3Cpath d='M5.4 7V4.9a2.6 2.6 0 0 1 5.2 0V7'/%3E%3C/svg%3E");
+  --i-check: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.5 8.4l3 3 6-6.8'/%3E%3C/svg%3E");
+  --i-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 3.5 10.5 8 6 12.5'/%3E%3C/svg%3E");
+  --i-back: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M10 3.5 5.5 8l4.5 4.5'/%3E%3C/svg%3E");
+  --i-key: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='5.2' cy='10.8' r='2.8'/%3E%3Cpath d='M7.2 8.8 13.2 2.8M11.2 4.8l1.6 1.6M9.6 6.4l1.2 1.2'/%3E%3C/svg%3E");
+  --i-relay: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='2.5' y='2.5' width='11' height='4.5' rx='1.3'/%3E%3Crect x='2.5' y='9' width='11' height='4.5' rx='1.3'/%3E%3Cpath d='M5 4.75h.01M5 11.25h.01'/%3E%3C/svg%3E");
+  --i-people: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='5.6' cy='5.4' r='2.3'/%3E%3Cpath d='M1.9 13.1c.6-2.1 2-3.3 3.7-3.3s3.1 1.2 3.7 3.3'/%3E%3Cpath d='M10.5 3.5a2.3 2.3 0 0 1 0 4M11.7 10c1.3.5 2.1 1.5 2.5 3'/%3E%3C/svg%3E");
+  --i-copy: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='5.5' y='5.5' width='8' height='8' rx='1.6'/%3E%3Cpath d='M10.5 5.5V4a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 4v5A1.5 1.5 0 0 0 4 10.5h1.5'/%3E%3C/svg%3E");
+  --i-leave: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6.5 2.5H3.8a1.3 1.3 0 0 0-1.3 1.3v8.4a1.3 1.3 0 0 0 1.3 1.3h2.7'/%3E%3Cpath d='M10.5 5 13.5 8l-3 3M13.3 8H6.5'/%3E%3C/svg%3E");
+  --i-send: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 13V3.6M3.9 7.6 8 3.5l4.1 4.1'/%3E%3C/svg%3E");
+  --i-dots: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 4' fill='none' stroke='black' stroke-width='0' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='2' cy='2' r='2' fill='black' stroke='none'/%3E%3Ccircle cx='8' cy='2' r='2' fill='black' stroke='none'/%3E%3Ccircle cx='14' cy='2' r='2' fill='black' stroke='none'/%3E%3C/svg%3E");
 }
 
-* { box-sizing: border-box; }
+@supports (height: 100dvh) {
+  :root { --vh: 100dvh; }      /* the visible viewport, minus mobile browser chrome */
+}
+
+/* ---- 2. Base ------------------------------------------------------------- */
+
+*, *::before, *::after { box-sizing: border-box; }
 
 /* `display: flex/grid` beats the `hidden` attribute's UA `display: none`, so
    any flex container toggled via `.hidden` would stay visible (and keep eating
    clicks). Enforce the attribute globally rather than patching each case. */
 [hidden] { display: none !important; }
 
-/* Anything holding key material, ids or handles opts back into monospace. */
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  /* Whatever the browser scrolls into view — a control reached with Tab, a
+     field focused as the soft keyboard opens — clears both bars. */
+  scroll-padding-top: calc(var(--sticky-top) + var(--sp-2));
+  scroll-padding-bottom: calc(var(--tabbar-space) + var(--sp-2));
+}
+/* While a refusal sticks to the bottom of step 1 or 2 (section 6), it is
+   one more bar to clear: 9rem holds the longest refusal at 320px, so a
+   control reached with Tab — Connect above all, the recovery the hint asks
+   for — never ends up under it (WCAG 2.4.11). */
+html:has(#viewLive:not([hidden]) > :is(#scrIdentity, #scrRoom):not([hidden]) :is(#idHint, #roomHint).err:not(:empty)) {
+  scroll-padding-bottom: calc(var(--tabbar-space) + var(--sp-2) + 9rem);
+}
+
+/* Background without assets: a blue light above the page. No
+   `background-attachment: fixed` — it janks in Android WebView. */
+body {
+  margin: 0;
+  min-height: var(--vh);
+  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: var(--fs-3);
+  line-height: 1.5;
+  background:
+    radial-gradient(120% 420px at 50% -140px, var(--glow-bg), transparent 70%) no-repeat,
+    linear-gradient(180deg, var(--bg-top) 0, var(--bg) 360px) no-repeat,
+    var(--bg);
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+}
+
+h1, h2, p, ul, dl, dd { margin: 0; }
+::selection { background: var(--ring); }
+::placeholder { color: var(--muted); opacity: 1; }
+
+/* Anything holding key material, ids or handles opts into monospace. */
 .mono,
+.wordmark,
 .safety,
 .roomid,
+.u-name,
 .u-fp,
 .kv dd,
+.alg-desc,
+.chatmode,
 #room,
 #contact,
 #addHandle,
-#idFingerprint,
-.myhandle .hint.ok {
+#peerFingerprint,
+.myhandle .hint.ok,
+.idhead-sub.ok {
   font-family: var(--font-mono);
 }
+/* A handle is one token: it breaks anywhere rather than at its hyphens. */
+.idhead-sub.ok,
+#myHandleText.ok { word-break: break-all; }
 
-body {
-  margin: 0;
-  background: var(--bg);
-  background-image: linear-gradient(180deg, #11161d 0%, var(--bg) 320px);
-  background-repeat: no-repeat;
-  color: var(--fg);
-  display: flex;
-  justify-content: center;
-  padding: 2rem 1rem;
-  line-height: 1.45;
+/* Visually hidden, still read by assistive tech (and still a <label for>). */
+.vh {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
 }
 
-main { width: 100%; max-width: 640px; }
+/* One focus treatment: a 2px accent ring. */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+:focus:not(:focus-visible) { outline: none; }
 
-/* The wordmark stays monospace — it reads as the product's mark, not as UI. */
-h1 {
-  font-family: var(--font-mono);
-  font-size: 1.15rem;
-  margin: 0;
-  letter-spacing: -0.02em;
-  font-weight: 650;
-  display: flex;
-  flex-direction: column;
-  gap: 0.1rem;
-}
-h1 .sub {
-  font-family: var(--font-ui);
-  font-size: 0.72rem;
-  color: var(--muted);
-  font-weight: 400;
-  letter-spacing: 0.01em;
+/* Shared icon plumbing: an element sets `--icon`, its pseudo-element paints
+   it in currentColor through the mask. (Section 7 repeats this list for
+   forced-colors mode — keep the two in step.) */
+.u-mark::before,
+.legend-item::before,
+.chatmode::before,
+.facts li::before,
+.hint.err::before,
+.hint.ok:not(#myHandleText)::before,
+.u-claim::before,
+.disclosure > summary::after,
+.composer button::before,
+#chatBack::before,
+#copyRoom::before,
+#copyHandle::before,
+#disconnect::before,
+.locked > .lead::before,
+.wordmark::after,
+.gate::before {
+  content: "";
+  flex: none;
+  background: currentColor;
+  -webkit-mask: var(--icon) center / contain no-repeat;
+  mask: var(--icon) center / contain no-repeat;
 }
 
-/* App header: menu button + title, separated from the view by a hairline. */
+/* ---- 3. App shell -------------------------------------------------------- */
+
+/* Phone: a slim bar holding only the wordmark. It scrolls away with the page
+   (it names the product, it does not navigate) and gives way entirely inside
+   a chat window (section 7); the tabs dock to the bottom edge. Section 7
+   makes it a sticky bar with the tabs on wider screens. Solid ground here — a
+   translucent bar would need backdrop-filter, which would also make the bar
+   the containing block of the fixed tab bar inside it. */
 .apphead {
+  position: static;
+  height: var(--bar-h);
+  background: var(--bg);
+  border-bottom: 1px solid var(--border-soft);
+}
+.apphead-inner {
   display: flex;
   align-items: center;
-  gap: 0.7rem;
-  margin-bottom: var(--sp-4);
-  padding-bottom: var(--sp-3);
-  border-bottom: 1px solid var(--border-soft);
+  gap: var(--sp-4);
+  height: 100%;
+  max-width: var(--content);
+  margin: 0 auto;
+  padding: 0 var(--gutter);
 }
-#menuBtn { font-size: 1rem; line-height: 1; padding: 0.45rem 0.6rem; }
-
-/* Left drawer menu. */
-.drawer {
-  position: fixed;
-  top: 0; left: 0; bottom: 0;
-  width: min(75vw, 264px);
-  background: var(--panel);
-  border-right: 1px solid var(--border);
-  box-shadow: var(--shadow-2);
-  padding: var(--sp-3) var(--sp-2) var(--sp-4);
-  z-index: 20;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-/* Drawer head: the wordmark, so the panel is anchored instead of four nav
-   items floating in an empty column. */
-.drawer-head {
-  padding: var(--sp-2) 0.8rem var(--sp-3);
-  margin-bottom: var(--sp-2);
-  border-bottom: 1px solid var(--border-soft);
-}
-.drawer-head .mark {
-  display: block;
-  font-family: var(--font-mono);
-  font-size: 0.95rem;
+/* The wordmark stays monospace — it reads as the product's mark, not as UI.
+   The lock tile in front of it is the launcher icon's shape: a 24px tile
+   (::before) with the padlock (::after) centred in it. The tagline stays in
+   the <h1> for assistive tech (`.vh` in the markup). */
+.wordmark {
+  --icon: var(--i-lock);
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-3);
   font-weight: 650;
   letter-spacing: -0.02em;
-}
-.drawer-head .tag { display: block; font-size: 0.68rem; color: var(--muted); margin-top: 0.1rem; }
-/* Drawer foot: pinned to the bottom, states the one thing worth restating. */
-.drawer-foot {
-  margin-top: auto;
-  padding: var(--sp-3) 0.8rem 0;
-  border-top: 1px solid var(--border-soft);
-  font-size: 0.68rem;
-  color: var(--muted);
-  line-height: 1.5;
-  white-space: normal;
-}
-.navitem {
-  display: flex;
-  align-items: center;
-  gap: 0.7rem;
-  background: none;
-  border: 1px solid transparent;
+  line-height: 1;
   color: var(--fg);
-  text-align: left;
-  padding: 0.6rem 0.8rem;
+}
+.wordmark::before {
+  content: "";
+  flex: none;
+  width: 24px;
+  height: 24px;
   border-radius: var(--r-s);
-  font-family: var(--font-ui);
-  font-size: 0.88rem;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background-color 0.12s, color 0.12s;
+  background: var(--panel-2);
+  border: 1px solid var(--border-soft);
+}
+.wordmark::after {
+  position: absolute;
+  left: var(--sp-1);
+  top: calc(50% - var(--sp-2));
+  width: 16px;
+  height: 16px;
+  color: var(--fg);
+}
+
+.tabbar {
+  position: fixed;
+  inset: auto 0 0;
+  z-index: 30;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  height: var(--tabbar-space);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  background: var(--bg);       /* same ground as the Android navigation bar below it */
+  border-top: 1px solid var(--border-soft);
 }
 /* The nav items are `button`s — keep them off the button tiers entirely. */
-.navitem:hover { border-color: transparent; }
-.navitem.active { font-weight: 550; }
-.navicon { width: 16px; height: 16px; flex: 0 0 auto; color: var(--muted); transition: color 0.12s; }
-.navitem:hover { background: var(--panel-2); }
-.navitem:active { background: var(--accent-soft); }
-.navitem.active { background: var(--accent-soft); color: var(--accent); outline: none; }
-.navitem.active .navicon { color: var(--accent); }
-.navitem:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.scrim { position: fixed; inset: 0; background: rgba(1, 4, 9, 0.6); z-index: 10; }
+.tabbar .navitem {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-1);
+  min-height: 0;
+  height: auto;                /* stretches to the row: the bar's 1px top border stays inside it */
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  color: var(--muted);
+  font-size: var(--fs-1);
+  font-weight: 500;
+  line-height: 1.2;
+}
+.tabbar .navitem:hover { background: none; color: var(--fg); }
+.tabbar .navitem:focus-visible { outline-offset: -4px; border-radius: var(--r-m); }
+/* 20px icon inside a pill that fills in for the current tab. */
+.navicon {
+  width: 52px;
+  height: 28px;
+  padding: 4px 16px;
+  border-radius: var(--r-pill);
+}
+.tabbar .navitem[aria-current="page"] { color: var(--accent); }
+.tabbar .navitem[aria-current="page"] .navicon { background: var(--accent-soft); }
 
-/* Users view: contact list with trust marks. */
-.userlist { list-style: none; margin: var(--sp-2) 0 var(--sp-3); padding: 0; }
-.userlist li {
+main {
+  max-width: var(--content);
+  margin: 0 auto;
+  padding: var(--main-pt) var(--gutter) var(--main-pb);
+}
+main:has(> #viewLive:not([hidden]) > #scrChat:not([hidden])),
+main:has(> #viewChats:not([hidden]) #chatsUnlocked:not([hidden]) #chatConvo:not([hidden])) {
+  padding-top: var(--stage-pt);
+  padding-bottom: var(--stage-pb);
+}
+
+/* Every view and screen is a vertical stack: sections are separated by
+   space, not by boxes. Using `gap` (not margins) means a `hidden` section
+   takes its spacing with it. */
+.view,
+.screen:not(.window),
+#setup,
+#identity,
+#usersUnlocked,
+#profileUnlocked,
+#chatsUnlocked,
+#chatListWrap {
+  --gap: var(--sp-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+}
+#identity { --gap: var(--sp-4); }
+#chatListWrap { --gap: var(--sp-4); }
+
+/* ---- 4. Screen header ---------------------------------------------------- */
+
+/* One pattern on every view: overline (the view's role), title, one muted
+   sentence; the content sits under it without a panel around it. */
+.screenhead {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-2);  /* 24px gap + 8 = 32 between header and content */
+}
+.screenhead > :not(.step) { max-width: 60ch; }
+.overline,
+.step {
+  font-size: var(--fs-1);
+  font-weight: 600;
+  line-height: 1.4;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+label.overline { margin-bottom: var(--sp-2); }
+.title {
+  font-size: var(--fs-6);
+  font-weight: 650;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  color: var(--fg);
+  text-wrap: balance;
+}
+/* The second title size: a dialog's or a gate's heading, your own name. */
+.title-2,
+.idhead-name {
+  font-size: var(--fs-5);
+  font-weight: 650;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  color: var(--fg);
+  text-wrap: balance;
+}
+.lede { color: var(--muted); text-wrap: pretty; }
+
+/* The live flow's step line: the text stays, and a three-segment progress
+   line above it shows where you are. Done steps are dimmed accent, the
+   current one full accent ("you are here"), later ones a neutral track. */
+.step {
+  --seg: calc((100% - 2 * var(--sp-1)) / 3);
+  --s1: var(--track);
+  --s2: var(--track);
+  --s3: var(--track);
+  position: relative;
+  padding-top: var(--sp-4);
+}
+.step::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 3px;
+  background:
+    linear-gradient(var(--s1), var(--s1)) 0 0 / var(--seg) 100% no-repeat,
+    linear-gradient(var(--s2), var(--s2)) 50% 0 / var(--seg) 100% no-repeat,
+    linear-gradient(var(--s3), var(--s3)) 100% 0 / var(--seg) 100% no-repeat;
+}
+#stepIdentity { --s1: var(--accent); }
+#stepRoom { --s1: var(--select-border); --s2: var(--accent); }
+/* The step line takes focus on navigation (so a screen reader lands on the
+   new screen); a mouse user should not see a ring for it. */
+.step[tabindex]:focus:not(:focus-visible) { outline: none; }
+.step[tabindex]:focus-visible { outline-offset: 4px; border-radius: 2px; }
+
+/* ---- 5. Components ------------------------------------------------------- */
+
+/* 5.1 Buttons. The DEFAULT is the quiet secondary (transparent + hairline) —
+   a screen earns at most one `.primary`, so the eye lands on the action that
+   moves the flow forward instead of on every Copy button. Order of weight:
+   primary (filled), secondary (outline), ghost (text), danger (tinted
+   outline; every danger action is confirm-gated in app.js). */
+button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  min-height: var(--control-h);
+  padding: 0 var(--sp-4);
+  font-family: var(--font-ui);
+  font-size: var(--control-fs);
+  font-weight: 500;
+  line-height: 1.2;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-s);
+  cursor: pointer;
+  white-space: nowrap;
+}
+button:hover { background: var(--panel-2); border-color: var(--muted); }
+button:active { background: var(--panel); }
+button:disabled,
+button:disabled:hover {
+  opacity: 0.45;
+  cursor: not-allowed;
+  background: transparent;
+  border-color: var(--border);
+}
+
+button.primary {
+  color: var(--on-accent);
+  background: var(--accent-fill);
+  border-color: transparent;
+  box-shadow: var(--highlight-fill);
+  font-weight: 600;
+}
+button.primary:hover { background: var(--accent-fill-hover); border-color: transparent; }
+button.primary:disabled,
+button.primary:disabled:hover { background: var(--accent-fill); border-color: transparent; }
+
+/* Ghost: no outline at all — navigation and dismissals that should recede. */
+button.ghost { color: var(--muted); border-color: transparent; }
+button.ghost:hover { color: var(--fg); background: var(--panel-2); border-color: transparent; }
+
+button.danger {
+  color: var(--err-fg);
+  background: color-mix(in srgb, var(--err) 8%, transparent);
+  border-color: color-mix(in srgb, var(--err) 45%, transparent);
+}
+button.danger:hover {
+  background: color-mix(in srgb, var(--err) 16%, transparent);
+  border-color: var(--err);
+}
+
+/* 5.2 Fields. */
+label {
+  display: block;
+  margin-bottom: var(--sp-2);
+  font-size: var(--fs-2);
+  font-weight: 500;
+  color: var(--muted);
+}
+
+input,
+select {
+  width: 100%;
+  min-height: var(--control-h);
+  padding: 0 var(--sp-3);
+  font: inherit;
+  font-size: var(--control-fs);
+  color: var(--fg);
+  background: var(--inset);
+  border: 1px solid var(--field);
+  border-radius: var(--r-s);
+}
+/* A long placeholder or value ends in "…", not a cut glyph (a passphrase
+   stays a row of dots). */
+input:not([type="password"]),
+select { text-overflow: ellipsis; }
+/* Prose placeholders in the mono fields are set in the interface face. */
+#room::placeholder,
+#contact::placeholder,
+#addHandle::placeholder { font-family: var(--font-ui); letter-spacing: 0; }
+input:hover,
+select:hover { border-color: var(--muted); }
+/* Text fields show focus for mouse and keyboard alike: a 2px accent ring
+   (border + 1px shadow) with a soft halo. */
+input:focus-visible,
+select:focus-visible {
+  outline: 2px solid transparent;   /* invisible, except in forced-colors mode */
+  outline-offset: 0;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent), 0 0 0 4px var(--ring);
+}
+input:disabled { opacity: 0.55; cursor: not-allowed; }
+/* A native select, restyled: the chevron is two gradients in a token colour. */
+select {
+  appearance: none;
+  padding-right: var(--sp-7);
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 20px) 50%, calc(100% - 15px) 50%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  cursor: pointer;
+}
+select option { background: var(--panel); color: var(--fg); }
+
+/* A field with its buttons on one line. `.wrap` lets the field take its own
+   line first when the row runs out of room. */
+.inline { display: flex; align-items: center; gap: var(--sp-2); }
+.inline > input,
+.inline > select { flex: 1 1 auto; min-width: 0; }
+.inline > button { flex: none; }
+.inline.wrap { flex-wrap: wrap; }
+.inline.wrap > input,
+.inline.wrap > select { flex-basis: 100%; }
+
+.row { margin: 0; }
+.row > .hint,
+.row > .inline + .hint { margin-top: var(--sp-2); }
+
+/* Hints: one line of secondary text under the thing they describe. */
+.hint {
+  font-size: var(--fs-2);
+  line-height: 1.5;
+  color: var(--muted);
+  overflow-wrap: anywhere;     /* a pasted handle never widens the page */
+  text-wrap: pretty;
+}
+/* Success is quiet: muted text behind a small green check. */
+.hint.ok { color: var(--muted); }
+.hint.err { color: var(--err); }
+/* An empty status line (app.js writes and clears these) leaves the flow, so
+   it costs no gap — but it stays rendered, so `aria-live` still announces
+   what is written into it later. */
+.hint:empty { position: absolute; margin: 0; }
+/* A hint that is a direct item of a stack hugs the item above it. */
+:where(.view, .screen, #setup, #identity, #usersUnlocked, #profileUnlocked,
+       #chatsUnlocked, #chatListWrap, .panel) > .hint:not(:empty) {
+  margin-top: calc(var(--sp-2) - var(--gap, 0px));
+}
+/* Errors carry an icon so they do not rely on colour. */
+.hint.err:not(:empty),
+.hint.ok:not(:empty):not(#myHandleText) { display: flex; gap: var(--sp-2); }
+.hint:empty::before { content: none; }
+.hint.err::before {
+  --icon: var(--i-alert);
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+}
+.hint.ok:not(#myHandleText)::before {
+  --icon: var(--i-check);
+  width: 14px;
+  height: 14px;
+  margin-top: 3px;
+  color: var(--ok);
+}
+/* A relay reason the app does not know (app.js A3): the app says its own
+   sentence; the relay's words follow on a line of their own, quoted, in mono
+   and muted — visibly not the app talking. */
+.hint.err:has(> .relay-said) {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  column-gap: var(--sp-2);
+}
+.relay-said {
+  grid-column: 2;
+  font-family: var(--font-mono);
+  font-size: var(--fs-1);
+  color: var(--muted);
+}
+
+/* 5.3 Cards: one surface step up, a hairline and a 1px top highlight. The
+   card is for a distinct object (your handle, your account, a locked store)
+   — never a wrapper around a whole screen. */
+.panel {
+  --gap: var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  padding: var(--sp-4);
+  background: var(--panel);
   border: 1px solid var(--border-soft);
   border-radius: var(--r-m);
-  background: var(--inset);
-  padding: 0.65rem 0.8rem;
-  margin-bottom: var(--sp-2);
-  transition: border-color 0.12s;
+  box-shadow: var(--shadow-1);
 }
-.u-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; flex-wrap: wrap; }
-.u-name { font-family: var(--font-mono); font-size: 0.92rem; color: var(--fg); font-weight: 600; }
-.u-mark { font-size: 0.74rem; color: var(--muted); }
-.u-mark.ok { color: var(--ok); }
-.u-mark.mid { color: var(--warn); }
-.u-fp { font-size: 0.78rem; color: var(--muted); margin: 0.35rem 0; word-break: break-word; }
+
+/* 5.4 Wells: key material lives recessed, in mono — this app's version of a
+   terminal snippet. Fingerprints (8 groups) break 4 + 4; the safety number
+   (10 groups) 5 + 5, or 2 per line on a phone. The padding centres a
+   content box exactly that many groups wide, so a line never ends with a
+   lone group. */
+.safety {
+  --groups: 20ch;              /* 4 groups of 4 + 3 spaces, plus slack */
+  --bleed: 0px;                /* how far the well reaches past its container */
+  padding: var(--sp-4) max(var(--sp-3), calc((100% + 2 * var(--bleed) - var(--groups) - 0.4em) / 2));
+  font-size: var(--fs-5);
+  line-height: 1.6;
+  letter-spacing: 0.02em;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg);
+  background: var(--inset);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-s);
+  overflow-wrap: anywhere;
+}
+#safetyNumber { --groups: 25ch; }  /* 5 groups of 4 + 4 spaces, plus slack: 5 + 5 */
+/* Below 340px 25ch of 20px mono no longer fits, and 4 + 4 + 2 would read
+   like a fingerprint: a size down keeps it 5 + 5 (pentest P4). */
+@media (max-width: 339px) {
+  #safetyNumber { font-size: var(--fs-4); }
+}
+
+/* 5.5 Pills: trust marks, connection status, chips, badges. One shape —
+   24px tall (20px for the inline badge), fully round, tinted from their own
+   text colour. */
+.u-mark,
+.status,
+.chip,
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-height: var(--pill-h);
+  padding: 0 var(--sp-3) 0 var(--sp-2);
+  border-radius: var(--r-pill);
+  border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+  background: color-mix(in srgb, currentColor 10%, transparent);
+  font-size: var(--fs-1);
+  font-weight: 500;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+/* Trust mark: icon + the word + 1/2/3 filled dots, so the level reads
+   without colour. app.js sets `.ok` (verified) / `.mid` (vouched); no class
+   is unverified or unknown. It may wrap (a long "vouched by" list) but never
+   past its container. */
+.u-mark {
+  --icon: var(--i-shield);
+  --level: 32%;
+  max-width: 100%;
+  padding-block: 2px;
+  color: var(--muted);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+/* The neutral marks carry no tint: muted text on a tint of itself drops
+   below 4.5:1 on a hovered row. */
+.u-mark:not(.ok):not(.mid):not(.changed) { background: transparent; }
+.u-mark.ok { --icon: var(--i-shield-check); --level: 100%; color: var(--ok); }
+.u-mark.mid { --icon: var(--i-shield-dot); --level: 69%; color: var(--warn); }
+.u-mark::before { width: 14px; height: 14px; }
+.u-mark::after,
+.legend-item b::after {
+  content: "";
+  flex: none;
+  width: 16px;
+  height: 4px;
+  background: linear-gradient(90deg,
+    currentColor 0 var(--level),
+    color-mix(in srgb, currentColor 30%, transparent) var(--level) 100%);
+  -webkit-mask: var(--i-dots) center / contain no-repeat;
+  mask: var(--i-dots) center / contain no-repeat;
+}
+
+/* Connection status: a dot and a word (a little more air: the dot glows). */
+.status {
+  gap: var(--sp-2);
+  font-size: var(--fs-2);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.status::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.status.ok { color: var(--ok); }
+/* Connected is a state worth a glow — the only one on the screen. */
+.status.ok::before { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
+.status.err { color: var(--err-fg); }
+.status.err::before { background: var(--err); }
+.status:empty { display: none; }
+
+/* Status chips: state as discrete pills instead of a `·`-joined line, so
+   "registered" vs "not registered" is legible at a glance. */
+.chips { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+/* Green means verified elsewhere, so an "on" chip stays neutral: fg text and
+   a filled green dot (an "off" chip has a hollow muted one). */
+.chip {
+  font-size: var(--fs-2);
+  color: var(--muted);
+  background: transparent;
+  border-color: var(--border-soft);
+}
+.chip::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  border: 1.5px solid currentColor;
+}
+.chip.on { color: var(--fg); }
+.chip.on::before { background: var(--ok); border-color: var(--ok); }
+
+.badge {
+  min-height: 20px;
+  padding: 0 var(--sp-2);
+  font-style: normal;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--ok);
+}
+.badge.pq { font-family: var(--font-mono); font-weight: 500; color: var(--muted); background: transparent; }
+
+/* Chat mode: a padlock and the mode name, in mono (it is a cipher name). */
+.chatmode {
+  --icon: var(--i-lock);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-size: var(--fs-1);
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.chatmode::before { width: 14px; height: 14px; }
+.chatmode:empty { display: none; }
+
+/* 5.6 Lists: ONE container with hairline dividers, not a card per row. */
+.userlist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-m);
+  box-shadow: var(--shadow-1);
+}
+/* A row: a 40px avatar disc (the initial app.js puts in `data-initial`),
+   then name + trust mark, the claim / warning / fingerprint lines, and the
+   actions on a line of their own under it all, right-aligned. Named areas
+   keep every part in its place whichever optional lines a row has; an
+   absent line is an empty 0px track (row-gap 0, the parts space themselves
+   with margins). The fingerprint track is the flexible one, so a spanning
+   avatar that is taller than the text adds its space under the text, never
+   between its lines. */
+.userlist > li {
+  display: grid;
+  grid-template-columns: var(--avatar) minmax(0, 1fr);
+  grid-template-rows: auto auto auto 1fr auto;
+  grid-template-areas:
+    "av head"
+    "av claim"
+    "av warn"
+    "av fp"
+    "act act";
+  align-items: start;
+  column-gap: var(--sp-3);
+  min-height: var(--row-h);
+  padding: var(--sp-3) var(--sp-4);
+}
+.userlist > li > * + * { margin-top: var(--sp-2); }
+.userlist > li > .u-head { grid-area: head; }
+.userlist > li > .u-claim { grid-area: claim; }
+.userlist > li > .hint { grid-area: warn; }
+.userlist > li > .u-fp { grid-area: fp; }
+.userlist > li > .u-actions { grid-area: act; margin-top: var(--sp-3); }
+.userlist > li::before {
+  content: attr(data-initial) / "";   /* decorative: the name says it */
+  grid-area: av;
+  width: var(--avatar);
+  height: var(--avatar);
+  font-size: var(--fs-4);
+}
+.userlist > li:not([data-initial])::before { content: none; }
+.userlist > li + li { border-top: 1px solid var(--border-soft); }
+/* On a phone the mark goes under the name, in every row alike — side by
+   side, a 40px avatar leaves a handle too little room and it would break.
+   Section 7 puts them on one line; a key-changed mark (a sentence) always
+   keeps a line of its own, so it can never squeeze the name. */
+.u-head {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--sp-1);
+}
+.u-name {
+  min-width: 0;
+  font-size: var(--fs-3);
+  font-weight: 600;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+/* The fingerprint you compare when you verify someone — muted, not faint:
+   it is read, not skimmed. */
+.u-fp {
+  font-size: var(--fs-1);
+  letter-spacing: 0.02em;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
 .u-fp.err { color: var(--err); }
 /* A sender's self-claimed handle. Deliberately quiet and marked as a claim —
    it is attacker-chosen text, never an identity (pentest F-01). */
 .u-claim {
-  font-size: 0.72rem;
-  color: var(--warn);
-  margin: 0.35rem 0 0;
-  word-break: break-word;
+  --icon: var(--i-alert);
+  display: flex;
+  gap: var(--sp-2);
+  font-size: var(--fs-2);
+  color: var(--warn-fg);
+  overflow-wrap: anywhere;
 }
-.u-actions { margin-top: 0.35rem; }
-.u-actions button { font-size: 0.78rem; padding: 0.4rem 0.6rem; }
-
-/* Chats view: chat list rows + WhatsApp-style conversation bubbles. */
-.chatrow { cursor: pointer; }
-.chatrow:hover { border-color: var(--accent); }
-/* The conversation header keeps a flex row on every screen size (the mobile
-   .topbar grid is meant for the live-room bar only). */
-.topbar.convo-head { position: static; margin-bottom: 0.6rem; display: flex; align-items: center; flex-wrap: wrap; }
-.convo-head .u-name { flex: 1 1 auto; }
-.convo-head .u-mark { flex: 0 0 auto; }
-#chatModeSel { margin-left: auto; }
-#chatBack { flex: 0 0 auto; }
-.chatmode { font-size: 0.72rem; color: var(--muted); }
-#chatModeSel { width: auto; flex: 0 0 auto; padding: 0.3rem 0.4rem; font-size: 0.76rem; }
-.pending {
-  background: rgba(210, 153, 34, 0.09);
-  border: 1px solid rgba(210, 153, 34, 0.55);
-  color: #e3b341;
+.u-claim::before { width: 16px; height: 16px; margin-top: 2px; }
+.u-actions { justify-content: flex-end; flex-wrap: wrap; }
+/* Remove is confirm-gated and rare: a quiet ghost that turns red on hover,
+   so red on this screen means one thing — a key that changed. */
+.u-actions > .danger { color: var(--muted); background: transparent; border-color: transparent; }
+.u-actions > .danger:hover { color: var(--err-fg); background: var(--panel-2); border-color: transparent; }
+/* A contact whose key changed since it was saved wears the alert mark
+   (app.js sets `.changed`; the dots still show the trust level). The mark
+   says a sentence, so it is a box, not a pill; the row's err line then
+   drops its own icon — one alert per row. */
+.u-mark.changed {
+  --icon: var(--i-alert);
+  flex-wrap: wrap;              /* the key-changed caption takes a line of its own */
+  align-items: flex-start;
+  padding: var(--sp-1) var(--sp-2);
   border-radius: var(--r-s);
-  padding: 0.5rem 0.6rem;
-  margin-bottom: 0.6rem;
-  font-size: 0.82rem;
+  color: var(--err-fg);
 }
-.pending button { margin-left: 0.4rem; font-size: 0.76rem; padding: 0.3rem 0.55rem; }
-#chatLog {
-  list-style: none;
-  margin: 0 0 var(--sp-3);
-  padding: var(--sp-2);
-  height: min(50vh, 440px);
-  overflow-y: auto;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--r-m);
-  background: var(--inset);
+.u-mark.changed::before,
+.u-mark.changed::after { margin-top: 2px; }
+.u-mark.changed::after { margin-top: 7px; }
+/* What changed is a caption on its own line under the word and the dots
+   (app.js B5), quieter by size and weight. It keeps the box's colour: muted
+   grey on the red tint is 4.3:1 on a hovered row, under the 4.5:1 floor. */
+.u-mark-note {
+  order: 1;
+  flex-basis: 100%;
+  padding-left: calc(14px + var(--sp-1));  /* under the word, not the icon */
+  font-size: var(--fs-1);
+  font-weight: 400;
+}
+li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
+
+/* Empty state: one title, one sentence, centred in the list's frame. */
+.userlist > li.empty {
+  display: block;
+  padding: var(--sp-6) var(--sp-5);
+  text-align: center;
+  font-size: var(--fs-2);
+  color: var(--muted);
+}
+.empty .empty-title {
+  display: block;
+  margin-bottom: var(--sp-1);
+  font-size: var(--fs-4);
+  font-weight: 600;
+  color: var(--fg);
+}
+
+/* Trust legend: the three marks and what they mean, in the list's "?". */
+.legend {
+  display: grid;
+  gap: var(--sp-2);
+  font-size: var(--fs-2);
+  color: var(--muted);
+}
+/* Icon | term | definition as a grid, so a wrapped definition lines up
+   under its own first line, never under the icon or the term. */
+.legend-item {
+  --icon: var(--i-shield);
+  --level: 32%;
+  display: grid;
+  grid-template-columns: 16px auto minmax(0, 1fr);
+  align-items: start;
+  column-gap: var(--sp-2);
+}
+.legend-item::before {
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  color: var(--muted);
+}
+.legend-item b {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-weight: 600;
+  color: var(--fg);
+}
+.legend-item.ok { --icon: var(--i-shield-check); --level: 100%; }
+.legend-item.mid { --icon: var(--i-shield-dot); --level: 69%; }
+.legend-item.ok::before,
+.legend-item.ok b { color: var(--ok); }
+.legend-item.mid::before,
+.legend-item.mid b { color: var(--warn); }
+
+/* 5.7 Windows: a chat is one surface — a bar, the log, the composer — sized
+   to the viewport so the log scrolls and the composer never leaves the
+   screen (and never sits under the phone tab bar). On a phone it runs edge
+   to edge and may shrink as far as the viewport does (a soft keyboard, a
+   landscape phone) — the log gives way first; section 7 turns it into a card
+   with a floor on wider screens. */
+.window {
   display: flex;
   flex-direction: column;
-  gap: 0.35rem;
+  height: var(--stage-h);
+  min-height: 0;
+  margin-inline: calc(-1 * var(--gutter));
+  overflow: hidden;
+  background: var(--panel);
 }
-#chatLog li {
-  max-width: 82%;
-  padding: 0.45rem 0.7rem;
+.topbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: var(--row-h);
+  padding: var(--sp-2) var(--sp-4);
+  border-bottom: 1px solid var(--border-soft);
+}
+.roomid {
+  min-width: 0;
+  padding: var(--sp-1) var(--sp-2);
+  font-size: var(--fs-2);
+  letter-spacing: 0.02em;
+  color: var(--muted);
+  background: var(--inset);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-s);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.roomid:empty { visibility: hidden; }
+
+/* Bubbles: the live room and the async chats render messages the same way.
+   Mine right in the accent fill, theirs left on the raised surface, system
+   lines centred and small. The tail corner (4px) points at the sender. */
+.bubbles {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  list-style: none;
+  margin: 0;
+  padding: var(--sp-4);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--inset);
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+.bubbles > li {
+  position: relative;
+  max-width: 78%;
+  padding: var(--sp-2) var(--sp-3);
   border-radius: var(--r-l);
+  font-size: var(--fs-3);
+  line-height: 1.45;
   white-space: pre-wrap;
-  word-break: break-word;
-  font-size: 0.9rem;
-  box-shadow: var(--shadow-1);
+  overflow-wrap: anywhere;
 }
-#chatLog li.me {
+.bubbles > li + li { margin-top: var(--sp-1); }
+.bubbles > li.me {
   align-self: flex-end;
-  background: linear-gradient(180deg, #2264c4, #1d55a8);
-  color: #fff;
+  color: var(--on-accent);
+  background: var(--accent-fill);
+  border: 1px solid transparent;   /* drawn in forced-colors mode */
   border-bottom-right-radius: 4px;
 }
-#chatLog li.peer {
+.bubbles > li.peer {
   align-self: flex-start;
   background: var(--panel-2);
   border: 1px solid var(--border-soft);
   border-bottom-left-radius: 4px;
 }
-@media (max-width: 600px) {
-  #chatLog { height: calc(100dvh - 21rem); min-height: 10rem; }
-}
-
-.panel {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--r-m);
-  padding: var(--sp-4);
-  margin-bottom: var(--sp-4);
-  box-shadow: var(--shadow-1);
-}
-
-.row { margin-bottom: 0.85rem; }
-.row:last-child { margin-bottom: 0; }
-
-label {
-  display: block;
-  font-size: 0.76rem;
+/* A change of speaker gets air; consecutive messages stay grouped. */
+.bubbles > li.me + li.peer,
+.bubbles > li.peer + li.me,
+.bubbles > li.sys + li:not(.sys),
+.bubbles > li:not(.sys) + li.sys { margin-top: var(--sp-4); }
+.bubbles > li.sys {
+  align-self: center;
+  max-width: 92%;
+  padding: 2px var(--sp-2);
+  font-size: var(--fs-1);
+  text-align: center;
   color: var(--muted);
-  margin-bottom: 0.35rem;
-  letter-spacing: 0.02em;
+  text-wrap: balance;
 }
-
-input, select {
-  width: 100%;
-  background: var(--inset);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: var(--r-s);
-  padding: 0.55rem 0.65rem;
-  font: inherit;
-  transition: border-color 0.12s, box-shadow 0.12s;
-}
-
-input:focus, select:focus {
-  outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--ring);
-}
-
-.inline { display: flex; gap: 0.5rem; align-items: center; }
-.inline input { flex: 1; }
-
-/* Button tiers. The DEFAULT is the quiet secondary — a screen earns at most
-   one `.primary`, so the eye lands on the action that moves the flow forward
-   (Continue / Connect / Send / unlock-messaging) instead of on every Copy
-   button competing for the same attention. */
-button {
-  background: var(--panel-2);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: var(--r-s);
-  padding: 0.5rem 0.85rem;
-  font-family: var(--font-ui);
-  font-size: 0.85rem;
-  font-weight: 500;
-  cursor: pointer;
+/* The live log's "me" / "peer" labels: in a 1:1 chat the side and the
+   colour already say who spoke, so — as in the async chats — they are not
+   drawn. They stay in the text (clipped, like `.vh`), so the aria-live log
+   still announces who said what. */
+#log .who {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
   white-space: nowrap;
-  transition: background-color 0.12s, border-color 0.12s, color 0.12s, filter 0.12s;
 }
-button:hover { background: color-mix(in srgb, var(--panel-2) 82%, var(--fg)); border-color: var(--muted); }
-button:active { filter: brightness(0.93); }
-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-button:disabled { opacity: 0.4; cursor: not-allowed; filter: none; background: var(--panel-2); border-color: var(--border); }
+/* Before the first message (waiting for a peer, for approval, for the
+   handshake) the log is the screen's empty state: its lines sit in the
+   middle, and the latest one — what is happening now — is read, not
+   skimmed. Auto margins, not `justify-content`, so a long run of lines
+   still scrolls from the top. */
+#log:not(:has(> li.me, > li.peer)) > li:first-child { margin-top: auto; }
+#log:not(:has(> li.me, > li.peer)) > li.sys:last-child {
+  margin-bottom: auto;
+  max-width: 32ch;
+  font-size: var(--fs-3);
+  color: var(--fg);
+}
 
-button.primary {
-  background: linear-gradient(180deg, var(--accent-2), var(--accent));
-  color: #fff;
-  border-color: rgba(255, 255, 255, 0.1);
-  font-weight: 550;
+/* Composer: pill field + round send. The button keeps its "Send" text for
+   assistive tech; the arrow is drawn in its place. */
+.composer {
+  flex: none;
+  padding: var(--sp-3);
+  border-top: 1px solid var(--border-soft);
+}
+.composer input {
+  padding: 0 var(--sp-4);
+  border-radius: var(--r-pill);
+}
+.composer button {
+  --icon: var(--i-send);
+  width: var(--control-h);
+  padding: 0;
+  border-radius: 50%;
+  font-size: 0;
+}
+.composer button::before { width: 20px; height: 20px; }
+/* Disabled reads as disabled (a grey disc), not as a pressed primary. */
+.composer button.primary:disabled,
+.composer button.primary:disabled:hover {
+  opacity: 1;
+  color: var(--muted);
+  background: var(--panel-2);
+  border-color: var(--border-soft);
+  box-shadow: none;
+}
+.window > .hint:not(:empty),
+.convo > .hint:not(:empty) { padding: 0 var(--sp-4) var(--sp-3); }
+
+/* 5.8 Sheet: the admission prompt floats over a scrim — a bottom sheet on a
+   phone, a centred dialog wider up (section 7). On a phone it docks ABOVE
+   the tab bar, never over it: a tap meant for a tab as a knock arrives must
+   not land on "Let them in" (pentest 2026-09-22 P1; app.js also ignores the
+   first 500 ms of clicks, and the entrance animation below takes no
+   pointer events). No grab handle — it cannot be dragged away. */
+.sheet {
+  --gap: var(--sp-4);
+  position: fixed;
+  inset: auto 0 var(--tabbar-space);
+  z-index: 41;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  max-height: calc(var(--vh) - var(--tabbar-space) - var(--sp-7));
+  overflow-y: auto;
+  padding: var(--sp-5) var(--gutter);
+  background: var(--panel);
+  border: 1px solid var(--border-soft);
+  border-bottom: 0;
+  border-radius: var(--r-l) var(--r-l) 0 0;
+  box-shadow: var(--shadow-2);
+}
+#scrChat:has(> .sheet:not([hidden]))::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: var(--scrim);
+}
+/* Without :has (a WebView older than Chromium 105) the scrim above cannot
+   match; a spread shadow does the same job. */
+@supports not selector(:has(*)) {
+  .sheet:not([hidden]) { box-shadow: 0 0 0 100vmax var(--scrim), var(--shadow-2); }
+}
+.sheet > .hint:not(:empty) { margin-top: calc(var(--sp-2) - var(--gap)); }
+/* Reading order: what is asked (title + hint), then — when there is one —
+   the warning, as a box directly under the title, then the key, who it
+   is, the decision. */
+.sheet > .row:first-child { order: -2; }
+#admitWarn.err:not(:empty) {
+  order: -1;
+  margin-top: 0;
+  padding: var(--sp-3);
+  font-size: var(--fs-3);
+  color: var(--err-fg);
+  background: color-mix(in srgb, var(--err) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--err) 40%, transparent);
+  border-radius: var(--r-s);
+}
+#admitWarn.err::before { margin-top: 3px; }
+/* Let in / Deny carry equal weight: same size, side by side. */
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2); }
+
+/* 5.9 Gate: the in-person verification takes the whole window while it is
+   up — nothing to type into, nothing to read past. */
+.gate {
+  --icon: var(--i-shield);
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-5) var(--sp-4);
+  text-align: center;
+}
+.gate::before {
+  display: none;              /* phone: every pixel goes to the number and the buttons */
+  width: 32px;
+  height: 32px;
+  color: var(--muted);
+}
+.gate.changed { --icon: var(--i-alert); }
+.gate.changed::before { display: block; color: var(--err); }  /* a warning is never dropped */
+.gate > .row,
+.gate > #peerFingerprint { width: 100%; max-width: 52ch; text-align: left; }
+/* The warning icon shares that left edge (it was centred over a left-aligned title). */
+.gate.changed::before {
+  width: 100%;
+  max-width: 52ch;
+  -webkit-mask-position: left center;
+  mask-position: left center;
+}
+/* The line under the title (and its "?"): left-aligned under the centred
+   title, at the hint size, in a measure a phone can hold. */
+.gate .row > .qline {
+  max-width: 60ch;
+  margin-inline: 0;
+  text-align: left;
+}
+/* The safety number is the one thing on this screen: a band across the whole
+   window, 5 + 5 groups — wide enough for 20px on a 360px phone. */
+.gate .safety {
+  --bleed: var(--sp-4);
+  align-self: stretch;
+  margin-inline: calc(-1 * var(--bleed));
+  padding-block: var(--sp-3);
+  border-radius: 0;
+  border-inline: 0;
+}
+.gate.changed .safety { border-color: color-mix(in srgb, var(--err) 55%, transparent); }
+/* Loud title when a pinned contact's identity key has changed. */
+#verify.changed #verifyTitle { color: var(--err-fg); }
+.stacked {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  width: 100%;
+  max-width: 400px;
+}
+.stacked > button { width: 100%; white-space: normal; }
+
+/* Warning states: when the key does not match (the gate is `.changed`) or
+   the joiner is not who you expected (#admitWarn is an error), "proceed" is
+   no longer the primary — neither button is — and the safe action comes
+   first. The connection pill stops glowing while the alarm is up.
+   The window's own hint line (#hint) is visually clipped whenever the gate
+   is up, alarm or not: the gate says what matters then. That clips every
+   message written to it meanwhile, not only a repeat of the gate — relay
+   `error` frames, key-exchange failures, directory warnings — so those are
+   not SEEN until the gate closes. They are clipped, not removed: the line
+   stays the aria-live region hint() makes of it, so they are announced. */
+.gate.changed #verifyOk,
+#admit:has(#admitWarn.err:not(:empty)) #admitOk {
+  color: var(--fg);
+  background: transparent;
+  border-color: var(--border);
+  box-shadow: none;
+  font-weight: 500;
+}
+.gate.changed #verifyOk:hover,
+#admit:has(#admitWarn.err:not(:empty)) #admitOk:not(:disabled):hover {
+  background: var(--panel-2);
+  border-color: var(--muted);
+}
+.gate.changed .stacked { flex-direction: column-reverse; }
+#admit:has(#admitWarn.err:not(:empty)) .pair > #admitNo { order: -1; }
+#scrChat:has(> #verify.changed:not([hidden])) #chatStatus,
+#scrChat:has(#admitWarn.err:not(:empty)) #chatStatus { color: var(--muted); }
+#scrChat:has(> #verify.changed:not([hidden])) #chatStatus::before,
+#scrChat:has(#admitWarn.err:not(:empty)) #chatStatus::before { box-shadow: none; }
+#scrChat:has(> #verify:not([hidden])) #hint {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* 5.10 Disclosure row: a setting that is safe by default collapses to one
+   row that names the current choice; it opens in place. */
+.disclosure {
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-m);
   box-shadow: var(--shadow-1);
 }
-button.primary:hover { filter: brightness(1.08); background: linear-gradient(180deg, var(--accent-2), var(--accent)); border-color: rgba(255, 255, 255, 0.1); }
-button.primary:disabled { filter: none; background: linear-gradient(180deg, var(--accent-2), var(--accent)); }
-
-/* Ghost: no fill at all — for navigation and dismissals that should recede. */
-button.ghost { background: none; border-color: transparent; color: var(--muted); }
-button.ghost:hover { background: var(--panel-2); border-color: var(--border); color: var(--fg); }
-
-.status { font-size: 0.85rem; color: var(--muted); margin-left: 0.6rem; }
-.status.ok { color: var(--ok); }
-.status.err { color: var(--err); }
-
-/* Three-step flow: step indicator + per-screen navigation. */
-.step {
-  font-size: 0.68rem;
-  color: var(--muted);
-  margin: 0 0 var(--sp-3);
-  letter-spacing: 0.1em;
-  font-weight: 500;
-  text-transform: uppercase;
-}
-.step strong { color: var(--accent); font-weight: 650; }
-.nav { display: flex; justify-content: flex-end; }
-
-/* Chat top bar: room id (copyable) + status + disconnect, always in view. */
-.topbar {
+.disclosure > summary {
+  --icon: var(--i-chevron);
   display: flex;
   align-items: center;
-  gap: 0.5rem;
-  padding: 0.6rem 0.75rem;
-  position: sticky;
-  top: 0;
-  z-index: 1;
-}
-.roomid {
-  font-size: 0.8rem;
-  color: var(--muted);
-  background: var(--inset);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--r-s);
-  padding: 0.35rem 0.5rem;
-  white-space: nowrap;
-}
-.topbar .status { flex: 1; text-align: right; margin-left: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.topbar button { padding: 0.35rem 0.6rem; font-size: 0.82rem; }
-
-/* Encryption picker: radio cards (large touch targets, description visible). */
-.alg-cards { display: grid; gap: 0.45rem; }
-.alg-card {
-  display: block;
-  background: var(--inset);
-  border: 1px solid var(--border);
-  border-radius: var(--r-m);
-  padding: 0.65rem 0.8rem;
+  gap: var(--sp-3);
+  min-height: var(--row-h);
+  padding: var(--sp-3) var(--sp-4);
+  list-style: none;
   cursor: pointer;
-  margin-bottom: 0;
-  transition: border-color 0.12s, background-color 0.12s;
+  font-weight: 500;
+  color: var(--fg);
 }
-.alg-card:hover { border-color: var(--muted); }
+.disclosure > summary::-webkit-details-marker { display: none; }
+.disclosure > summary::after {
+  width: 16px;
+  height: 16px;
+  margin-left: auto;
+  color: var(--muted);
+}
+.disclosure > summary:hover { background: var(--panel-2); }
+.disclosure > summary:focus-visible { outline-offset: -2px; border-radius: var(--r-m); }
+.disclosure[open] > summary { border-bottom: 1px solid var(--border-soft); }
+.disclosure[open] > summary::after { transform: rotate(90deg); }
+.disclosure > .qline { padding: var(--sp-3) var(--sp-4) 0; }
+
+/* "?": an explanation one tap away (no script — a <details class="why">).
+   A line (`.qline`) is a title, a label or ONE sentence; the "?" follows its
+   last word as a 24px ring, and the explanation opens as a quiet panel under
+   the whole line. The details is inline, so its panel (a block) drops below
+   the line box; its line stays where it was. The summary's words ("Why?")
+   are for assistive tech; the glyph is decoration. */
+.qline { text-wrap: balance; }   /* the "?" never ends up alone on a line */
+.qline > :not(.why) { display: inline; }
+.qline > label { margin: 0; }
+.why { display: inline; }
+/* A closed panel leaves no box behind: where the "?" is an item of a grid or
+   flex row, an empty (content-visibility: hidden) box would add a gap. */
+.why:not([open])::details-content { display: none; }
+.why > summary {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin: -4px 0 -4px var(--sp-2);   /* never taller than the line it sits in */
+  vertical-align: middle;
+  list-style: none;
+  cursor: pointer;
+  font-family: var(--font-ui);
+  font-size: var(--fs-2);
+  font-weight: 650;
+  line-height: 1;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 50%;
+}
+.why > summary::-webkit-details-marker { display: none; }
+.why > summary::before { content: "?"; content: "?" / ""; }
+.why > summary:hover,
+.why > summary:focus-visible,
+.why[open] > summary { color: var(--accent-2); border-color: var(--accent); }
+/* The panel: 13px, muted, a hairline above it. Everything it could inherit
+   from the line (a title's size, an overline's capitals) is reset. */
+.why > :not(summary) {
+  display: block;
+  max-width: 60ch;
+  margin: var(--sp-2) 0 0;
+  padding: var(--sp-2) 0 0;
+  font-family: var(--font-ui);
+  font-size: var(--fs-2);
+  font-weight: 400;
+  line-height: 1.5;
+  letter-spacing: 0;
+  text-transform: none;
+  text-align: left;
+  color: var(--muted);
+  text-wrap: pretty;
+  border-top: 1px solid var(--border-soft);
+}
+.why > div > * + * { margin-top: var(--sp-2); }
+.why > .legend { display: grid; }
+.why > .legend > * { margin: 0; }
+/* In a row of controls (the chat head, an action row) the "?" is one more
+   item of the row, and its panel takes a line of its own under the row. */
+:is(.inline, .topbar) > .why { display: contents; }
+:is(.inline, .topbar) > .why > summary { align-self: center; flex: none; margin: 0 0 0 var(--sp-1); }
+:is(.inline, .topbar) > .why > :not(summary) { margin-top: 0; }
+:is(.inline, .topbar) > .why::details-content { flex-basis: 100%; }
+/* A labelled row with a "?" (`.why-row`): in the markup the details comes
+   AFTER the field, so wherever the layout below is not supported the panel
+   still opens under the field. Here the ring moves up beside the label
+   (negative order) and the panel stays under the field — never between a
+   label and what it labels. Only the label and the summary are placed;
+   the panel (the ::details-content box, or in older engines the slot around
+   it) keeps its place after the field in any engine. */
+.row.why-row {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2) 0;
+}
+.row.why-row > * { margin: 0; }
+.why-row > label { order: -2; }
+.why-row > .why { display: contents; }
+.why-row > .why > summary { order: -1; margin: 0 0 0 var(--sp-2); }
+.why-row > :not(label):not(.why) { flex: 1 1 100%; min-width: 0; }
+.why-row > .why::details-content { flex: 1 1 100%; }
+.why-row > .why > :not(summary) { flex: 1 1 100%; margin-top: 0; }
+/* On a phone the ring keeps its size and the target grows to 44px. Where
+   that reaches a control beside or under the line, the control stays on top
+   (z-index), so the larger target never takes a tap meant for it. */
+@media (max-width: 600px) {
+  /* 24px ring (22px inside its border) + 11px on each side = 44px */
+  .why > summary::after { content: ""; position: absolute; inset: -11px; }
+  /* ...and a labelled row leaves it the room: 12px from the ring to the field. */
+  .row.why-row { row-gap: var(--sp-3); }
+  :is(.why-row > input, .why-row > .inline > input, #contactRow > input) {
+    position: relative;
+    z-index: 1;
+  }
+}
+
+/* Encryption options: rows in the disclosure, one anatomy — name (+badge),
+   the cipher spec in mono, a radio mark on the right. */
+.alg-cards { display: grid; margin-top: var(--sp-3); border-top: 1px solid var(--border-soft); }
+.alg-card {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--sp-1) var(--sp-4);
+  margin: 0;
+  padding: var(--sp-3) var(--sp-4);
+  cursor: pointer;
+}
+.alg-card + .alg-card { border-top: 1px solid var(--border-soft); }
+.alg-card:hover { background: var(--panel-2); }
 .alg-card input {
-  /* Visually hidden but still focusable/checkable — the card is the control. */
+  /* Visually hidden but still focusable/checkable — the row is the control. */
   position: absolute;
-  width: 1px; height: 1px;
+  width: 1px;
+  height: 1px;
   opacity: 0;
   pointer-events: none;
 }
+/* The radio mark: a ring (3:1 against the row), filled with a dot when chosen. */
+.alg-card::after {
+  content: "";
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1.5px solid var(--faint);
+}
 .alg-card:has(input:checked) {
+  background: linear-gradient(180deg, var(--select-top), var(--select-bottom));
+}
+.alg-card:has(input:checked)::after {
   border-color: var(--accent);
-  background: var(--accent-soft);
-  box-shadow: 0 0 0 1px var(--accent);
+  background: radial-gradient(circle, var(--accent) 0 4px, transparent 4.5px);
 }
-.alg-card:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
-.alg-name { display: block; font-size: 0.9rem; color: var(--fg); margin-bottom: 0.15rem; font-weight: 600; }
-.alg-card:has(input:checked) .alg-name { color: var(--accent); }
-/* The description is a cipher spec — monospace, so it reads as one. */
-.alg-desc { display: block; font-family: var(--font-mono); font-size: 0.76rem; color: var(--muted); }
-.badge {
-  font-style: normal;
-  font-size: 0.64rem;
-  font-weight: 550;
-  letter-spacing: 0.03em;
-  color: var(--ok);
-  border: 1px solid color-mix(in srgb, var(--ok) 55%, transparent);
-  background: color-mix(in srgb, var(--ok) 10%, transparent);
-  border-radius: 999px;
-  padding: 0.08rem 0.5rem;
-  margin-left: 0.35rem;
-  vertical-align: 0.1em;
-}
-.badge.pq {
-  font-family: var(--font-mono);
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
-}
-
-/* Phone-sized screens: tighter chrome, bigger touch targets, chat fills the
-   viewport. 16px inputs stop mobile browsers from zooming on focus. */
-@media (max-width: 600px) {
-  body { padding: 0.75rem 0.6rem; }
-  h1 { font-size: 1.1rem; margin-bottom: 0.6rem; }
-  .panel { padding: var(--sp-3); }
-  input, select, button { font-size: 16px; }
-  button { padding: 0.65rem 0.9rem; }
-  /* 2×2 grid: room id | copy  //  status | disconnect. */
-  .topbar { display: grid; grid-template-columns: 1fr auto; gap: 0.4rem; }
-  .topbar button { font-size: 13px; padding: 0.45rem 0.55rem; }
-  .roomid { overflow: hidden; text-overflow: ellipsis; font-size: 0.72rem; align-self: center; }
-  .topbar .status { text-align: left; margin: 0; align-self: center; }
-  .topbar #disconnect { justify-self: end; }
-  /* 100dvh minus header, top bar, send form and margins. */
-  #log { height: calc(100dvh - 17rem); min-height: 10rem; }
-}
-
-#log {
-  list-style: none;
-  margin: 0 0 var(--sp-3);
-  padding: 0;
-  height: min(55vh, 480px);
-  overflow-y: auto;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--r-m);
-  background: var(--inset);
-}
-#log li { padding: 0.4rem 0.65rem; border-bottom: 1px solid var(--border-soft); white-space: pre-wrap; word-break: break-word; }
-#log li:last-child { border-bottom: none; }
-#log li.me  { color: var(--accent); }
-#log li.peer { color: var(--fg); }
-#log li.sys  { color: var(--muted); font-style: italic; }
-#log li .who { font-size: 0.72rem; color: var(--muted); margin-right: 0.4rem; }
-
-.hint { font-size: 0.84rem; color: var(--muted); margin: 0.5rem 0 0; min-height: 1em; }
-.hint.err { color: var(--err); }
-.hint.ok { color: var(--ok); }
-
-/* Destructive: tinted outline rather than a solid red block. It still reads as
-   "this one is different" without competing with the primary action — every
-   danger button here is already confirm-gated in app.js. */
-button.danger {
-  background: color-mix(in srgb, var(--err) 10%, transparent);
-  border-color: color-mix(in srgb, var(--err) 45%, transparent);
-  color: #ff9c93;
-}
-button.danger:hover {
-  background: color-mix(in srgb, var(--err) 18%, transparent);
-  border-color: var(--err);
-  color: #ffb3ab;
-}
-
-/* Safety number: large, grouped, easy to read aloud and compare in person. */
-.safety {
-  font-size: 1.05rem;
-  letter-spacing: 0.06em;
-  line-height: 1.75;
+.alg-card:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: -2px; }
+.alg-name {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  font-weight: 600;
   color: var(--fg);
-  background: var(--inset);
-  border: 1px solid var(--border);
-  border-radius: var(--r-m);
-  padding: var(--sp-3) var(--sp-4);
-  margin: 0.25rem 0;
-  word-break: break-word;
 }
+.alg-card:has(input:checked) .alg-name { color: var(--accent-2); }
+/* The description is a cipher spec — monospace, so it reads as one. */
+.alg-desc { font-size: var(--fs-1); color: var(--muted); }
 
-/* Loud banner when a pinned contact's identity key has changed. */
-#verify.changed { border-color: var(--err); }
-#verify.changed #verifyTitle { color: var(--err); }
-
-/* One-time-pad panel. */
-#otpPanel { margin-bottom: 0.85rem; }
-#otpTools { margin-top: 0.6rem; border: 1px solid var(--border-soft); border-radius: var(--r-s); padding: 0.5rem 0.7rem; background: var(--inset); }
-#otpTools summary { cursor: pointer; font-size: 0.82rem; color: var(--accent); }
-.otp-sub { margin-top: 0.8rem; padding-top: 0.7rem; border-top: 1px solid var(--border-soft); }
-.otp-sub:first-of-type { border-top: none; }
-.otp-entropy { display: block; width: 100%; max-width: 340px; height: 90px; background: var(--panel); border: 1px dashed var(--border); border-radius: var(--r-s); touch-action: none; cursor: crosshair; }
-#otpForget { margin-left: 0.5rem; }
-
-/* In-place unlock row shown in a locked Profile / Users / Chats view. */
-.unlock-row { margin-top: var(--sp-3); }
-.unlock-row input { flex: 1; min-width: 0; }
-
-/* "Your handle" share block in the Users view */
-.myhandle { padding: 0.65rem 0.8rem; background: var(--inset); border: 1px solid var(--border-soft); border-radius: var(--r-m); }
-
-/* Invite QR in the Profile view: white quiet-zone card, pixelated upscale so
-   the small module grid stays crisp when enlarged. */
-.profile-qr {
-  display: block;
-  width: 200px;
-  max-width: 100%;
-  height: auto;
-  image-rendering: pixelated;
-  background: #fff;
-  padding: 10px;
-  border-radius: var(--r-s);
-  border: 1px solid var(--border);
-  box-shadow: var(--shadow-1);
+/* 5.11 Locked card: the same gate on Profile, Users and Chats, as wide as
+   the column — one line behind a padlock (and its "?"), passphrase + Unlock
+   on one line, a status line. */
+.locked { padding: var(--sp-5); }
+.locked > .lead {
+  position: relative;
+  padding-left: calc(20px + var(--sp-3));
+  font-size: var(--fs-3);
+  line-height: 1.5;
+  color: var(--fg);
 }
-#myHandleText { word-break: break-all; margin: 0.3rem 0; }
+.locked > .lead > .hint { font-size: inherit; color: inherit; }
+.locked > .lead::before {
+  --icon: var(--i-lock);
+  position: absolute;
+  top: 2px;
+  left: 0;
+  width: 20px;
+  height: 20px;
+  color: var(--muted);
+}
+.locked > button { align-self: flex-start; }
+/* "Open anyway" and its "?" (the benign reasons); gone with the button. */
+.adopt-row:has(> button[hidden]) { display: none; }
 
-/* ---- shared display components ------------------------------------------
-   Small pieces the Profile/Users/Chats views share, so the same kind of
-   information looks the same everywhere. */
-
-/* Key/value grid: a sans label column against monospace values. Replaces the
-   "Label:" + one long joined sentence pattern the Profile view used. */
+/* 5.12 Key/value grid: a sans label column against monospace values, ruled
+   like a table. */
 .kv {
   display: grid;
-  grid-template-columns: minmax(5.5rem, auto) 1fr;
-  gap: 0.3rem 0.9rem;
-  margin: 0.4rem 0 0;
-  font-size: 0.8rem;
+  grid-template-columns: minmax(96px, max-content) 1fr;
+  font-size: var(--fs-2);
 }
-.kv dt { color: var(--muted); }
-.kv dd { margin: 0; color: var(--fg); word-break: break-word; }
+.kv dt,
+.kv dd { padding: var(--sp-3) 0; border-top: 1px solid var(--border-soft); }
+.kv dt { padding-right: var(--sp-5); color: var(--muted); }
+.kv dd { color: var(--fg); overflow-wrap: anywhere; }
 
-/* Status chips: state as a row of discrete pills instead of a `·`-joined line,
-   so "registered" vs "not registered" is legible at a glance. */
-.chips { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.4rem; }
-.chip {
-  font-size: 0.7rem;
-  font-weight: 500;
-  color: var(--muted);
-  background: var(--panel-2);
-  border: 1px solid var(--border-soft);
-  border-radius: 999px;
-  padding: 0.15rem 0.6rem;
-  white-space: nowrap;
-}
-.chip.on {
-  color: var(--ok);
-  border-color: color-mix(in srgb, var(--ok) 45%, transparent);
-  background: color-mix(in srgb, var(--ok) 10%, transparent);
-}
-.chip.off { color: var(--muted); }
-
-/* Empty state: a centered line in the well where the list will appear, so an
-   empty Users/Chats view looks deliberate rather than broken. */
-.userlist li.empty {
-  border: 1px dashed var(--border);
-  background: none;
-  text-align: center;
-  color: var(--muted);
-  font-size: 0.8rem;
-  padding: var(--sp-5) var(--sp-4);
-  line-height: 1.6;
-}
-.empty .empty-title { display: block; color: var(--fg); font-size: 0.88rem; font-weight: 550; margin-bottom: 0.25rem; }
-
-/* Trust legend: three aligned items instead of one run-on paragraph. */
-.legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.3rem 1.1rem;
-  margin: var(--sp-3) 0 0;
-  padding-top: var(--sp-3);
-  border-top: 1px solid var(--border-soft);
-  font-size: 0.78rem;
-  color: var(--muted);
-}
-.legend-item { display: flex; align-items: baseline; gap: 0.35rem; }
-.legend-item b { color: var(--fg); font-weight: 550; }
-
-/* Profile identity head: the one place the user's own name should be big. */
-.idhead { display: flex; align-items: center; gap: 0.8rem; margin-bottom: var(--sp-4); }
-.avatar {
-  flex: 0 0 auto;
-  width: 44px; height: 44px;
+/* 5.13 Identity head: the one place the user's own name is big. The avatar
+   disc is the same one the lists draw at 40px (5.6). */
+.idhead { display: flex; align-items: center; gap: var(--sp-4); }
+.avatar,
+.userlist > li::before {
+  flex: none;
   display: grid;
   place-items: center;
   border-radius: 50%;
-  background: var(--accent-soft);
-  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
-  color: var(--accent);
   font-family: var(--font-mono);
-  font-size: 1.1rem;
   font-weight: 650;
+  line-height: 1;
   text-transform: uppercase;
-}
-.idhead-text { min-width: 0; }
-.idhead-name { font-size: 1rem; font-weight: 600; margin: 0; word-break: break-word; }
-.idhead-name.none { color: var(--muted); font-weight: 400; font-size: 0.9rem; }
-.idhead-sub { font-family: var(--font-mono); font-size: 0.76rem; color: var(--muted); margin: 0.1rem 0 0; word-break: break-all; }
-/* Without `.ok` this holds the "register a username first" sentence, not a
-   handle — prose belongs in the UI face. */
-.idhead-sub:not(.ok) { font-family: var(--font-ui); }
-
-/* Progressive disclosure for the encryption picker: the default is safe, so the
-   choice is available without being the first thing a newcomer must decide. */
-#algDetails > summary {
-  cursor: pointer;
-  font-size: 0.84rem;
-  font-weight: 550;
   color: var(--fg);
-  padding: 0.45rem 0;
-  list-style-position: inside;
+  background: var(--panel-2);
+  border: 1px solid var(--border-soft);
 }
-#algDetails > summary:hover { color: var(--accent); }
-#algDetails > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-#algDetails[open] > summary { margin-bottom: var(--sp-2); }
-/* The step heading takes focus on navigation; never show a stray outline for it. */
-.step[tabindex]:focus { outline: none; }
-.step[tabindex]:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.avatar { width: 56px; height: 56px; font-size: var(--fs-6); }
+.idhead-text { min-width: 0; }
+.idhead-name { overflow-wrap: anywhere; }
+.idhead-name.none { font-size: var(--fs-4); font-weight: 500; color: var(--muted); }
+.idhead-sub {
+  margin-top: var(--sp-1);
+  font-size: var(--fs-2);
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+/* Invite QR: a white card with an 8px quiet zone; the small module grid is
+   upscaled with hard pixels so it stays crisp. */
+.profile-qr {
+  display: block;
+  width: 176px;
+  max-width: 100%;
+  height: auto;
+  padding: var(--sp-2);
+  image-rendering: pixelated;
+  background: var(--paper);
+  border-radius: var(--r-m);
+}
+
+/* ---- 6. Views ------------------------------------------------------------ */
+
+
+/* Live room, step 1. The first-run line (and its "?" with the three facts)
+   shows only while there is no identity yet: once one exists the status
+   line under the title says where you are. */
+#scrIdentity:not(:has(#idCreate:not([hidden]))) .id-pitch { display: none; }
+.facts { display: grid; gap: var(--sp-2); padding: 0; list-style: none; }
+.facts li { display: flex; align-items: center; gap: var(--sp-3); }
+.facts li::before { width: 16px; height: 16px; color: var(--fg); }
+.fact-key { --icon: var(--i-key); }
+.fact-relay { --icon: var(--i-relay); }
+.fact-person { --icon: var(--i-people); }
+/* The status line is the screen's one line under the title: "Unlocked."
+   quietly, behind a green dot (errors keep their icon, 5.2). */
+#identity > #idStatus:not(:empty) { margin-top: calc(-1 * var(--sp-3)); }
+#identity > #idStatus.ok::before {
+  width: 8px;
+  height: 8px;
+  margin: 7px 2px 0;
+  border-radius: 50%;
+  -webkit-mask: none;
+  mask: none;
+  background: var(--ok);
+}
+/* The fingerprint row (label + "?" + well) exists only with an identity. */
+.fp-row:has(> #idFingerprint[hidden]) { display: none; }
+#identity .actions { flex-wrap: wrap; }
+#identity .actions > button { flex: 1 1 auto; }
+/* Copy backup is a quiet ghost on the column's edge, never full width. */
+#identity .actions > .ghost { flex: none; margin-left: calc(-1 * var(--sp-3)); padding: 0 var(--sp-3); }
+/* Forget (a locked identity whose passphrase is lost): the quiet last line
+   of the locked screen, a text-style danger ghost. Unlocked, it lives on
+   Profile, so this one steps aside even where app.js un-hides it. */
+#identity > #idForget {
+  order: 2;
+  align-self: flex-start;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: 0 var(--sp-1);
+  margin: calc(-1 * var(--sp-2)) 0 0 calc(-1 * var(--sp-3));
+  padding: 0 var(--sp-3);
+  white-space: normal;
+  text-align: left;
+  font-weight: 500;
+  color: var(--err-fg);
+  background: transparent;
+  border-color: transparent;
+}
+#identity > #idForget:hover { background: color-mix(in srgb, var(--err) 8%, transparent); }
+#idForget > .forget-q { color: var(--muted); }
+#scrIdentity:has(#idUnlock[hidden]) #idForget { display: none; }
+/* An error on this step (a wrong passphrase above all) is written where the
+   user acted: under Create / Unlock, right above the Forget line it may lead
+   to. The neutral status keeps its place under the title. */
+#identity > #idStatus.err:not(:empty) { order: 1; margin-top: calc(var(--sp-2) - var(--gap)); }
+#account > .hint:not(:empty) { margin-top: calc(var(--sp-2) - var(--gap)); }
+#account > .row[hidden] + .hint:not(:empty) { margin-top: 0; }
+#login { margin-left: calc(-1 * var(--sp-1)); }
+
+/* Forward navigation sits at the end of the screen. Without an identity the
+   "continue anyway" button is a fallback, so it drops to a ghost. A label
+   that no longer fits (large system text) wraps instead of leaving the
+   screen. */
+.nav { display: flex; justify-content: flex-end; }
+.nav > button { flex: 1 1 auto; min-width: 0; white-space: normal; }
+#toRoom:not(.primary) { color: var(--muted); border-color: transparent; }
+#toRoom:not(.primary):hover { color: var(--fg); background: var(--panel-2); }
+.nav.back { justify-content: flex-start; }
+.nav.back > button { flex: none; margin-left: calc(-1 * var(--sp-2)); padding: 0 var(--sp-2); }
+/* Step 2's way back sits above the header, where "back" is looked for; the
+   markup keeps it last so the tab order still runs through the form first. */
+#scrRoom > .nav.back { order: -1; margin-bottom: calc(var(--sp-2) - var(--gap)); }
+
+/* Live room, step 2: the chat code as a well. 64 hex characters do not fit
+   a phone's width, so there, while the field is not being edited, its end
+   fades out (a gradient over the inner edge) instead of cutting a glyph in
+   half. Wider, the whole code shows (a window too narrow for it ends in
+   "…", the fields' default). */
+#room { letter-spacing: 0.02em; }
+.code-row { position: relative; }
+@media (max-width: 600px) {
+  #room { text-overflow: clip; }
+  .code-row:not(:focus-within)::after {
+    content: "";
+    position: absolute;
+    top: 1px;
+    right: 1px;
+    width: var(--sp-7);
+    height: calc(var(--control-h) - 2px);
+    border-radius: 0 var(--r-s) var(--r-s) 0;
+    background: linear-gradient(90deg, transparent, var(--inset) 60%);
+    pointer-events: none;
+  }
+}
+.code-row > button { flex: 0 1 auto; }
+/* "Expecting a specific person?" is optional, so it is a collapsed row; with
+   a mode that needs no identity app.js hides #contactRow, and the row goes. */
+#expectRow:has(> #contactRow[hidden]) { display: none; }
+/* Closed again with a handle in it, the row still says a value is set. */
+#expectRow:not([open]):has(#contact:not(:placeholder-shown)) > summary::before {
+  content: "Set ·";
+  flex: none;
+  white-space: nowrap;
+  color: var(--ok);
+  font-weight: 600;
+}
+#contactRow { display: grid; gap: var(--sp-2); padding: var(--sp-4); }
+#contactRow > .qline { margin: 0; }
+.connect-row { flex-wrap: wrap; gap: var(--sp-3); }
+.connect-row > .primary { flex: 1 1 auto; }
+/* A refusal written to step 1 or 2 must be seen where it is written: if the
+   line is below the fold (or would sit under the tab bar), it sticks to the
+   bottom of the screen, above the bar, on its own ground (pentest P2). */
+:is(#idHint, #roomHint).err:not(:empty) {
+  position: sticky;
+  bottom: calc(var(--tabbar-space) + var(--sp-2));
+  z-index: 1;
+  padding: var(--sp-2) var(--sp-3);
+  color: var(--err-fg);
+  background:
+    linear-gradient(color-mix(in srgb, var(--err) 10%, transparent) 0 0),
+    var(--bg);
+  border: 1px solid color-mix(in srgb, var(--err) 40%, transparent);
+  border-radius: var(--r-s);
+}
+/* Sections of a screen, not cards: a hairline and space above them. */
+#otpPanel,
+#account,
+#myHandleRow {
+  padding: var(--sp-5) 0 0;
+  background: none;
+  border: 0;
+  border-top: 1px solid var(--border-soft);
+  border-radius: 0;
+  box-shadow: none;
+}
+#otpPanel { --gap: var(--sp-4); }
+#otpPanel > .hint:not(:empty) { margin-top: calc(var(--sp-2) - var(--gap)); }
+#otpTools > summary { min-height: var(--control-h); font-size: var(--fs-2); }
+.otp-sub {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+}
+.otp-sub + .otp-sub { border-top: 1px solid var(--border-soft); }
+.otp-sub > label { margin-bottom: calc(var(--sp-2) - var(--sp-3)); }
+.otp-entropy {
+  display: block;
+  width: 100%;
+  max-width: 340px;
+  height: 90px;
+  background: var(--panel);
+  border: 1px dashed var(--border);
+  border-radius: var(--r-s);
+  touch-action: none;
+  cursor: crosshair;
+}
+
+/* Live room, step 3: the chat window. On a phone its bar is ONE row: the
+   room id over the connection pill on the left (the window's title), then
+   Copy as a quiet 44px icon right next to the id it copies, then Disconnect
+   in words — the way out of a session keeps its label (four 16px labels do
+   not fit one row at 360px). Copy keeps its words for assistive tech, and
+   app.js still swaps them for "Copied ✓". Below 360px Disconnect becomes an
+   icon too. Section 7 sets the bar on one line with words. */
+#scrChat .topbar {
+  display: grid;
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr) auto auto;
+  grid-template-areas:
+    "id     id       copy leave"
+    "status verified copy leave";
+  align-items: center;
+  gap: 2px var(--sp-1);
+  padding: var(--sp-2) var(--sp-1) var(--sp-1) var(--sp-4);
+}
+#scrChat .topbar .roomid {
+  grid-area: id;
+  justify-self: start;
+  max-width: 100%;
+  padding: 0;
+  color: var(--fg);
+  background: none;
+  border: 0;
+  border-radius: 0;
+}
+/* The pill never wraps inside itself: a status too long for its column
+   ends in "…" (a block, so text-overflow applies; the dot goes inline). */
+#scrChat .topbar .status:not(:empty) {
+  display: block;
+  grid-area: status;
+  justify-self: start;
+  min-width: 0;
+  max-width: 100%;
+  line-height: calc(var(--pill-h) - 2px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#scrChat .topbar .status::before {
+  display: inline-block;
+  margin-right: var(--sp-2);
+  vertical-align: middle;
+}
+#copyRoom {
+  --icon: var(--i-copy);
+  grid-area: copy;
+  width: var(--control-h);
+  padding: 0;
+  font-size: 0;
+}
+#copyRoom::before,
+#disconnect::before { width: 20px; height: 20px; }
+#disconnect { --icon: var(--i-leave); grid-area: leave; padding: 0 var(--sp-3); }
+#disconnect::before { display: none; }
+@media (max-width: 359px) {
+  #disconnect { width: var(--control-h); padding: 0; font-size: 0; }
+  #disconnect::before { display: block; }
+}
+/* Verified in person (app.js B2): a pill beside the connection pill. On a
+   phone it is the icon and "verified" without the level dots; " in person"
+   is clipped like `.vh`, so it is still read out. From 360 to 389px, where
+   Disconnect still has its word, only the icon fits: the words stay for
+   assistive tech, as #copyRoom's do. Section 7 shows the pill in full. */
+#chatVerified {
+  grid-area: verified;
+  justify-self: start;
+  max-width: 100%;
+  overflow: hidden;   /* an unexpectedly wide font clips it, never overlaps Copy */
+  white-space: nowrap;
+}
+@media (max-width: 600px) {
+  #chatVerified::after { display: none; }
+  /* #chatVerified > .vh-narrow is clipped by the phone wordmark rule below. */
+}
+@media (min-width: 360px) and (max-width: 389px) {
+  #chatVerified { gap: 0; padding: 0 var(--sp-2); font-size: 0; }
+}
+/* Once verified, green belongs to "verified" alone: "connected" steps down
+   to a neutral pill that keeps only its green dot (design review H2). */
+#scrChat:has(#chatVerified:not([hidden])) #chatStatus.ok {
+  color: var(--muted);
+  background: transparent;
+  border-color: var(--border-soft);
+}
+#scrChat:has(#chatVerified:not([hidden])) #chatStatus.ok::before { background: var(--ok); box-shadow: none; }
+/* The sheet's quiet way out (pentest P3): a ghost (muted until hovered)
+   centred under the decision pair — it decides no knock. */
+#admitLeave {
+  align-self: center;
+  margin-top: calc(var(--sp-1) - var(--gap));
+}
+.convo {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+/* While the gate is up the log and composer step aside (and the hint line
+   is clipped: see "Warning states" in 5.9). */
+#scrChat:has(> #verify:not([hidden])) #chat { flex: none; }
+#scrChat:has(> #verify:not([hidden])) :is(#log, #sendForm) { display: none; }
+#peerFingerprint { font-size: var(--fs-1); letter-spacing: 0.02em; max-width: 44ch; }
+#admitFingerprint { margin: 0; }
+#admitWho { font-size: var(--fs-2); color: var(--muted); }
+
+/* Users: your handle as a section (the handle, a Copy icon, "Invite link"),
+   add-by-handle as one line, then the list under its own label, whose "?"
+   holds what the marks mean. */
+#myHandleText { font-size: var(--fs-3); overflow-wrap: anywhere; }
+#myHandleText.ok { color: var(--fg); }
+.myhandle > .hint:not(:empty) { margin-top: 0; }
+/* The handle, then ONE row with its two quiet actions: Copy handle (icon +
+   words — an icon alone beside "Invite link" read as that link's icon) and
+   Invite link. The copy result also shows in the icon: a check, or the alert. */
+#myHandleActions { gap: var(--sp-1); margin: var(--sp-1) 0 0 calc(-1 * var(--sp-3)); }
+#myHandleActions > button { padding: 0 var(--sp-3); color: var(--muted); border-color: transparent; }
+#myHandleActions > button:hover { color: var(--fg); background: var(--panel-2); border-color: transparent; }
+#copyHandle { --icon: var(--i-copy); }
+#copyHandle::before { width: 16px; height: 16px; }
+#copyHandle.copied { color: var(--ok); }   /* its words say "Copied ✓" */
+#copyHandle.copy-failed { --icon: var(--i-alert); color: var(--err); }
+/* Add stays the primary but reads as not-yet while there is nothing to add;
+   it is still clickable (app.js says what a handle looks like). */
+.inline:has(> #addHandle:placeholder-shown) > #addContact { opacity: 0.45; box-shadow: none; }
+.list > #userList { margin-top: var(--sp-1); }
+
+/* Chats: rows open a conversation. */
+.chatrow { cursor: pointer; }
+.chatrow:hover { background: var(--panel-2); }
+/* A row is a keyboard stop (app.js B4): the ring sits inside it, where the
+   list's edges cannot clip it, on the hover ground. */
+.chatrow:focus-visible { outline-offset: -2px; background: var(--panel-2); }
+.chatrow .u-fp {
+  font-family: var(--font-ui);
+  font-size: var(--fs-2);
+  letter-spacing: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The picker's placeholder alone means there is no one to open a chat with:
+   Open then looks disabled (app.js ignores it without a pick anyway). */
+.inline:has(> #chatNew > option:only-child) > #chatStart { opacity: 0.45; pointer-events: none; }
+/* In a conversation the view becomes the window: the header gives way and
+   the conversation takes the height that is left. */
+#viewChats:has(#chatsUnlocked:not([hidden]) #chatConvo:not([hidden])) { height: var(--stage-h); min-height: 0; }
+#viewChats:has(#chatsUnlocked:not([hidden]) #chatConvo:not([hidden])) > .screenhead { display: none; }
+#viewChats:has(#chatsUnlocked:not([hidden]) #chatConvo:not([hidden])) :is(#chatsPanel, #chatsUnlocked) {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+#chatConvo { flex: 1 1 auto; height: auto; min-height: 0; }
+#viewChats:has(#chatsUnlocked:not([hidden]) #chatConvo:not([hidden])) #chatsUnlocked { --gap: 0px; }
+#viewChats:has(#chatsUnlocked:not([hidden]) #chatConvo:not([hidden])) #chatsStatus:not(:empty) { margin-bottom: var(--sp-2); }
+/* Head: back, then the name — never cut short: it wraps before it would be
+   truncated — then the trust mark, the mode, the mode picker, flowing onto
+   the next line as the width runs out (on a phone: name + mark, then the
+   picker). A key-changed mark is a sentence: it always takes a full line of
+   its own under the name. The back button sits in the head's left padding,
+   level with the first line. */
+.convo-head {
+  position: relative;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-2);
+  padding: var(--sp-2) var(--sp-3) var(--sp-2) calc(var(--sp-1) + var(--control-h) + var(--sp-2));
+}
+/* The back button keeps its "‹" for assistive tech; a chevron is drawn. */
+#chatBack {
+  --icon: var(--i-back);
+  position: absolute;
+  top: var(--sp-2);
+  left: var(--sp-1);
+  width: var(--control-h);
+  padding: 0;
+  font-size: 0;
+}
+#chatBack::before { width: 20px; height: 20px; }
+#chatPeer {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  min-width: min(12ch, 100%);
+  min-height: var(--control-h);
+  font-size: var(--fs-4);
+}
+#chatPeerMark.changed { flex-basis: 100%; }
+/* The mode picker, as a chip: a full-size control (44px, 16px text on a
+   phone) in the pill shape, as wide as the mode it shows. It always shows
+   the current mode, so a second "SEALED" chip beside it is noise. */
+.convo-head #chatMode { display: none; }
+#chatModeSel {
+  flex: none;
+  width: auto;
+  max-width: 100%;
+  field-sizing: content;
+  padding: 0 var(--sp-6) 0 var(--sp-3);
+  border-radius: var(--r-pill);
+  background-color: var(--panel-2);
+  border-color: var(--border-soft);
+}
+/* A pending mode switch sits above the composer (after the log), in warn. */
+#chatLog { order: 1; }
+.pending {
+  order: 2;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  font-size: var(--fs-2);
+  color: var(--warn-fg);
+  background: color-mix(in srgb, var(--warn) 10%, var(--panel));
+  border-top: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+}
+.pending > span { flex: 1 1 100%; }
+/* Declining a mode switch is not destructive: app.js marks it `.danger`,
+   the bar shows it as an ordinary secondary next to Accept. */
+.pending > .danger { color: var(--fg); background: transparent; border-color: var(--border); }
+.pending > .danger:hover { background: var(--panel-2); border-color: var(--muted); }
+#chatForm { order: 3; }
+#chatHint { order: 4; }
+
+/* Profile. */
+#profileHandleActions { margin-top: calc(var(--sp-2) - var(--gap)); }
+.row.why-row.qr-row { row-gap: var(--sp-3); }
+/* The key details are for the curious: a collapsed row. */
+.tech > .kv { padding: 0 var(--sp-4) var(--sp-1); }
+.tech > .kv > dt:first-of-type,
+.tech > .kv > dt:first-of-type + dd { border-top: 0; }
+#profileUnlocked .actions { padding-top: var(--sp-5); border-top: 1px solid var(--border-soft); }
+#profileUnlocked .actions > button { flex: 1 1 auto; }
+/* Sign out is a ghost with its "?" (#profileSessionHint) right after it;
+   Forget (danger) comes last, on its own. */
+#profileUnlocked .actions > #profileLogout { flex: none; }
+@media (max-width: 600px) {
+  #profileUnlocked .actions > #profileExport { flex-basis: 100%; }
+  #profileLogout { margin-left: calc(-1 * var(--sp-4)); }
+}
+/* Forget identity: last, separated, a quiet red word (confirm-gated). */
+.forget-row { display: flex; padding-top: var(--sp-2); }
+#profileForget {
+  margin-left: calc(-1 * var(--sp-3));
+  padding: 0 var(--sp-3);
+  color: var(--err-fg);
+  background: transparent;
+  border-color: transparent;
+}
+#profileForget:hover { background: color-mix(in srgb, var(--err) 8%, transparent); border-color: transparent; }
+
+/* ---- 7. Media ------------------------------------------------------------ */
+
+/* Phone only. Inside a chat window the window IS the screen: the wordmark
+   bar gives way (its h1 stays for assistive tech), and in a conversation —
+   which has its own back button — so does the tab bar. The live room keeps
+   the tab bar: it is the way out of a room you are waiting in. */
+@media (max-width: 600px) {
+  :root:has(main > #viewLive:not([hidden]) > #scrChat:not([hidden])),
+  :root:has(main > #viewChats:not([hidden]) #chatsUnlocked:not([hidden]) #chatConvo:not([hidden])) {
+    --bar-h: 0px;
+  }
+  :root:has(main > #viewChats:not([hidden]) #chatsUnlocked:not([hidden]) #chatConvo:not([hidden])) {
+    --tabbar-space: env(safe-area-inset-bottom, 0px);
+  }
+  body:has(main > #viewLive:not([hidden]) > #scrChat:not([hidden])) .apphead,
+  body:has(main > #viewChats:not([hidden]) #chatsUnlocked:not([hidden]) #chatConvo:not([hidden])) .apphead {
+    border-bottom: 0;
+  }
+  body:has(main > #viewLive:not([hidden]) > #scrChat:not([hidden])) .apphead .wordmark,
+  body:has(main > #viewChats:not([hidden]) #chatsUnlocked:not([hidden]) #chatConvo:not([hidden])) .apphead .wordmark,
+  #chatVerified > .vh-narrow {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  body:has(main > #viewChats:not([hidden]) #chatsUnlocked:not([hidden]) #chatConvo:not([hidden])) .tabbar {
+    display: none;
+  }
+
+  /* The composer's hint is one quiet line unless it is an error. */
+  :is(#chatHint, #hint):not(.err) {
+    overflow: hidden;
+    font-size: var(--fs-1);
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  .qr-well > .profile-qr { width: 224px; margin-inline: auto; }
+}
+
+/* A short phone viewport (the soft keyboard is up, or a landscape phone):
+   the tabs stay — they are the only navigation there is — as a 44px row of
+   icons, so the fields and the composer keep the room. The labels are
+   clipped like `.vh`, so every tab keeps its name. Nothing here depends on
+   focus: a bar that came back when a field lost focus moved the button
+   under the finger between touch-down and click, and the first tap on Send
+   or Connect was lost (cold review, round 2). */
+@media (max-width: 600px) and (max-height: 560px) {
+  :root { --tab-h: calc(var(--control-h) + 1px); }  /* 44px tabs under the 1px top border */
+  /* Labels are clipped, so hue alone marked the current tab (cold review, round 3):
+     a 2px accent bar along the top of the tab says it at 5:1 as well. */
+  .tabbar .navitem { position: relative; }
+  .tabbar .navitem[aria-current="page"]::after {
+    content: "";
+    position: absolute;
+    inset: 0 var(--sp-3) auto;
+    height: 2px;
+    border-radius: 0 0 2px 2px;
+    background: var(--accent);
+  }
+  .tabbar .navlabel {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+
+/* Wider than a phone: the tabs move into a translucent sticky top bar with a
+   2px indicator under the current one, controls tighten to 40px/15px, and
+   rows that stacked sit side by side again. */
+@media (min-width: 601px) {
+  :root {
+    --gutter: var(--sp-5);
+    --bar-h: 56px;
+    --sticky-top: var(--bar-h);
+    --tabbar-space: 0px;
+    --main-pt: var(--sp-6);
+    --main-pb: var(--sp-7);
+    --stage-pt: var(--main-pt);
+    --stage-pb: var(--main-pb);
+    --control-h: 40px;
+    --control-fs: var(--fs-3);
+  }
+
+  /* Views of different length do not shift sideways when a scrollbar comes
+     and goes (phones overlay their scrollbars, so this is desktop only). */
+  html { scrollbar-gutter: stable; }
+
+  .apphead {
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    background: var(--bar-bg);
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+  }
+  /* The bar, the column and a chat window share one width and one left
+     edge; forms keep a reading width on that edge (below). */
+  .apphead-inner { max-width: var(--content-wide); }
+  .wordmark { font-size: var(--fs-4); }
+  .tabbar {
+    position: static;
+    display: flex;
+    gap: var(--sp-1);
+    height: 100%;
+    margin-left: auto;
+    padding: 0;
+    background: none;
+    border: 0;
+  }
+  .tabbar .navitem {
+    position: relative;
+    flex-direction: row;
+    gap: var(--sp-2);
+    height: 100%;
+    padding: 0 var(--sp-3);
+    font-size: var(--fs-3);
+  }
+  .navicon { width: 20px; height: 20px; padding: 0; }
+  .tabbar .navitem[aria-current="page"] { color: var(--fg); }
+  .tabbar .navitem[aria-current="page"] .navicon { color: var(--accent); background: none; }
+  .tabbar .navitem[aria-current="page"]::after {
+    content: "";
+    position: absolute;
+    inset: auto var(--sp-3) -1px;
+    height: 2px;
+    border-radius: 2px 2px 0 0;
+    background: var(--accent);
+  }
+
+  /* Content takes the column (832 inside the bar's 880): the Chats and
+     Users lists and a chat window share both its edges, so opening a chat
+     does not jump the page wider. A form keeps its reading width (632) on
+     the same left edge — the Live room steps, Profile, the locked cards, the
+     add and pick rows above a list — so every screen starts at the x of the
+     wordmark. */
+  main { max-width: var(--content-wide); }
+  .screen:not(.window),
+  #viewProfile,
+  .locked,
+  #usersUnlocked > .row:not(.panel),
+  #chatListWrap > .row { max-width: calc(var(--content) - 2 * var(--gutter)); }
+
+  .inline.wrap > input,
+  .inline.wrap > select { flex-basis: 240px; }
+  .inline.wrap.code-row > input { flex-basis: 100%; }  /* the code gets its own line */
+
+  .panel { padding: var(--sp-5); }
+  .window,
+  #viewChats:has(#chatsUnlocked:not([hidden]) #chatConvo:not([hidden])) { min-height: 360px; }
+  .window {
+    margin-inline: 0;
+    border: 1px solid var(--border-soft);
+    border-radius: var(--r-l);
+    box-shadow: var(--shadow-1);
+  }
+
+  /* Forward buttons keep their own width, and every forward action sits on
+     the column's left edge, screen after screen. */
+  #identity .actions > button,
+  .nav > button,
+  .connect-row > .primary,
+  #profileUnlocked .actions > button { flex: none; }
+  .nav { justify-content: flex-start; }
+  #profileHandleActions { padding-left: calc(56px + var(--sp-4)); }
+
+  /* Users rows keep the phone anatomy — the actions on their own line,
+     right-aligned under the fingerprint — so the text column keeps the row's
+     width: the name and its trust mark share the head line (the mark at the
+     row's right edge, above the actions) and the fingerprint stays on one
+     line. */
+  .u-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: var(--sp-1) var(--sp-3);
+  }
+  .u-head > .u-mark { justify-self: end; }
+  .u-head > .u-mark.changed { grid-column: 1 / -1; justify-self: start; }
+
+  #safetyNumber { font-size: var(--fs-6); }
+  .gate { padding: var(--sp-7) var(--sp-6); }
+  .gate .safety { --bleed: var(--sp-6); padding-block: var(--sp-4); }
+  /* On a wide window the gate reads as one left-aligned column, centred: the
+     icon, the title, its explanation, the contact's fingerprint and the two
+     buttons share one left edge; only the number's band spans the window. */
+  .gate::before,
+  .gate > .row,
+  .gate > #peerFingerprint {
+    width: 100%;
+    max-width: 30rem;
+    text-align: left;
+  }
+  .gate::before {
+    display: block;
+    -webkit-mask-position: left center;
+    mask-position: left center;
+  }
+  .gate .row > .qline { max-width: none; margin-inline: 0; }
+
+  /* The live bar on one line: room chip, Copy, the status pill, Disconnect
+     in words. Nothing in it shrinks or double-truncates; a narrow window
+     wraps it instead. */
+  #scrChat .topbar {
+    display: flex;
+    flex-wrap: wrap;
+    padding: var(--sp-2) var(--sp-4);
+  }
+  #scrChat .topbar .roomid {
+    flex: none;
+    padding: var(--sp-1) var(--sp-2);
+    color: var(--muted);
+    background: var(--inset);
+    border: 1px solid var(--border-soft);
+    border-radius: var(--r-s);
+  }
+  #scrChat .topbar .status { flex: none; margin-left: auto; }
+  #chatVerified { flex: none; }
+  #copyRoom { width: auto; padding: 0 var(--sp-3); font-size: var(--control-fs); }
+  #copyRoom::before { display: none; }
+
+  .convo-head { padding: var(--sp-2) var(--sp-4) var(--sp-2) calc(var(--sp-2) + var(--control-h) + var(--sp-3)); }
+  #chatBack { left: var(--sp-2); }
+  #chatPeerMark.changed { order: 1; }   /* name + picker on one line, the alert under both */
+  .pending > span { flex: 1 1 auto; }
+  .pending > button { padding: 0 var(--sp-3); font-size: var(--fs-2); }
+
+  /* The admission prompt is a centred dialog. */
+  .sheet {
+    inset: 0;
+    width: min(480px, calc(100% - 2 * var(--sp-5)));
+    height: fit-content;
+    max-height: calc(var(--vh) - 2 * var(--sp-7));
+    margin: auto;
+    padding: var(--sp-5);
+    border-bottom: 1px solid var(--border-soft);
+    border-radius: var(--r-l);
+  }
+
+}
+
+/* A translucent bar needs the blur; without it, fall back to solid. */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .apphead { background: var(--bg); }
+}
+
+/* Forced colours (Windows contrast themes): backgrounds are replaced by the
+   theme's Canvas, which would paint every mask icon invisible. The icons opt
+   out and take the text colour (buttons: the button text colour), so the
+   back and send buttons are never empty. Not the trust dots: a solid fill
+   would show three dots for every level — the words carry the level. */
+@media (forced-colors: active) {
+  .u-mark::before,
+  .legend-item::before,
+  .chatmode::before,
+  .facts li::before,
+  .hint.err::before,
+  .hint.ok:not(#myHandleText)::before,
+  .u-claim::before,
+  .disclosure > summary::after,
+  .locked > .lead::before,
+  .wordmark::after,
+  .gate::before,
+  .status::before {
+    forced-color-adjust: none;
+    background: CanvasText;
+  }
+  .composer button::before,
+  #chatBack::before,
+  #copyRoom::before,
+  #copyHandle::before,
+  #disconnect::before {
+    forced-color-adjust: none;
+    background: ButtonText;
+  }
+  .composer button:disabled::before { background: GrayText; }
+  /* The current tab: its tinted pill (phone) and accent underline (wider)
+     are painted over by Canvas, so it is marked in Highlight instead — the
+     pill as an outline, the underline as itself. */
+  .tabbar .navitem[aria-current="page"],
+  .tabbar .navitem[aria-current="page"] .navicon { color: Highlight; }
+  .tabbar .navitem[aria-current="page"] .navicon { outline: 2px solid Highlight; }
+  .tabbar .navitem[aria-current="page"]::after {
+    forced-color-adjust: none;
+    background: Highlight;
+  }
+}
+@media (forced-colors: active) and (min-width: 601px) {
+  .tabbar .navitem[aria-current="page"] .navicon { outline: 0; }
+}
+
+/* Motion: short colour/border transitions, a 6px rise when a view or step
+   appears, the sheet sliding up. None of it runs for people who asked the
+   system for reduced motion. The live-room view and the chat window do not
+   move: a transform there would re-anchor the fixed admission sheet. The
+   sheet is opaque from its first frame and takes no pointer events while it
+   slides in (pentest P1: nothing transparent-but-clickable). */
+@media (prefers-reduced-motion: no-preference) {
+  button,
+  input,
+  select,
+  .navicon,
+  .alg-card,
+  .chatrow,
+  .disclosure > summary,
+  .why > summary {
+    transition:
+      color var(--t-fast) ease-out,
+      background-color var(--t-fast) ease-out,
+      border-color var(--t-fast) ease-out,
+      box-shadow var(--t-fast) ease-out;
+  }
+  .disclosure > summary::after { transition: transform var(--t-move) var(--ease); }
+  .view:not(#viewLive):not([hidden]),
+  .screen:not(.window):not([hidden]) { animation: rise var(--t-move) var(--ease); }
+  .sheet:not([hidden]) { animation: sheet-in var(--t-move) var(--ease); }
+  #scrChat:has(> .sheet:not([hidden]))::before { animation: fade-in 160ms ease-out; }
+}
+@keyframes rise { from { opacity: 0; transform: translateY(6px); } }
+@keyframes sheet-in {
+  from { transform: translateY(var(--sp-5)); pointer-events: none; }
+  to { pointer-events: none; }
+}
+@keyframes fade-in { from { opacity: 0; } }

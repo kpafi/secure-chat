@@ -56,7 +56,7 @@ const els = {
   safetyNumber: $("safetyNumber"),
   // room admission (owner approves who may join)
   admit: $("admit"), admitFingerprint: $("admitFingerprint"), admitWho: $("admitWho"),
-  admitWarn: $("admitWarn"), admitOk: $("admitOk"), admitNo: $("admitNo"),
+  admitWarn: $("admitWarn"), admitOk: $("admitOk"), admitNo: $("admitNo"), admitLeave: $("admitLeave"),
   idHint: $("idHint"), roomHint: $("roomHint"), roomHelp: $("roomHelp"),
   stepIdentity: $("stepIdentity"), stepRoom: $("stepRoom"),
   copyCode: $("copyCode"), algDetails: $("algDetails"), algSummary: $("algSummary"), peerFingerprint: $("peerFingerprint"),
@@ -68,9 +68,9 @@ const els = {
   scrIdentity: $("scrIdentity"), scrRoom: $("scrRoom"), scrChat: $("scrChat"),
   toRoom: $("toRoom"), toIdentity: $("toIdentity"),
   roomShort: $("roomShort"), copyRoom: $("copyRoom"),
-  chatStatus: $("chatStatus"), disconnect: $("disconnect"),
-  // drawer menu + views
-  menuBtn: $("menuBtn"), drawer: $("drawer"), scrim: $("scrim"),
+  chatStatus: $("chatStatus"), disconnect: $("disconnect"), chatVerified: $("chatVerified"),
+  chatTop: document.querySelector("#scrChat > .topbar"), tabbar: $("tabbar"),
+  // views
   viewLive: $("viewLive"), viewUsers: $("viewUsers"), viewChats: $("viewChats"),
   viewProfile: $("viewProfile"),
   // profile view
@@ -106,7 +106,7 @@ const els = {
   chatPeerMark: $("chatPeerMark"), chatLog: $("chatLog"),
   chatForm: $("chatForm"), chatText: $("chatText"), chatSend: $("chatSend"),
   chatHint: $("chatHint"), chatMode: $("chatMode"), chatModeSel: $("chatModeSel"),
-  chatPending: $("chatPending"),
+  chatPending: $("chatPending"), chatModeWhy: $("chatModeWhy"), expectRow: $("expectRow"),
 };
 
 const enc = new TextEncoder();
@@ -218,6 +218,22 @@ function isMinted(code) {
 // vanished with the chat screen and the user was left on the room screen with
 // no idea why. The refusal parks its message here and onclose re-shows it.
 let closeHint = null;
+// Phase 2a fix round (pentest P2): every close the APP starts goes through
+// closeWs(). onclose re-shows a relay-parked reason (A3) only for a close the
+// app did NOT start — the relay's or the network's — so a parked "room closed"
+// can never relabel the user's own Disconnect or "It differs", or a client
+// refusal. `refusal`, when given, is what onclose shows (it wins over anything
+// the relay said). `sock` is the socket the refusal belongs to (a frame's own).
+let clientClosing = false;
+function closeWs(refusal = null, sock = ws) {
+  if (!sock) return;
+  // Round 3 (pentest L2): a frame handled after its socket's onclose ran (the
+  // room screen is up) — show the refusal now instead of dropping it.
+  if (sock.readyState === WebSocket.CLOSED) { if (refusal !== null && sock === ws) hint(refusal, true); return; }
+  if (refusal !== null) closeHint = refusal;
+  clientClosing = true;
+  sock.close();
+}
 let knockQueue = [];       // [{jid, bundle, anon}] waiting for our verdict
 let currentRoom = null;    // the room this connection is in (keyconfirm effects)
 // L-1: a backstop on the approval queue, NOT the control.
@@ -304,7 +320,7 @@ function savePin(key, bundle) {
 // Pentest 2026-07-27 H-1: compare the KEYS, not their spelling. `atob` used to
 // accept several base64 strings per key, so a relay flipping one character
 // produced a bundle that verified, digested and safety-numbered identically yet
-// compared UNEQUAL here — a free "⚠ identity key CHANGED" alarm on a genuine
+// compared UNEQUAL here — a free "identity key CHANGED" alarm on a genuine
 // peer, and a route to getting a non-canonical string pinned. Decoding is
 // canonical now, so `field` also rejects a re-spelled key outright; comparing
 // decoded bytes makes that independent of where the value came from.
@@ -377,34 +393,28 @@ function showScreen(name) {
 }
 let screenShown = false;
 
-// ---- drawer menu + top-level views ----------------------------------------
-// Three views: live (the 3-step room flow), users (contact list + trust),
-// chats (async DMs, later phase). Pure presentation — switching views never
-// touches an active connection.
-
-function setDrawer(open) {
-  els.drawer.hidden = !open;
-  els.scrim.hidden = !open;
-  els.menuBtn.setAttribute("aria-expanded", open ? "true" : "false");
-  if (open) {
-    const active = els.drawer.querySelector(".navitem.active");
-    if (active) active.focus();
-  }
-}
+// ---- top-level views (tab bar) ---------------------------------------------
+// Four views: live (the 3-step room flow), chats (async DMs), users (contact
+// list + trust), profile. Pure presentation — switching views never touches
+// an active connection.
 
 function showView(name) {
+  const liveWasHidden = els.viewLive.hidden;
   els.viewProfile.hidden = name !== "profile";
   els.viewLive.hidden = name !== "live";
   els.viewUsers.hidden = name !== "users";
   els.viewChats.hidden = name !== "chats";
-  for (const b of els.drawer.querySelectorAll(".navitem")) {
+  for (const b of document.querySelectorAll(".navitem")) {
     const on = b.dataset.view === name;
     b.classList.toggle("active", on);
     // Which view is current was conveyed by colour alone; say it out loud too.
     if (on) b.setAttribute("aria-current", "page");
     else b.removeAttribute("aria-current");
   }
-  setDrawer(false);
+  // An admission prompt that came in behind another view is revealed only now:
+  // it gets the same 500 ms guard and focus as a prompt that just appeared.
+  if (name === "live" && liveWasHidden && !els.admit.hidden) armAdmitGuard(admitShownFor);
+  setAdmitModal(!els.admit.hidden); // B3: modal only while the sheet is on screen
   if (name === "profile") renderProfile();
   if (name === "users") refreshUsers();
   if (name === "chats") {
@@ -442,9 +452,67 @@ function clearHints() {
   }
 }
 
+// Relay `error` frames (phase 2a, pentest pre-existing). They used to render as
+// "Server: " + reason — words the RELAY chose, shown as the app's own sentence,
+// so a hostile relay had a line in our voice ("Server: tap It matches"). The
+// honest relay only ever sends the fixed reasons in backend/main.py; each maps
+// to a sentence the client owns. Anything else gets a generic sentence, and the
+// raw reason appears only as a quoted, clipped aside on its own line — never
+// joined into our words. A Map, not an object literal: a reason such as
+// "constructor" must not find Object.prototype.
+const RELAY_REASONS = new Map([
+  ["binary frames not accepted", "The relay could not read what this app sent and closed the connection. Connect again."],
+  ["frame too large", "A message was larger than the relay accepts, so it closed the connection."],
+  ["non-ascii", "The relay only carries plain ASCII text, so it closed the connection."],
+  ["rate limited", "The relay is rate-limiting this connection — wait a moment and try again."],
+  ["bad envelope", "The relay could not read a message from this app and dropped it."],
+  ["already joined", "The relay says this connection is already in a chat."],
+  ["join timeout", "Joining took too long, so the relay closed the connection. Connect again."],
+  ["approval timeout", "The person who created this chat did not let you in within the time limit."],
+  ["idle timeout", "Nothing was sent for a long time, so the relay closed the connection. Connect again to continue."],
+  ["room full", "That chat already has two people in it."],
+  ["room closed", "The person who created this chat left, so the chat was closed."],
+  ["not waiting", "The relay says you are not waiting to be let into this chat."],
+  ["already knocked", "Your request to join was already passed on — wait for the person who created this chat."],
+  ["not in room", "The relay says you are not in this chat, so it did not pass that on."],
+  ["not the room owner", "Only the person who created this chat can let people in or turn them away."],
+  ["no such waiting peer", "That person is no longer waiting to be let in."],
+]);
+// The relay closes the socket right after these (main.py), and onclose returns
+// to the room screen, which clears every hint — the trap the refusals escape
+// through `closeHint`. These sentences are parked the same way.
+const RELAY_FATAL = new Set([
+  "binary frames not accepted", "frame too large", "non-ascii",
+  "join timeout", "approval timeout", "idle timeout", "room closed",
+]);
+let closeRelayReason = null;
+
+function relayErrorHint(reason) {
+  const known = typeof reason === "string" ? RELAY_REASONS.get(reason) : undefined;
+  hint(known || "The relay refused the request.", true);
+  if (known || typeof reason !== "string" || !reason) return;
+  // Printable ASCII only (no bidi override or line break can rearrange the
+  // line), at most 80 characters, in quotes, in an element of its own.
+  let said = reason.replace(/[^\x20-\x7e]+/g, "?");
+  if (said.length > 80) said = said.slice(0, 79) + "…";
+  const aside = document.createElement("span");
+  aside.className = "relay-said";
+  aside.textContent = `relay says: "${said}"`;
+  activeHintEl().append(aside);
+}
+
 function accountStatus(text, cls = "") {
   els.accountStatus.textContent = text;
   els.accountStatus.className = "hint" + (cls ? " " + cls : "");
+}
+
+// Phase 2b fix round, D3: once registered, the username field with Register
+// and Log in steps aside (it competed with Continue); the status line keeps
+// the handle. It comes back whenever it is the way forward again: not
+// registered, signed out, or the automatic directory login failing (Log in is
+// then the manual retry).
+function showUsernameRow(show) {
+  els.username.closest(".row").hidden = !show;
 }
 
 function addLine(kind, who, text) {
@@ -493,9 +561,9 @@ function setIdentityStatus(text, cls = "") {
 async function showIdentityUnlocked() {
   myBundle = identity.publicBundle();
   const fp = await identity.fingerprint();
-  setIdentityStatus("Identity unlocked. Your contact verifies this in person.", "ok");
+  setIdentityStatus("Unlocked.", "ok");
   els.idFingerprint.hidden = false;
-  els.idFingerprint.textContent = "Your fingerprint: " + fp;
+  els.idFingerprint.textContent = fp; // its label is static markup (with a "?")
   els.idPassRow.hidden = true;
   els.idCreate.hidden = true;
   els.idUnlock.hidden = true;
@@ -518,7 +586,8 @@ async function showIdentityUnlocked() {
   }
   if (savedName && savedToken) {
     els.username.value = savedName;
-    accountStatus(`Your contact handle: ${savedName}#${savedToken} — share it so contacts can look you up.`);
+    accountStatus(`Registered as ${savedName}#${savedToken} — share this handle.`);
+    showUsernameRow(false);
     // Async chats only DELIVER once we hold a directory session: pollMailbox
     // needs it, and it is the only way mail is ever fetched. Requiring a
     // separate "Log in" click meant a registered user could send messages that
@@ -527,8 +596,10 @@ async function showIdentityUnlocked() {
   } else if (savedName) {
     els.username.value = savedName;
     accountStatus(`Saved username: ${savedName}. Register (once) to get your shareable handle, or log in to prove control.`);
+    showUsernameRow(true);
   } else {
-    accountStatus("Optional: claim a username so contacts can look up this identity.");
+    accountStatus(""); // the "?" beside the username label explains it
+    showUsernameRow(true);
   }
 }
 
@@ -552,9 +623,9 @@ function refreshIdentityUI() {
   els.idUnlock.hidden = !stored;
   els.idForget.hidden = !stored;
   if (stored) {
-    setIdentityStatus("Your identity is locked. Enter your passphrase to unlock it.");
+    setIdentityStatus("Locked — enter your passphrase.");
   } else {
-    setIdentityStatus("No identity on this device yet. Create one so contacts can confirm it is really you.");
+    setIdentityStatus("No identity on this device yet.");
   }
 }
 
@@ -568,7 +639,7 @@ async function createIdentity() {
     setIdentityStatus("An identity already exists here. Unlock it, or Forget it first.", "err");
     return;
   }
-  setIdentityStatus("Generating identity keys (Ed25519 + ML-DSA-65)…");
+  setIdentityStatus("Generating keys…");
   try {
     identity = await Identity.generate();
     const blob = await identity.export(pass);
@@ -639,8 +710,9 @@ function wireViewUnlock(passEl, btnEl, statusFn, render) {
     // The identity opened; a store may still have refused (fix review
     // 2026-09-21: this used to print an empty, success-looking status).
     statusFn(contactsError ? "Unlocked, but: " + contactsError : "", !!contactsError);
-    // An invite link may have been waiting on the identity (Users view).
-    applyPendingInvite();
+    // An invite link waiting on the identity is applied by refreshUsers(), the
+    // Users view's render (phase 2a, pentest pre-existing): applied here first,
+    // its line was cleared by that render and the invite already consumed.
     render();
   };
   btnEl.addEventListener("click", go);
@@ -655,7 +727,7 @@ async function exportIdentity() {
   if (!blob) return;
   try {
     await navigator.clipboard.writeText(blob);
-    setIdentityStatus("Encrypted backup copied to clipboard. Keep it safe — it is useless without your passphrase.", "ok");
+    setIdentityStatus("Backup copied. It is useless without your passphrase.", "ok");
   } catch {
     setIdentityStatus("Could not access the clipboard. Backup not copied.", "err");
   }
@@ -711,7 +783,8 @@ async function registerAccount() {
     const { lookup_token } = await account.register(API_BASE, identity, username);
     localStorage.setItem(LS_USERNAME, username);
     localStorage.setItem(LS_LOOKUP_TOKEN, lookup_token);
-    accountStatus(`Registered. Your contact handle is ${username}#${lookup_token} — share it (username alone will not resolve).`, "ok");
+    accountStatus(`Registered as ${username}#${lookup_token} — share this handle.`, "ok");
+    showUsernameRow(false);
     // Registering is when a first-time user gets their handle, and it is the
     // moment they expect chats to work. Take the directory session now, or they
     // would send messages fine while silently receiving nothing until they
@@ -762,6 +835,7 @@ async function autoLogin(username) {
     const wait = Math.min(120000, 6000 * 2 ** Math.min(autoLoginFailures, 5));
     autoLoginBackoffUntil = Date.now() + wait;
     renderProfile();
+    showUsernameRow(true); // D3: the manual Log in is the fallback
     // Visible, once per failure streak, so the user is not silently offline.
     // Routed through hint(), which writes to whichever screen is actually in
     // front of the user — addLine() alone put this in the CHAT TRANSCRIPT, a
@@ -893,6 +967,10 @@ function usersStatus(text, isErr = false) {
 }
 
 function refreshUsers() {
+  // Phase 2a, pentest pre-existing: the one place the status line is cleared.
+  // renderUserList() used to clear it, which erased addContactFromHandle()'s
+  // result ("…keys DIFFER…") and the invite line below in their own render.
+  usersStatus("");
   const unlocked = contacts.isUnlocked();
   els.usersLocked.hidden = unlocked;
   els.usersUnlocked.hidden = !unlocked;
@@ -901,8 +979,7 @@ function refreshUsers() {
       ? "Contact store error: " + contactsError +
         (contactsAdoptable ? "" :
           " (Forget + recreate the identity resets it — contacts are bound to the identity passphrase.)")
-      : "Contacts are stored encrypted under your identity passphrase. " +
-        "Enter it to unlock them here.";
+      : "Locked. Enter your passphrase.";
     // F-ATREST-003/004/005: the override is offered, never taken for the user.
     els.usersAdopt.hidden = !contactsAdoptable;
     els.usersAdoptHint.hidden = !contactsAdoptable;
@@ -1046,7 +1123,7 @@ function applyPendingInvite() {
     return;
   }
   els.addHandle.value = handle;
-  usersStatus("Someone shared this handle with you — review it and click Add (you still verify them in person to trust the key).");
+  usersStatus("Handle received — review it and press Add.");
 }
 
 // A deliberate empty state in the well the list will occupy, instead of the
@@ -1073,6 +1150,7 @@ function renderUserList() {
   }
   for (const c of all) {
     const li = document.createElement("li");
+    li.dataset.initial = c.username.charAt(0); // the avatar disc (CSS attr())
 
     const head = document.createElement("div");
     head.className = "u-head";
@@ -1080,18 +1158,8 @@ function renderUserList() {
     name.className = "u-name";
     name.textContent = c.username;
     const mark = document.createElement("span");
-    let markText = "⚪ unverified", markCls = "";
-    if (c.verified) {
-      markText = "🟢 verified by you";
-      markCls = " ok";
-    } else if (c.vouchedBy && c.vouchedBy.length) {
-      // Middle trust level: someone YOU verified has published a vouch whose
-      // signature checked out against YOUR pinned copy of their keys.
-      markText = "🟡 vouched by " + c.vouchedBy.join(", ");
-      markCls = " mid";
-    }
-    mark.className = "u-mark" + markCls;
-    mark.textContent = markText;
+    // No key-changed caption here: this row says it in a sentence of its own.
+    renderMark(mark, c, false);
     head.append(name, mark);
     li.appendChild(head);
 
@@ -1108,14 +1176,14 @@ function renderUserList() {
     if (c.keyChangedAt && !c.verified) {
       const warn = document.createElement("div");
       warn.className = "hint err";
-      warn.textContent = "⚠ this user's key CHANGED since you saved them — re-verify in person before trusting";
+      warn.textContent = "this user's key CHANGED since you saved them — re-verify in person before trusting";
       li.appendChild(warn);
     } else if (c.reverify && !c.verified) {
-      // Set by the H-01 store migration: the old 🟢 was compared against a
+      // Set by the H-01 store migration: the old verified mark was compared against a
       // fingerprint that did not cover the encryption keys.
       const warn = document.createElement("div");
       warn.className = "hint err";
-      warn.textContent = "⚠ verification reset — the fingerprint format now also covers this user's encryption keys; compare it again in person";
+      warn.textContent = "verification reset — the fingerprint format now also covers this user's encryption keys; compare it again in person";
       li.appendChild(warn);
     }
 
@@ -1151,15 +1219,15 @@ function renderUserList() {
       await contacts.setVerified(c.username, !c.verified);
       let statusMsg = null, statusErr = false;
       if (!c.verified) {
-        // Just turned 🟢 — offer to publish a signed vouch so users who
-        // verified YOU can see this contact as 🟡 "vouched by you". Opt-in.
+        // Just turned verified — offer to publish a signed vouch so users who
+        // verified YOU can see this contact as "vouched by you". Opt-in.
         if (apiToken && identity && confirm(
           `Also publish a signed vouch for "${c.username}"? Anyone who has verified YOU ` +
-          "will then see them as 🟡 vouched-by-you. (This reveals publicly that you know them.)",
+          "will then see them as vouched-by-you. (This reveals publicly that you know them.)",
         )) {
           try {
             // Vouch over the FULL in-person-verified bundle incl. encryption
-            // keys (H-01) so the 🟡 mark attests the keys used to seal async
+            // keys (H-01) so the vouched mark attests the keys used to seal async
             // messages, not just the signing identity.
             await account.vouch(API_BASE, identity, apiToken, dirName(c), {
               ed: c.ed, mldsa: c.mldsa, ecdh: c.ecdh ?? null, mlkem: c.mlkem ?? null,
@@ -1176,8 +1244,8 @@ function renderUserList() {
         // Turned back to unverified — retract a published vouch if any.
         account.unvouch(API_BASE, apiToken, dirName(c)).catch(() => { /* none published */ });
       }
-      renderUserList(); // clears the status line…
-      if (statusMsg) usersStatus(statusMsg, statusErr); // …so report after
+      renderUserList();
+      usersStatus(statusMsg || "", statusErr); // this action's result replaces the last one's
     });
     const rbtn = document.createElement("button");
     rbtn.type = "button";
@@ -1186,6 +1254,7 @@ function renderUserList() {
     rbtn.addEventListener("click", async () => {
       if (!confirm(`Remove "${c.username}" (and your verification of them) from this device?`)) return;
       await contacts.remove(c.username);
+      usersStatus(""); // a line about the removed row would now be stale
       renderUserList();
     });
     row.append(vbtn, rbtn);
@@ -1193,15 +1262,14 @@ function renderUserList() {
 
     els.userList.appendChild(li);
   }
-  usersStatus("");
-  refreshVouchMarks(); // opportunistic 🟡 refresh; re-renders only on change
+  refreshVouchMarks(); // opportunistic vouched-mark refresh; re-renders only on change
 }
 
-// Refresh the 🟡 marks: fetch vouches for unverified contacts and validate
+// Refresh the vouched marks: fetch vouches for unverified contacts and validate
 // them LOCALLY — a vouch counts only if (a) the voucher is a contact YOU
 // verified in person, (b) the server-returned voucher keys equal your pinned
 // copy, and (c) the dual signature verifies over the target bundle YOU hold.
-// A lying directory therefore cannot invent a 🟡 mark.
+// A lying directory therefore cannot invent a vouched mark.
 const VOUCH_RECHECK_MS = 10 * 60 * 1000;
 let vouchRefreshRunning = false;
 
@@ -1227,7 +1295,7 @@ async function refreshVouchMarks() {
         // H-01: verify the vouch over the FULL bundle WE hold for this contact,
         // including the encryption keys. If a malicious directory swapped the
         // ecdh/mlkem it served us, the v2 vouch signature (which the in-person
-        // voucher made over the REAL enc keys) no longer matches, so no 🟡 is
+        // voucher made over the REAL enc keys) no longer matches, so no vouched mark is
         // awarded — the mark can never vouch for keys the directory forged.
         const ok = await Identity.verify(
           { ed: voucher.ed, mldsa: voucher.mldsa },
@@ -1271,8 +1339,8 @@ async function addContactFromHandle() {
   }
   // Never auto-verify from the fetched bundle: the directory is not a trust
   // root, and a pin only attests the SIGNING identity, not the encryption keys
-  // (H-01). upsert() keeps an existing 🟢 only when EVERY key (incl. ecdh/mlkem)
-  // still matches what was verified in person; any change drops it to ⚪.
+  // (H-01). upsert() keeps an existing verified mark only when EVERY key (incl. ecdh/mlkem)
+  // still matches what was verified in person; any change drops it to unverified.
   const before = contacts.get(parsed.username);
   await contacts.upsert({
     username: parsed.username, token: parsed.token,
@@ -1282,10 +1350,10 @@ async function addContactFromHandle() {
   const after = contacts.get(parsed.username);
   els.addHandle.value = "";
   usersStatus(after.verified
-    ? `Updated "${parsed.username}" — keys match what you verified in person (🟢).`
+    ? `Updated "${parsed.username}" — keys match what you verified in person.`
     : (before && before.verified
-      ? `⚠ "${parsed.username}" — the fetched keys DIFFER from what you verified; reset to ⚪. Re-verify in person.`
-      : `Added "${parsed.username}" (⚪ unverified — compare fingerprints in person to trust this key).`));
+      ? `"${parsed.username}" — the fetched keys DIFFER from what you verified; reset to unverified. Re-verify in person.`
+      : `Added "${parsed.username}" (unverified — compare fingerprints in person to trust this key).`));
   renderUserList();
 }
 
@@ -1304,14 +1372,31 @@ function chatHint(text, isErr = false) {
   els.chatHint.className = "hint" + (isErr ? " err" : "");
 }
 
-function contactMark(c) {
-  if (!c) return "⚪ not in your users list";
-  if (c.verified) return "🟢 verified by you";
-  // F-PROTO-005 (adjacent): a record whose keys changed since it was last
-  // verified says so wherever the mark is shown, not only in the Users list.
-  const changed = c.keyChangedAt ? " — key CHANGED since you last verified" : "";
-  if (c.vouchedBy && c.vouchedBy.length) return "🟡 vouched by " + c.vouchedBy.join(", ") + changed;
-  return "⚪ unverified" + changed;
+// The trust mark, drawn into `el` (a11y/design review B5). The pill holds the
+// words and the level class: ok = verified by you; mid = vouched — someone YOU
+// verified published a vouch whose signature checked out against YOUR pinned
+// copy of their keys; none = unverified / not a contact.
+// F-PROTO-005 (adjacent): a record whose keys changed since it was last
+// verified says so wherever the mark is shown. That used to be a suffix run
+// into the pill's words; it is now a caption span on its own line inside the
+// box-shaped `.changed` mark. Its " — " stays in the text, visually hidden, so
+// the mark's textContent reads exactly as it did.
+function renderMark(el, c, note = true) {
+  const vouched = !!(c && !c.verified && c.vouchedBy && c.vouchedBy.length);
+  const changed = !!(c && !c.verified && c.keyChangedAt);
+  el.className = "u-mark" + (c && c.verified ? " ok" : vouched ? " mid" : "") + (changed ? " changed" : "");
+  el.textContent = !c ? "not in your users list"
+    : c.verified ? "verified by you"
+      : vouched ? "vouched by " + c.vouchedBy.join(", ") : "unverified";
+  if (changed && note) {
+    const cap = document.createElement("span");
+    cap.className = "u-mark-note";
+    const sep = document.createElement("span");
+    sep.className = "vh";
+    sep.textContent = " — ";
+    cap.append(sep, "key CHANGED since you last verified");
+    el.append(cap);
+  }
 }
 
 function refreshChats() {
@@ -1324,23 +1409,28 @@ function refreshChats() {
     // exit was Forget identity. The Chats view now carries both.
     els.chatsLocked.querySelector("p").textContent = contactsError && identity
       ? "Chat store error: " + contactsError
-      : "Chats are stored encrypted under your identity passphrase. Enter it to unlock them here.";
+      : "Locked. Enter your passphrase.";
     els.chatsAdopt.hidden = !contactsAdoptable;
     els.chatsAdoptHint.hidden = !contactsAdoptable;
     return;
   }
   if (!apiToken) {
-    chatsStatus("You can send now; to RECEIVE messages, log in (Live room → step 1) so the mailbox can be fetched.");
+    chatsStatus("Not logged in — messages cannot arrive. Log in on step 1 of the Live room.");
   } else {
     chatsStatus("");
   }
   // "Start a chat" picker: saved users not already in the chat list.
   els.chatNew.textContent = "";
   const have = new Set(chats.list().map((c) => c.username));
-  const candidates = contacts.list().filter((c) => !have.has(c.username));
+  const saved = contacts.list();
+  const candidates = saved.filter((c) => !have.has(c.username));
   const none = document.createElement("option");
   none.value = "";
-  none.textContent = candidates.length ? "— pick a user —" : "— add users in the Users view first —";
+  // Phase 2a, pentest pre-existing: "add users first" was also shown when
+  // every saved user already had a chat open.
+  none.textContent = candidates.length ? "— pick a user —"
+    : saved.length ? "— every saved user already has a chat —"
+      : "— add users in the Users view first —";
   els.chatNew.appendChild(none);
   for (const c of candidates) {
     const o = document.createElement("option");
@@ -1356,28 +1446,35 @@ function refreshChats() {
 }
 
 function renderChatList() {
+  // C2 (a11y review): a re-render (mail arriving) replaces the rows; a row
+  // that had keyboard focus gets it back instead of dropping it to <body>.
+  const focused = els.chatList.contains(document.activeElement) ? document.activeElement.dataset.user : null;
   els.chatConvo.hidden = true;
   els.chatListWrap.hidden = false;
   els.chatList.textContent = "";
   const open = chats.list();
   if (open.length === 0) {
-    els.chatList.appendChild(emptyRow(
-      "No chats yet",
-      "Pick a saved user above and open a chat — messages are sealed end-to-end and wait on the relay until they fetch them.",
-    ));
+    els.chatList.appendChild(contacts.list().length
+      ? emptyRow("No chats yet", "Pick a user above.")
+      : emptyRow("No users yet", "Add someone in Users."));
   }
   for (const chat of open) {
     const c = contacts.get(chat.username);
     const li = document.createElement("li");
     li.className = "chatrow";
+    // B4 (a11y review): the row opens a conversation, so the keyboard reaches
+    // and operates it like the button it is.
+    li.tabIndex = 0;
+    li.setAttribute("role", "button");
+    li.dataset.initial = chat.username.charAt(0); // the avatar disc (CSS attr())
+    li.dataset.user = chat.username;              // C2: find the row again
     const head = document.createElement("div");
     head.className = "u-head";
     const name = document.createElement("span");
     name.className = "u-name";
     name.textContent = chat.username;
     const mark = document.createElement("span");
-    mark.className = "u-mark" + (c && c.verified ? " ok" : c && c.vouchedBy && c.vouchedBy.length ? " mid" : "");
-    mark.textContent = contactMark(c);
+    renderMark(mark, c);
     head.append(name, mark);
     const last = chat.messages[chat.messages.length - 1];
     const preview = document.createElement("div");
@@ -1385,14 +1482,29 @@ function renderChatList() {
     preview.textContent = last ? (last.dir === "out" ? "you: " : "") + last.text.slice(0, 60) : "no messages yet";
     li.append(head, preview);
     li.addEventListener("click", () => openChat(chat.username));
+    li.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      e.preventDefault(); // Space would scroll the list
+      openChat(chat.username);
+    });
     els.chatList.appendChild(li);
   }
+  if (focused) focusChatRow(focused);
+}
+
+// C2: focus the row for `username`, else the first row.
+function focusChatRow(username) {
+  const rows = [...els.chatList.querySelectorAll("li.chatrow")];
+  const row = rows.find((r) => r.dataset.user === username) || rows[0];
+  if (row) row.focus();
 }
 
 async function openChat(username) {
   await chats.ensure(username);
   activeChat = username;
   renderConversation();
+  // C2: the row that had focus is hidden now; continue in the conversation.
+  els.chatBack.focus();
 }
 
 function renderConversation() {
@@ -1402,8 +1514,7 @@ function renderConversation() {
   els.chatConvo.hidden = false;
   const c = contacts.get(activeChat);
   els.chatPeer.textContent = activeChat;
-  els.chatPeerMark.className = "u-mark" + (c && c.verified ? " ok" : c && c.vouchedBy && c.vouchedBy.length ? " mid" : "");
-  els.chatPeerMark.textContent = contactMark(c);
+  renderMark(els.chatPeerMark, c);
   els.chatLog.textContent = "";
   for (const m of chat.messages) {
     const li = document.createElement("li");
@@ -1415,22 +1526,25 @@ function renderConversation() {
 
   // Mode indicator + picker (picker shows the CURRENT mode; changing it
   // proposes a switch).
-  els.chatMode.textContent = "🔒 " + chat.mode;
+  els.chatMode.textContent = chat.mode;
   els.chatModeSel.value = chat.mode;
 
   // Pending mode negotiation banner.
   renderPending(chat);
 
+  // What the mode means sits behind the "?" beside the mode picker; the
+  // composer's hint line keeps only what the user must act on.
+  els.chatModeWhy.textContent = chat.mode === "AES256"
+    ? "AES256 — extra AES-256-GCM under your shared chat passphrase, inside the sealed PQ envelope."
+    : "SEALED — hybrid ECDH P-256 + ML-KEM-768, sender sealed inside. " + (c && c.verified ? "" : "Verify this contact in person for the strongest trust.");
   if (!c) {
     chatHint("This sender is not in your Users list — you cannot reply until they share their handle.", true);
   } else if (!c.token) {
     chatHint("No handle token saved for this user — re-add them by their full username#token handle to reply.", true);
   } else if (!c.ecdh || !c.mlkem) {
     chatHint("This user has not published encryption keys yet (older app) — they must unlock once with the updated app; then re-add them.", true);
-  } else if (chat.mode === "AES256") {
-    chatHint("🔒 AES256 — extra AES-256-GCM under your shared chat passphrase, inside the sealed PQ envelope.");
   } else {
-    chatHint("🔒 SEALED — hybrid ECDH P-256 + ML-KEM-768, sender sealed inside. " + (c.verified ? "" : "Verify this contact in person for the strongest trust."));
+    chatHint("");
   }
 }
 
@@ -1905,6 +2019,7 @@ async function connectInner() {
 
   peerBundle = null;
   verified = false;
+  els.chatVerified.hidden = true; // B2: nobody is verified on a new connection
   myNonce = freshNonce();
   peerNonce = null;
   helloAnswered = false;
@@ -1920,6 +2035,8 @@ async function connectInner() {
   sessionRoom = room;
   sessionAlg = alg;
   sessionRoomMine = roomCodeMine;
+  clientClosing = false;
+  closeRelayReason = null; closeHint = null; // L2: nothing parked carries over
   setStatus("connecting…");
   els.connect.disabled = true;
   try {
@@ -1950,8 +2067,9 @@ async function connectInner() {
   // could both pass verification before either pins the peer identity — the
   // TOCTOU half of C-01. A single FIFO chain makes the pin check atomic.
   msgChain = Promise.resolve();
+  const sock = ws; // L2: every frame is handled against the socket it came on
   ws.onmessage = (ev) => {
-    msgChain = msgChain.then(() => handleMessage(room, ev.data)).catch(() => {});
+    msgChain = msgChain.then(() => handleMessage(room, ev.data, sock)).catch(() => {});
   };
 
   ws.onclose = () => {
@@ -1959,17 +2077,21 @@ async function connectInner() {
     if (joined) addLine("sys", "", "disconnected");
     joined = false;
     verified = false;
+    els.chatVerified.hidden = true; // B2
     roomRole = null;
     admittedBundle = null;
     admittedAnon = false;
     wasPending = false;
     keyConfirm.reset();
     knockQueue = [];
-    hideAdmitPrompt();
+    hideAdmitPrompt(); // also lifts the B3 modal: nothing stays inert after a drop
     enableSend(false);
     els.verify.hidden = true;
     showScreen("room");
     if (closeHint) { hint(closeHint, true); closeHint = null; }
+    else if (closeRelayReason && !clientClosing) relayErrorHint(closeRelayReason); // A3; P2: not ours
+    closeRelayReason = null;
+    clientClosing = false;
     els.connect.disabled = false;
     releaseOtpLock();
   };
@@ -2057,6 +2179,54 @@ async function queueKnock(m) {
 // A generation counter fixes both: only the most recently STARTED render may
 // write, and it re-reads the queue head after every await.
 let knockRenderGen = 0;
+// 2026-09-22 rework pentest, tap-through under the tab bar: a tap aimed at what
+// sat under the prompt must not decide it. Clicks (and keys, same handler) that
+// HAPPENED (event timeStamp, not dispatch time) in the first 500 ms after the
+// prompt became visible — shown, a new knock at its head, or revealed by a
+// switch back to the Live view — are ignored, and so is any click while the
+// queue head is not the knock the prompt shows (a render still in flight).
+let admitShownAt = 0, admitShownFor = null;
+function armAdmitGuard(k) {
+  admitShownAt = performance.now();
+  admitShownFor = k;
+  els.admitNo.focus();
+}
+// 2026-09-23 final pentest (Low): a prompt armed while the page was hidden;
+// the window-activating click must not decide it. Coming back to the page (the
+// tab shown again, or the window focused) re-arms the guard for the prompt on
+// screen. Only the window's OWN focus event reaches this listener (element
+// focus does not bubble), so the click that brings the window forward is
+// dropped and the next one, 500 ms on, decides as usual.
+const rearmAdmitGuard = () => {
+  if (document.visibilityState === "visible" && !els.viewLive.hidden && !els.admit.hidden) armAdmitGuard(admitShownFor);
+};
+document.addEventListener("visibilitychange", rearmAdmitGuard);
+window.addEventListener("focus", rearmAdmitGuard);
+
+// B3 (a11y review): the sheet is modal for the keyboard and assistive tech as
+// well, not only under the pointer (the scrim): everything else a Tab could
+// reach — the tab bar, the chat bar, the gate, the log and composer — is inert
+// while it is up. Only while it is ON SCREEN: a knock that arrives behind
+// another view un-hides #admit inside the hidden Live view, and an inert tab
+// bar then would leave no way back to it. showView re-applies it on a switch.
+function setAdmitModal(on) {
+  const modal = on && !els.viewLive.hidden;
+  for (const el of [els.tabbar, els.chatTop, els.verify, els.chat]) el.inert = modal;
+}
+// With the rest inert, Tab would walk off the sheet into the browser chrome:
+// wrap it between the sheet's first and last focusable instead. Escape does
+// nothing on purpose — a knock is decided, never dismissed.
+els.admit.addEventListener("keydown", (e) => {
+  if (e.key !== "Tab") return;
+  const stops = [...els.admit.querySelectorAll("button, [tabindex]")]
+    .filter((el) => !el.disabled && !el.hidden && el.tabIndex >= 0);
+  if (!stops.length) return;
+  const first = stops[0], last = stops[stops.length - 1];
+  if (e.shiftKey ? document.activeElement === first : document.activeElement === last) {
+    e.preventDefault();
+    (e.shiftKey ? last : first).focus();
+  }
+});
 
 async function showNextKnock() {
   const gen = ++knockRenderGen;
@@ -2073,30 +2243,44 @@ async function showNextKnock() {
     // hashing. Whatever they decided is newer than this; do not write over it.
     if (gen !== knockRenderGen || knockQueue[0] !== k) return;
     els.admitFingerprint.textContent = fp;
+    els.admitFingerprint.hidden = false;
     // Who is this, in OUR terms? Matched on the keys themselves — never on a
     // name the other side chose (F-01).
     const known = contacts.isUnlocked()
       ? contacts.list().find((c) => c.ed === k.bundle.ed && c.mldsa === k.bundle.mldsa)
       : null;
-    els.admitWho.textContent = known
-      ? `${dirName(known)} — ${contactMark(known)}`
-      : (pinsReadable()
-        ? "Not in your users list — ⚪ you have never verified this key"
-        : "Unknown — your saved users could not be read, so trust cannot be checked");
+    if (known) {
+      // B1 (design review): our name for them, then the same trust pill the
+      // lists draw.
+      const name = document.createElement("span");
+      name.className = "u-name"; // H1 (design review): a handle, set like every other one
+      name.textContent = dirName(known);
+      const mark = document.createElement("span");
+      renderMark(mark, known);
+      els.admitWho.textContent = "";
+      els.admitWho.append(name, " ", mark);
+    } else {
+      els.admitWho.textContent = pinsReadable()
+        ? "Not in your users list — you have never verified this key"
+        : "Unknown — your saved users could not be read, so trust cannot be checked";
+    }
     // If this session was aimed at a specific contact, say whether it is them.
     if (expectedPeerBundle && !sameBundle(expectedPeerBundle, k.bundle)) {
       els.admitWarn.textContent =
-        "⚠ This is NOT the user you selected for this session. Deny unless you know why.";
+        "This is NOT the user you selected for this session. Deny unless you know why.";
       els.admitWarn.className = "hint err";
     }
   } else if (k.unproven) {
-    els.admitFingerprint.textContent = "—";
+    // B6 (design review): no key, no fingerprint well (was an empty "—" box).
+    els.admitFingerprint.textContent = "";
+    els.admitFingerprint.hidden = true;
     els.admitWho.textContent = "Presented an identity it could not prove.";
     els.admitWarn.textContent =
-      "⚠ The signature over their claimed keys is invalid. Deny: this is what an impersonation attempt looks like.";
+      "The signature over their claimed keys is invalid. Deny: this is what an impersonation attempt looks like.";
     els.admitWarn.className = "hint err";
   } else {
-    els.admitFingerprint.textContent = "—";
+    els.admitFingerprint.textContent = "";
+    els.admitFingerprint.hidden = true; // B6
     els.admitWho.textContent =
       "No identity — they are connecting without one (passphrase or one-time-pad modes only).";
     els.admitWarn.textContent =
@@ -2115,7 +2299,10 @@ async function showNextKnock() {
       "to talk to a different person, disconnect and start a new chat.";
     els.admitWarn.className = "hint";
   }
+  const fresh = els.admit.hidden || admitShownFor !== k;
   els.admit.hidden = false;
+  setAdmitModal(true); // B3; before the guard, so its focus lands on Deny
+  if (fresh) armAdmitGuard(k);
   if (knockQueue.length > 1) {
     els.admitWarn.textContent +=
       (els.admitWarn.textContent ? " " : "") +
@@ -2124,9 +2311,16 @@ async function showNextKnock() {
 }
 
 function hideAdmitPrompt() {
+  // C1 (a11y review): hiding the sheet hides the button that had focus. Put
+  // focus where the next decision is — the gate's safety number when it is up,
+  // else the chat bar — instead of dropping it to <body>.
+  const hadFocus = els.admit.contains(document.activeElement);
   els.admit.hidden = true;
+  setAdmitModal(false); // B3
+  if (hadFocus) (els.verify.hidden ? els.copyRoom : els.safetyNumber).focus();
   els.admitOk.disabled = false;
   els.admitFingerprint.textContent = "";
+  els.admitFingerprint.hidden = false; // B6
   els.admitWho.textContent = "";
   els.admitWarn.textContent = "";
 }
@@ -2245,12 +2439,11 @@ const keyConfirm = makeKeyConfirmation({
   hint: (msg) => hint(msg),
   fail: (why) => {
     addLine("sys", "", `[${why} — refusing to continue]`);
-    hint(
+    // Phase 2a fix round (pentest P1): shown after the close, like the A2 refusals.
+    closeWs(
       "Key confirmation failed: you and your contact do not hold the same session key. " +
       "Messages would silently fail to arrive. Disconnecting.",
-      true,
     );
-    if (ws) ws.close();
   },
   finish: () => finishSession(currentRoom),
 });
@@ -2264,6 +2457,10 @@ async function onChannelReady(room) {
 async function finishSession(room) {
   if (cipher.needsHandshake) {
     await enterVerification(room, peerBundle);
+    // C1: the gate is the decision on screen now. Focus its safety number (a
+    // read-only stop, never "It matches") unless the user is somewhere else.
+    if (!els.verify.hidden && (document.activeElement === document.body ||
+        els.scrChat.contains(document.activeElement))) els.safetyNumber.focus();
     return;
   }
   verified = true;
@@ -2276,13 +2473,16 @@ async function finishSession(room) {
   }
 }
 
-async function handleMessage(room, raw) {
+async function handleMessage(room, raw, sock) {
   let m;
   try {
     m = JSON.parse(raw);
   } catch {
     return;
   }
+  // A3: a fatal relay error is followed by the close, never by more traffic;
+  // any later frame means the socket lived on and the parked sentence is stale.
+  if (!m || m.type !== "error") closeRelayReason = null;
 
   switch (m.type) {
     // We are waiting for the room owner to let us in (P-08). Nothing of ours
@@ -2300,9 +2500,8 @@ async function handleMessage(room, raw) {
         // first. Both end the same way: refuse, and let the creator start over
         // in the order the design promises (creator connects, then approves).
         addLine("sys", "", "[we created this chat code but the relay says someone else owns the room — refusing]");
-        closeHint = "You created this code, so you should be the one approving people. " +
-          "Connect first, then send the code — or press New code and connect before sharing it.";
-        if (ws) ws.close();
+        closeWs("You created this code, so you should be the one approving people. " +
+          "Connect first, then send the code — or press New code and connect before sharing it.", sock);
         return;
       }
       roomRole = "guest";
@@ -2377,8 +2576,9 @@ async function handleMessage(room, raw) {
       // approval prompt would never appear, with nothing on screen to say so.
       if (m.role !== "owner" && m.role !== "guest") {
         addLine("sys", "", "[this relay does not support join approval — refusing]");
-        hint("This relay is running an older protocol without the join-approval step. Update the relay (or your app) before using it.", true);
-        if (ws) ws.close();
+        // Phase 2a, pentest pre-existing (this and the five refusals in `key`):
+        // a hint() here was erased by onclose's return to the room screen.
+        closeWs("This relay is running an older protocol without the join-approval step. Update the relay (or your app) before using it.", sock);
         return;
       }
       // Write-once (see `pending`). The only legitimate sequence for a guest is
@@ -2390,8 +2590,7 @@ async function handleMessage(room, raw) {
         roomRole = m.role;
       } else if (roomRole !== m.role) {
         addLine("sys", "", "[the relay changed our role mid-session — refusing]");
-        closeHint = "The relay tried to change your role in this room. Disconnected.";
-        if (ws) ws.close();
+        closeWs("The relay tried to change your role in this room. Disconnected.", sock);
         return;
       }
       // Pentest 2026-07-27 M-2, guest half. The owner half (below, in the
@@ -2405,15 +2604,13 @@ async function handleMessage(room, raw) {
         // the creator straight in as a guest (already refused below via
         // `wasPending`, kept explicit so the invariant survives a refactor).
         addLine("sys", "", "[we created this chat code but the relay seated us as a guest — refusing]");
-        closeHint = "You created this code, so you should be the one approving people. " +
-          "The relay tried to seat you as a guest. Connect first, then send the code.";
-        if (ws) ws.close();
+        closeWs("You created this code, so you should be the one approving people. " +
+          "The relay tried to seat you as a guest. Connect first, then send the code.", sock);
         return;
       }
       if (roomRole === "guest" && !wasPending) {
         addLine("sys", "", "[we were seated in this room without ever asking to be let in — refusing]");
-        closeHint = "This relay put you in the room without the owner approving you. Disconnected.";
-        if (ws) ws.close();
+        closeWs("This relay put you in the room without the owner approving you. Disconnected.", sock);
         return;
       }
       els.roomShort.textContent = room.slice(0, 8) + "…" + room.slice(-8);
@@ -2520,8 +2717,7 @@ async function handleMessage(room, raw) {
         const ok = await verifyHandshake(idbCanon, room, [myNonce, peerNonce], pub, sig);
         if (!ok) {
           addLine("sys", "", "[handshake signature INVALID — refusing to connect; a relay may be tampering with the key exchange]");
-          hint("Authentication failed — disconnecting. This is what a MITM attempt looks like.", true);
-          if (ws) ws.close();
+          closeWs("Authentication failed — disconnecting. This is what a MITM attempt looks like.", sock);
           return;
         }
 
@@ -2547,22 +2743,19 @@ async function handleMessage(room, raw) {
         // with nobody admitted means the relay seated someone behind our back.
         if (roomRole === "owner" && !admittedSomeone()) {
           addLine("sys", "", "[a peer completed the key exchange without ever being approved — refusing]");
-          hint("Someone was connected to this room without your approval. The relay is not behaving. Disconnecting.", true);
-          if (ws) ws.close();
+          closeWs("Someone was connected to this room without your approval. The relay is not behaving. Disconnecting.", sock);
           return;
         }
         if (admittedBundle && !sameBundle(admittedBundle, idbCanon)) {
           addLine("sys", "", "[the peer that connected is NOT the one you let in — refusing]");
-          hint("The identity that completed the key exchange differs from the one you approved. Disconnecting.", true);
-          if (ws) ws.close();
+          closeWs("The identity that completed the key exchange differs from the one you approved. Disconnecting.", sock);
           return;
         }
         // Admitting someone who showed no identity, then receiving a signed
         // handshake, means the socket changed its story between the two steps.
         if (admittedAnon) {
           addLine("sys", "", "[the peer you let in had no identity but now sends one — refusing]");
-          hint("This peer introduced itself without an identity and then produced one. Disconnecting.", true);
-          if (ws) ws.close();
+          closeWs("This peer introduced itself without an identity and then produced one. Disconnecting.", sock);
           return;
         }
 
@@ -2578,8 +2771,7 @@ async function handleMessage(room, raw) {
           peerBundle = idbCanon; // write-once for this connection, canonical (H-1)
         } else if (!sameBundle(peerBundle, idbCanon)) {
           addLine("sys", "", "[a SECOND identity tried to complete the key exchange — refusing; this is a relay MITM attempt]");
-          hint("Two different identities attempted this handshake — disconnecting to protect you.", true);
-          if (ws) ws.close();
+          closeWs("Two different identities attempted this handshake — disconnecting to protect you.", sock);
           return;
         }
         // M-5: refuse handshake material once confirmation has completed.
@@ -2638,7 +2830,11 @@ async function handleMessage(room, raw) {
     }
 
     case "error":
-      hint("Server: " + (m.reason || "error"), true);
+      // Phase 2a, pentest pre-existing: our sentence for a known reason, never
+      // the relay's words as ours (see RELAY_REASONS).
+      if (sock.readyState === WebSocket.CLOSED) break; // L2: its onclose already ran
+      relayErrorHint(m.reason);
+      closeRelayReason = RELAY_FATAL.has(m.reason) ? m.reason : null;
       break;
   }
 }
@@ -2662,7 +2858,7 @@ async function enterVerification(room, verifiedBundle) {
   if (expectedPeerBundle && !sameBundle(expectedPeerBundle, bundle)) {
     els.verify.hidden = false;
     els.verify.classList.add("changed");
-    els.verifyTitle.textContent = `⚠ Key does NOT match the directory entry for "${expectedPeerName}"`;
+    els.verifyTitle.textContent = `Key does NOT match the directory entry for "${expectedPeerName}"`;
     els.verifyHint.textContent =
       `The key presented in this room is different from the one the directory publishes for "${expectedPeerName}". ` +
       "Do NOT proceed unless you confirm this safety number with them in person.";
@@ -2678,7 +2874,7 @@ async function enterVerification(room, verifiedBundle) {
   if (!pinsReadable()) {
     els.verify.hidden = false;
     els.verify.classList.add("changed");
-    els.verifyTitle.textContent = "⚠ Your saved contacts could not be opened — key changes cannot be detected";
+    els.verifyTitle.textContent = "Your saved contacts could not be opened — key changes cannot be detected";
     els.verifyHint.textContent =
       "Your contact store is locked or damaged" +
       (contactsError ? ` (${contactsError})` : "") +
@@ -2733,7 +2929,7 @@ async function enterVerification(room, verifiedBundle) {
   } else if (pin) {
     // A pin exists but the key changed: loud warning, require re-verification.
     els.verify.classList.add("changed");
-    els.verifyTitle.textContent = "⚠ Contact identity key CHANGED — re-verify in person";
+    els.verifyTitle.textContent = "Contact identity key CHANGED — re-verify in person";
     els.verifyHint.textContent =
       "The identity key you pinned before is different now. This happens if your contact reset their " +
       "device — but it is also what an interceptor looks like. Do NOT proceed until you have confirmed " +
@@ -2742,6 +2938,9 @@ async function enterVerification(room, verifiedBundle) {
   } else {
     els.verify.classList.remove("changed");
     els.verifyTitle.textContent = "Verify your contact — in person";
+    // Phase 2b fix round, pentest S1: a warning variant above rewrote the
+    // hint; a clean first contact must not inherit it (same words as index.html).
+    els.verifyHint.textContent = "Read it aloud to your contact. It must match exactly.";
     if (expectedPeerBundle) {
       addLine("sys", "", `key matches the directory entry for "${expectedPeerName}" — still verify in person`);
     }
@@ -2752,6 +2951,11 @@ async function enterVerification(room, verifiedBundle) {
 function unlockMessaging() {
   verified = true;
   els.verify.hidden = true;
+  // B2 (design review): the header keeps saying so for this connection. Only
+  // the in-person paths get here — onVerifyOk, and a saved pin, which only
+  // onVerifyOk writes — never AES256/OTP (finishSession). Hidden again by
+  // connect() and onclose.
+  els.chatVerified.hidden = false;
   enableSend(true);
   addLine("sys", "", "secure channel established");
   hint("Verified. Messages are end-to-end encrypted.", false);
@@ -2770,7 +2974,7 @@ async function onVerifyOk() {
     addLine("sys", "", "[verified for this session only — the pin could NOT be saved: " + e.message + "]");
   }
   // An in-person safety-number confirmation is the strongest trust signal we
-  // have — mirror it into the Users list (🟢) when the peer is known by name.
+  // have — mirror it into the Users list (verified) when the peer is known by name.
   // Store the FULL bundle incl. the encryption keys the safety number covered
   // (H-01), so async chats trust exactly the keys just verified in person.
   if (expectedPeerName && contacts.isUnlocked()) {
@@ -2788,7 +2992,10 @@ async function onVerifyOk() {
 
 function onVerifyNo() {
   addLine("sys", "", "disconnected — contact not verified");
-  if (ws) ws.close();
+  // Fix round (pentest P2/P4): the room screen says why the user is back there,
+  // in the app's words — never a reason the relay parked before the click.
+  closeWs("You disconnected because the safety numbers did not match — someone may be intercepting " +
+    "this chat. Check with your contact over another channel before you try again.");
 }
 
 // One send at a time. The ciphers serialize concurrent encrypt/decrypt calls
@@ -2892,12 +3099,11 @@ function otpPersistFailed(err) {
   verified = false;
   enableSend(false);
   addLine("sys", "", "[could not save one-time-pad progress — stopping to prevent key reuse]");
-  hint(
+  // Phase 2a fix round (pentest P1): shown after the close, like the A2 refusals.
+  closeWs(
     "Could not save pad progress: " + err.message +
     " — disconnecting so the pad cannot be reused. Free up storage, then reconnect.",
-    true,
   );
-  if (ws) ws.close();
 }
 
 // ---- pad exclusive lock (one live session per pad) ------------------------
@@ -3022,7 +3228,7 @@ let otpEntropySamples = [];
 function updateEntropyStatus() {
   const n = otpEntropySamples.length / 3;
   els.otpEntropyStatus.textContent = n === 0
-    ? "Entropy from drawing: none yet (the OS random generator is used regardless)."
+    ? "Entropy from drawing: none yet." // the "?" says the OS generator is used regardless
     : `Entropy from drawing: ${n} motion samples captured.`;
 }
 function entropyBytes() {
@@ -3112,7 +3318,7 @@ async function otpExport() {
     // causes key reuse. Warn once and require a second click to confirm.
     if (record.exported && pendingReexportId !== id) {
       pendingReexportId = id;
-      otpStatusMsg("⚠ This pad was already exported. A pad must be imported on only ONE device — re-exporting risks catastrophic key reuse. Click Export again to confirm you know what you are doing.", true);
+      otpStatusMsg("This pad was already exported. A pad must be imported on only ONE device — re-exporting risks catastrophic key reuse. Click Export again to confirm you know what you are doing.", true);
       return;
     }
     pendingReexportId = null;
@@ -3263,18 +3469,24 @@ function syncAlgUI() {
   if (alg !== "DHKE") els.algDetails.open = true;
 }
 els.algCards.addEventListener("change", syncAlgUI); // radio changes bubble here
+// Phase 2b fix round: a filled "Expecting…" value never hides in the collapsed
+// row. Opened when it holds a value; never closed under the user's typing.
+if (els.contact.value) els.expectRow.open = true;
+els.contact.addEventListener("input", () => { if (els.contact.value) els.expectRow.open = true; });
 
 els.connect.addEventListener("click", connect);
 els.form.addEventListener("submit", sendText);
 els.verifyOk.addEventListener("click", onVerifyOk);
 els.verifyNo.addEventListener("click", onVerifyNo);
-els.admitOk.addEventListener("click", () => decideKnock(true));
-els.admitNo.addEventListener("click", () => decideKnock(false));
+for (const [btn, allow] of [[els.admitOk, true], [els.admitNo, false]]) {
+  btn.addEventListener("click", (e) => {
+    if (knockQueue[0] !== admitShownFor || e.timeStamp - admitShownAt < 500) return;
+    decideKnock(allow);
+  });
+}
 
-// drawer menu + views
-els.menuBtn.addEventListener("click", () => setDrawer(els.drawer.hidden));
-els.scrim.addEventListener("click", () => setDrawer(false));
-for (const b of els.drawer.querySelectorAll(".navitem")) {
+// tab bar
+for (const b of document.querySelectorAll(".navitem")) {
   b.addEventListener("click", () => showView(b.dataset.view));
 }
 els.addContact.addEventListener("click", addContactFromHandle);
@@ -3282,15 +3494,19 @@ els.addContact.addEventListener("click", addContactFromHandle);
 // "Your handle" share controls (Users view). Copy the raw handle, or an invite
 // link that pre-fills the add field for the recipient. Both are convenience
 // only — neither conveys trust (the recipient still verifies in person).
+// The result is also a class, so a button drawn as an icon alone (Users:
+// Copy handle) can show it: its words are clipped there.
 async function copyToClipboard(btn, text, okLabel = "Copied ✓") {
   const orig = btn.textContent;
   try {
     await navigator.clipboard.writeText(text);
     btn.textContent = okLabel;
+    btn.classList.add("copied");
   } catch {
     btn.textContent = "Copy failed";
+    btn.classList.add("copy-failed");
   }
-  setTimeout(() => { btn.textContent = orig; }, 1500);
+  setTimeout(() => { btn.textContent = orig; btn.classList.remove("copied", "copy-failed"); }, 1500);
 }
 els.copyHandle.addEventListener("click", () => {
   const h = myHandle();
@@ -3328,6 +3544,7 @@ els.profileLogout.addEventListener("click", async () => {
   // Say WHERE to sign back in: this button is in Profile, the login field is on
   // the identity screen, and "sign in again" on its own sends people looking.
   accountStatus("Signed out of the directory. Sealed messages will not arrive until you log in again on the identity screen.", "ok");
+  showUsernameRow(true); // D3: Log in is on that screen again
   addLine("sys", "", "[signed out of the directory — sealed messages will not arrive until you log in again]");
 });
 els.profileForget.addEventListener("click", async () => {
@@ -3340,8 +3557,10 @@ els.chatStart.addEventListener("click", () => {
   if (els.chatNew.value) openChat(els.chatNew.value);
 });
 els.chatBack.addEventListener("click", () => {
+  const was = activeChat;
   activeChat = null;
   refreshChats();
+  focusChatRow(was); // C2: back to the row that was open
 });
 els.chatForm.addEventListener("submit", sendChatMessage);
 els.chatModeSel.addEventListener("change", () => {
@@ -3352,7 +3571,14 @@ els.chatModeSel.addEventListener("change", () => {
 els.toRoom.addEventListener("click", () => showScreen("room"));
 els.toIdentity.addEventListener("click", () => showScreen("identity"));
 els.disconnect.addEventListener("click", () => {
-  if (ws) ws.close(); // onclose does the cleanup and returns to the room screen
+  closeWs(); // onclose does the cleanup and returns to the room screen
+});
+// Fix round (pentest P3): the modal sheet's own way out, for an owner facing an
+// endless supply of knocks. Round 3 (pentest L1): on a phone the sheet docks
+// over the composer, so a tap meant for it could leave — same 500 ms rule.
+els.admitLeave.addEventListener("click", (e) => {
+  if (e.timeStamp - admitShownAt < 500) return;
+  closeWs();
 });
 els.copyRoom.addEventListener("click", async () => {
   try {

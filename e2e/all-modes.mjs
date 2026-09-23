@@ -248,6 +248,9 @@ async function runMode(mode, alice, bob) {
   const shownFp = await text(alice.page, "#admitFingerprint");
   check(`${mode}: owner sees the knocker's real fingerprint`, shownFp === bob.fingerprint,
     `${shownFp.slice(0, 20)}…`);
+  // app.js ignores admit/deny in the prompt's first 500 ms (2026-09-22 rework
+  // pentest, tap-through): decide after a reader's pause, as a person would.
+  await sleep(600);
   await alice.page.click("#admitOk");
 
   // Each mode raises its own gate: the identity-authenticated ones show a

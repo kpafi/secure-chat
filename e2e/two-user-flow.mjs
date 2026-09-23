@@ -51,9 +51,9 @@ async function newTab(label, ctx = null) {
   return { ctx, page, label };
 }
 
+// The four views are tabs that are always on screen (top bar on desktop,
+// bottom bar on a phone) — one click, no menu to open first.
 async function view(page, name) {
-  await page.click("#menuBtn");
-  await sleep(150);
   await page.click(`.navitem[data-view="${name}"]`);
   await sleep(400);
 }
@@ -121,12 +121,24 @@ await sleep(800);
 const prefilled = await inviteTab.page.evaluate(() => document.querySelector("#addHandle").value);
 check("unlocking in place prefills the invited handle", prefilled === bob.handle,
   JSON.stringify(prefilled));
+// Phase 2a (pentest, pre-existing): the invite's explanation was written, then
+// erased by the list render that followed it.
+const statusLine = (page) => page.evaluate(() => {
+  const el = document.querySelector("#usersStatus"), r = el.getBoundingClientRect();
+  return { text: el.textContent.trim(), shown: r.width > 0 && r.height > 0 };
+});
+const inviteLine = await statusLine(inviteTab.page);
+check("A1: the invite tab says a handle was received (not erased by the render)",
+  /^Handle received — review it and press Add\.$/.test(inviteLine.text) && inviteLine.shown, JSON.stringify(inviteLine));
 
 // Add bob from that tab.
 await inviteTab.page.click("#addContact");
 await inviteTab.page.waitForFunction(
   () => document.querySelectorAll("#userList li:not(.empty)").length > 0, { timeout: 30000 });
 check("contact added from the invite tab", true);
+const addedLine = await statusLine(inviteTab.page);
+check("A1: the add result stays on screen and names the contact",
+  addedLine.shown && addedLine.text.includes(`"${bob.username}"`), JSON.stringify(addedLine));
 await inviteTab.page.close();
 
 // --- 3. async chat delivers to someone who never added the sender ----------
@@ -144,6 +156,44 @@ await alice.page.waitForFunction(() => !document.querySelector("#chatConvo").hid
 await alice.page.type("#chatText", "hello bob, this is alice");
 await alice.page.click("#chatSend");
 await sleep(1000);
+
+// Phase 2a, A4: bob is alice's only saved user and now has a chat, so the
+// picker must not tell her to add users first.
+await alice.page.click("#chatBack");
+await sleep(400);
+const pickerNote = await alice.page.evaluate(() => document.querySelector("#chatNew option").textContent);
+check("A4: the picker says every saved user already has a chat",
+  pickerNote === "— every saved user already has a chat —", JSON.stringify(pickerNote));
+// Phase 2a, B4 (a11y review): a chat row is a keyboard stop — Tab from the
+// Open button reaches it — and Enter opens the conversation.
+await alice.page.focus("#chatStart");
+await alice.page.keyboard.press("Tab");
+const rowFocus = await alice.page.evaluate(() => {
+  const a = document.activeElement;
+  return { row: a.matches("#chatList > li.chatrow"), role: a.getAttribute("role") };
+});
+await alice.page.keyboard.press("Enter");
+await alice.page.waitForFunction(() => !document.querySelector("#chatConvo").hidden, { timeout: 5000 }).catch(() => {});
+const rowOpened = await alice.page.evaluate(() => ({
+  convo: !document.querySelector("#chatConvo").hidden, peer: document.querySelector("#chatPeer").textContent,
+}));
+check("B4: Tab reaches the first chat row and Enter opens the conversation",
+  rowFocus.row && rowFocus.role === "button" && rowOpened.convo && rowOpened.peer === bob.username,
+  JSON.stringify({ rowFocus, rowOpened }));
+// Fix round, C2 (a11y review): opening the row hides it — focus continues in the
+// conversation; Back returns focus to the row that was open, not to <body>.
+const focusIn = (page) => page.evaluate(() => {
+  const a = document.activeElement;
+  return { id: a.id || a.tagName, convo: document.querySelector("#chatConvo").contains(a),
+    list: document.querySelector("#chatListWrap").contains(a), user: a.dataset ? a.dataset.user || null : null };
+});
+const afterOpen = await focusIn(alice.page);
+await alice.page.keyboard.press("Enter"); // on "Back to chats", where focus now is
+await sleep(300);
+const afterBack = await focusIn(alice.page);
+check("C2: focus moves into the conversation on open, and back to that row on Back",
+  afterOpen.convo && afterOpen.id === "chatBack" && afterBack.list && afterBack.user === bob.username,
+  JSON.stringify({ afterOpen, afterBack }));
 
 await view(bob.page, "chats");
 let bobGot = [];
@@ -207,6 +257,32 @@ const aliceMarks = await alice.page.evaluate(() =>
   [...document.querySelectorAll("#userList .u-mark")].map((e) => e.textContent));
 check("alice can mark bob verified (green)",
   aliceMarks.some((m) => m.includes("verified by you")), JSON.stringify(aliceMarks));
+
+// --- 6. fix round, C4 (B5): a changed key is a caption inside the mark -------
+// Bob's record gets new keys in alice's store (what a re-keyed contact looks
+// like after a directory refresh). The Chats row's box mark then carries the
+// key-changed caption as its own span; the Users row, which says it in a
+// sentence of its own, does not.
+console.log("\n6. key-changed caption (store-level re-key of bob in alice's page)");
+await alice.page.evaluate(async (u) => {
+  const { Identity } = await import("./identity.js");
+  const contacts = await import("./contacts.js");
+  const c = contacts.get(u);
+  const k = (await Identity.generate()).publicBundle();
+  await contacts.upsert({ username: u, token: c.token, ed: k.ed, mldsa: k.mldsa, ecdh: k.ecdh, mlkem: k.mlkem });
+}, bob.username);
+await view(alice.page, "chats");
+const chatMark = await alice.page.evaluate((u) => {
+  const row = document.querySelector(`#chatList li[data-user="${u}"]`);
+  const m = row && row.querySelector(".u-mark"), n = m && m.querySelector(".u-mark-note");
+  return m ? { cls: m.className, text: m.textContent, note: n ? n.textContent : null } : null;
+}, bob.username);
+await view(alice.page, "users");
+const userNotes = await alice.page.evaluate(() => document.querySelectorAll("#userList .u-mark-note").length);
+check("B5: the Chats row's key-changed mark carries the caption span; the Users row does not",
+  !!chatMark && /\bchanged\b/.test(chatMark.cls) && /key CHANGED since you last verified/.test(chatMark.note || "") &&
+  chatMark.text === "unverified — key CHANGED since you last verified" && userNotes === 0,
+  JSON.stringify({ chatMark, userNotes }));
 
 await browser.close();
 
