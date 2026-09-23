@@ -647,12 +647,15 @@
          them (app.js; the same words the Users row carries). -->
     <div class="contact-warn" id="contactWarn"></div>
     <div class="row">
-      <label class="overline" id="contactHandleLabel">Handle</label>
+      <p class="overline" id="contactHandleLabel">Handle</p>
       <div class="handle-line">
         <p class="hint contact-handle" id="contactHandle"></p>
-        <button id="contactCopyHandle" type="button">Copy handle</button>
+        <button id="contactCopyHandle" type="button" aria-describedby="contactHandleLabel">Copy</button>
       </div>
     </div>
+    <dl class="facts-line" id="contactFacts"></dl>
+    <!-- The fingerprint sits directly above the action that says you
+         compared it. -->
     <div class="row why-row">
       <label class="overline">Fingerprint</label>
       <p class="safety" id="contactFingerprint"></p>
@@ -663,13 +666,10 @@
           that seal messages to them.</div>
       </details>
     </div>
-    <dl class="kv" id="contactFacts"></dl>
     <p class="hint" id="contactStatus" aria-live="polite"></p>
     <div class="row inline wrap contact-actions">
       <button id="contactMessage" type="button" class="primary">Message</button>
       <button id="contactVerify" type="button">Verified in person ✓</button>
-    </div>
-    <div class="row forget-row">
       <button id="contactRemove" type="button" class="danger">Remove</button>
     </div>
   </section>

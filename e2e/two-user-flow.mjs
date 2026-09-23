@@ -266,6 +266,7 @@ await alice.page.waitForFunction(() => {
   const b = document.querySelector("#contactVerify");
   return !document.querySelector("#contactSheet").hidden && b && !b.disabled && /Verified in person/i.test(b.textContent);
 }, { timeout: 10000 }).catch(() => {});
+await sleep(600); // the sheet ignores activations in its first 500 ms (a double tap's second half)
 await alice.page.evaluate(() => document.querySelector("#contactVerify").click());
 await sleep(2500);
 await alice.page.evaluate(() => document.querySelector("#contactClose").click());

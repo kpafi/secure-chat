@@ -514,6 +514,7 @@ async function markVerified(page, username) {
     const b = document.querySelector("#contactVerify");
     return b && !b.disabled && !document.querySelector("#contactSheet").hidden;
   }, { timeout: 10000 }).catch(() => {});
+  await sleep(600); // the sheet ignores activations in its first 500 ms
   const clicked = await page.evaluate(() => {
     const btn = document.querySelector("#contactVerify");
     if (!btn || btn.disabled || !/verif/i.test(btn.textContent) || /unverif/i.test(btn.textContent)) return false;

@@ -843,9 +843,17 @@ select option { background: var(--panel); color: var(--fg); }
   -webkit-mask: var(--icon) center / contain no-repeat;
   mask: var(--icon) center / contain no-repeat;
 }
-.userlist > li > .u-open:hover,
+/* A Users row hovers as one: a click anywhere on it opens the profile
+   (app.js forwards the claim / warning lines to the button). */
+.userlist > li:has(> .u-open) { cursor: pointer; }
+.userlist > li:has(> .u-open):hover,
 .chatrow:has(> .chatrow-open:hover) { background: var(--panel-2); }
-.userlist > li > :is(.u-open, .chatrow-open, .u-avatar):focus-visible { outline-offset: -2px; background: var(--panel-2); }
+/* The Chats avatar answers on the disc itself (hot M7): hover, press, and
+   the focus ring round the disc, not a box round the column. */
+.chatrow > button.u-avatar:is(:hover, :active)::before { background: var(--panel-2); border-color: var(--muted); }
+.chatrow > button.u-avatar:focus-visible { outline: none; }
+.chatrow > button.u-avatar:focus-visible::before { outline: 2px solid var(--accent); outline-offset: 2px; }
+.userlist > li > :is(.u-open, .chatrow-open):focus-visible { outline-offset: -2px; background: var(--panel-2); }
 /* The lines under a Users row's head: aligned with the name, not the disc. */
 .userlist > li > .u-open ~ * {
   margin: calc(-1 * var(--sp-1)) var(--sp-4) var(--sp-3) calc(var(--sp-4) + var(--avatar) + var(--sp-3));
@@ -1241,40 +1249,79 @@ li:has(> .u-open .u-mark.changed) > .hint.err::before,
   border: 1px solid color-mix(in srgb, var(--err) 40%, transparent);
   border-radius: var(--r-s);
 }
+/* The handle and its Copy on ONE line (hot M4): 13px mono wraps a long
+   handle into two even lines beside the button. When the claim line above
+   already quotes it, the value is not printed twice (hot M8, app.js). */
 .contact-sheet .handle-line {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: var(--sp-2) var(--sp-3);
+  gap: var(--sp-3);
 }
-.contact-handle { min-width: 0; font-size: var(--fs-3); overflow-wrap: anywhere; }
+.contact-handle { min-width: 0; font-size: var(--fs-2); overflow-wrap: anywhere; }
 .contact-handle.ok { font-family: var(--font-mono); color: var(--fg); word-break: break-all; }
+.contact-handle.dup { display: none; }
+.contact-handle.dup + #contactCopyHandle { margin-left: calc(-1 * var(--sp-3)); }
 #contactCopyHandle { --icon: var(--i-copy); flex: none; }
 #contactCopyHandle::before { width: 16px; height: 16px; }
 #contactCopyHandle.copied { color: var(--ok); }
 #contactCopyHandle.copy-failed { --icon: var(--i-alert); color: var(--err); }
 #contactFingerprint { margin: 0; }
-.contact-sheet > .kv { margin-top: calc(-1 * var(--sp-2)); }
-.contact-sheet > .kv > dt:first-of-type,
-.contact-sheet > .kv > dt:first-of-type + dd { border-top: 0; }
-.contact-sheet > .kv > dd { font-family: var(--font-ui); }
+/* Facts: one quiet caption line — only what the pill does not say (hot M3). */
+.facts-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 var(--sp-2);
+  margin: calc(var(--sp-1) - var(--gap)) 0 0;
+  font-size: var(--fs-1);
+  color: var(--muted);
+}
+.facts-line:empty { display: none; }
+.facts-line > dt::after { content: ":"; }
+.facts-line > dd { margin: 0 var(--sp-2) 0 0; color: var(--fg); }
+/* Actions: natural widths, the one primary grows; Verify first when it is
+   the primary (a changed key). Remove last, right-aligned, a muted word
+   until hover or focus — red on this sheet means the changed key (hot M5). */
 .contact-actions { gap: var(--sp-2); }
-.contact-actions > button { flex: 1 1 auto; }
-/* Remove: last, a quiet red word, as Forget is on Profile (confirm-gated). */
-.contact-sheet > .forget-row { padding-top: 0; margin-top: calc(-1 * var(--sp-2)); }
+.contact-actions > button {
+  flex: 0 1 auto;
+  height: auto;
+  white-space: normal;       /* 200% text: the words wrap, the button stays in the sheet */
+}
+.contact-actions > .primary { flex: 1 1 auto; }
+.contact-actions > #contactVerify.primary { order: -1; }
 #contactRemove {
-  margin-left: calc(-1 * var(--sp-3));
+  margin-left: auto;
   padding: 0 var(--sp-3);
-  color: var(--err-fg);
+  color: var(--muted);
   background: transparent;
   border-color: transparent;
 }
-#contactRemove:hover { background: color-mix(in srgb, var(--err) 8%, transparent); border-color: transparent; }
+#contactRemove:is(:hover, :focus-visible) {
+  color: var(--err-fg);
+  background: color-mix(in srgb, var(--err) 8%, transparent);
+  border-color: transparent;
+}
+/* On a phone the actions stay on screen while the sheet scrolls, so one is
+   visible the moment it opens, however short the screen (hot M4). */
+@media (max-width: 600px) {
+  .contact-actions {
+    position: sticky;
+    bottom: calc(-1 * var(--sp-5));
+    z-index: 1;
+    margin: 0 calc(-1 * var(--gutter)) calc(-1 * var(--sp-5));
+    padding: var(--sp-3) var(--gutter) var(--sp-5);
+    background: var(--panel);
+    border-top: 1px solid var(--border-soft);
+  }
+  #contactName { font-size: var(--fs-4); }
+}
 /* The conversation's name opens the profile: it looks like the name, and
    says it is a control only on hover and focus. A sender who is not a saved
    user has no profile: the name is then plain text. */
 button.peer-open {
+  flex: 0 1 auto;               /* as wide as the name, not the whole track (hot m3) */
+  max-width: 100%;
   justify-content: flex-start;
   padding: 0 var(--sp-2);
   margin-left: calc(-1 * var(--sp-2));

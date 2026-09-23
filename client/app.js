@@ -1150,6 +1150,10 @@ function emptyRow(title, detail) {
 }
 
 function renderUserList() {
+  // Cold M3: a re-render (mail, a vouch refresh) replaces the rows; the row
+  // that had keyboard focus gets it back, as the Chats list does (C2).
+  const focused = els.userList.contains(document.activeElement)
+    ? document.activeElement.closest("li")?.dataset.user : null;
   els.userList.textContent = "";
   const all = contacts.list().sort((a, b) => a.username.localeCompare(b.username));
   if (all.length === 0) {
@@ -1188,9 +1192,22 @@ function renderUserList() {
     // The claim and the warnings stay IN the list: a security signal is never
     // behind a tap. The profile repeats them.
     for (const line of contactWarnings(c)) li.appendChild(line);
+    // F-07: a contact whose stored keys are malformed cannot be verified —
+    // said in the list too, not only behind the tap (the fingerprint is
+    // computed here for that alone).
+    Identity.fingerprintOf(keysOf(c)).catch(() => {
+      const warn = document.createElement("div");
+      warn.className = "hint err";
+      warn.textContent = "fingerprint unavailable — stored keys are malformed";
+      li.appendChild(warn);
+    });
+    // Hot M6: the pointer opens the profile from anywhere on the row — the
+    // claim and warning lines too; the keyboard has the one button.
+    li.addEventListener("click", (e) => { if (!e.target.closest("button")) open.click(); });
 
     els.userList.appendChild(li);
   }
+  if (focused) [...els.userList.children].find((li) => li.dataset.user === focused)?.querySelector(".u-open")?.focus();
   refreshVouchMarks(); // opportunistic vouched-mark refresh; re-renders only on change
   renderContact(); // the profile over the list follows the store
 }
@@ -1237,6 +1254,16 @@ let contactFrom = null;    // "users" | "chats" | "convo": where focus goes back
 let contactKeys = null;    // the keys the fingerprint on screen is (being) computed from;
                            // a computation for any other keys never writes
 let contactFpReady = false;
+let contactBusy = false;   // a Verify/Unverify is running: the button stays disabled (pentest L-1)
+let contactShownAt = 0;    // when the sheet appeared (the 500 ms rule below)
+
+// The sheet appears under the user's own tap, so a double tap's second half
+// lands on it — on a phone right where Unverify or Message now sit (pentest
+// L-3). Same rule as the admission prompt: an activation within 500 ms of the
+// sheet appearing is not a decision about what it shows. The event's own
+// timestamp, so a queued event cannot pass as a late one.
+const CONTACT_GUARD_MS = 500;
+const contactTooSoon = (e) => !e || e.timeStamp < contactShownAt + CONTACT_GUARD_MS;
 
 const keysOf = (c) => ({ ed: c.ed, mldsa: c.mldsa, ecdh: c.ecdh ?? null, mlkem: c.mlkem ?? null });
 const sameKeys = (a, b) => !!a && !!b &&
@@ -1249,10 +1276,14 @@ function openContact(username, from) {
   contactKeys = null; // a fresh open always recomputes the fingerprint
   els.contactStatus.textContent = "";
   els.contactStatus.className = "hint";
+  // Pentest L-4: one Copy button serves every contact; a "Copied ✓" left over
+  // from the last one must not stand beside this one's handle.
+  resetCopyLabel(els.contactCopyHandle);
   renderContact();
   if (contactShown === null) return; // the render found nothing to show
   els.contactSheet.hidden = false;
   els.contactScrim.hidden = false;
+  contactShownAt = performance.now();
   applyModal();
   els.contactClose.focus();
 }
@@ -1275,9 +1306,11 @@ function closeContact(restoreFocus = true) {
 function contactReturnFocus(user, from) {
   const inList = (list, sel) =>
     [...list.querySelectorAll("li")].find((li) => li.dataset.user === user)?.querySelector(sel);
+  // Cold M2: after a Remove the Chats avatar is a picture (a span) and the
+  // conversation's name is disabled — fall back to what is still a control.
   const target = from === "users" ? inList(els.userList, ".u-open") || els.addHandle
-    : from === "chats" ? inList(els.chatList, ".u-avatar") || els.chatNew
-      : from === "convo" && !els.chatConvo.hidden ? els.chatPeer : null;
+    : from === "chats" ? inList(els.chatList, "button.u-avatar") || inList(els.chatList, ".chatrow-open") || els.chatNew
+      : from === "convo" && !els.chatConvo.hidden ? (els.chatPeer.disabled ? els.chatBack : els.chatPeer) : null;
   if (target && !target.disabled) target.focus();
 }
 
@@ -1288,16 +1321,18 @@ function renderContact() {
 
   els.contactAvatar.textContent = c.username.charAt(0);
   els.contactName.textContent = c.username;
-  renderMark(els.contactMark, c);
+  renderMark(els.contactMark, c, false); // hot M5: the box under the head says it
   els.contactWarn.textContent = "";
   els.contactWarn.append(...contactWarnings(c));
 
   // The handle is what addresses them. For a contact made from an unknown
   // sender's mail it is the name THEY put in the envelope: labelled a claim.
-  els.contactHandleLabel.textContent = c.auto ? "Handle they claim" : "Handle";
+  els.contactHandleLabel.textContent = c.auto || c.claimedName ? "Handle they claim" : "Handle";
   if (c.token) {
     els.contactHandle.textContent = mailHandle(c);
-    els.contactHandle.className = "hint contact-handle ok";
+    // Hot M8: when the claim line above already quotes this very handle, it
+    // is not printed a second time, larger and in mono (label and Copy stay).
+    els.contactHandle.className = "hint contact-handle ok" + (c.claimedName === mailHandle(c) ? " dup" : "");
     els.contactCopyHandle.hidden = false;
   } else {
     els.contactHandle.textContent = "No handle saved — re-add them by their username#token handle to reply.";
@@ -1329,13 +1364,14 @@ function renderContact() {
 
   // What else the app knows, quietly: when, whether, by whom, and whether a
   // sealed message can reach them. Day precision only.
+  // Hot M3: only what the pill does not already say — two dates, and the one
+  // reason a sealed message cannot reach them (no token says so above).
   const day = (t) => new Date(t).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
   els.contactFacts.textContent = "";
   const facts = [];
   if (c.addedAt) facts.push(["Saved", day(c.addedAt)]);
-  facts.push(["Verified", c.verified && c.verifiedAt ? day(c.verifiedAt) : c.verified ? "yes" : "not yet"]);
-  if (!c.verified && c.vouchedBy && c.vouchedBy.length) facts.push(["Vouched by", c.vouchedBy.join(", ")]);
-  facts.push(["Messages", c.ecdh && c.mlkem ? "can receive sealed messages" : "no encryption keys published yet"]);
+  if (c.verified && c.verifiedAt) facts.push(["Verified", day(c.verifiedAt)]);
+  if (c.token && !(c.ecdh && c.mlkem)) facts.push(["Sealed mail", "no encryption keys published yet"]);
   for (const [term, value] of facts) {
     const dt = document.createElement("dt");
     dt.textContent = term;
@@ -1351,9 +1387,22 @@ function renderContactActions(c) {
   // Message: not from the conversation it would reopen, and not while the
   // chat store is closed.
   els.contactMessage.hidden = contactFrom === "convo" || !chats.isUnlocked();
-  els.contactVerify.className = c.verified ? "ghost" : "";
+  // One next step. A changed key (or the H-01 reset) makes verifying it the
+  // step (hot B1 — Signal's pattern); otherwise Message, but only when a
+  // sealed message can actually reach them (hot M1).
+  const changed = !c.verified && !!(c.keyChangedAt || c.reverify);
+  const canSend = !!(c.token && c.ecdh && c.mlkem);
+  els.contactMessage.className = changed || !canSend ? "" : "primary";
+  els.contactVerify.className = c.verified ? "ghost" : changed ? "primary" : "";
   els.contactVerify.textContent = c.verified ? "Unverify" : "Verified in person ✓";
+  // Pentest L-1: the click acts as it was rendered, never as a fresh read
+  // of the store says — a second click must not undo the first.
+  els.contactVerify.dataset.action = c.verified ? "unverify" : "verify";
+  // Disabling the focused button would drop focus to <body>: keep it in the
+  // sheet. (A running action is refused by contactBusy, not by disabling.)
+  const hadFocus = document.activeElement === els.contactVerify;
   els.contactVerify.disabled = !c.verified && !contactFpReady;
+  if (hadFocus && els.contactVerify.disabled) els.contactSheet.focus();
 }
 
 function contactStatus(text, isErr = false) {
@@ -1365,34 +1414,47 @@ function contactStatus(text, isErr = false) {
 // follows whichever list is under it.
 function contactsChanged() {
   if (!els.viewUsers.hidden) renderUserList();
+  // Pentest L-2 / cold M1: the Chats row marks and the conversation header
+  // show the same trust state — they follow too (each re-renders the sheet).
+  else if (!els.viewChats.hidden && chats.isUnlocked() && contacts.isUnlocked()) refreshChats();
   else renderContact();
 }
 
 els.contactClose.addEventListener("click", () => closeContact());
-els.contactScrim.addEventListener("click", () => closeContact());
+// Cold m1: a press on the scrim must not blur the sheet first, or the close
+// cannot tell focus was in it and does not give it back to the opener. Cold
+// m2: the second half of the double tap that opened the sheet lands here
+// while it slides in — not a request to close it.
+els.contactScrim.addEventListener("mousedown", (e) => e.preventDefault());
+els.contactScrim.addEventListener("click", (e) => { if (!contactTooSoon(e)) closeContact(); });
+// Cold m3: Escape closes from wherever focus is while the sheet is up (a
+// click on its text focuses the sheet itself; the rest of the page is inert).
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape" || contactShown === null) return;
+  e.preventDefault();
+  closeContact();
+});
 els.contactSheet.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") {
-    e.preventDefault();
-    closeContact();
-    return;
-  }
   if (e.key !== "Tab") return;
   const stops = [...els.contactSheet.querySelectorAll("button, summary, [tabindex]")]
     .filter((el) => !el.disabled && el.tabIndex >= 0 && el.offsetParent !== null);
   if (!stops.length) return;
   const first = stops[0], last = stops[stops.length - 1];
-  if (e.shiftKey ? document.activeElement === first : document.activeElement === last) {
+  const at = document.activeElement;
+  if (e.shiftKey ? at === first || at === els.contactSheet : at === last) {
     e.preventDefault();
     (e.shiftKey ? last : first).focus();
   }
 });
 
-els.contactCopyHandle.addEventListener("click", () => {
+els.contactCopyHandle.addEventListener("click", (e) => {
+  if (contactTooSoon(e)) return;
   const c = contactShown !== null ? contacts.get(contactShown) : null;
   if (c && c.token) copyToClipboard(els.contactCopyHandle, mailHandle(c));
 });
 
-els.contactMessage.addEventListener("click", async () => {
+els.contactMessage.addEventListener("click", async (e) => {
+  if (contactTooSoon(e)) return;
   const user = contactShown;
   if (user === null || !contacts.get(user) || !chats.isUnlocked()) return;
   closeContact(false);
@@ -1400,55 +1462,73 @@ els.contactMessage.addEventListener("click", async () => {
   await openChat(user);
 });
 
-els.contactVerify.addEventListener("click", async () => {
+els.contactVerify.addEventListener("click", async (e) => {
+  if (contactTooSoon(e) || contactBusy) return;
   const user = contactShown;
   const c = user !== null ? contacts.get(user) : null;
   if (!c) return;
-  if (!c.verified && !confirm(
+  // Pentest L-1: act as the button was rendered. If the store no longer
+  // agrees (another tab, or a click that raced the last one), redraw.
+  const wantVerified = els.contactVerify.dataset.action === "verify";
+  if (wantVerified === !!c.verified) { renderContact(); return; }
+  if (wantVerified ? !confirm(
     `Mark "${c.username}" as verified ONLY if you compared this fingerprint with them in person ` +
     "(or over a call where you recognise their voice). Continue?",
+  ) : !confirm(
+    // Unverify revokes the pin: as destructive as Remove, and gated the same.
+    `Unverify "${c.username}"? You will need to compare the fingerprint with them in person again.`,
   )) return;
   // What the user compared is the fingerprint on screen. If the record's keys
   // moved while the sheet was open (a mail re-keyed them), that is not the
   // key this click would mark: refuse and show the new one instead.
   const now = contacts.get(user);
-  if (!now || contactShown !== user || (!c.verified && (!contactFpReady || !sameKeys(keysOf(now), contactKeys)))) {
+  if (!now || contactShown !== user || !!now.verified !== !!c.verified ||
+      (wantVerified && (!contactFpReady || !sameKeys(keysOf(now), contactKeys)))) {
     renderContact();
     contactStatus("This user's keys changed while their profile was open — compare the new fingerprint.", true);
     return;
   }
-  await contacts.setVerified(c.username, !c.verified);
+  contactBusy = true;
   let statusMsg = null, statusErr = false;
-  if (!c.verified) {
-    // Just turned verified — offer to publish a signed vouch so users who
-    // verified YOU can see this contact as "vouched by you". Opt-in.
-    if (apiToken && identity && confirm(
-      `Also publish a signed vouch for "${c.username}"? Anyone who has verified YOU ` +
-      "will then see them as vouched-by-you. (This reveals publicly that you know them.)",
-    )) {
-      try {
-        // Vouch over the FULL in-person-verified bundle incl. encryption
-        // keys (H-01) so the vouched mark attests the keys used to seal async
-        // messages, not just the signing identity.
-        await account.vouch(API_BASE, identity, apiToken, dirName(c), keysOf(c));
-        statusMsg = `Vouch for "${c.username}" published.`;
-      } catch (e) {
-        statusMsg = "Could not publish the vouch: " + e.message;
-        statusErr = true;
+  try {
+    await contacts.setVerified(c.username, wantVerified);
+    if (wantVerified) {
+      // Just turned verified — offer to publish a signed vouch so users who
+      // verified YOU can see this contact as "vouched by you". Opt-in.
+      if (apiToken && identity && confirm(
+        `Also publish a signed vouch for "${c.username}"? Anyone who has verified YOU ` +
+        "will then see them as vouched-by-you. (This reveals publicly that you know them.)",
+      )) {
+        try {
+          // Vouch over the FULL in-person-verified bundle incl. encryption
+          // keys (H-01) so the vouched mark attests the keys used to seal async
+          // messages, not just the signing identity.
+          await account.vouch(API_BASE, identity, apiToken, dirName(c), keysOf(c));
+          statusMsg = `Vouch for "${c.username}" published.`;
+        } catch (err) {
+          statusMsg = "Could not publish the vouch: " + err.message;
+          statusErr = true;
+        }
+      } else if (!apiToken) {
+        statusMsg = "Tip: Log in (Live room → step 1) to also publish a signed vouch for people you verify.";
       }
-    } else if (!apiToken) {
-      statusMsg = "Tip: Log in (Live room → step 1) to also publish a signed vouch for people you verify.";
+    } else if (apiToken) {
+      // Turned back to unverified — retract a published vouch if any.
+      account.unvouch(API_BASE, apiToken, dirName(c)).catch(() => { /* none published */ });
     }
-  } else if (apiToken) {
-    // Turned back to unverified — retract a published vouch if any.
-    account.unvouch(API_BASE, apiToken, dirName(c)).catch(() => { /* none published */ });
+  } finally {
+    contactBusy = false;
   }
+  // The button now says the opposite: a second click of a double click must
+  // not take it at its new word — the 500 ms rule starts again.
+  contactShownAt = performance.now();
   contactsChanged();
   contactStatus(statusMsg || "", statusErr);
   if (!els.viewUsers.hidden) usersStatus(statusMsg || "", statusErr); // this action's result replaces the last one's
 });
 
-els.contactRemove.addEventListener("click", async () => {
+els.contactRemove.addEventListener("click", async (e) => {
+  if (contactTooSoon(e)) return;
   const user = contactShown;
   const c = user !== null ? contacts.get(user) : null;
   if (!c) return;
@@ -1728,6 +1808,8 @@ function renderConversation() {
   const c = contacts.get(activeChat);
   els.chatPeer.textContent = activeChat;
   els.chatPeer.disabled = !c; // no saved user, no profile
+  els.chatPeer.toggleAttribute("aria-haspopup", !!c); // cold m4: and it opens nothing
+  if (c) els.chatPeer.setAttribute("aria-haspopup", "dialog");
   renderMark(els.chatPeerMark, c);
   els.chatLog.textContent = "";
   for (const m of chat.messages) {
@@ -1751,6 +1833,7 @@ function renderConversation() {
   els.chatModeWhy.textContent = chat.mode === "AES256"
     ? "AES256 — extra AES-256-GCM under your shared chat passphrase, inside the sealed PQ envelope."
     : "SEALED — hybrid ECDH P-256 + ML-KEM-768, sender sealed inside. " + (c && c.verified ? "" : "Verify this contact in person for the strongest trust.");
+  renderContact(); // the profile over the conversation follows the store
   if (!c) {
     chatHint("This sender is not in your Users list — you cannot reply until they share their handle.", true);
   } else if (!c.token) {
@@ -3723,8 +3806,14 @@ els.addContact.addEventListener("click", addContactFromHandle);
 // only — neither conveys trust (the recipient still verifies in person).
 // The result is also a class, so a button drawn as an icon alone (Users:
 // Copy handle) can show it: its words are clipped there.
+// A button's resting label is kept once (pentest L-4): read live, a second
+// click inside the 1.5 s window took "Copied ✓" for the label and kept it.
+function resetCopyLabel(btn) {
+  if (btn.dataset.label) btn.textContent = btn.dataset.label;
+  btn.classList.remove("copied", "copy-failed");
+}
 async function copyToClipboard(btn, text, okLabel = "Copied ✓") {
-  const orig = btn.textContent;
+  const orig = btn.dataset.label || (btn.dataset.label = btn.textContent);
   try {
     await navigator.clipboard.writeText(text);
     btn.textContent = okLabel;
