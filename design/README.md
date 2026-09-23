@@ -73,8 +73,21 @@ design, e2e coverage and a pentest pass):
 
 ## Verification of the rework
 
-Every change goes through the project's own gates before it is committed: `client` unit tests,
-`backend` pytest, the four e2e runs in `e2e/` (with their navigation helper updated for the tab
-bar), `e2e/screenshots.mjs` for a phone + desktop contact sheet of every state, a pentest pass on
-the diff (`.claude/agents/pentest-new-code.md`), and two independent design reviews (one
-adversarial, one dispassionate) on the screenshots and the diff.
+Every change went through the project's own gates before it was committed, and through three
+independent reviews (their reports are summarised in `design/research/reviews.md`):
+
+- `client` unit tests and `backend` pytest (162) unchanged and green.
+- The e2e runs in `e2e/`, with their navigation helper updated for the tab bar and new
+  assertions added, never weakened: `two-user-flow` 8/8, `room-admission` 26/26 (was 13; the
+  additions pin the admission sheet's geometry, its pointer-events layer, the 500 ms admit/deny
+  guard under reduced motion, keyboard activation and a view-switch reveal — each proven by a
+  mutant that fails exactly one of them), `no-dead-ends` 17/17 (the current-view mark must
+  move), `hostile-relay` 12/12 (a refusal must be hit-testable on a phone), `all-modes` 32/32.
+- `e2e/screenshots.mjs`: 20 states at 390×844 and 1280×800 with an empty overflow section (the
+  old client overflowed on Profile and on the verify gate at 390px).
+- A pentest of the diff (`.claude/agents/pentest-new-code.md`), four passes: nothing Critical, High
+  or Medium; three Low findings in the phone layout and the new admission guard (the sheet docked
+  over the tab bar, refusal text under the bar, a prompt armed while the page was hidden), each
+  fixed with a test that its own mutant fails; no open findings at commit 2bbc64d.
+- A harsh design review and a dispassionate correctness/a11y review, each in three rounds; the
+  last round found no blocker or major.
