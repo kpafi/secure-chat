@@ -84,7 +84,7 @@ function hostileRelay() {
 }
 
 const errors = [];
-async function agent(label) {
+async function agent(label, viewport = { width: 1000, height: 900 }) {
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
   page.on("pageerror", (e) => errors.push(`${label}: ${e.message}`));
@@ -93,7 +93,7 @@ async function agent(label) {
     if (m.type() === "error" && !/favicon|404/.test(t)) errors.push(`${label}: ${t}`);
   });
   await page.evaluateOnNewDocument(hostileRelay);
-  await page.setViewport({ width: 1000, height: 900 });
+  await page.setViewport(viewport);
   await page.goto(APP, { waitUntil: "networkidle0" });
   await page.type("#idPass", PASS);
   await page.click("#idCreate");
@@ -142,6 +142,34 @@ check("the creator cannot send", await alice.page.evaluate(() => document.queryS
 check("the creator is told how to recover, on the screen she lands on",
   /connect first|new code/i.test(await text(alice.page, "#roomHint")),
   JSON.stringify(await text(alice.page, "#roomHint")));
+
+// --- 1b. the same refusal on a phone must be SEEN, not just written ----------
+// 2026-09-22 rework pentest (P2): on a 390x844 phone the room screen is taller
+// than the viewport and the explanation landed below the fold, or under the
+// fixed tab bar. It is written, so the check above passed; it must also be on
+// screen and on top: whatever is at its centre is the hint itself.
+console.log("\n1b. the same demotion on a phone (390x844, touch): the refusal is on screen");
+const phone = await agent("alice-phone", { width: 390, height: 844, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
+await phone.page.$eval("#connect", (e) => e.click());
+await phone.page.waitForFunction(() => /connect first|new code/i.test(document.querySelector("#roomHint").textContent),
+  { timeout: 30000 }).catch(() => {});
+await sleep(300);
+const hintHit = await phone.page.evaluate(() => {
+  const el = document.querySelector("#roomHint");
+  const r = el.getBoundingClientRect();
+  const x = r.left + r.width / 2, y = r.top + r.height / 2;
+  const hit = document.elementFromPoint(x, y);
+  return {
+    text: el.textContent.trim(),
+    box: [Math.round(r.top), Math.round(r.bottom)],
+    viewport: innerHeight,
+    hit: hit ? (hit.id || hit.closest("[id]")?.id || hit.tagName) : null,
+    onTop: !!hit && (hit === el || el.contains(hit)),
+  };
+});
+check("on a phone, the refusal is on screen and nothing covers it",
+  /connect first|new code/i.test(hintHit.text) && hintHit.onTop,
+  JSON.stringify({ ...hintHit, text: hintHit.text.slice(0, 40) + "…" }));
 
 // --- 2. the control: a pasted code goes through the honest pending path -----
 console.log("\n2. bob PASTES a code and gets the same 'pending' — that is the honest path, not a demotion");

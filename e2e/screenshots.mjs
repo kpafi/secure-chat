@@ -1044,6 +1044,8 @@ await step("live-admission-prompt", async () => {
 await step("live-verify-owner", async () => {
   if (!live.guestWaiting) throw new Error("no guest is waiting (see 15)");
   const p = alice.page, b = others.bob.page;
+  // app.js ignores admit/deny in the prompt's first 500 ms (tap-through guard).
+  await sleep(600);
   await click(p, "#admitOk");
   await Promise.all([waitGate(p), waitGate(b)]);
   live.gates = true;

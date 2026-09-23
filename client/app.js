@@ -69,8 +69,7 @@ const els = {
   toRoom: $("toRoom"), toIdentity: $("toIdentity"),
   roomShort: $("roomShort"), copyRoom: $("copyRoom"),
   chatStatus: $("chatStatus"), disconnect: $("disconnect"),
-  // drawer menu + views
-  menuBtn: $("menuBtn"), drawer: $("drawer"), scrim: $("scrim"),
+  // views
   viewLive: $("viewLive"), viewUsers: $("viewUsers"), viewChats: $("viewChats"),
   viewProfile: $("viewProfile"),
   // profile view
@@ -304,7 +303,7 @@ function savePin(key, bundle) {
 // Pentest 2026-07-27 H-1: compare the KEYS, not their spelling. `atob` used to
 // accept several base64 strings per key, so a relay flipping one character
 // produced a bundle that verified, digested and safety-numbered identically yet
-// compared UNEQUAL here — a free "⚠ identity key CHANGED" alarm on a genuine
+// compared UNEQUAL here — a free "identity key CHANGED" alarm on a genuine
 // peer, and a route to getting a non-canonical string pinned. Decoding is
 // canonical now, so `field` also rejects a re-spelled key outright; comparing
 // decoded bytes makes that independent of where the value came from.
@@ -377,34 +376,27 @@ function showScreen(name) {
 }
 let screenShown = false;
 
-// ---- drawer menu + top-level views ----------------------------------------
-// Three views: live (the 3-step room flow), users (contact list + trust),
-// chats (async DMs, later phase). Pure presentation — switching views never
-// touches an active connection.
-
-function setDrawer(open) {
-  els.drawer.hidden = !open;
-  els.scrim.hidden = !open;
-  els.menuBtn.setAttribute("aria-expanded", open ? "true" : "false");
-  if (open) {
-    const active = els.drawer.querySelector(".navitem.active");
-    if (active) active.focus();
-  }
-}
+// ---- top-level views (tab bar) ---------------------------------------------
+// Four views: live (the 3-step room flow), chats (async DMs), users (contact
+// list + trust), profile. Pure presentation — switching views never touches
+// an active connection.
 
 function showView(name) {
+  const liveWasHidden = els.viewLive.hidden;
   els.viewProfile.hidden = name !== "profile";
   els.viewLive.hidden = name !== "live";
   els.viewUsers.hidden = name !== "users";
   els.viewChats.hidden = name !== "chats";
-  for (const b of els.drawer.querySelectorAll(".navitem")) {
+  for (const b of document.querySelectorAll(".navitem")) {
     const on = b.dataset.view === name;
     b.classList.toggle("active", on);
     // Which view is current was conveyed by colour alone; say it out loud too.
     if (on) b.setAttribute("aria-current", "page");
     else b.removeAttribute("aria-current");
   }
-  setDrawer(false);
+  // An admission prompt that came in behind another view is revealed only now:
+  // it gets the same 500 ms guard and focus as a prompt that just appeared.
+  if (name === "live" && liveWasHidden && !els.admit.hidden) armAdmitGuard(admitShownFor);
   if (name === "profile") renderProfile();
   if (name === "users") refreshUsers();
   if (name === "chats") {
@@ -1073,6 +1065,7 @@ function renderUserList() {
   }
   for (const c of all) {
     const li = document.createElement("li");
+    li.dataset.initial = c.username.charAt(0); // the avatar disc (CSS attr())
 
     const head = document.createElement("div");
     head.className = "u-head";
@@ -1080,16 +1073,17 @@ function renderUserList() {
     name.className = "u-name";
     name.textContent = c.username;
     const mark = document.createElement("span");
-    let markText = "⚪ unverified", markCls = "";
+    let markText = "unverified", markCls = "";
     if (c.verified) {
-      markText = "🟢 verified by you";
+      markText = "verified by you";
       markCls = " ok";
     } else if (c.vouchedBy && c.vouchedBy.length) {
       // Middle trust level: someone YOU verified has published a vouch whose
       // signature checked out against YOUR pinned copy of their keys.
-      markText = "🟡 vouched by " + c.vouchedBy.join(", ");
+      markText = "vouched by " + c.vouchedBy.join(", ");
       markCls = " mid";
     }
+    if (c.keyChangedAt && !c.verified) markCls += " changed";
     mark.className = "u-mark" + markCls;
     mark.textContent = markText;
     head.append(name, mark);
@@ -1108,14 +1102,14 @@ function renderUserList() {
     if (c.keyChangedAt && !c.verified) {
       const warn = document.createElement("div");
       warn.className = "hint err";
-      warn.textContent = "⚠ this user's key CHANGED since you saved them — re-verify in person before trusting";
+      warn.textContent = "this user's key CHANGED since you saved them — re-verify in person before trusting";
       li.appendChild(warn);
     } else if (c.reverify && !c.verified) {
-      // Set by the H-01 store migration: the old 🟢 was compared against a
+      // Set by the H-01 store migration: the old verified mark was compared against a
       // fingerprint that did not cover the encryption keys.
       const warn = document.createElement("div");
       warn.className = "hint err";
-      warn.textContent = "⚠ verification reset — the fingerprint format now also covers this user's encryption keys; compare it again in person";
+      warn.textContent = "verification reset — the fingerprint format now also covers this user's encryption keys; compare it again in person";
       li.appendChild(warn);
     }
 
@@ -1151,15 +1145,15 @@ function renderUserList() {
       await contacts.setVerified(c.username, !c.verified);
       let statusMsg = null, statusErr = false;
       if (!c.verified) {
-        // Just turned 🟢 — offer to publish a signed vouch so users who
-        // verified YOU can see this contact as 🟡 "vouched by you". Opt-in.
+        // Just turned verified — offer to publish a signed vouch so users who
+        // verified YOU can see this contact as "vouched by you". Opt-in.
         if (apiToken && identity && confirm(
           `Also publish a signed vouch for "${c.username}"? Anyone who has verified YOU ` +
-          "will then see them as 🟡 vouched-by-you. (This reveals publicly that you know them.)",
+          "will then see them as vouched-by-you. (This reveals publicly that you know them.)",
         )) {
           try {
             // Vouch over the FULL in-person-verified bundle incl. encryption
-            // keys (H-01) so the 🟡 mark attests the keys used to seal async
+            // keys (H-01) so the vouched mark attests the keys used to seal async
             // messages, not just the signing identity.
             await account.vouch(API_BASE, identity, apiToken, dirName(c), {
               ed: c.ed, mldsa: c.mldsa, ecdh: c.ecdh ?? null, mlkem: c.mlkem ?? null,
@@ -1194,14 +1188,14 @@ function renderUserList() {
     els.userList.appendChild(li);
   }
   usersStatus("");
-  refreshVouchMarks(); // opportunistic 🟡 refresh; re-renders only on change
+  refreshVouchMarks(); // opportunistic vouched-mark refresh; re-renders only on change
 }
 
-// Refresh the 🟡 marks: fetch vouches for unverified contacts and validate
+// Refresh the vouched marks: fetch vouches for unverified contacts and validate
 // them LOCALLY — a vouch counts only if (a) the voucher is a contact YOU
 // verified in person, (b) the server-returned voucher keys equal your pinned
 // copy, and (c) the dual signature verifies over the target bundle YOU hold.
-// A lying directory therefore cannot invent a 🟡 mark.
+// A lying directory therefore cannot invent a vouched mark.
 const VOUCH_RECHECK_MS = 10 * 60 * 1000;
 let vouchRefreshRunning = false;
 
@@ -1227,7 +1221,7 @@ async function refreshVouchMarks() {
         // H-01: verify the vouch over the FULL bundle WE hold for this contact,
         // including the encryption keys. If a malicious directory swapped the
         // ecdh/mlkem it served us, the v2 vouch signature (which the in-person
-        // voucher made over the REAL enc keys) no longer matches, so no 🟡 is
+        // voucher made over the REAL enc keys) no longer matches, so no vouched mark is
         // awarded — the mark can never vouch for keys the directory forged.
         const ok = await Identity.verify(
           { ed: voucher.ed, mldsa: voucher.mldsa },
@@ -1271,8 +1265,8 @@ async function addContactFromHandle() {
   }
   // Never auto-verify from the fetched bundle: the directory is not a trust
   // root, and a pin only attests the SIGNING identity, not the encryption keys
-  // (H-01). upsert() keeps an existing 🟢 only when EVERY key (incl. ecdh/mlkem)
-  // still matches what was verified in person; any change drops it to ⚪.
+  // (H-01). upsert() keeps an existing verified mark only when EVERY key (incl. ecdh/mlkem)
+  // still matches what was verified in person; any change drops it to unverified.
   const before = contacts.get(parsed.username);
   await contacts.upsert({
     username: parsed.username, token: parsed.token,
@@ -1282,10 +1276,10 @@ async function addContactFromHandle() {
   const after = contacts.get(parsed.username);
   els.addHandle.value = "";
   usersStatus(after.verified
-    ? `Updated "${parsed.username}" — keys match what you verified in person (🟢).`
+    ? `Updated "${parsed.username}" — keys match what you verified in person.`
     : (before && before.verified
-      ? `⚠ "${parsed.username}" — the fetched keys DIFFER from what you verified; reset to ⚪. Re-verify in person.`
-      : `Added "${parsed.username}" (⚪ unverified — compare fingerprints in person to trust this key).`));
+      ? `"${parsed.username}" — the fetched keys DIFFER from what you verified; reset to unverified. Re-verify in person.`
+      : `Added "${parsed.username}" (unverified — compare fingerprints in person to trust this key).`));
   renderUserList();
 }
 
@@ -1305,13 +1299,13 @@ function chatHint(text, isErr = false) {
 }
 
 function contactMark(c) {
-  if (!c) return "⚪ not in your users list";
-  if (c.verified) return "🟢 verified by you";
+  if (!c) return "not in your users list";
+  if (c.verified) return "verified by you";
   // F-PROTO-005 (adjacent): a record whose keys changed since it was last
   // verified says so wherever the mark is shown, not only in the Users list.
   const changed = c.keyChangedAt ? " — key CHANGED since you last verified" : "";
-  if (c.vouchedBy && c.vouchedBy.length) return "🟡 vouched by " + c.vouchedBy.join(", ") + changed;
-  return "⚪ unverified" + changed;
+  if (c.vouchedBy && c.vouchedBy.length) return "vouched by " + c.vouchedBy.join(", ") + changed;
+  return "unverified" + changed;
 }
 
 function refreshChats() {
@@ -1370,13 +1364,15 @@ function renderChatList() {
     const c = contacts.get(chat.username);
     const li = document.createElement("li");
     li.className = "chatrow";
+    li.dataset.initial = chat.username.charAt(0); // the avatar disc (CSS attr())
     const head = document.createElement("div");
     head.className = "u-head";
     const name = document.createElement("span");
     name.className = "u-name";
     name.textContent = chat.username;
     const mark = document.createElement("span");
-    mark.className = "u-mark" + (c && c.verified ? " ok" : c && c.vouchedBy && c.vouchedBy.length ? " mid" : "");
+    mark.className = "u-mark" + (c && c.verified ? " ok" : c && c.vouchedBy && c.vouchedBy.length ? " mid" : "") +
+      (c && c.keyChangedAt && !c.verified ? " changed" : "");
     mark.textContent = contactMark(c);
     head.append(name, mark);
     const last = chat.messages[chat.messages.length - 1];
@@ -1402,7 +1398,8 @@ function renderConversation() {
   els.chatConvo.hidden = false;
   const c = contacts.get(activeChat);
   els.chatPeer.textContent = activeChat;
-  els.chatPeerMark.className = "u-mark" + (c && c.verified ? " ok" : c && c.vouchedBy && c.vouchedBy.length ? " mid" : "");
+  els.chatPeerMark.className = "u-mark" + (c && c.verified ? " ok" : c && c.vouchedBy && c.vouchedBy.length ? " mid" : "") +
+    (c && c.keyChangedAt && !c.verified ? " changed" : "");
   els.chatPeerMark.textContent = contactMark(c);
   els.chatLog.textContent = "";
   for (const m of chat.messages) {
@@ -1415,7 +1412,7 @@ function renderConversation() {
 
   // Mode indicator + picker (picker shows the CURRENT mode; changing it
   // proposes a switch).
-  els.chatMode.textContent = "🔒 " + chat.mode;
+  els.chatMode.textContent = chat.mode;
   els.chatModeSel.value = chat.mode;
 
   // Pending mode negotiation banner.
@@ -1428,9 +1425,9 @@ function renderConversation() {
   } else if (!c.ecdh || !c.mlkem) {
     chatHint("This user has not published encryption keys yet (older app) — they must unlock once with the updated app; then re-add them.", true);
   } else if (chat.mode === "AES256") {
-    chatHint("🔒 AES256 — extra AES-256-GCM under your shared chat passphrase, inside the sealed PQ envelope.");
+    chatHint("AES256 — extra AES-256-GCM under your shared chat passphrase, inside the sealed PQ envelope.");
   } else {
-    chatHint("🔒 SEALED — hybrid ECDH P-256 + ML-KEM-768, sender sealed inside. " + (c.verified ? "" : "Verify this contact in person for the strongest trust."));
+    chatHint("SEALED — hybrid ECDH P-256 + ML-KEM-768, sender sealed inside. " + (c.verified ? "" : "Verify this contact in person for the strongest trust."));
   }
 }
 
@@ -2057,6 +2054,29 @@ async function queueKnock(m) {
 // A generation counter fixes both: only the most recently STARTED render may
 // write, and it re-reads the queue head after every await.
 let knockRenderGen = 0;
+// 2026-09-22 rework pentest, tap-through under the tab bar: a tap aimed at what
+// sat under the prompt must not decide it. Clicks (and keys, same handler) that
+// HAPPENED (event timeStamp, not dispatch time) in the first 500 ms after the
+// prompt became visible — shown, a new knock at its head, or revealed by a
+// switch back to the Live view — are ignored, and so is any click while the
+// queue head is not the knock the prompt shows (a render still in flight).
+let admitShownAt = 0, admitShownFor = null;
+function armAdmitGuard(k) {
+  admitShownAt = performance.now();
+  admitShownFor = k;
+  els.admitNo.focus();
+}
+// 2026-09-23 final pentest (Low): a prompt armed while the page was hidden;
+// the window-activating click must not decide it. Coming back to the page (the
+// tab shown again, or the window focused) re-arms the guard for the prompt on
+// screen. Only the window's OWN focus event reaches this listener (element
+// focus does not bubble), so the click that brings the window forward is
+// dropped and the next one, 500 ms on, decides as usual.
+const rearmAdmitGuard = () => {
+  if (document.visibilityState === "visible" && !els.viewLive.hidden && !els.admit.hidden) armAdmitGuard(admitShownFor);
+};
+document.addEventListener("visibilitychange", rearmAdmitGuard);
+window.addEventListener("focus", rearmAdmitGuard);
 
 async function showNextKnock() {
   const gen = ++knockRenderGen;
@@ -2081,19 +2101,19 @@ async function showNextKnock() {
     els.admitWho.textContent = known
       ? `${dirName(known)} — ${contactMark(known)}`
       : (pinsReadable()
-        ? "Not in your users list — ⚪ you have never verified this key"
+        ? "Not in your users list — you have never verified this key"
         : "Unknown — your saved users could not be read, so trust cannot be checked");
     // If this session was aimed at a specific contact, say whether it is them.
     if (expectedPeerBundle && !sameBundle(expectedPeerBundle, k.bundle)) {
       els.admitWarn.textContent =
-        "⚠ This is NOT the user you selected for this session. Deny unless you know why.";
+        "This is NOT the user you selected for this session. Deny unless you know why.";
       els.admitWarn.className = "hint err";
     }
   } else if (k.unproven) {
     els.admitFingerprint.textContent = "—";
     els.admitWho.textContent = "Presented an identity it could not prove.";
     els.admitWarn.textContent =
-      "⚠ The signature over their claimed keys is invalid. Deny: this is what an impersonation attempt looks like.";
+      "The signature over their claimed keys is invalid. Deny: this is what an impersonation attempt looks like.";
     els.admitWarn.className = "hint err";
   } else {
     els.admitFingerprint.textContent = "—";
@@ -2115,7 +2135,9 @@ async function showNextKnock() {
       "to talk to a different person, disconnect and start a new chat.";
     els.admitWarn.className = "hint";
   }
+  const fresh = els.admit.hidden || admitShownFor !== k;
   els.admit.hidden = false;
+  if (fresh) armAdmitGuard(k);
   if (knockQueue.length > 1) {
     els.admitWarn.textContent +=
       (els.admitWarn.textContent ? " " : "") +
@@ -2662,7 +2684,7 @@ async function enterVerification(room, verifiedBundle) {
   if (expectedPeerBundle && !sameBundle(expectedPeerBundle, bundle)) {
     els.verify.hidden = false;
     els.verify.classList.add("changed");
-    els.verifyTitle.textContent = `⚠ Key does NOT match the directory entry for "${expectedPeerName}"`;
+    els.verifyTitle.textContent = `Key does NOT match the directory entry for "${expectedPeerName}"`;
     els.verifyHint.textContent =
       `The key presented in this room is different from the one the directory publishes for "${expectedPeerName}". ` +
       "Do NOT proceed unless you confirm this safety number with them in person.";
@@ -2678,7 +2700,7 @@ async function enterVerification(room, verifiedBundle) {
   if (!pinsReadable()) {
     els.verify.hidden = false;
     els.verify.classList.add("changed");
-    els.verifyTitle.textContent = "⚠ Your saved contacts could not be opened — key changes cannot be detected";
+    els.verifyTitle.textContent = "Your saved contacts could not be opened — key changes cannot be detected";
     els.verifyHint.textContent =
       "Your contact store is locked or damaged" +
       (contactsError ? ` (${contactsError})` : "") +
@@ -2733,7 +2755,7 @@ async function enterVerification(room, verifiedBundle) {
   } else if (pin) {
     // A pin exists but the key changed: loud warning, require re-verification.
     els.verify.classList.add("changed");
-    els.verifyTitle.textContent = "⚠ Contact identity key CHANGED — re-verify in person";
+    els.verifyTitle.textContent = "Contact identity key CHANGED — re-verify in person";
     els.verifyHint.textContent =
       "The identity key you pinned before is different now. This happens if your contact reset their " +
       "device — but it is also what an interceptor looks like. Do NOT proceed until you have confirmed " +
@@ -2770,7 +2792,7 @@ async function onVerifyOk() {
     addLine("sys", "", "[verified for this session only — the pin could NOT be saved: " + e.message + "]");
   }
   // An in-person safety-number confirmation is the strongest trust signal we
-  // have — mirror it into the Users list (🟢) when the peer is known by name.
+  // have — mirror it into the Users list (verified) when the peer is known by name.
   // Store the FULL bundle incl. the encryption keys the safety number covered
   // (H-01), so async chats trust exactly the keys just verified in person.
   if (expectedPeerName && contacts.isUnlocked()) {
@@ -3112,7 +3134,7 @@ async function otpExport() {
     // causes key reuse. Warn once and require a second click to confirm.
     if (record.exported && pendingReexportId !== id) {
       pendingReexportId = id;
-      otpStatusMsg("⚠ This pad was already exported. A pad must be imported on only ONE device — re-exporting risks catastrophic key reuse. Click Export again to confirm you know what you are doing.", true);
+      otpStatusMsg("This pad was already exported. A pad must be imported on only ONE device — re-exporting risks catastrophic key reuse. Click Export again to confirm you know what you are doing.", true);
       return;
     }
     pendingReexportId = null;
@@ -3268,13 +3290,15 @@ els.connect.addEventListener("click", connect);
 els.form.addEventListener("submit", sendText);
 els.verifyOk.addEventListener("click", onVerifyOk);
 els.verifyNo.addEventListener("click", onVerifyNo);
-els.admitOk.addEventListener("click", () => decideKnock(true));
-els.admitNo.addEventListener("click", () => decideKnock(false));
+for (const [btn, allow] of [[els.admitOk, true], [els.admitNo, false]]) {
+  btn.addEventListener("click", (e) => {
+    if (knockQueue[0] !== admitShownFor || e.timeStamp - admitShownAt < 500) return;
+    decideKnock(allow);
+  });
+}
 
-// drawer menu + views
-els.menuBtn.addEventListener("click", () => setDrawer(els.drawer.hidden));
-els.scrim.addEventListener("click", () => setDrawer(false));
-for (const b of els.drawer.querySelectorAll(".navitem")) {
+// tab bar
+for (const b of document.querySelectorAll(".navitem")) {
   b.addEventListener("click", () => showView(b.dataset.view));
 }
 els.addContact.addEventListener("click", addContactFromHandle);

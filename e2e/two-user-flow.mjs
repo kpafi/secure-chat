@@ -51,9 +51,9 @@ async function newTab(label, ctx = null) {
   return { ctx, page, label };
 }
 
+// The four views are tabs that are always on screen (top bar on desktop,
+// bottom bar on a phone) — one click, no menu to open first.
 async function view(page, name) {
-  await page.click("#menuBtn");
-  await sleep(150);
   await page.click(`.navitem[data-view="${name}"]`);
   await sleep(400);
 }

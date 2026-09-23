@@ -4,54 +4,56 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="referrer" content="no-referrer" />
+  <meta name="color-scheme" content="dark" />
   <title>secure-chat</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
+  <!-- App bar. On phones it is a slim wordmark bar and #tabbar docks to the
+       bottom of the screen; wider, the tabs sit in this bar next to the mark. -->
+  <header class="apphead">
+    <div class="apphead-inner">
+      <h1 class="wordmark">secure-chat <span class="vh">end-to-end encrypted relay</span></h1>
+      <nav id="tabbar" class="tabbar" aria-label="Views">
+        <button type="button" class="navitem active" data-view="live">
+          <svg class="navicon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3.2" y="7" width="9.6" height="6.3" rx="1.6"/><path d="M5.4 7V4.9a2.6 2.6 0 0 1 5.2 0V7"/></svg>
+          <span class="navlabel">Live room</span>
+        </button>
+        <button type="button" class="navitem" data-view="chats">
+          <svg class="navicon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M13.4 8.6a1.9 1.9 0 0 1-1.9 1.9H8.2l-2.9 2.6v-2.6H4.5a1.9 1.9 0 0 1-1.9-1.9V5a1.9 1.9 0 0 1 1.9-1.9h7a1.9 1.9 0 0 1 1.9 1.9z"/></svg>
+          <span class="navlabel">Chats</span>
+        </button>
+        <button type="button" class="navitem" data-view="users">
+          <svg class="navicon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="5.6" cy="5.4" r="2.3"/><path d="M1.9 13.1c.6-2.1 2-3.3 3.7-3.3s3.1 1.2 3.7 3.3"/><path d="M10.5 3.5a2.3 2.3 0 0 1 0 4M11.7 10c1.3.5 2.1 1.5 2.5 3"/></svg>
+          <span class="navlabel">Users</span>
+        </button>
+        <button type="button" class="navitem" data-view="profile">
+          <svg class="navicon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="5.2" r="2.7"/><path d="M2.9 13.4c.7-2.5 2.8-3.9 5.1-3.9s4.4 1.4 5.1 3.9"/></svg>
+          <span class="navlabel">Profile</span>
+        </button>
+      </nav>
+    </div>
+  </header>
+
   <main>
-    <header class="apphead">
-      <button id="menuBtn" type="button" class="ghost" aria-label="Menu"
-              aria-expanded="false" aria-controls="drawer">☰</button>
-      <h1>secure-chat <span class="sub">end-to-end encrypted relay</span></h1>
-    </header>
-
-    <nav id="drawer" class="drawer" aria-label="Views" hidden>
-      <div class="drawer-head">
-        <span class="mark">secure-chat</span>
-        <span class="tag">end-to-end encrypted relay</span>
-      </div>
-      <button type="button" class="navitem" data-view="profile">
-        <svg class="navicon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="5.2" r="2.7"/><path d="M2.9 13.4c.7-2.5 2.8-3.9 5.1-3.9s4.4 1.4 5.1 3.9"/></svg>
-        <span>Profile</span>
-      </button>
-      <button type="button" class="navitem active" data-view="live">
-        <svg class="navicon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="3.2" y="7" width="9.6" height="6.3" rx="1.6"/><path d="M5.4 7V4.9a2.6 2.6 0 0 1 5.2 0V7"/></svg>
-        <span>Live room</span>
-      </button>
-      <button type="button" class="navitem" data-view="users">
-        <svg class="navicon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="5.6" cy="5.4" r="2.3"/><path d="M1.9 13.1c.6-2.1 2-3.3 3.7-3.3s3.1 1.2 3.7 3.3"/><path d="M10.5 3.5a2.3 2.3 0 0 1 0 4M11.7 10c1.3.5 2.1 1.5 2.5 3"/></svg>
-        <span>Users</span>
-      </button>
-      <button type="button" class="navitem" data-view="chats">
-        <svg class="navicon" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13.4 8.6a1.9 1.9 0 0 1-1.9 1.9H8.2l-2.9 2.6v-2.6H4.5a1.9 1.9 0 0 1-1.9-1.9V5a1.9 1.9 0 0 1 1.9-1.9h7a1.9 1.9 0 0 1 1.9 1.9z"/></svg>
-        <span>Chats</span>
-      </button>
-      <p class="drawer-foot">
-        Keys never leave this device. The relay sees ciphertext only.
-      </p>
-    </nav>
-    <div id="scrim" class="scrim" hidden></div>
-
     <!-- View: live room (the original 3-step flow) -->
     <div id="viewLive" class="view">
 
     <!-- Screen 1: identity + optional account directory -->
     <div id="scrIdentity" class="screen">
-      <p class="step" id="stepIdentity" tabindex="-1">Step 1 of 3 — <strong>Identity</strong> · Room · Chat</p>
+      <header class="screenhead welcome">
+        <p class="step" id="stepIdentity" tabindex="-1">Step 1 of 3 — <strong>Identity</strong> · Room · Chat</p>
+        <h2 class="title">Your keys are made on this device. Nobody else holds them.</h2>
+        <ul class="facts">
+          <li class="fact-key">Keys stay on this device</li>
+          <li class="fact-relay">The relay sees ciphertext only</li>
+          <li class="fact-person">You verify each other in person</li>
+        </ul>
+      </header>
 
-      <section class="panel" id="identity">
+      <section id="identity">
         <div class="row">
-          <label>Your identity on this device</label>
+          <label class="overline">Your identity on this device</label>
           <p class="hint" id="idStatus" aria-live="polite">Checking for an identity on this device…</p>
         </div>
         <div class="row" id="idPassRow">
@@ -59,19 +61,19 @@
           <input id="idPass" type="password" autocomplete="off"
                  placeholder="protects your keys on this device — only you know it" />
         </div>
-        <div class="row inline">
+        <p class="hint safety" id="idFingerprint" hidden></p>
+        <div class="row inline actions">
           <button id="idCreate" type="button">Create identity</button>
           <button id="idUnlock" type="button">Unlock</button>
           <button id="idExport" type="button" hidden>Copy backup</button>
           <button id="idForget" type="button" class="danger" hidden>Forget</button>
         </div>
-        <p class="hint" id="idFingerprint" hidden></p>
       </section>
 
       <section class="panel" id="account" hidden>
         <div class="row">
-          <label for="username">Pick a username (optional) — lets people add you by name</label>
-          <div class="inline">
+          <label for="username">Pick a username — lets people add you by name</label>
+          <div class="inline wrap">
             <input id="username" type="text" inputmode="latin" autocomplete="off"
                    spellcheck="false" maxlength="32" placeholder="3–32 chars: a-z 0-9 _ . -" />
             <button id="register" type="button">Register</button>
@@ -89,26 +91,49 @@
 
     <!-- Screen 2: room + encryption setup -->
     <div id="scrRoom" class="screen" hidden>
-      <p class="step" id="stepRoom" tabindex="-1">Step 2 of 3 — Identity · <strong>Room</strong> · Chat</p>
+      <header class="screenhead">
+        <p class="step" id="stepRoom" tabindex="-1">Step 2 of 3 — Identity · <strong>Room</strong> · Chat</p>
+        <h2 class="title">Your chat code</h2>
+        <p class="lede">Share it with the one person you want to talk to.</p>
+      </header>
 
-      <section class="panel" id="setup">
+      <section id="setup">
         <div class="row">
-          <label for="room">Your chat code — share it with the one person you want to talk to</label>
-          <div class="inline">
+          <label for="room" class="vh">Your chat code — share it with the one person you want to talk to</label>
+          <div class="inline wrap code-row">
             <input id="room" type="text" inputmode="latin" autocomplete="off"
                    spellcheck="false" maxlength="80"
                    aria-describedby="roomHelp"
                    placeholder="a code is created for you automatically" />
             <button id="copyCode" type="button">Copy</button>
-            <button id="gen" type="button">New code</button>
+            <button id="gen" type="button" class="ghost">New code</button>
           </div>
-          <p class="hint" id="roomHelp">
-            Both of you must use the same code. Send it however you like — it is
-            useless on its own, because the messages are encrypted end-to-end.
-          </p>
+          <div class="help">
+            <p class="hint" id="roomHelp">Both of you must use the same code.</p>
+            <details class="why">
+              <summary>Why?</summary>
+              <p class="hint">
+                Send it however you like — it is useless on its own, because the
+                messages are encrypted end-to-end.
+              </p>
+            </details>
+          </div>
         </div>
 
-        <details class="row" id="algDetails">
+        <div class="row" id="contactRow">
+          <label for="contact">Who are you expecting? (optional)</label>
+          <input id="contact" type="text" inputmode="latin" autocomplete="off"
+                 spellcheck="false" maxlength="99" placeholder="paste their handle, e.g. alice#a1b2c3…" />
+          <details class="why">
+            <summary>Why?</summary>
+            <p class="hint">
+              If you paste the handle they gave you, we can check the person who joins
+              is really them. Leave it blank and you will compare a safety number instead.
+            </p>
+          </details>
+        </div>
+
+        <details class="row disclosure" id="algDetails">
           <summary id="algSummary">Security options — currently: DHKE (recommended)</summary>
           <p class="hint">
             Every option here is end-to-end encrypted. The default suits almost
@@ -148,11 +173,13 @@
           <input id="pass" type="password" autocomplete="off" placeholder="agree on this out of band" />
         </div>
 
-        <div id="otpPanel" hidden>
+        <div id="otpPanel" class="panel" hidden>
           <div class="row">
             <label for="otpSelect">One-time pad</label>
-            <select id="otpSelect"><option value="">— no pad on this device —</option></select>
-            <button id="otpForget" type="button" class="danger" hidden>Forget</button>
+            <div class="inline wrap">
+              <select id="otpSelect"><option value="">— no pad on this device —</option></select>
+              <button id="otpForget" type="button" class="danger" hidden>Forget</button>
+            </div>
           </div>
           <div class="row">
             <label for="otpPass">Pad passphrase (encrypts this pad on this device; unlocks it to use)</label>
@@ -160,7 +187,7 @@
           </div>
           <p class="hint" id="otpStatus">Generate a pad, or import one your contact gave you in person.</p>
 
-          <details id="otpTools">
+          <details id="otpTools" class="disclosure">
             <summary>Generate / share a pad</summary>
 
             <div class="otp-sub">
@@ -182,7 +209,7 @@
               <canvas id="otpEntropy" width="320" height="90" class="otp-entropy" aria-label="draw here to add entropy"></canvas>
               <p class="hint" id="otpEntropyStatus">Entropy from drawing: none yet (the OS random generator is used regardless).</p>
               <div class="row">
-                <button id="otpGenerate" type="button" class="primary">Generate pad</button>
+                <button id="otpGenerate" type="button">Generate pad</button>
               </div>
             </div>
 
@@ -194,7 +221,7 @@
                 more than one device causes catastrophic key reuse — generate a separate pad
                 for each contact.
               </p>
-              <div class="row">
+              <div class="row inline wrap">
                 <button id="otpExport" type="button">Export selected pad…</button>
                 <button id="otpImport" type="button">Import pad file…</button>
               </div>
@@ -203,42 +230,34 @@
           </details>
         </div>
 
-        <div class="row" id="contactRow">
-          <label for="contact">Who are you expecting? (optional)</label>
-          <input id="contact" type="text" inputmode="latin" autocomplete="off"
-                 spellcheck="false" maxlength="99" placeholder="paste their handle, e.g. alice#a1b2c3…" />
-          <p class="hint">
-            If you paste the handle they gave you, we can check the person who joins
-            is really them. Leave it blank and you will compare a safety number instead.
-          </p>
-        </div>
-
-        <div class="row">
+        <div class="row inline connect-row">
           <button id="connect" type="button" class="primary">Connect</button>
           <span id="status" class="status" aria-live="polite">disconnected</span>
         </div>
         <p class="hint" id="roomHint" aria-live="polite"></p>
       </section>
 
-      <div class="row nav">
+      <div class="row nav back">
         <button id="toIdentity" type="button" class="ghost">‹ Back to identity</button>
       </div>
     </div>
 
-    <!-- Screen 3: chat (with verification gate) -->
-    <div id="scrChat" class="screen" hidden>
-      <div class="topbar panel">
+    <!-- Screen 3: chat (with verification gate). One window: the bar, then
+         either the verification gate or the log + composer. -->
+    <div id="scrChat" class="screen window" hidden>
+      <div class="topbar">
         <span class="roomid" id="roomShort"></span>
         <button id="copyRoom" type="button" class="ghost">Copy room id</button>
         <span id="chatStatus" class="status"></span>
-        <button id="disconnect" type="button" class="danger">Disconnect</button>
+        <button id="disconnect" type="button" class="ghost">Disconnect</button>
       </div>
 
       <!-- Someone is asking to join the chat you created. Only you can let
-           them in; until you do, they are in no room and receive nothing. -->
-      <section class="panel" id="admit" hidden>
+           them in; until you do, they are in no room and receive nothing.
+           Drawn as a sheet (phone) / dialog (wider) over a scrim. -->
+      <section class="sheet" id="admit" role="dialog" aria-modal="true" aria-labelledby="admitTitle" hidden>
         <div class="row">
-          <label id="admitTitle">Someone wants to join this chat</label>
+          <label id="admitTitle" class="title-2">Someone wants to join this chat</label>
           <p class="hint" id="admitHint">
             They know your chat code. Let them in only if you are expecting
             them — check the key fingerprint below against the person you
@@ -248,15 +267,15 @@
         <p class="safety" id="admitFingerprint" aria-live="polite" tabindex="0"></p>
         <p class="hint" id="admitWho"></p>
         <p class="hint" id="admitWarn"></p>
-        <div class="row inline">
+        <div class="row inline pair">
           <button id="admitOk" type="button" class="primary">Let them in</button>
           <button id="admitNo" type="button" class="danger">Deny</button>
         </div>
       </section>
 
-      <section class="panel" id="verify" hidden>
+      <section class="gate" id="verify" hidden>
         <div class="row">
-          <label id="verifyTitle">Verify your contact — in person</label>
+          <label id="verifyTitle" class="title-2">Verify your contact — in person</label>
           <p class="hint" id="verifyHint">
             Compare this safety number with your contact over a trusted channel
             (in person, or a call where you recognise their voice). It must be
@@ -266,15 +285,15 @@
         </div>
         <p class="safety" id="safetyNumber" aria-live="polite" tabindex="0"></p>
         <p class="hint" id="peerFingerprint"></p>
-        <div class="row inline">
+        <div class="row stacked">
           <button id="verifyOk" type="button" class="primary">It matches — unlock messaging</button>
           <button id="verifyNo" type="button" class="danger">It differs — disconnect</button>
         </div>
       </section>
 
-      <section class="panel" id="chat">
-        <ul id="log" aria-live="polite"></ul>
-        <form id="sendForm" class="inline" autocomplete="off">
+      <section class="convo" id="chat">
+        <ul id="log" class="bubbles" aria-live="polite" tabindex="0"></ul>
+        <form id="sendForm" class="inline composer" autocomplete="off">
           <input id="text" type="text" maxlength="2000" aria-label="Message to send"
                  placeholder="Type a message…" disabled />
           <button id="send" type="submit" class="primary" disabled>Send</button>
@@ -284,13 +303,15 @@
     </div>
     </div><!-- /viewLive -->
 
-    <!-- View: users (known keys + trust) -->
     <!-- View: profile (your own identity, presentation-only) -->
     <div id="viewProfile" class="view" hidden>
-      <p class="step">Profile — your identity on this device</p>
+      <header class="screenhead">
+        <p class="overline">Your identity on this device</p>
+        <h2 class="title">Profile</h2>
+      </header>
 
-      <section class="panel">
-        <div id="profileLocked">
+      <section>
+        <div id="profileLocked" class="panel locked">
           <p class="hint">
             Your profile shows the identity stored on this device.
             Enter your passphrase to unlock it here.
@@ -310,49 +331,58 @@
               <p class="idhead-sub" id="profileHandleText"></p>
             </div>
           </div>
-          <div class="row inline" id="profileHandleActions" hidden>
+          <div class="row inline wrap" id="profileHandleActions" hidden>
             <button id="profileCopyHandle" type="button">Copy handle</button>
-            <button id="profileCopyInvite" type="button">Copy invite link</button>
+            <button id="profileCopyInvite" type="button" class="ghost">Copy invite link</button>
           </div>
-          <div class="row" id="profileQrRow" hidden>
-            <label>Invite QR — a contact scans this to add you</label>
+          <div class="row qr-row" id="profileQrRow" hidden>
+            <label class="overline">Invite QR <span class="caption">A contact scans this to add you</span></label>
             <canvas id="profileQr" class="profile-qr" aria-label="QR code of your invite link"></canvas>
-            <p class="hint">
-              Scanning only pre-fills your handle on their device — they still
-              verify you by comparing fingerprints in person.
-            </p>
+            <details class="why">
+              <summary>Why?</summary>
+              <p class="hint">
+                Scanning only pre-fills your handle on their device — they still
+                verify you by comparing fingerprints in person.
+              </p>
+            </details>
           </div>
           <div class="row">
-            <label>Fingerprint — what contacts compare with you in person</label>
+            <label class="overline">Fingerprint <span class="caption">What contacts compare with you in person</span></label>
             <p class="safety" id="profileFingerprint"></p>
           </div>
           <div class="row">
-            <label>Keys</label>
+            <label class="overline">Technical details</label>
             <dl class="kv" id="profileKeys"></dl>
           </div>
           <div class="row">
-            <label>Status</label>
+            <label class="overline">Status</label>
             <div class="chips" id="profileStatus"></div>
           </div>
-          <div class="row inline">
+          <div class="row inline wrap actions">
             <button id="profileExport" type="button">Copy backup</button>
             <button id="profileLogout" type="button" hidden>Sign out of directory</button>
-            <button id="profileForget" type="button" class="danger">Forget identity</button>
           </div>
           <p class="hint" id="profileSessionHint" hidden>
             Signing out revokes this device's directory session on the relay, so a
             copied session token stops working. Your identity and contacts stay
             on this device.
           </p>
+          <div class="row forget-row">
+            <button id="profileForget" type="button" class="danger">Forget identity</button>
+          </div>
         </div>
       </section>
     </div><!-- /viewProfile -->
 
+    <!-- View: users (known keys + trust) -->
     <div id="viewUsers" class="view" hidden>
-      <p class="step">Users — known public keys &amp; trust</p>
+      <header class="screenhead">
+        <p class="overline">Known public keys &amp; trust</p>
+        <h2 class="title">Users</h2>
+      </header>
 
-      <section class="panel">
-        <div id="usersLocked">
+      <section>
+        <div id="usersLocked" class="panel locked">
           <p class="hint">
             Contacts are stored encrypted under your identity passphrase.
             Enter it to unlock them here.
@@ -373,12 +403,12 @@
           <button id="usersAdopt" type="button" hidden>Open anyway (I understand the risk)</button>
         </div>
         <div id="usersUnlocked" hidden>
-          <div class="row myhandle" id="myHandleRow">
-            <label>Your handle — share it so others can add you</label>
+          <div class="row panel myhandle" id="myHandleRow">
+            <label class="overline">Your handle <span class="caption">Share it so others can add you</span></label>
             <p class="hint" id="myHandleText"></p>
-            <div class="inline" id="myHandleActions" hidden>
+            <div class="inline wrap" id="myHandleActions" hidden>
               <button id="copyHandle" type="button">Copy handle</button>
-              <button id="copyInvite" type="button">Copy invite link</button>
+              <button id="copyInvite" type="button" class="ghost">Copy invite link</button>
             </div>
           </div>
           <div class="row">
@@ -392,9 +422,9 @@
           <p class="hint" id="usersStatus" aria-live="polite"></p>
           <ul id="userList" class="userlist"></ul>
           <div class="legend">
-            <span class="legend-item">🟢 <b>verified</b> — you compared the fingerprint in person</span>
-            <span class="legend-item">🟡 <b>vouched</b> — someone you verified has verified them</span>
-            <span class="legend-item">⚪ <b>unverified</b></span>
+            <span class="legend-item ok"><b>verified</b> <span>— you compared the fingerprint in person</span></span>
+            <span class="legend-item mid"><b>vouched</b> <span>— someone you verified has verified them</span></span>
+            <span class="legend-item"><b>unverified</b></span>
           </div>
         </div>
       </section>
@@ -402,10 +432,13 @@
 
     <!-- View: chats (async 1:1 via the sealed mailbox) -->
     <div id="viewChats" class="view" hidden>
-      <p class="step">Chats — direct messages</p>
+      <header class="screenhead">
+        <p class="overline">Direct messages</p>
+        <h2 class="title">Chats</h2>
+      </header>
 
-      <section class="panel" id="chatsPanel">
-        <div id="chatsLocked">
+      <section id="chatsPanel">
+        <div id="chatsLocked" class="panel locked">
           <p class="hint">
             Chats are stored encrypted under your identity passphrase.
             Enter it to unlock them here.
@@ -433,15 +466,15 @@
               <label for="chatNew">Start a chat with a saved user</label>
               <div class="inline">
                 <select id="chatNew"></select>
-                <button id="chatStart" type="button" class="primary">Open</button>
+                <button id="chatStart" type="button">Open</button>
               </div>
             </div>
             <ul id="chatList" class="userlist"></ul>
           </div>
 
-          <div id="chatConvo" hidden>
+          <div id="chatConvo" class="window" hidden>
             <div class="topbar convo-head">
-              <button id="chatBack" type="button" class="ghost">‹</button>
+              <button id="chatBack" type="button" class="ghost" aria-label="Back to chats">‹</button>
               <span class="u-name" id="chatPeer"></span>
               <span class="u-mark" id="chatPeerMark"></span>
               <span class="chatmode" id="chatMode"></span>
@@ -452,8 +485,8 @@
               </select>
             </div>
             <div id="chatPending" class="pending" hidden></div>
-            <ul id="chatLog"></ul>
-            <form id="chatForm" class="inline" autocomplete="off">
+            <ul id="chatLog" class="bubbles" tabindex="0"></ul>
+            <form id="chatForm" class="inline composer" autocomplete="off">
               <input id="chatText" type="text" maxlength="2000" aria-label="Message to send"
                      placeholder="Type a message…" />
               <button id="chatSend" type="submit" class="primary">Send</button>
