@@ -667,9 +667,14 @@
       </details>
     </div>
     <p class="hint" id="contactStatus" aria-live="polite"></p>
-    <div class="row inline wrap contact-actions">
+    <!-- The two decisions (app.js puts the primary first). On a phone this
+         row stays on screen while the sheet scrolls; Remove, rare and
+         confirm-gated, is under it, last. -->
+    <div class="row inline contact-actions">
       <button id="contactMessage" type="button" class="primary">Message</button>
       <button id="contactVerify" type="button">Verified in person ✓</button>
+    </div>
+    <div class="contact-remove-row">
       <button id="contactRemove" type="button" class="danger">Remove</button>
     </div>
   </section>

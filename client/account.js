@@ -222,12 +222,15 @@ export function vouchMessageBytes(targetUsername, targetBundle) {
 // Publish a vouch for a contact whose bundle WE hold (signed over OUR pinned
 // copy — if the directory has a different key for them, the server refuses,
 // which is exactly right: never vouch for a key you did not verify).
-export async function vouch(base, identity, sessionToken, targetUsername, targetBundle) {
+// `signal` (optional) bounds the request: a relay that never answers must not
+// hold the caller's UI state forever.
+export async function vouch(base, identity, sessionToken, targetUsername, targetBundle, signal = undefined) {
   const { ed: sig, mldsa: mldsa_sig } = await identity.sign(vouchMessageBytes(targetUsername, targetBundle));
   const res = await fetch(base + "/api/vouch", {
     method: "POST",
     headers: { ...JSON_HEADERS, authorization: "Bearer " + sessionToken },
     body: JSON.stringify({ target: targetUsername, sig, mldsa_sig }),
+    signal,
   });
   if (!res.ok) throw new Error("vouch failed: " + (await asError(res)));
   return res.json();

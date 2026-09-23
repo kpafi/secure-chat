@@ -49,7 +49,15 @@ async function newTab(label) {
     const t = m.text();
     if (m.type() === "error" && !/favicon|404/.test(t)) errors.push(`${label}: ${t}`);
   });
-  page.on("dialog", (d) => d.accept()); // every confirm() says yes
+  // Every confirm() says yes, unless a check asks for one "no"; each
+  // dialog's text is kept, so a check can count the gates it passed.
+  page.dialogs = [];
+  page.answers = []; // queued answers for the next dialogs (true = OK), then OK
+  page.on("dialog", (d) => {
+    page.dialogs.push(d.message());
+    const yes = page.answers.length ? page.answers.shift() : true;
+    if (yes) d.accept(); else d.dismiss();
+  });
   await page.setViewport({ width: 1000, height: 900 });
   await page.goto(APP, { waitUntil: "networkidle0" });
   return { ctx, page, label };
@@ -91,7 +99,7 @@ async function addUser(page, handle) {
 const sheet = (page) => page.evaluate(() => {
   const s = document.querySelector("#contactSheet");
   const a = document.activeElement;
-  const dd = [...document.querySelectorAll("#contactFacts > dt")].map((dt) => [dt.textContent, dt.nextElementSibling.textContent]);
+  const dd = [...document.querySelectorAll("#contactFacts dt")].map((dt) => [dt.textContent, dt.nextElementSibling.textContent]);
   return {
     open: !s.hidden && !document.querySelector("#contactScrim").hidden,
     name: document.querySelector("#contactName").textContent,
@@ -261,9 +269,11 @@ check("the conversation's name is a button that opens the profile — without Me
 // Pentest L-2 / cold M1: Unverify from here — the header's mark follows.
 await alice.page.click("#contactVerify"); // Unverify (confirm accepted)
 await alice.page.waitForFunction(() => document.querySelector("#contactVerify").textContent === "Verified in person ✓", { timeout: 10000 }).catch(() => {});
-const headerMark = await alice.page.evaluate(() => document.querySelector("#chatPeerMark").textContent);
-check("Unverify from the conversation's profile updates the header's mark at once",
-  headerMark === "unverified", JSON.stringify(headerMark));
+const headerMark = await alice.page.evaluate(() => ({
+  mark: document.querySelector("#chatPeerMark").textContent, verify: document.querySelector("#contactVerify").textContent,
+}));
+check("Unverify from the conversation's profile updates the header's mark and the sheet at once",
+  headerMark.mark === "unverified" && headerMark.verify === "Verified in person ✓", JSON.stringify(headerMark));
 await alice.page.keyboard.press("Escape");
 await waitSheet(alice.page, false);
 f = await focusInfo(alice.page);
@@ -393,6 +403,129 @@ await alice.page.evaluate(async () => {
   await (await import("./contacts.js")).remove("e2e-dave-helper");
 });
 
+// --- 4b. the gates, and what the fix rounds pinned --------------------------------
+console.log("\n4b. gates");
+const store = (page, fn, ...args) => page.evaluate(fn, ...args);
+const isVerified = (u) => store(alice.page, async (n) => (await import("./contacts.js")).get(n)?.verified ?? null, u);
+await alice.page.click(`${rowOf(bob.username)} > .u-open`);
+await waitSheet(alice.page);
+await waitFp(alice.page);
+// Key changed: the primary (Verify) is first for Tab too, not only on screen.
+await alice.page.focus("#contactClose");
+const order = [];
+for (let i = 0; i < 8; i++) {
+  await alice.page.keyboard.press("Tab");
+  order.push(await alice.page.evaluate(() => document.activeElement.id || document.activeElement.tagName));
+}
+check("key changed: Tab reaches Verify (the primary, shown first) before Message",
+  order.indexOf("contactVerify") >= 0 && order.indexOf("contactVerify") < order.indexOf("contactMessage"), JSON.stringify(order));
+
+// Verify (the vouch declined: the test re-keyed bob locally, so the relay
+// would rightly refuse a vouch over those keys), then Unverify is
+// confirm-gated: "no" keeps it.
+alice.page.answers = [true, false];
+await alice.page.click("#contactVerify");
+await alice.page.waitForFunction(() => document.querySelector("#contactVerify").textContent === "Unverify", { timeout: 15000 }).catch(() => {});
+await sleep(600);
+const nDialogs = alice.page.dialogs.length;
+alice.page.answers = [false];
+await alice.page.click("#contactVerify");
+await sleep(300);
+const unvText = alice.page.dialogs.slice(nDialogs).join(" | ");
+check("Unverify asks first, and \"no\" leaves the contact verified",
+  /^Unverify "/.test(unvText) && (await isVerified(bob.username)) === true, JSON.stringify({ unvText }));
+
+// data-action: the button acts as it was drawn. Flip the store behind it (a
+// second tab would); the click redraws instead of acting on a fresh read.
+await store(alice.page, async (u) => { await (await import("./contacts.js")).setVerified(u, false); }, bob.username);
+await sleep(600);
+const nD2 = alice.page.dialogs.length;
+await alice.page.click("#contactVerify"); // still reads "Unverify"
+await sleep(300);
+const redraw = await alice.page.evaluate(() => document.querySelector("#contactVerify").textContent);
+check("a click on a button whose state the store no longer has redraws it and asks nothing",
+  alice.page.dialogs.length === nD2 && redraw === "Verified in person ✓" && (await isVerified(bob.username)) === false,
+  JSON.stringify({ redraw, dialogs: alice.page.dialogs.length - nD2 }));
+
+// Busy: a vouch the relay never answers. A second click is refused and says
+// why; the round trip is bounded, so Verify/Unverify work again afterwards.
+await alice.page.setRequestInterception(true);
+const held = [];
+const onReq = (r) => {
+  if (r.method() === "POST" && r.url().endsWith("/api/vouch")) { held.push(r); return; } // never answered
+  r.continue();
+};
+alice.page.on("request", onReq);
+await sleep(600);
+await alice.page.click("#contactVerify"); // verify + vouch prompt accepted, vouch hangs
+await alice.page.waitForFunction(() => /Publishing the vouch/.test(document.querySelector("#contactStatus").textContent), { timeout: 10000 }).catch(() => {});
+await sleep(700);
+const nD3 = alice.page.dialogs.length;
+await alice.page.click("#contactVerify");
+await sleep(200);
+const busy = await alice.page.evaluate(() => ({
+  status: document.querySelector("#contactStatus").textContent, label: document.querySelector("#contactVerify").textContent,
+}));
+check("while the vouch is in flight the store shows verified at once, and a second click is refused with a reason",
+  busy.label === "Unverify" && /Still publishing the vouch/.test(busy.status) && alice.page.dialogs.length === nD3 &&
+  (await isVerified(bob.username)) === true && held.length === 1, JSON.stringify({ busy, held: held.length }));
+await alice.page.waitForFunction(() => /Could not publish the vouch/.test(document.querySelector("#contactStatus").textContent),
+  { timeout: 25000 }).catch(() => {});
+const timedOut = await alice.page.evaluate(() => document.querySelector("#contactStatus").textContent);
+alice.page.off("request", onReq);
+await alice.page.setRequestInterception(false);
+await sleep(600);
+await alice.page.click("#contactVerify"); // Unverify, accepted
+await sleep(800);
+check("a vouch that never returns times out, says so, and Unverify works again",
+  /Could not publish the vouch/.test(timedOut) && (await isVerified(bob.username)) === false, JSON.stringify(timedOut));
+await alice.page.keyboard.press("Escape");
+await waitSheet(alice.page, false);
+
+// Seeded records: an adopted claim (not auto) and malformed stored keys.
+await store(alice.page, async () => {
+  const { Identity } = await import("./identity.js");
+  const contacts = await import("./contacts.js");
+  const k = (await Identity.generate()).publicBundle();
+  await contacts.upsert({ username: "e2e-adopt", token: "adopttoken0123456789abcd", claimedName: "someone-else#faketoken000000000000",
+    ed: k.ed, mldsa: k.mldsa, ecdh: k.ecdh, mlkem: k.mlkem });
+  await contacts.upsert({ username: "e2e-broken", token: null, ed: "AAAA", mldsa: "AAAA", ecdh: null, mlkem: null });
+});
+await view(alice.page, "chats");
+await view(alice.page, "users");
+await sleep(400);
+const broken = await alice.page.evaluate((sel) => document.querySelector(`${sel} > .hint.err`)?.textContent || null, rowOf("e2e-broken"));
+check("malformed stored keys are said in the Users row, not only behind the tap",
+  broken === "fingerprint unavailable — stored keys are malformed", JSON.stringify(broken));
+await alice.page.click(`${rowOf("e2e-adopt")} > .u-open`);
+await waitSheet(alice.page);
+s = await sheet(alice.page);
+check("a contact that carries a claimed name gets \"Handle they claim\" even when not automatic",
+  s.handleLabel === "Handle they claim" && s.handle === "e2e-adopt#adopttoken0123456789abcd", JSON.stringify([s.handleLabel, s.handle]));
+// Copy's result belongs to one contact: copy here, open bob, it reads "Copy".
+await alice.page.click("#contactCopyHandle");
+await sleep(150);
+const copied = await alice.page.evaluate(() => document.querySelector("#contactCopyHandle").textContent);
+await alice.page.keyboard.press("Escape");
+await waitSheet(alice.page, false);
+await alice.page.click(`${rowOf(bob.username)} > .u-open`);
+await waitSheet(alice.page);
+const onBob = await alice.page.evaluate(() => document.querySelector("#contactCopyHandle").textContent);
+check("a copy result on one contact never shows on the next one's Copy",
+  copied !== "Copy" && onBob === "Copy", JSON.stringify({ copied, onBob }));
+await alice.page.keyboard.press("Escape");
+await waitSheet(alice.page, false);
+// Remove from Users: the sheet closes, the row goes, focus on the add field.
+await alice.page.click(`${rowOf("e2e-adopt")} > .u-open`);
+await waitSheet(alice.page);
+await alice.page.click("#contactRemove");
+await waitSheet(alice.page, false);
+f = await focusInfo(alice.page);
+const adoptGone = await alice.page.evaluate((sel) => !document.querySelector(sel), rowOf("e2e-adopt"));
+check("Remove from Users closes the sheet, drops the row, and focus lands on the add field",
+  !(await sheet(alice.page)).open && adoptGone && f.id === "addHandle", JSON.stringify({ adoptGone, f }));
+await store(alice.page, async () => { await (await import("./contacts.js")).remove("e2e-broken"); });
+
 // --- 5. an automatic contact (a stranger's mail) -------------------------------
 console.log("\n5. automatic contact");
 const carol = await onboard(carolSpec, "carol");
@@ -416,10 +549,13 @@ if (auto) {
   await alice.page.click(`#chatList > li[data-user="${auto}"] > .u-avatar`);
   await waitSheet(alice.page);
   s = await sheet(alice.page);
-  const dup = await alice.page.evaluate(() => getComputedStyle(document.querySelector("#contactHandle")).display);
-  check("an automatic contact's handle is labelled a claim and not printed twice beside the claim line (hot M8)",
-    s.handleLabel === "Handle they claim" && s.handle === carol.handle && dup === "none" &&
-    s.warn.includes(`claims to be "${carol.handle}"`), JSON.stringify({ label: s.handleLabel, handle: s.handle, dup, warn: s.warn }));
+  const shown = await alice.page.evaluate(() => getComputedStyle(document.querySelector("#contactHandle")).display);
+  const rowClaim = await alice.page.evaluate((sel) => document.querySelector(`${sel} > .u-claim`)?.textContent, rowOf(auto));
+  check("an automatic contact's handle is labelled a claim, printed once: the sheet's claim line points at it (hot M8, M-B)",
+    s.handleLabel === "Handle they claim" && s.handle === carol.handle && shown !== "none" &&
+    s.warn === "claims the handle below — unverified, they chose this name themselves" &&
+    rowClaim === `claims to be "${carol.handle}" — unverified, they chose this name themselves`,
+    JSON.stringify({ label: s.handleLabel, handle: s.handle, shown, warn: s.warn, rowClaim }));
   await alice.page.click("#contactRemove");
   await waitSheet(alice.page, false);
   f = await focusInfo(alice.page);
