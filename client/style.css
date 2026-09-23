@@ -631,6 +631,20 @@ select option { background: var(--panel); color: var(--fg); }
   margin-top: 3px;
   color: var(--ok);
 }
+/* A relay reason the app does not know (app.js A3): the app says its own
+   sentence; the relay's words follow on a line of their own, quoted, in mono
+   and muted — visibly not the app talking. */
+.hint.err:has(> .relay-said) {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  column-gap: var(--sp-2);
+}
+.relay-said {
+  grid-column: 2;
+  font-family: var(--font-mono);
+  font-size: var(--fs-1);
+  color: var(--muted);
+}
 
 /* 5.3 Cards: one surface step up, a hairline and a 1px top highlight. The
    card is for a distinct object (your handle, your account, a locked store)
@@ -889,6 +903,7 @@ select option { background: var(--panel); color: var(--fg); }
    drops its own icon — one alert per row. */
 .u-mark.changed {
   --icon: var(--i-alert);
+  flex-wrap: wrap;              /* the key-changed caption takes a line of its own */
   align-items: flex-start;
   padding: var(--sp-1) var(--sp-2);
   border-radius: var(--r-s);
@@ -897,6 +912,16 @@ select option { background: var(--panel); color: var(--fg); }
 .u-mark.changed::before,
 .u-mark.changed::after { margin-top: 2px; }
 .u-mark.changed::after { margin-top: 7px; }
+/* What changed is a caption on its own line under the word and the dots
+   (app.js B5), quieter by size and weight. It keeps the box's colour: muted
+   grey on the red tint is 4.3:1 on a hovered row, under the 4.5:1 floor. */
+.u-mark-note {
+  order: 1;
+  flex-basis: 100%;
+  padding-left: calc(14px + var(--sp-1));  /* under the word, not the icon */
+  font-size: var(--fs-1);
+  font-weight: 400;
+}
 li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
 
 /* Empty state: one title, one sentence, centred in the list's frame. */
@@ -1583,10 +1608,10 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
    icon too. Section 7 sets the bar on one line with words. */
 #scrChat .topbar {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr) auto auto;
   grid-template-areas:
-    "id     copy leave"
-    "status copy leave";
+    "id     id       copy leave"
+    "status verified copy leave";
   align-items: center;
   gap: 2px var(--sp-1);
   padding: var(--sp-2) var(--sp-1) var(--sp-1) var(--sp-4);
@@ -1633,6 +1658,39 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
   #disconnect { width: var(--control-h); padding: 0; font-size: 0; }
   #disconnect::before { display: block; }
 }
+/* Verified in person (app.js B2): a pill beside the connection pill. On a
+   phone it is the icon and "verified" without the level dots; " in person"
+   is clipped like `.vh`, so it is still read out. From 360 to 389px, where
+   Disconnect still has its word, only the icon fits: the words stay for
+   assistive tech, as #copyRoom's do. Section 7 shows the pill in full. */
+#chatVerified {
+  grid-area: verified;
+  justify-self: start;
+  max-width: 100%;
+  overflow: hidden;   /* an unexpectedly wide font clips it, never overlaps Copy */
+  white-space: nowrap;
+}
+@media (max-width: 600px) {
+  #chatVerified::after { display: none; }
+  /* #chatVerified > .vh-narrow is clipped by the phone wordmark rule below. */
+}
+@media (min-width: 360px) and (max-width: 389px) {
+  #chatVerified { gap: 0; padding: 0 var(--sp-2); font-size: 0; }
+}
+/* Once verified, green belongs to "verified" alone: "connected" steps down
+   to a neutral pill that keeps only its green dot (design review H2). */
+#scrChat:has(#chatVerified:not([hidden])) #chatStatus.ok {
+  color: var(--muted);
+  background: transparent;
+  border-color: var(--border-soft);
+}
+#scrChat:has(#chatVerified:not([hidden])) #chatStatus.ok::before { background: var(--ok); box-shadow: none; }
+/* The sheet's quiet way out (pentest P3): a ghost (muted until hovered)
+   centred under the decision pair — it decides no knock. */
+#admitLeave {
+  align-self: center;
+  margin-top: calc(var(--sp-1) - var(--gap));
+}
 .convo {
   flex: 1 1 auto;
   min-height: 0;
@@ -1657,6 +1715,9 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
 /* Chats: rows open a conversation. */
 .chatrow { cursor: pointer; }
 .chatrow:hover { background: var(--panel-2); }
+/* A row is a keyboard stop (app.js B4): the ring sits inside it, where the
+   list's edges cannot clip it, on the hover ground. */
+.chatrow:focus-visible { outline-offset: -2px; background: var(--panel-2); }
 .chatrow .u-fp {
   font-family: var(--font-ui);
   font-size: var(--fs-2);
@@ -1780,7 +1841,8 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
     border-bottom: 0;
   }
   body:has(main > #viewLive:not([hidden]) > #scrChat:not([hidden])) .apphead .wordmark,
-  body:has(main > #viewChats:not([hidden]) #chatsUnlocked:not([hidden]) #chatConvo:not([hidden])) .apphead .wordmark {
+  body:has(main > #viewChats:not([hidden]) #chatsUnlocked:not([hidden]) #chatConvo:not([hidden])) .apphead .wordmark,
+  #chatVerified > .vh-narrow {
     position: absolute;
     width: 1px;
     height: 1px;
@@ -1983,6 +2045,7 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
     border-radius: var(--r-s);
   }
   #scrChat .topbar .status { flex: none; margin-left: auto; }
+  #chatVerified { flex: none; }
   #copyRoom { width: auto; padding: 0 var(--sp-3); font-size: var(--control-fs); }
   #copyRoom::before { display: none; }
 

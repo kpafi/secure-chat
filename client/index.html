@@ -249,6 +249,10 @@
         <span class="roomid" id="roomShort"></span>
         <button id="copyRoom" type="button" class="ghost">Copy room id</button>
         <span id="chatStatus" class="status"></span>
+        <!-- Shown once the safety number was confirmed in person (app.js B2).
+             A phone keeps the icon and "verified"; the rest stays for
+             assistive tech, clipped like `.vh`. -->
+        <span id="chatVerified" class="u-mark ok" hidden>verified<span class="vh-narrow"> in person</span></span>
         <button id="disconnect" type="button" class="ghost">Disconnect</button>
       </div>
 
@@ -271,6 +275,8 @@
           <button id="admitOk" type="button" class="primary">Let them in</button>
           <button id="admitNo" type="button" class="danger">Deny</button>
         </div>
+        <!-- The sheet is modal; this is its way out that decides no knock. -->
+        <button id="admitLeave" type="button" class="ghost">Leave chat</button>
       </section>
 
       <section class="gate" id="verify" hidden>
@@ -469,7 +475,8 @@
                 <button id="chatStart" type="button">Open</button>
               </div>
             </div>
-            <ul id="chatList" class="userlist"></ul>
+            <!-- role="none": each row is a button (app.js), not a list item. -->
+            <ul id="chatList" class="userlist" role="none"></ul>
           </div>
 
           <div id="chatConvo" class="window" hidden>

@@ -166,8 +166,38 @@ const mallorySees = {
 check("a waiting peer gets no key exchange and cannot send",
   !mallorySees.verify && !mallorySees.canSend, JSON.stringify(mallorySees));
 
+// Phase 2a, B3 (a11y review): the sheet is modal for the keyboard as well.
+// Everything behind it is inert, and Tab / Shift+Tab wrap inside it: from
+// Deny (last) to the fingerprint block (first), through Let them in, and back.
+const inertNow = (page) => page.evaluate(() =>
+  ["#tabbar", "#scrChat > .topbar", "#verify", "#chat"].map((s) => document.querySelector(s).inert));
+const behindSheet = await inertNow(alice.page);
+check("B3: with the sheet up, the tab bar, chat bar, gate and log are inert",
+  behindSheet.every((x) => x === true), JSON.stringify(behindSheet));
+await alice.page.focus("#admitNo");
+const tabWalk = [];
+for (const shift of [false, false, true, false, false, false]) {
+  if (shift) await alice.page.keyboard.down("Shift");
+  await alice.page.keyboard.press("Tab");
+  if (shift) await alice.page.keyboard.up("Shift");
+  tabWalk.push(await alice.page.evaluate(() => document.activeElement.id || document.activeElement.tagName));
+}
+check("B3: Tab and Shift+Tab stay inside the sheet (Deny -> Leave chat -> fingerprint, Shift+Tab back to Leave, on to Deny)",
+  JSON.stringify(tabWalk) === JSON.stringify(["admitLeave", "admitFingerprint", "admitLeave", "admitFingerprint", "admitOk", "admitNo"]),
+  JSON.stringify(tabWalk));
+
 // --- 3. the invited peer knocks too, and is let in -------------------------
 console.log("\n3. the invited peer knocks; alice denies the squatter and admits bob");
+// Phase 2a fix round, C4 (B1): bob is someone alice verified before, so his
+// prompt must carry her name for him and the same trust pill the lists draw.
+const bobBundle = await bob.page.evaluate(async (pass) => {
+  const { Identity } = await import("./identity.js");
+  return (await Identity.import(localStorage.getItem("sc.identity.v1"), pass)).publicBundle();
+}, PASS);
+await alice.page.evaluate(async (b) => {
+  const contacts = await import("./contacts.js");
+  await contacts.upsert({ username: "bob", token: null, ed: b.ed, mldsa: b.mldsa, ecdh: b.ecdh, mlkem: b.mlkem, verified: true });
+}, bobBundle);
 await joinRoom(bob.page, code);
 await bob.page.waitForFunction(
   () => /waiting for approval/i.test(document.querySelector("#chatStatus").textContent),
@@ -196,6 +226,13 @@ await alice.page.waitForFunction(() => !document.querySelector("#admit").hidden,
 const bobFp = await text(alice.page, "#admitFingerprint");
 check("the second prompt shows bob's fingerprint", bobFp === bob.fingerprint,
   `${bobFp.slice(0, 24)}… vs ${bob.fingerprint.slice(0, 24)}…`);
+const knownWho = await alice.page.evaluate(() => {
+  const w = document.querySelector("#admitWho"), m = w.querySelector(".u-mark"), n = w.querySelector(".u-name");
+  return { name: n ? n.textContent : null, mark: m ? m.className : null, words: m ? m.textContent : null };
+});
+check("B1: a known, verified knocker is shown by name with the green trust pill",
+  knownWho.name === "bob" && /\bu-mark\b.*\bok\b/.test(knownWho.mark || "") && knownWho.words === "verified by you",
+  JSON.stringify(knownWho));
 await sleep(DECIDE_PAUSE);
 await alice.page.click("#admitOk");
 
@@ -208,6 +245,18 @@ await alice.page.waitForFunction(
 const [snA, snB] = [await text(alice.page, "#safetyNumber"), await text(bob.page, "#safetyNumber")];
 check("both peers reach the safety-number gate after approval", !!snA && snA === snB,
   `${snA.slice(0, 20)}… / ${snB.slice(0, 20)}…`);
+const afterDecide = await inertNow(alice.page);
+check("B3: once the knocks are decided nothing is inert", afterDecide.every((x) => x === false),
+  JSON.stringify(afterDecide));
+// Fix round, C1 (a11y review): the admit hid the focused button; focus is on
+// the gate's safety number now, on both sides — never dropped to <body>.
+const gateFocus = async (page) => {
+  await page.waitForFunction(() => document.activeElement.id === "safetyNumber", { timeout: 3000 }).catch(() => {});
+  return page.evaluate(() => document.activeElement.id || document.activeElement.tagName);
+};
+const [gfA, gfB] = [await gateFocus(alice.page), await gateFocus(bob.page)];
+check("C1: after Let them in, focus is on the gate (safety number) for owner and guest",
+  gfA === "safetyNumber" && gfB === "safetyNumber", JSON.stringify({ owner: gfA, guest: gfB }));
 
 await alice.page.click("#verifyOk");
 await bob.page.click("#verifyOk");
@@ -236,6 +285,24 @@ check("and both directions work", /back the other way/.test(bobLog),
 const malloryStillOut = await mallory.page.evaluate(() =>
   document.querySelector("#text").disabled && document.querySelector("#verify").hidden);
 check("the denied peer never gains the room", malloryStillOut);
+
+// Phase 2a, B2 (design review): after the in-person check the live-room header
+// says so, next to (not instead of) the connection status.
+const header = (page) => page.evaluate(() => {
+  const v = document.querySelector("#chatVerified"), r = v.getBoundingClientRect();
+  return { hidden: v.hidden, shown: !v.hidden && r.width > 0 && r.height > 0, text: v.textContent,
+    status: document.querySelector("#chatStatus").textContent };
+});
+const [hdrA, hdrB] = [await header(alice.page), await header(bob.page)];
+check("B2: after the safety-number check both headers show 'verified in person'; the status still reads connected",
+  hdrA.shown && hdrB.shown && hdrA.text === "verified in person" && hdrA.status === "connected" && hdrB.status === "connected",
+  JSON.stringify({ hdrA, hdrB }));
+await alice.page.click("#disconnect");
+await alice.page.waitForFunction(
+  () => document.querySelector("#chatStatus").textContent.trim() === "disconnected", { timeout: 15000 }).catch(() => {});
+const hdrGone = await header(alice.page);
+check("B2: after disconnect the verified pill is hidden", hdrGone.hidden && hdrGone.status === "disconnected",
+  JSON.stringify(hdrGone));
 
 // --- 5. on a phone, a tap already on its way does not let anyone in --------
 // 2026-09-22 rework pentest (tap-through): on a 390px touch screen the
@@ -354,6 +421,13 @@ await sleep(DECIDE_PAUSE);
 await tapIfShown(ra.page, "#admitNo");
 await k1.page.waitForFunction(() => /did not let you in/.test(document.querySelector("#log").textContent), { timeout: 20000 }).catch(() => {});
 check("reduced motion: after a pause, Deny turns the knocker away", /did not let you in/.test(await text(k1.page, "#log")));
+// Fix round, C1: that Deny emptied the queue and hid the focused button.
+const afterDeny = await ra.page.evaluate(() => {
+  const a = document.activeElement, r = a.getBoundingClientRect();
+  return { id: a.id || a.tagName, shown: a !== document.body && r.width > 0 && r.height > 0 };
+});
+check("C1: after the last Deny, focus moves to the chat bar (Copy room id), not <body>",
+  afterDeny.id === "copyRoom" && afterDeny.shown, JSON.stringify(afterDeny));
 
 // b) a prompt revealed by a view switch
 const rb = await reducedOwner("rita-b-phone-reduced"), k2 = await agent("knocker-2");
@@ -362,6 +436,7 @@ await rb.page.touchscreen.tap(rbUsersTab.x, rbUsersTab.y);
 await rb.page.waitForFunction(() => !document.querySelector("#viewUsers").hidden);
 await joinRoom(k2.page, rb.roomCode);
 await rb.page.waitForFunction(() => !document.querySelector("#admit").hidden, { timeout: 30000 });
+const rbBehindInert = await rb.page.evaluate(() => document.querySelector("#tabbar").inert); // B3, read below
 await sleep(900); // the knock is older than the guard by the time the owner looks
 const rbLiveTab = await centreOf(rb.page, '.navitem[data-view="live"]');
 await rb.page.touchscreen.tap(rbLiveTab.x, rbLiveTab.y);
@@ -373,6 +448,9 @@ const rbSwitch = { ...(await decided(rb.page)), focusOnReveal, guest: (await tex
 check("reduced motion: a prompt revealed by switching back to the Live room ignores a tap at once",
   rbSwitch.admits === 0 && /waiting for approval/.test(rbSwitch.guest), JSON.stringify(rbSwitch));
 check("reduced motion: that reveal puts focus on Deny", focusOnReveal === "admitNo", focusOnReveal);
+const rbRevealedInert = await rb.page.evaluate(() => document.querySelector("#tabbar").inert);
+check("B3: a knock behind another view leaves the tab bar usable; revealing it makes the bar inert",
+  rbBehindInert === false && rbRevealedInert === true, JSON.stringify({ rbBehindInert, rbRevealedInert }));
 
 // c) the keyboard inside the first 500 ms, then after it
 const rc = await reducedOwner("rita-c-phone-reduced"), k3 = await agent("knocker-3");
@@ -513,6 +591,104 @@ await sleep(1500);
 const hsOut = { ...swap, ...(await decided(hs.page)), knocker7: (await text(k7.page, "#chatStatus")).toLowerCase() };
 check("PT4a: a click while the next knock's prompt is still being drawn admits no one",
   hsOut.oldStillShown && hsOut.admits === 0 && /waiting for approval/.test(hsOut.knocker7), JSON.stringify(hsOut));
+
+// Phase 2a, B3: the connection drops while a knock is still pending (knocker-7's
+// prompt is up). The reset path must lift the modal — nothing may stay inert.
+const beforeDrop = { prompt: await visible(hs.page, "#admit"), inert: await inertNow(hs.page) };
+await hs.page.evaluate(() => window.__ws.close());
+await hs.page.waitForFunction(
+  () => document.querySelector("#chatStatus").textContent.trim() === "disconnected", { timeout: 15000 }).catch(() => {});
+const afterDrop = { prompt: await visible(hs.page, "#admit"), inert: await inertNow(hs.page) };
+check("B3: a disconnect with a knock pending leaves nothing inert",
+  beforeDrop.prompt && beforeDrop.inert.every((x) => x === true) && !afterDrop.prompt && afterDrop.inert.every((x) => x === false),
+  JSON.stringify({ beforeDrop, afterDrop }));
+
+// --- 8. the sheet's own way out (phase 2a fix round, pentest P3) -----------
+// Under an endless supply of knocks Deny was the only way off the modal
+// sheet. "Leave chat" sits in its Tab cycle, disconnects (after the same
+// 500 ms rule as the decisions — round 3, L1: section 9), and leaves nothing
+// inert. The waiter is then told by the REAL relay that the room closed.
+console.log("\n8. 'Leave chat' inside the admission sheet");
+const lv = await agent("owner-leaves"), k8 = await agent("knocker-8");
+const lvCode = await ownerConnected(lv);
+await joinRoom(k8.page, lvCode);
+await lv.page.waitForFunction(() => !document.querySelector("#admit").hidden, { timeout: 30000 });
+await lv.page.focus("#admitNo");
+await lv.page.keyboard.press("Tab");
+const onLeave = await lv.page.evaluate(() => document.activeElement.id);
+await sleep(DECIDE_PAUSE);
+await lv.page.keyboard.press("Enter");
+await lv.page.waitForFunction(
+  () => document.querySelector("#chatStatus").textContent.trim() === "disconnected", { timeout: 15000 }).catch(() => {});
+const left = {
+  onLeave, status: (await text(lv.page, "#chatStatus")).toLowerCase(), prompt: await visible(lv.page, "#admit"),
+  inert: await inertNow(lv.page), decisions: await decided(lv.page),
+};
+check("P3: Tab from Deny reaches Leave chat; Enter leaves — disconnected, sheet gone, nothing inert, no decision",
+  left.onLeave === "admitLeave" && left.status === "disconnected" && !left.prompt && left.inert.every((x) => x === false) &&
+  left.decisions.admits === 0 && left.decisions.denies === 0, JSON.stringify(left));
+await k8.page.waitForFunction(
+  () => document.querySelector("#chatStatus").textContent.trim() === "disconnected", { timeout: 15000 }).catch(() => {});
+const k8Hint = await text(k8.page, "#roomHint");
+check("A3 (real relay): the waiter reads the app's 'room closed' sentence after its socket closed",
+  k8Hint === "The person who created this chat left, so the chat was closed.", JSON.stringify(k8Hint));
+
+// --- 9. round 3, pentest L1: "Leave chat" under a tap meant for the composer --
+// On a phone the sheet docks over the composer. With reduced motion nothing in
+// CSS delays it, so a tap aimed at the composer as the knock arrives lands on
+// "Leave chat" — which must ignore it (the same 500 ms rule), then work.
+console.log("\n9. phone, reduced motion: a tap meant for the composer as a knock arrives does not leave");
+const lt = await reducedOwner("owner-leavetap-phone-reduced"), k9 = await agent("knocker-9");
+const composer = await lt.page.evaluate(() => ["#send", "#text"].map((s) => {
+  const r = document.querySelector(s).getBoundingClientRect(); return { s, x: r.left + r.width / 2, y: r.top + r.height / 2 };
+}));
+await joinRoom(k9.page, lt.roomCode);
+await lt.page.waitForFunction(() => !document.querySelector("#admit").hidden, { timeout: 30000, polling: "mutation" });
+const onLeaveNow = await lt.page.evaluate((pts) => pts.filter((p) => {
+  const t = document.elementFromPoint(p.x, p.y); return t && t.closest("#admitLeave");
+}), composer);
+const aim = onLeaveNow[0] || composer[0];
+await lt.page.touchscreen.tap(aim.x, aim.y);
+await sleep(300);
+const ltEarly = (await text(lt.page, "#chatStatus")).toLowerCase();
+await sleep(DECIDE_PAUSE);
+await lt.page.touchscreen.tap(aim.x, aim.y);
+await lt.page.waitForFunction(
+  () => document.querySelector("#chatStatus").textContent.trim() === "disconnected", { timeout: 15000 }).catch(() => {});
+const ltLate = (await text(lt.page, "#chatStatus")).toLowerCase();
+check("L1: a tap on the composer's spot as the sheet appears lands on Leave chat and is ignored; 600 ms later it leaves",
+  !!onLeaveNow.length && ltEarly === "connected" && ltLate === "disconnected",
+  JSON.stringify({ aim: aim.s, coveredByLeave: onLeaveNow.map((p) => p.s), ltEarly, ltLate }));
+
+// --- 10. round 3, T1: Enter, Enter on the auto-focused Deny while the gate is up --
+// The owner let A in and is at the safety-number gate when B knocks. Enter on
+// the focused Deny turns B away and hides the sheet; focus goes to the safety
+// number, so a second Enter (a double press, key repeat) must pass nothing.
+console.log("\n10. a knock while the gate is up: Enter on Deny, then Enter again");
+const df = await agent("owner-denyfocus"), dA = await agent("peer-a"), dB = await agent("knocker-b");
+const dfCode = await ownerConnected(df);
+await joinRoom(dA.page, dfCode);
+await df.page.waitForFunction(() => !document.querySelector("#admit").hidden, { timeout: 30000 });
+await sleep(DECIDE_PAUSE);
+await df.page.click("#admitOk");
+await df.page.waitForFunction(() => !document.querySelector("#verify").hidden, { timeout: 60000 });
+await joinRoom(dB.page, dfCode);
+await df.page.waitForFunction(() => !document.querySelector("#admit").hidden, { timeout: 30000 });
+await sleep(DECIDE_PAUSE);
+const dfFocus0 = await df.page.evaluate(() => document.activeElement.id);
+await df.page.keyboard.press("Enter");
+await sleep(400);
+await df.page.keyboard.press("Enter");
+await sleep(800);
+const dfAfter = await df.page.evaluate(() => ({
+  focus: document.activeElement.id || document.activeElement.tagName,
+  gate: !document.querySelector("#verify").hidden, sheet: !document.querySelector("#admit").hidden,
+  pill: !document.querySelector("#chatVerified").hidden,
+}));
+const dfDecided = await decided(df.page);
+check("T1: Enter on Deny, then Enter again, passes no gate (focus on the safety number, no verified pill)",
+  dfFocus0 === "admitNo" && dfDecided.denies === 1 && dfAfter.gate && !dfAfter.sheet && !dfAfter.pill &&
+  dfAfter.focus === "safetyNumber", JSON.stringify({ dfFocus0, ...dfAfter, ...dfDecided }));
 
 await browser.close();
 
