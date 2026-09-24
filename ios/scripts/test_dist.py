@@ -27,12 +27,15 @@ def run(*args, out):
 
 
 # 1. The workflow still runs on branch pushes (pentest dist-1 F1: adding
-#    `tags` without `branches` silently turned branch runs off).
+#    `tags` without `branches` silently turned branch runs off). Run from
+#    backend.yml too, since a broken trigger stops ios.yml from running.
 try:
     import yaml  # type: ignore
     wf = yaml.safe_load((ROOT / ".github/workflows/ios.yml").read_text())
     push = (wf.get("on") or wf.get(True))["push"]
-    check("ios.yml runs on branch pushes", "branches" in push or "tags" not in push, str(push.keys()))
+    # Exactly all branches: `branches: [main]` would silently stop runs on
+    # feature branches, `branches: []` on every branch.
+    check("ios.yml runs on every branch push", push.get("branches") == ["**"], str(push.get("branches")))
     check("ios.yml runs on ios-v* tags", "ios-v*" in (push.get("tags") or []))
 except ImportError:
     check("pyyaml available for the trigger lint", False)
@@ -63,6 +66,7 @@ with tempfile.TemporaryDirectory() as d:
         ("dot-dot path", ["--version", "1.2.3", "--build", "1", "--base-url", "https://a.b/.."]),
         ("bad host", ["--version", "1.2.3", "--build", "1", "--base-url", "https://-a..b/ios"]),
         ("bad date", ["--version", "1.2.3", "--build", "1", "--date", "x"]),
+        ("impossible date", ["--version", "1.2.3", "--build", "1", "--date", "9999-99-99"]),
     ]:
         args = list(args)
         if "--base-url" not in args:

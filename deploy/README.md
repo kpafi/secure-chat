@@ -199,16 +199,21 @@ assets are not a public download — this server is the distribution point.
    files: `SecureChat-0.3.0.ipa`, `SecureChat-0.3.0.ipa.sha256`, `apps.json`,
    `icon.png`. `apps.json` points at `https://138-199-144-35.sslip.io/ios`
    unless the repository variable `IOS_DIST_BASE_URL` says otherwise.
-3. Copy them to the box:
+3. Check the IPA against the hash in the **GitHub release notes** (the
+   release job computed it; the `.sha256` file only proves the bundle agrees
+   with itself), then copy the files to the box:
    ```bash
+   echo "<hash from the release notes>  SecureChat-0.3.0.ipa" | sha256sum -c
    sudo mkdir -p /srv/secure-chat-ios
-   sha256sum -c SecureChat-0.3.0.ipa.sha256        # before copying
    sudo cp SecureChat-0.3.0.ipa SecureChat-0.3.0.ipa.sha256 apps.json icon.png /srv/secure-chat-ios/
    sudo chown -R root:root /srv/secure-chat-ios && sudo chmod 644 /srv/secure-chat-ios/*
    sudo systemctl reload caddy
    ```
-4. Users add `https://<host>/ios/apps.json` as a source in SideStore
-   (`ios/README.md`, "Getting it onto an iPhone").
+4. Send users the **version and the full SHA-256** through a channel other
+   than this server, and the download link; they verify and install from the
+   file (`ios/README.md`, Option A, step 5). `apps.json` is there for
+   SideStore's update notice only — users are told not to install from it.
+   Publish only the current version's hash, so an old IPA cannot pass.
 
 Keep old IPAs out of the directory once a new one is published — `apps.json`
 lists one version, and a stale file is just attack surface. The Onion does not

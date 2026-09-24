@@ -115,17 +115,26 @@ What the user does (the tools change; **docs.sidestore.io** is authoritative):
 3. Install the small helper "VPN" the guide names (it only lets SideStore
    talk to the phone itself, for signing without a computer).
 4. Open SideStore, sign in, import the pairing file.
-5. **Verify, then install that exact file.** Download
-   `https://<your relay host>/ios/SecureChat-<version>.ipa`, compute its
-   SHA-256 yourself (on a computer: `shasum -a 256 SecureChat-*.ipa`, or an iOS
-   Shortcut), compare it with the value the operator sent you through a
-   **different channel** (not this server), then in SideStore tap **+** and
-   pick that file.
-6. Optional, for update notices: SideStore → Sources → **+** →
-   `https://<your relay host>/ios/apps.json`. **Do not treat a source install
-   as verified**: SideStore checks the download against a hash that comes from
-   the same server, so a hostile server can serve a matching pair. Any hash in
-   the description text is informational only. Repeat step 5 for every update.
+5. **Verify, then install that exact file.** The operator sends you, through
+   a **different channel** than the relay (a chat, in person), the **version**
+   and the **full SHA-256** of the current IPA. Download
+   `https://<your relay host>/ios/SecureChat-<version>.ipa`, then check it
+   **mechanically** — never by eye, a server can make the first and last few
+   characters match:
+   - on a computer: `echo "<hash>  SecureChat-<version>.ipa" | shasum -a 256 -c`
+     must print `OK`;
+   - on the iPhone: a Shortcut with *Receive files from Share Sheet* →
+     *Generate Hash* (SHA-256) → *If* the hash *is* `<paste the hash>` →
+     *Show "OK"*, otherwise *Show "MISMATCH"*; share the downloaded file to it.
+
+   Only if it says OK: in SideStore tap **+** and pick **that file**. Check the
+   version too — an old, genuine IPA also has a genuine hash.
+6. **Do not add the source for installing, and never tap *Update* in
+   SideStore.** SideStore checks a source download only against a hash from
+   the same server, so a hostile server can serve a matching pair; any hash in
+   the description is informational. Updates arrive the same way as step 5:
+   the operator announces version + hash through the second channel, you
+   repeat step 5.
 7. Open secure-chat, enter the relay address (`https://…`).
 
 Problems, stated plainly:
@@ -176,9 +185,12 @@ Problems, stated plainly:
 - **Invite links open in Safari**, not in the Home Screen web app, and
   Safari's storage is separate — so an invite lands where the identity is not.
   Paste the handle into the web app instead.
-- No service workers, deliberately and enforced (`worker-src 'none'` in the
-  relay's CSP): a worker would outlive a cleaned-up relay and keep serving
-  its code.
+- No service workers (`worker-src 'none'` in the relay's CSP). That stops a
+  stray same-origin script from planting a worker; it does **not** protect
+  against a compromised relay, which sets its own headers — and a worker a
+  compromised relay did plant would keep serving its code after the relay is
+  cleaned up. Recovery then means deleting the web app (and its data):
+  keep the identity backup.
 - No offline mode: without the relay there is no client.
 
 ### With an Apple Developer account (not set up)

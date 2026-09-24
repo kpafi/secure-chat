@@ -320,8 +320,13 @@ jobs:
             [ -f "$f" ] && [ ! -L "$f" ] || { echo "missing $n"; exit 1; }
             files="$files $f"
           done
-          # Recompute: the .sha256 file came from the same untrusted job.
+          # Recompute: the .sha256 file came from the same untrusted job. This
+          # only makes the notes match the uploaded IPA; it cannot vouch for a
+          # build job that was itself compromised.
+          set -o pipefail
           SUM=$(sha256sum "dist/SecureChat-$V.ipa" | cut -d' ' -f1)
+          case "$SUM" in *[!0-9a-f]*) echo "bad checksum"; exit 1 ;; esac
+          [ "${#SUM}" -eq 64 ] || { echo "bad checksum"; exit 1; }
           [ "$SUM" = "$(cut -d' ' -f1 "dist/SecureChat-$V.ipa.sha256")" ] || { echo "checksum file does not match the IPA"; exit 1; }
           gh release create "$TAG" $files --repo "$REPO" --title "iOS $V (unsigned)" \
             --notes "Unsigned iOS build for SideStore/AltStore. SHA-256 of SecureChat-$V.ipa: $SUM. Copy all four files to the relay's /ios/ directory (deploy/README.md)."
