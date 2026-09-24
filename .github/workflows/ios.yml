@@ -39,10 +39,8 @@ jobs:
         with:
           node-version: "22"
       # Only the relay tests the iOS app depends on (origin allow-list, CSP
-      # hash + drift guards). The full suite runs in deploy/deploy-*.sh (there
-      # is no other workflow yet — see ios/README.md), and
-      # tests/test_ws.py has a pre-existing intermittent hang (reproduced on
-      # master) that must not burn this pipeline's timeout.
+      # hash + drift guards), to keep this gate fast; the full relay + client
+      # suites run in .github/workflows/backend.yml (Linux, 1x billing).
       - name: Relay tests (iOS-relevant)
         timeout-minutes: 5
         working-directory: backend

@@ -115,10 +115,10 @@ Compare the IPA's SHA-256 (next to it in the artifact) before sideloading.
 - Screenshots of the app are possible (iOS offers no FLAG_SECURE).
 
 ## CI notes
-- The iOS gate runs only the relay tests the app depends on:
-  `tests/test_ws.py` has a pre-existing intermittent hang (seen on `master`
-  too), which must not burn this pipeline's timeout. The full relay suite
-  runs in `deploy/deploy-*.sh`.
+- The iOS gate runs only the relay tests the app depends on, to stay fast;
+  the full relay and client suites run in `.github/workflows/backend.yml`
+  (Linux). The intermittent `tests/test_ws.py` hang that once motivated the
+  split was a test-harness bug, fixed (see that file's header).
 - Screenshots and a test summary go to the `ci/ios-shots` branch from a
   separate job; the macOS job itself holds a read-only token. The publish
   job treats the artifact as hostile (allow-listed PNGs + SUMMARY.txt copied
