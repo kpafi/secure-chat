@@ -320,9 +320,39 @@ def _ed25519_verify(pub_raw: bytes, sig: bytes, msg: bytes) -> bool:
         return False
 
 
+# Pentest 2026-08-08 item 15 (ported from phase7-local 40d132e): `dilithium_py`
+# is NOT thread-safe in this deployment, and every endpoint that verifies an
+# ML-DSA signature (register, /auth/verify, /vouch) is a sync `def`, which
+# FastAPI runs in the anyio threadpool — so these calls really are concurrent.
+#
+# The library prefers `xoflib`, whose `shake256(seed)` returns a FRESH reader per
+# call. Without it, it falls back to `dilithium_py/shake/shake_wrapper.py`, whose
+# `shake128`/`shake256` are MODULE-LEVEL SINGLETONS carrying mutable state
+# (`buf`, `index`, `xof_read`). Two threads verifying at once interleave
+# `absorb`/`read` on the same object and read each other's keystream.
+#
+# There is no xoflib in the venv, and the effect is not subtle: 8 threads over
+# one VALID signature rejected 71-88 of 160 on master. It fails CLOSED (a
+# corrupted verify returns False, never True), so this is a login/registration
+# denial of service, never an auth bypass — but a login path that rejects half
+# of its valid signatures under ordinary concurrency is broken.
+#
+# Serialising is the fix rather than adding the dependency, because it is
+# correct WHATEVER backend is installed. Do NOT delete this lock on the strength
+# of an xoflib pin alone: adopting xoflib is a separate change that must come
+# with `tests/test_concurrency.py` run against the new backend.
+#
+# Cost: one verify is ~15 ms here, so this caps ML-DSA verification at ~66/s
+# process-wide, far above what the challenge/register buckets admit. The lock
+# serialises work that was already CPU-bound (GIL); it adds none. This is the
+# single ML-DSA call site in the request path, so it covers every endpoint.
+_mldsa_lock = threading.Lock()
+
+
 def _mldsa65_verify(pub_raw: bytes, sig: bytes, msg: bytes) -> bool:
     try:
-        return bool(ML_DSA_65.verify(pub_raw, msg, sig))
+        with _mldsa_lock:
+            return bool(ML_DSA_65.verify(pub_raw, msg, sig))
     except Exception:
         # A malformed key/sig must fail closed, never raise past the handler.
         return False
