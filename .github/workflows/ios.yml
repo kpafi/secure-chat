@@ -39,7 +39,8 @@ jobs:
         with:
           node-version: "22"
       # Only the relay tests the iOS app depends on (origin allow-list, CSP
-      # hash + drift guards). The full suite is the backend's own gate, and
+      # hash + drift guards). The full suite runs in deploy/deploy-*.sh (there
+      # is no other workflow yet — see ios/README.md), and
       # tests/test_ws.py has a pre-existing intermittent hang (reproduced on
       # master) that must not burn this pipeline's timeout.
       - name: Relay tests (iOS-relevant)
@@ -61,12 +62,14 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 35
     permissions:
-      contents: write   # only for the ci/ios-shots publish step below
+      contents: read    # pentest iOS-2 L-A: third-party tools run in this job
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Toolchain
         run: |
@@ -159,14 +162,6 @@ jobs:
           shasum -a 256 SecureChat-unsigned.ipa | tee SecureChat-unsigned.ipa.sha256
 
       - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ios-screenshots
-          path: shots/
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - uses: actions/upload-artifact@v4
         with:
           name: SecureChat-unsigned-ipa
           path: |
@@ -174,23 +169,21 @@ jobs:
             SecureChat-unsigned.ipa.sha256
           retention-days: 30
 
-      # Screenshots (for the design review) and a short test summary go to an
-      # orphan branch, force-pushed: artifacts need a browser login to fetch,
-      # a branch is one `git fetch`. Nothing else is written to the repo.
-      - name: Publish screenshots + test summary to ci/ios-shots
+      - name: Test summary for ci/ios-shots
         if: always()
-        env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          rm -rf /tmp/shots-branch && mkdir -p /tmp/shots-branch && cd /tmp/shots-branch
-          git init -q -b ci/ios-shots
-          cp -R "$GITHUB_WORKSPACE/shots/." . 2>/dev/null || true
-          { echo "run ${{ github.run_id }} sha ${{ github.sha }}";
+          mkdir -p shots
+          { echo "run ${{ github.run_id }} sha ${{ github.sha }} ref ${{ github.ref_name }}";
             grep -E "Test Case .*(passed|failed)|error:|TEST (SUCCEEDED|FAILED)|Executed" /tmp/xcodebuild-test.log 2>/dev/null | grep -v CHHaptic | head -300;
-          } > SUMMARY.txt
-          git -c user.name=ci -c user.email=ci@users.noreply.github.com add -A
-          git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "iOS CI ${{ github.run_id }} (${{ github.sha }})"
-          git push -qf "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git" ci/ios-shots
+          } > shots/SUMMARY.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-screenshots
+          path: shots/
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Collect failure logs
         if: failure()
@@ -206,3 +199,30 @@ jobs:
           name: ios-failure-logs
           path: failure/
           retention-days: 7
+
+  # Screenshots (for the design review) and the test summary go to an orphan
+  # branch, force-pushed: artifacts need a browser login to fetch, a branch is
+  # one `git fetch`. This job alone holds a write token and runs nothing but
+  # git on files it downloaded — no checkout, no third-party tools (pentest
+  # iOS-2 L-A: the macOS job, which runs brew/pip/xcodebuild, stays read-only).
+  publish-shots:
+    needs: ios
+    if: always() && needs.ios.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-screenshots
+          path: shots
+      - name: Push to ci/ios-shots
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd shots
+          git init -q -b ci/ios-shots
+          git -c user.name=ci -c user.email=ci@users.noreply.github.com add -A
+          git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "iOS CI ${{ github.run_id }} (${{ github.sha }})"
+          git push -qf "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git" ci/ios-shots

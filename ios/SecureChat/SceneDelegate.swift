@@ -10,8 +10,11 @@ import UIKit
 ///    cover goes up there and comes down on `sceneDidBecomeActive`;
 ///  * while the screen is being recorded, mirrored or AirPlayed
 ///    (`UIScreen.isCaptured`), the cover stays up;
-///  * the cover is a separate window at alert level + 1, so alerts and the
-///    keyboard are behind it too;
+///  * the cover is a separate window at alert level + 1, so alerts are
+///    behind it. The system keyboard is NOT: it lives in its own window above
+///    every app window (pentest iOS-2 L-C). So editing ends when the cover
+///    goes up, and any keyboard that tries to appear while it is up is
+///    dismissed again;
 ///  * a SCREENSHOT cannot be prevented or even announced beforehand — the OS
 ///    only reports it after the fact. Not covered.
 final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
@@ -21,6 +24,7 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     /// or the keyboard with its suggestions drawn on top of the cover.
     private(set) var shieldWindow: UIWindow?
     private var captureObserver: NSObjectProtocol?
+    private var keyboardObserver: NSObjectProtocol?
 
     func scene(_ scene: UIScene, willConnectTo session: UISceneSession,
                options connectionOptions: UIScene.ConnectionOptions) {
@@ -45,6 +49,14 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
             forName: UIScreen.capturedDidChangeNotification, object: nil, queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.updateShield(active: UIApplication.shared.applicationState == .active) }
+        }
+        keyboardObserver = NotificationCenter.default.addObserver(
+            forName: UIResponder.keyboardWillShowNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self = self, self.shieldWindow != nil else { return }
+                self.window?.endEditing(true)
+            }
         }
         updateShield(active: true)
     }

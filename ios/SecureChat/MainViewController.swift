@@ -21,6 +21,53 @@ final class MainViewController: UIViewController {
     private(set) var refusedToRun = false
     private var startedLoading = false
     private var crashTimes: [Date] = []
+    private var reloadWhenActive = false
+    private var crashView: UIView?
+
+    @objc private func appBecameActive() {
+        guard reloadWhenActive, !refusedToRun, let relay = Prefs.relay() else { return }
+        reloadWhenActive = false
+        load(relay)
+    }
+
+    /// The page's process died repeatedly in the foreground. Not the
+    /// security refusal: nothing is misconfigured, and "reinstall" would
+    /// wipe identity and pads (pentest iOS-2 L-B). Offer to try again.
+    private func showCrashLoop() {
+        guard crashView == nil, let wv = webView else { return }
+        wv.isHidden = true
+        var config = UIContentUnavailableConfiguration.empty()
+        config.image = UIImage(systemName: "exclamationmark.arrow.triangle.2.circlepath")
+        config.imageProperties.tintColor = Theme.muted
+        config.text = "secure-chat stopped responding"
+        config.textProperties.color = Theme.fg
+        config.secondaryText = "The page restarted several times in a row. Your identity and chats " +
+            "are still on this device. Try again, or close secure-chat and open it again."
+        config.secondaryTextProperties.color = Theme.muted
+        var button = UIButton.Configuration.filled()
+        button.title = "Try again"
+        config.button = button
+        config.buttonProperties.primaryAction = UIAction { [weak self] _ in self?.retryAfterCrashLoop() }
+        let v = UIContentUnavailableView(configuration: config)
+        v.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(v)
+        NSLayoutConstraint.activate([
+            v.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            v.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            v.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            v.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+        ])
+        crashView = v
+        UIAccessibility.post(notification: .screenChanged, argument: v)
+    }
+
+    private func retryAfterCrashLoop() {
+        crashView?.removeFromSuperview()
+        crashView = nil
+        crashTimes = []
+        webView?.isHidden = false
+        if let relay = Prefs.relay() { load(relay) }
+    }
 
     /// Dynamic Type for the page (cold review r1 M5). WKWebView ignores the
     /// system text size, unlike Android's WebView, so the page is zoomed with
@@ -115,11 +162,21 @@ final class MainViewController: UIViewController {
             // forever: a page that kills its process on every load gets three
             // tries a minute, then the refusal screen.
             guard let self = self, !self.refusedToRun, let relay = Prefs.relay() else { return }
+            // Pentest iOS-2 L-B: the system kills a background web process
+            // under memory pressure; that is not a crash loop and must not
+            // count. Reload when the app is back in front instead.
+            guard UIApplication.shared.applicationState == .active else {
+                self.reloadWhenActive = true
+                return
+            }
             let now = Date()
             self.crashTimes = self.crashTimes.filter { now.timeIntervalSince($0) < 60 } + [now]
-            if self.crashTimes.count > 3 { self.refuseToRun(); return }
+            if self.crashTimes.count > 3 { self.showCrashLoop(); return }
             self.load(relay)
         }
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(appBecameActive),
+            name: UIApplication.didBecomeActiveNotification, object: nil)
     }
 
     override func viewDidAppear(_ animated: Bool) {
