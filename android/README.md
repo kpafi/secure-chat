@@ -2,7 +2,8 @@
 
 A thin native shell around the **exact same** web client in `../client`. The
 point of the app (versus opening the site in a browser) is to close the web
-deployment's one honest trust gap (README "H1"): a browser trusts the server to
+deployment's one honest trust gap (`../README.md`, "Trust boundary of the
+web client"): a browser trusts the server to
 serve honest JavaScript on every load, so a compromised server could ship
 malicious crypto. The app instead **bundles the audited client inside the APK**
 and treats the relay as nothing but a dumb WebSocket/HTTP endpoint for opaque
@@ -61,25 +62,26 @@ with `SECURE_CHAT_EXTRA_ORIGINS="https://…"` — no code edit needed.
 # Needs a full JDK 21 (with jlink) and the Android SDK (platform 34, build-tools 34).
 export ANDROID_HOME=$HOME/android-sdk
 ./gradlew assembleDebug        # -> app/build/outputs/apk/debug/app-debug.apk
+./gradlew assembleRelease      # -> app/build/outputs/apk/release/ (signed if keystore.properties exists)
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
+Release signing reads `keystore.properties` (gitignored; template in
+`keystore.properties.example`). Without it `assembleRelease` produces an
+unsigned APK. A debug build has WebView remote debugging on, so use a release
+build on a phone you actually rely on.
+
 The bundled web client is **generated at build time** from `../client` by the
 `syncWebClient` Gradle task (so it can never drift from the reviewed source);
 `assets/web/` is gitignored.
 
-## Verification status (2026-07-08)
-- Debug APK builds clean from source; all 21 client files packaged.
-- Cross-origin mechanism verified in a real browser (Chromium): bundled client
-  on one origin, relay on another, relay config injected before scripts, app CSP
-  applied — full DHKE handshake (matching safety numbers), two-way messages, and
-  a cross-origin `/api` register all succeed.
-- **Verified ON-DEVICE** (Android 14 emulator, `google_apis;x86_64`, KVM): app
-  installs and renders the full UI in the real WebView; the relay config is
-  injected before page scripts (`addDocumentStartJavaScript` works on WebView
-  113); driven via CDP against a host-side AES256 peer over the relay (through
-  `adb reverse` loopback), the on-device WebSocket reached the relay, the AES256
-  nonce exchange completed, and messages decrypted **both directions** on the
-  device. This is what surfaced the Mixed-Content transport constraint above
-  (a `ws://10.0.2.2` relay was blocked; `127.0.0.1` via `adb reverse` works).
-- Remaining polish: app icon, a release-signing config, and an on-device pass of
-  the identity + safety-number gate (DHKE/RSA/PQKEM) — only AES256 was driven
-  end-to-end on-device so far (the handshake modes are covered in-browser).
+## Verification status
+- **Emulator (2026-07-08):** Android 14, driven over CDP against a host relay
+  through `adb reverse`: the relay config is injected before page scripts, and
+  an AES256 session decrypted messages both directions. This run surfaced the
+  Mixed-Content transport constraint above (`ws://10.0.2.2` blocked,
+  `127.0.0.1` via `adb reverse` works).
+- **Real phone (2026-09-21/22):** APK built and installed; the pad-floor
+  harness passed 33/33 against the real AndroidKeyStore; `FLAG_SECURE`
+  verified; unlock and login against the deployed relay observed.
+- The handshake modes (DHKE / RSA / PQKEM) and every other mode are covered in
+  real browsers by `e2e/all-modes.mjs`, which drives the same client code.

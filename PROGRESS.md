@@ -3,7 +3,18 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ RESUME HERE (2026-09-24, iOS app — branch `claude/vigilant-keller-s9sgs4`, NOT merged, NOT deployed)
+## ⮕ CURRENT STATE (2026-09-24)
+
+- **`master`** = release 0.3.0 plus the iOS app (PRs #2, #3). Tags `v0.1.0`–`v0.3.0`.
+- **Relay deployed** from `a54315f` (tag `v0.3.0`). Not yet on the box: the
+  relay's iOS origin (PR #2) and the `/ios/` download block in `deploy/Caddyfile`
+  (PR #3, see `deploy/README.md`).
+- **Not merged:** `android-ondevice-2026-09-21` (on-device notes and the
+  `formatDetail` fix `c7c9ccc` / `dfadca9`) and `fix/contact-remove-row`.
+- The sections below are the history, newest first; their headings say where
+  each piece of work ended up.
+
+## (2026-09-24, iOS app — merged to `master` as PR #2 `ea8b820` + PR #3 `f316816`; relay part NOT deployed)
 
 **What it is.** An iOS twin of the Android app: `ios/` — a WKWebView shell around the same bundled
 client (`../client`, synced into the app at build time), served from `secure-chat://app` by a
@@ -54,7 +65,7 @@ account wired in as signing secrets — the owner's decision. Private repo: macO
 (~70–110 billed per run); the workflow only runs on `ios/**`, the workflow file and
 `backend/config.py`.
 
-## ⮕ RESUME HERE (2026-09-24, contact profile — branch `claude/user-profile-view-e7qr9y`, NOT merged, NOT deployed)
+## (2026-09-24, contact profile — merged as PR #1 `963b402`, released as 0.3.0 `a54315f`, deployed)
 
 **What it is.** The owner's ask after testing 0.2.0: tap a saved user's row in Users, the avatar
 of a row in Chats, or the name in a conversation → a short profile as a sheet (handle, full
@@ -84,7 +95,7 @@ relay change, so the APK is not forced by this change). On the phone: open a con
 the three places, verify one in person, check the Android back button (known: it does not close
 the sheet).
 
-## ⮕ RESUME HERE (2026-09-21, the 2026-08-07 pentest: all 14 Medium fixed, NOT deployed)
+## (2026-09-21, the 2026-08-07 pentest: all 14 Medium fixed — merged as release 0.1.0, deployed)
 
 **Every Medium in `secure-chat-pentest-2026-08-07.md` is fixed on branch
 `claude/loving-cannon-ba5tbt`, with a regression test each, verified to FAIL
