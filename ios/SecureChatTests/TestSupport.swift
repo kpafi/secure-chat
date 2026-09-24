@@ -15,24 +15,56 @@ final class Page {
         self.label = label
     }
 
-    /// Run `body` as an async function in the page world and return its result
+    /// Run `body` as an async function in the page and return its result
     /// round-tripped through JSON (so `undefined` never reaches Swift).
+    ///
+    /// Only the plain Obj-C `evaluateJavaScript(_:completionHandler:)` is
+    /// used: `callAsyncJavaScript`'s Swift form lives in the WebKit overlay
+    /// (libswiftWebKit.dylib), which the iOS 18 simulator runtime does not
+    /// ship, so a test bundle using it fails to load (CI run 2). The promise
+    /// is started with one call and its settled value polled with another.
     @discardableResult
-    func eval(_ body: String, _ args: [String: Any] = [:]) async throws -> Any? {
-        let wrapped = """
-        const __r = await (async () => { \(body) })();
-        return JSON.stringify(__r === undefined ? null : __r);
+    func eval(_ body: String, _ args: [String: Any] = [:], timeout: TimeInterval = 90) async throws -> Any? {
+        let argData = try JSONSerialization.data(withJSONObject: args)
+        let argJSON = String(decoding: argData, as: UTF8.self)
+        let key = "t" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        // Each argument becomes a const of the same name inside the body.
+        let decls = args.keys.sorted().map { "const \($0) = __a[\"\($0)\"];" }.joined(separator: " ")
+        let start = """
+        (function () {
+          const R = (window.__scTest = window.__scTest || {});
+          R['\(key)'] = null;
+          const __args = \(argJSON);
+          (async (__a) => { \(decls) \(body) })(__args).then(
+            (v) => { R['\(key)'] = JSON.stringify({ ok: v === undefined ? null : v }); },
+            (e) => { R['\(key)'] = JSON.stringify({ err: String(e && e.stack || e) }); });
+          return 1;
+        })()
         """
-        let raw: Any = try await withCheckedThrowingContinuation { cont in
-            webView.callAsyncJavaScript(wrapped, arguments: args, in: nil, in: .page) { result in
-                switch result {
-                case .success(let v): cont.resume(returning: v)
-                case .failure(let e): cont.resume(throwing: e)
+        _ = try await evaluate(start)
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let text = try await evaluate("(window.__scTest || {})['\(key)'] || ''") as? String, !text.isEmpty {
+                _ = try? await evaluate("delete window.__scTest['\(key)']; 1")
+                let obj = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]
+                if let err = obj?["err"] as? String {
+                    throw NSError(domain: "Page.eval", code: 1, userInfo: [NSLocalizedDescriptionKey: "[\(label)] \(err)"])
                 }
+                let value = obj?["ok"]
+                return value is NSNull ? nil : value
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        throw NSError(domain: "Page.eval", code: 2, userInfo: [NSLocalizedDescriptionKey: "[\(label)] eval timed out"])
+    }
+
+    /// One plain `evaluateJavaScript` call; the script must return a value.
+    private func evaluate(_ script: String) async throws -> Any? {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Any?, Error>) in
+            webView.evaluateJavaScript(script) { value, error in
+                if let error = error { cont.resume(throwing: error) } else { cont.resume(returning: value) }
             }
         }
-        guard let text = raw as? String, let data = text.data(using: .utf8) else { return nil }
-        return try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
     }
 
     func bool(_ body: String, _ args: [String: Any] = [:]) async throws -> Bool {
