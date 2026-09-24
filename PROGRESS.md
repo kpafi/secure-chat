@@ -37,6 +37,10 @@ Known design debt and CI notes: end of `ios/README.md`. Pre-existing, NOT fixed 
 `backend/tests/test_ws.py::test_msg_relayed_verbatim_between_peers` intermittently hangs
 (reproduced on master), so the iOS gate runs only the iOS-relevant relay tests.
 
+**CI state at hand-off.** Run 9 (0ac36bb): gate green, 41/41 simulator tests, cold relaunch keeps
+storage, unsigned Release IPA built (debug hooks absent), screenshots published. 9 runs used about
+55 real macOS minutes ≈ 550 billed (10×). Reviews: `design/research/reviews/ios-*.md`.
+
 **Delivery.** CI builds an UNSIGNED IPA (artifact `SecureChat-unsigned-ipa`). Installing needs
 either sideloading (AltStore/Sideloadly, free Apple ID, 7-day re-sign) or an Apple Developer
 account wired in as signing secrets — the owner's decision. Private repo: macOS minutes bill 10×
