@@ -210,6 +210,15 @@ CLIENT_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "cli
 # oracles), so this allow-list is a defense-in-depth boundary, not the trust root.
 APP_WEBVIEW_ORIGIN = "https://secure-chat.internal"
 
+# Origin of the iOS app's bundled web client. WKWebView cannot serve local
+# content under https://, so the iOS shell serves the same bundled client from
+# a custom URL scheme (WKURLSchemeHandler, ios/SecureChat/AppSchemeHandler.swift)
+# and WebKit sends this scheme://host as the Origin. Same status as the Android
+# origin above: a single fixed value, defense in depth, not the trust root —
+# any other app could present the same custom scheme. Must match
+# AppOrigin.origin in ios/SecureChat/WebShell.swift.
+IOS_WEBVIEW_ORIGIN = "secure-chat://app"
+
 # --- WebSocket origin allow-list (CSWSH protection) -----------------------
 # Browsers send an Origin header on the WS handshake. We reject any *present*
 # origin not in this set, which blocks Cross-Site WebSocket Hijacking. A
@@ -258,6 +267,7 @@ ALLOWED_WS_ORIGINS = {
     "http://127.0.0.1:8000",
     "http://localhost:8000",
     APP_WEBVIEW_ORIGIN,
+    IOS_WEBVIEW_ORIGIN,
     *_EXTRA_ORIGINS,
 }
 
@@ -269,6 +279,7 @@ ALLOWED_WS_ORIGINS = {
 # public keys, gated by the per-account lookup token and the rate limiter.
 ALLOWED_HTTP_ORIGINS = [
     APP_WEBVIEW_ORIGIN,
+    IOS_WEBVIEW_ORIGIN,
     *_EXTRA_ORIGINS,
 ]
 

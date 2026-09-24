@@ -1,0 +1,169 @@
+# iOS build + simulator tests + unsigned IPA.
+#
+# COST NOTE: this repository is private, and GitHub bills macOS runner minutes
+# at 10x. A full run is roughly 10-15 real minutes = 100-150 of the monthly
+# free minutes. So it runs only when the iOS shell itself changes (or by hand),
+# never on client/backend-only pushes, and a newer push cancels an older run.
+name: iOS
+
+on:
+  push:
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Cheap Linux gate first (1x minutes): the relay suite (incl. the iOS
+  # origin + import-map drift guards) and the client unit tests. The macOS job
+  # does not start if these fail.
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Relay tests
+        working-directory: backend
+        run: |
+          python -m pip install -q -r requirements.txt
+          python -m pytest -q -p no:cacheprovider
+      - name: Client unit tests
+        working-directory: client
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+
+  ios:
+    needs: gate
+    runs-on: macos-15
+    timeout-minutes: 35
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Start a local relay (loopback, scratch DB)
+        run: |
+          python3 -m venv /tmp/relay-venv
+          /tmp/relay-venv/bin/pip install -q -r backend/requirements.txt
+          cd backend
+          SECURE_CHAT_DB=/tmp/sc-ci.db nohup /tmp/relay-venv/bin/python -m uvicorn main:app \
+            --host 127.0.0.1 --port 8000 --no-server-header --no-proxy-headers \
+            --no-access-log --log-level warning --ws-max-size 66560 > /tmp/relay.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/healthz && exit 0
+            sleep 1
+          done
+          cat /tmp/relay.log; exit 1
+
+      - name: Generate the Xcode project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Pick a simulator
+        id: sim
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 ios/scripts/pick-simulator.py)
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+
+      - name: Build and test on the simulator
+        env:
+          TEST_RUNNER_SC_TEST_RELAY: http://127.0.0.1:8000
+          TEST_RUNNER_SC_SHOT_DIR: ${{ github.workspace }}/shots
+        run: |
+          mkdir -p shots
+          set -o pipefail
+          xcodebuild test \
+            -project ios/SecureChat.xcodeproj -scheme SecureChat \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -resultBundlePath /tmp/SecureChat.xcresult \
+            -parallel-testing-enabled NO \
+            CODE_SIGN_IDENTITY=- \
+            | tee /tmp/xcodebuild-test.log | grep -E "^(Test Case|Test Suite|.*error:|.*warning: .*Swift|\*\*)" || true
+          grep -q "\*\* TEST SUCCEEDED \*\*" /tmp/xcodebuild-test.log
+
+      - name: Cold relaunch keeps the client's storage
+        run: |
+          UDID=${{ steps.sim.outputs.udid }}
+          xcrun simctl terminate "$UDID" org.securechat.app || true
+          DATA=$(xcrun simctl get_app_container "$UDID" org.securechat.app data)
+          rm -f "$DATA/Documents/persist-probe.txt"
+          SIMCTL_CHILD_SC_PERSIST_PROBE=1 xcrun simctl launch "$UDID" org.securechat.app
+          for i in $(seq 1 30); do
+            [ -f "$DATA/Documents/persist-probe.txt" ] && break
+            sleep 1
+          done
+          sleep 2
+          xcrun simctl io "$UDID" screenshot shots/20-cold-launch.png || true
+          echo "probe: $(cat "$DATA/Documents/persist-probe.txt" 2>/dev/null)"
+          test "$(cat "$DATA/Documents/persist-probe.txt")" = "persist-ok"
+
+      - name: Build the unsigned device IPA (Release)
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project ios/SecureChat.xcodeproj -scheme SecureChat -configuration Release \
+            -sdk iphoneos -destination "generic/platform=iOS" \
+            SYMROOT=/tmp/sc-release CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            | tail -n 5
+          APP=/tmp/sc-release/Release-iphoneos/SecureChat.app
+          # The Release binary must not carry the debug-only test hooks.
+          if strings "$APP/SecureChat" | grep -q "SC_PERSIST_PROBE\|SC_TEST_RELAY"; then
+            echo "debug hooks leaked into Release"; exit 1
+          fi
+          test -f "$APP/web/index.html"
+          ! ls "$APP/web" | grep -q "\.test\.mjs$"
+          mkdir -p /tmp/ipa/Payload && cp -R "$APP" /tmp/ipa/Payload/
+          (cd /tmp/ipa && zip -qry "$GITHUB_WORKSPACE/SecureChat-unsigned.ipa" Payload)
+          shasum -a 256 SecureChat-unsigned.ipa | tee SecureChat-unsigned.ipa.sha256
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-screenshots
+          path: shots/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SecureChat-unsigned-ipa
+          path: |
+            SecureChat-unsigned.ipa
+            SecureChat-unsigned.ipa.sha256
+          retention-days: 30
+
+      - name: Collect failure logs
+        if: failure()
+        run: |
+          mkdir -p failure
+          cp /tmp/relay.log /tmp/xcodebuild-test.log failure/ 2>/dev/null || true
+          grep -E "error:|failed|XCTAssert|Fatal" /tmp/xcodebuild-test.log | head -200 > failure/summary.txt || true
+          (cd /tmp && zip -qry "$GITHUB_WORKSPACE/failure/xcresult.zip" SecureChat.xcresult) || true
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ios-failure-logs
+          path: failure/
+          retention-days: 7

@@ -586,6 +586,29 @@ def test_allowed_origin_accepted():
         assert _join(ws, _room())["type"] == "joined"
 
 
+def test_ios_app_origin_accepted():
+    # The iOS shell serves the bundled client from a custom URL scheme
+    # (ios/SecureChat/WebShell.swift, AppOrigin.origin); WebKit sends that
+    # scheme://host as the WS Origin.
+    with client.websocket_connect("/ws", headers={"origin": "secure-chat://app"}) as ws:
+        assert _join(ws, _room())["type"] == "joined"
+
+
+def test_ios_lookalike_origins_rejected():
+    # Exact match only: a different host or a scheme prefix must not pass.
+    for origin in ("secure-chat://evil", "secure-chat://app.evil", "secure-chat-x://app", "null"):
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/ws", headers={"origin": origin}):
+                pass
+
+
+def test_ios_app_origin_gets_cors():
+    r = client.get("/healthz", headers={"origin": "secure-chat://app"})
+    assert r.headers.get("access-control-allow-origin") == "secure-chat://app"
+    r = client.get("/healthz", headers={"origin": "secure-chat://evil"})
+    assert "access-control-allow-origin" not in r.headers
+
+
 def test_missing_origin_accepted():
     # Native/CLI clients send no Origin header and must be allowed.
     with client.websocket_connect("/ws") as ws:
