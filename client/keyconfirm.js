@@ -70,7 +70,10 @@ export function makeKeyConfirmation(io) {
       // is expected and the matching one is still in flight — so the loudness
       // lives here instead. This also covers a case the original code hung on
       // forever: a relay that simply never delivers the peer's confirm frame.
-      fail("the other side never proved it derived the same key");
+      // Fix round (review of e0e8f30): like the overflow below, not a verdict
+      // on the peer — a relay that drops or reorders the confirm frame produces
+      // exactly this.
+      fail("no matching key confirmation arrived in time — the relay may have dropped or reordered it");
     }, CONFIRM_TIMEOUT_MS);
   }
 

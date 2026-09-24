@@ -141,7 +141,14 @@ export async function fetchBundle(base, handle) {
   );
   if (res.status === 404) return null;
   if (!res.ok) throw new Error("lookup failed: " + (await asError(res)));
-  const d = await res.json();
+  // Fix round (review of e0e8f30): a parse error echoes the relay's bytes.
+  let d;
+  try {
+    d = await res.json();
+  } catch {
+    throw new Error("the directory returned a malformed answer");
+  }
+  if (!d || typeof d !== "object") throw new Error("the directory returned a malformed answer");
   // Pentest 2026-07-29 M-6: canonicalise here, at the boundary where a
   // server-controlled string first enters the client.
   //
@@ -222,7 +229,12 @@ export async function login(base, identity, username) {
     body: JSON.stringify({ username }),
   });
   if (!cRes.ok) throw new Error("challenge failed: " + (await asError(cRes)));
-  const { challenge } = await cRes.json();
+  let challenge;
+  try {
+    ({ challenge } = await cRes.json());
+  } catch {
+    throw new Error("challenge failed: the directory returned a malformed answer");
+  }
 
   // Sign under the login domain prefix (matches accounts._login_message) so the
   // signature is bound to the login protocol and can't be cross-used elsewhere.
@@ -239,7 +251,11 @@ export async function login(base, identity, username) {
     body: JSON.stringify({ username, challenge, sig, mldsa_sig: mldsaSig }),
   });
   if (!vRes.ok) throw new Error("verify failed: " + (await asError(vRes)));
-  return vRes.json(); // { token, ttl }
+  try {
+    return await vRes.json(); // { token, ttl }
+  } catch {
+    throw new Error("verify failed: the directory returned a malformed answer");
+  }
 }
 
 // ---- web-of-trust vouches -------------------------------------------------
@@ -324,15 +340,23 @@ export async function sendMail(base, handle, envelope) {
 
 // Package 2, item 9 (F-WEB-003): the relay's own bounds (backend/config.py):
 // at most MAX_MAILBOX_PER_RECIPIENT = 200 queued envelopes per inbox, each at
-// most MAX_ENVELOPE_BYTES = 64 KiB. Nothing an honest relay returns exceeds
-// them, so the client holds a response to them BEFORE parsing it: a hostile
-// relay could otherwise hand us an arbitrarily large body to JSON.parse and an
-// arbitrarily long batch to open (an ML-KEM decapsulation and two signature
-// verifies each). The body bound leaves room for the JSON framing and the
-// created_at field of every entry.
+// most MAX_ENVELOPE_BYTES = 64 KiB. A hostile relay could otherwise hand us an
+// arbitrarily large body to JSON.parse and an arbitrarily long batch to open
+// (an ML-KEM decapsulation and two signature verifies each).
+//
+// Fix round (review of e0e8f30, Medium): the GET is DELETE-ON-READ, so
+// refusing a whole body throws away every envelope in it — the relay has
+// already dropped them. The first bound, 200 x (64 KiB + 1 KiB), was below
+// what an HONEST relay can send: an envelope may be 65 536 printable-ASCII
+// characters, and `"` and `\` JSON-escape to two characters each. A sender
+// holding our handle could post 104 envelopes of `"` and every real message
+// queued beside them was lost for good. So the body bound is the worst-case
+// ESCAPED size (2 x 64 KiB per envelope + framing), and everything below it is
+// parsed and judged PER ENTRY: one oversize or malformed entry never costs the
+// others.
 export const MAX_MAILBOX_BATCH = 200;
 export const MAX_ENVELOPE_CHARS = 64 * 1024;
-const MAX_MAILBOX_BODY_CHARS = MAX_MAILBOX_BATCH * (MAX_ENVELOPE_CHARS + 1024);
+const MAX_MAILBOX_BODY_CHARS = MAX_MAILBOX_BATCH * (2 * MAX_ENVELOPE_CHARS + 1024);
 
 // Fetch AND consume my queued envelopes (requires login; the server deletes
 // what it returns). Returns [{envelope, created_at}].
@@ -352,10 +376,16 @@ export async function fetchMail(base, sessionToken) {
   if (body.length > MAX_MAILBOX_BODY_CHARS) {
     throw new Error("mailbox fetch failed: the relay returned more than any mailbox can hold");
   }
-  const msgs = JSON.parse(body).messages;
+  let msgs;
+  try {
+    msgs = JSON.parse(body).messages;
+  } catch {
+    throw new Error("mailbox fetch failed: malformed answer");
+  }
   if (!Array.isArray(msgs)) throw new Error("mailbox fetch failed: malformed answer");
-  // An oversized entry is not an envelope the relay could have accepted; the
-  // batch is bounded to what one inbox can hold.
+  // Per entry: an oversized or malformed one is not an envelope the relay
+  // could have accepted and is skipped ALONE; the batch is bounded to what one
+  // inbox can hold.
   return msgs
     .filter((m) => m && typeof m.envelope === "string" && m.envelope.length <= MAX_ENVELOPE_CHARS)
     .slice(0, MAX_MAILBOX_BATCH);

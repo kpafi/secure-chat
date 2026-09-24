@@ -123,10 +123,29 @@ try {
     eq(f[0].envelope, "ok");
     body = JSON.stringify({ messages: [{ envelope: "x".repeat(64 * 1024) }] });
     eq((await fetchMail(mbBase, "t")).length, 1); // exactly at the limit is fine
-    body = '{"messages":["' + "z".repeat(200 * (64 * 1024 + 1024) + 1) + '"]}';
+    // Fix round (review of e0e8f30, Medium): the GET is delete-on-read, so a
+    // bound an HONEST relay can exceed destroys real mail. The relay accepts
+    // 65 536 printable-ASCII characters per envelope, `"` and `\` included,
+    // which JSON-escape to two each: 200 such envelopes must all come back.
+    body = JSON.stringify({ messages: Array.from({ length: 200 }, (_, i) => ({ envelope: (i % 2 ? "\\" : '"').repeat(64 * 1024), created_at: 0 })) });
+    assert.ok(body.length > 200 * (64 * 1024 + 1024), "fixture: the honest worst case is past the first bound"); n++;
+    const worst = await fetchMail(mbBase, "t");
+    eq(worst.length, 200);
+    eq(worst[0].envelope, '"'.repeat(64 * 1024));
+    // One over-cap entry beside a real one costs only itself.
+    body = JSON.stringify({ messages: [{ envelope: '"'.repeat(64 * 1024 + 1), created_at: 0 }, { envelope: "real-sealed-mail", created_at: 0 }] });
+    const mixed = await fetchMail(mbBase, "t");
+    eq(mixed.length, 1);
+    eq(mixed[0].envelope, "real-sealed-mail");
+    // Only a body no honest relay can produce is refused before parsing.
+    body = '{"messages":["' + "z".repeat(200 * (2 * 64 * 1024 + 1024) + 1) + '"]}';
     const e = await fetchMail(mbBase, "t").catch((x) => x);
     assert.ok(e instanceof Error && /more than any mailbox can hold/.test(e.message),
-      "item 9: a body larger than 200 x 65 KiB is refused before it is parsed"); n++;
+      "item 9: a body larger than 200 x (2 x 64 KiB + 1 KiB) is refused before it is parsed"); n++;
+    body = '{"messages": [not json';
+    const e3 = await fetchMail(mbBase, "t").catch((x) => x);
+    assert.ok(e3 instanceof Error && e3.message === "mailbox fetch failed: malformed answer",
+      "a parse failure is a fixed sentence, never the relay's bytes echoed by the SyntaxError"); n++;
     body = JSON.stringify({ messages: "nope" });
     const e2 = await fetchMail(mbBase, "t").catch((x) => x);
     assert.ok(e2 instanceof Error && /malformed/.test(e2.message)); n++;

@@ -168,7 +168,8 @@ console.log("OK  M-5: the simultaneous-connect race no longer disconnects both p
   assert.strictEqual(A.pending, 1, "the deadline is armed");
   A.fireTimers();
   assert.strictEqual(A.log.failed.length, 1, "the deadline makes it loud");
-  assert.match(A.log.failed[0], /never proved it derived the same key/);
+  assert.match(A.log.failed[0], /no matching key confirmation arrived in time — the relay may have dropped or reordered it/);
+  assert.doesNotMatch(A.log.failed[0], /the other side/, "fix round: the deadline names the relay, not the peer (like the overflow)");
   assert.strictEqual(A.log.finished, 0, "the session never unlocks");
 }
 console.log("OK  M-5: a real desync fails loudly at the deadline, never silently");
@@ -180,7 +181,7 @@ console.log("OK  M-5: a real desync fails loudly at the deadline, never silently
   const A = driver();
   await A.kc.onChains(chains(1).a);
   A.fireTimers();
-  assert.match(A.log.failed[0] || "", /never proved/, "a withheld confirm frame must not hang");
+  assert.match(A.log.failed[0] || "", /no matching key confirmation arrived in time/, "a withheld confirm frame must not hang");
 }
 console.log("OK  M-5: a withheld confirm frame is a timeout, not a hang");
 

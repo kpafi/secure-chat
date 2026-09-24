@@ -402,6 +402,95 @@ const myBundle = { ed: me.ed, mldsa: me.mldsa, ecdh: me.ecdh, mlkem: me.mlkem };
   console.log("OK  item 4: a reflected own handshake pins nothing; the genuine peer still completes (executed)");
 }
 
+
+// A guest session up to the point where the peer's signed handshake is due.
+async function guestAwaitingHandshake(alg) {
+  await nav("live");
+  const ws = await connect(alg);
+  await ws.deliver({ type: "pending" });
+  await ws.deliver({ type: "joined", role: "guest" });
+  await drain(ws);
+  const myHello = ws.sent.map((f) => (f.type === "key" ? unpack(f.payload) : null)).find((p) => p && p.hello && !p.reply);
+  const peerNonce = freshNonce();
+  await ws.deliver({ type: "key", room: ROOM, alg, payload: pack({ hello: true, n: peerNonce, reply: false }) });
+  await drain(ws);
+  return { ws, nonces: [myHello.n, peerNonce] };
+}
+const SAFE_HINT = /^[\x20-\x7e\u2014\u2013\u2026\u00d7\u2713\u201c\u201d\u2018\u2019\u2192\u00b7]*$/;
+
+// ---- fix round, finding 2: relay bytes cannot reach a hint through e.message --
+// A SyntaxError echoes up to ~20 characters of its source. Two routes: (a) a
+// key frame whose payload is not JSON (unpackKey — now a fixed sentence), and
+// (b) a signed RSA handshake whose `pub` is not JSON, which the CIPHER parses
+// (crypto.js unpackMsg) — covered only by the sink, hint(), which now cleans
+// whatever it is given.
+{
+  const { ws, nonces } = await guestAwaitingHandshake("RSA");
+  const evil = Buffer.from("\u202e{\u2028", "utf8").toString("base64");
+  ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "RSA", payload: evil }) });
+  await until(() => /Key exchange failed/.test(dom.el("hint").textContent), "the key-frame refusal");
+  assert.strictEqual(dom.el("hint").textContent, "Key exchange failed: malformed key frame",
+    "finding 2 (a): a key frame that is not JSON is refused with a fixed sentence");
+  const peer = await Identity.generate();
+  const pub = Buffer.from("\u202e{\u2028x", "utf8").toString("base64");
+  const sig = await signHandshake(peer, ROOM, nonces, pub);
+  ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "RSA", payload: pack({ pub, reply: false, idb: peer.publicBundle(), sig }) }) });
+  await until(() => /Key exchange failed: (?!malformed key frame)/.test(dom.el("hint").textContent), "the cipher's refusal");
+  const h = dom.el("hint").textContent;
+  assert.ok(SAFE_HINT.test(h), `finding 2 (b): the cipher's parse error of relay bytes reaches the hint cleaned: ${JSON.stringify(h)}`);
+  await dom.el("disconnect").click();
+  console.log("OK  fix round 2: relay bytes echoed by a parse error never reach a hint (executed)");
+}
+
+// ---- fix round, finding 5 (lead): a new session's cipher is not reachable ----
+// from the old socket. connectInner builds the new cipher and awaits init()
+// before reassigning `ws`; frames still queued on a RELAY-closed old socket
+// used to pass the gate in that window. Here the new connect is held inside
+// cipher.init() (DHKE's key generation) while the old socket delivers a
+// genuine, correctly signed peer handshake and a `joined`.
+{
+  const { ws: old, nonces } = await guestAwaitingHandshake("DHKE");
+  const sentBefore = old.sent.length;
+  // The genuine peer's handshake, built before key generation is held.
+  const peer = await Identity.generate();
+  const pc = makeCipher("DHKE", ROOM);
+  await pc.init();
+  const pub = await pc.handshakePayload();
+  const sig = await signHandshake(peer, ROOM, nonces, pub);
+  old.close(); // the RELAY hangs up (not the app): onclose runs, nothing retires it
+  const subtle = crypto.subtle;
+  const origGen = subtle.generateKey;
+  let release;
+  const held = new Promise((r) => { release = r; });
+  let entered = false;
+  subtle.generateKey = function (...a) { entered = true; return held.then(() => origGen.apply(this, a)); };
+  let done;
+  try {
+    done = dom.el("connect").click(); // suspended in cipher.init()
+    await until(() => entered, "the new connect to reach cipher.init()");
+    const lines0 = lines().length;
+    const hint0 = dom.el("roomHint").textContent;
+    old.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub, reply: false, idb: peer.publicBundle(), sig }) }) });
+    old.onmessage({ data: JSON.stringify({ type: "joined", role: "owner" }) });
+    for (let i = 0; i < 40; i++) await new Promise((r) => setTimeout(r, 5));
+    assert.strictEqual(lines().length, lines0, "finding 5: the old socket's backlog adds nothing to the transcript");
+    assert.strictEqual(dom.el("roomHint").textContent, hint0, "finding 5: ...nothing of it reaches the new session's cipher (no key-exchange refusal)");
+    assert.strictEqual(old.sent.length, sentBefore, "finding 5: ...and nothing is answered on the old socket");
+  } finally {
+    release();
+    subtle.generateKey = origGen;
+  }
+  await done;
+  const fresh = dom.socket();
+  assert.notStrictEqual(fresh, old, "fixture: the new connect completed");
+  fresh.open();
+  await tick();
+  current = fresh;
+  await fresh.deliver({ type: "joined", role: "owner" });
+  assert.notStrictEqual(fresh.readyState, 3, "control: the new session itself works");
+  await dom.el("disconnect").click();
+  console.log("OK  fix round 5: a relay-closed socket's backlog cannot reach the next session while it is being built (executed)");
+}
 // ---- items 6, 7, 8: the sealed receive path -----------------------------------
 dom.el("username").value = "alice";
 relay.challenge = () => ({ status: 200, body: { challenge: b64(crypto.getRandomValues(new Uint8Array(32))) } });
@@ -477,7 +566,7 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
   await poll();
   assert.strictEqual(chats.get(c6.username).mode, "AES256", "fixture: the chat is in AES256 mode");
   relay.mailbox = [
-    await sealed.seal(s6, myBundle, { kind: "msg", enc: await chats.innerEncrypt("pw", salt, "inner\nline‮") }, "trent#tok6"),
+    await sealed.seal(s6, myBundle, { kind: "msg", enc: await chats.innerEncrypt("pw", salt, "inner\nline\u202e") }, "trent#tok6"),
     await sealed.seal(s6, myBundle, { kind: "msg", enc: await chats.innerEncrypt("pw", salt, "inner ok") }, "trent#tok6"),
   ];
   await poll();
@@ -514,6 +603,31 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
   assert.ok(logged.every((l) => !/QUOTA-MARKER|carol|tok-secret/.test(l)),
     `item 14: the log line is a fixed string, never the error's message: ${JSON.stringify(logged)}`);
   console.log("OK  item 14: a dropped mailbox envelope is logged with a fixed string (executed)");
+}
+
+// ---- fix round, finding 3: a claim stored by an older client is not rendered raw --
+// processEnvelope now keeps only a handle, but a record written before that can
+// hold any string the sender chose. The Users list and the contact profile
+// render only a claim that parses as username#token.
+{
+  const other = await Identity.generate();
+  const ob = other.publicBundle();
+  await contacts.upsert({
+    username: "unknown-legacyclaim", auto: true, token: null, claimedName: "bank-support\u202e\u2028[verified by you]",
+    ed: ob.ed, mldsa: ob.mldsa, ecdh: ob.ecdh, mlkem: ob.mlkem,
+  });
+  await contacts.upsert({
+    username: "unknown-goodclaim", auto: true, token: "tokg", addrUsername: "grace", claimedName: "grace#tokg",
+    ed: (await Identity.generate()).publicBundle().ed, mldsa: ob.mldsa,
+  });
+  await nav("users");
+  const text = dom.el("userList").textContent;
+  assert.ok(/unknown-legacyclaim/.test(text), "fixture: the legacy record is listed");
+  assert.ok(!/[\u202e\u2028]/.test(text) && !/bank-support/.test(text),
+    "finding 3: a stored claim that is not a handle is not rendered (it carried U+202E / U+2028)");
+  assert.match(text, /claims to be "grace#tokg"/, "control: a claim that is a handle is still shown as a claim");
+  await nav("live");
+  console.log("OK  fix round 3: a non-handle claimedName from an older client is never rendered (executed)");
 }
 
 // ---- item 2: all three eviction tiers, EXECUTED -------------------------------

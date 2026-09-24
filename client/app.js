@@ -239,13 +239,17 @@ let closeHint = null;
 // refusal. `refusal`, when given, is what onclose shows (it wins over anything
 // the relay said). `sock` is the socket the refusal belongs to (a frame's own).
 let clientClosing = false;
-// Package 2, item 3 (F-PROTO-002): the sockets THIS app decided to close — a
-// refusal, the user's Disconnect. handleMessage handles no further frame from
-// them (see there).
-const appClosedSockets = new WeakSet();
+// Package 2, item 3 (F-PROTO-002): RETIRED sockets — the ones this app decided
+// to close (a refusal, the user's Disconnect) and, from the first line of a new
+// connectInner(), the previous session's socket whatever closed it (fix round,
+// review of e0e8f30: connectInner builds the new cipher and awaits its init()
+// before `ws` is reassigned, and backlog frames of a relay-closed old socket
+// used to pass the gate in that window and drive the NEW session's cipher).
+// handleMessage handles no further frame from a retired socket (see there).
+const retiredSockets = new WeakSet();
 function closeWs(refusal = null, sock = ws) {
   if (!sock) return;
-  appClosedSockets.add(sock);
+  retiredSockets.add(sock);
   // Round 3 (pentest L2): a frame handled after its socket's onclose ran (the
   // room screen is up) — show the refusal now instead of dropping it.
   if (sock.readyState === WebSocket.CLOSED) { if (refusal !== null && sock === ws) hint(refusal, true); return; }
@@ -301,7 +305,14 @@ function packKey(obj) {
   return bufToB64(enc.encode(JSON.stringify(obj)));
 }
 function unpackKey(b64) {
-  return JSON.parse(dec.decode(b64ToBuf(b64)));
+  // Fix round (review of e0e8f30): a SyntaxError echoes up to ~20 characters of
+  // its source — relay bytes, U+202E included — and this error reaches
+  // hint("Key exchange failed: " + e.message). A fixed sentence instead.
+  try {
+    return JSON.parse(dec.decode(b64ToBuf(b64)));
+  } catch {
+    throw new Error("malformed key frame");
+  }
 }
 
 // ---- pin store (TOFU + change detection) ----------------------------------
@@ -468,9 +479,19 @@ function activeHintEl() {
   return els.hint;
 }
 
+// Fix round (review of e0e8f30): hints carry e.message from anywhere — a
+// cipher's parse error of relay bytes, a directory answer — so the sink itself
+// applies the transcript's rule (printable ASCII plus the app's own
+// typography; see logSafe) and a length cap, whatever the caller built.
+const HINT_MAX_CHARS = 600;
+function hintSafe(text) {
+  let s = String(text).replace(LOG_UNSAFE_RE, " ");
+  if (s.length > HINT_MAX_CHARS) s = s.slice(0, HINT_MAX_CHARS - 1) + "\u2026";
+  return s;
+}
 function hint(text, isErr = false) {
   const el = activeHintEl();
-  el.textContent = text;
+  el.textContent = hintSafe(text);
   el.className = "hint" + (isErr ? " err" : "");
   // Errors are announced immediately; ordinary progress waits for a pause.
   el.setAttribute("aria-live", isErr ? "assertive" : "polite");
@@ -534,7 +555,7 @@ function relayErrorHint(reason) {
 }
 
 function accountStatus(text, cls = "") {
-  els.accountStatus.textContent = text;
+  els.accountStatus.textContent = hintSafe(text);
   els.accountStatus.className = "hint" + (cls ? " " + cls : "");
 }
 
@@ -1095,7 +1116,7 @@ async function unlockContacts(pass, opts = {}) {
 }
 
 function usersStatus(text, isErr = false) {
-  els.usersStatus.textContent = text;
+  els.usersStatus.textContent = hintSafe(text);
   els.usersStatus.className = "hint" + (isErr ? " err" : "");
 }
 
@@ -1350,12 +1371,18 @@ function contactWarnings(c, inSheet = false) {
   // cannot make themselves LOOK like a name you recognise. In the profile,
   // when the claim IS the handle printed under it, the sentence points there
   // instead of quoting the attacker's string a second time (hot M8, M-B).
-  if (c.claimedName) {
+  // Fix round (review of e0e8f30): processEnvelope keeps only a handle now,
+  // but a record written by an older client can hold any string the sender
+  // chose (U+202E, line breaks). Only a claim that parses as username#token is
+  // rendered, and in its parsed form.
+  const parsedClaim = typeof c.claimedName === "string" ? account.parseHandle(c.claimedName) : null;
+  const claimed = parsedClaim ? parsedClaim.username + "#" + parsedClaim.token : null;
+  if (claimed) {
     const claim = document.createElement("div");
     claim.className = "u-claim";
-    claim.textContent = inSheet && c.token && c.claimedName === mailHandle(c)
+    claim.textContent = inSheet && c.token && claimed === mailHandle(c)
       ? "claims the handle below — unverified, they chose this name themselves"
-      : `claims to be "${c.claimedName}" — unverified, they chose this name themselves`;
+      : `claims to be "${claimed}" — unverified, they chose this name themselves`;
     out.push(claim);
   }
   if (c.keyChangedAt && !c.verified) {
@@ -1963,12 +1990,12 @@ let activeChat = null;    // username of the open conversation, or null
 let mailboxTimer = null;  // polling interval handle
 
 function chatsStatus(text, isErr = false) {
-  els.chatsStatus.textContent = text;
+  els.chatsStatus.textContent = hintSafe(text);
   els.chatsStatus.className = "hint" + (isErr ? " err" : "");
 }
 
 function chatHint(text, isErr = false) {
-  els.chatHint.textContent = text;
+  els.chatHint.textContent = hintSafe(text);
   els.chatHint.className = "hint" + (isErr ? " err" : "");
 }
 
@@ -2594,6 +2621,11 @@ async function connect() {
 }
 
 async function connectInner() {
+  // Fix round (review of e0e8f30, lead): synchronously, before ANY await — the
+  // old session's socket is finished the moment a new session starts to be
+  // built (the button is only live once it is closed), so nothing it still has
+  // queued may reach the cipher and nonces this call is about to replace.
+  if (ws) retiredSockets.add(ws);
   const room = roomCode();
   const alg = algValue();
   if (!ROOM_RE.test(room)) {
@@ -3174,7 +3206,7 @@ async function handleMessage(room, raw, sock) {
   // forged handshake whose refusal must still reach the room screen (round 3
   // L2, e2e/hostile-relay.mjs sections 6 and 8). A frame already being handled
   // when the socket closes finishes either way.
-  if (!ws || sock !== ws || appClosedSockets.has(sock)) return;
+  if (!ws || sock !== ws || retiredSockets.has(sock)) return;
   let m;
   try {
     m = JSON.parse(raw);
