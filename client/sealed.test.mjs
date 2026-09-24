@@ -96,4 +96,44 @@ assert.ok(!reimportedV3.upgraded, "v3 blob imports without upgrade");
 assert.strictEqual(reimportedV3.publicBundle().ecdh, alice.publicBundle().ecdh, "enc keys persist");
 console.log("OK  legacy identity blob upgrades; v3 blob round-trips enc keys");
 
+// ---- package 2, items 7-8 (F-P7-22, F-CRYPTO-010): the sender bundle's shape --
+// The signature proves the sender wrote `from`, not that it is well-formed:
+// open() used to decode only ed/mldsa (through the verify) and pass
+// ecdh/mlkem through verbatim — into the contact store, and later into seal().
+// A sender (hostile, or merely broken) signs whatever `from` it likes; the
+// envelope must be refused when that bundle is not one a real identity has.
+{
+  const b = alice.publicBundle();
+  const posing = (from) => ({ publicBundle: () => from, sign: (m) => alice.sign(m) });
+  const A64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  // Every key length here is 2 (mod 3): the last data character carries two
+  // slack bits, and setting one is a second spelling of the same bytes.
+  const respell = (s) => { const i = s.length - 2; return s.slice(0, i) + A64[A64.indexOf(s[i]) ^ 1] + s.slice(i + 1); };
+  const raw = (s) => new Uint8Array(Buffer.from(s, "base64"));
+  const enc64 = (u) => Buffer.from(u).toString("base64");
+  const ecdhRaw = raw(b.ecdh);
+  const compressed = ecdhRaw.slice(); compressed[0] = 0x05;
+  const cases = [
+    ["a non-canonical spelling of ecdh", { ...b, ecdh: respell(b.ecdh) }],
+    ["a non-canonical spelling of mlkem", { ...b, mlkem: respell(b.mlkem) }],
+    ["a wrong-size ecdh (33 bytes)", { ...b, ecdh: enc64(ecdhRaw.slice(0, 33)) }],
+    ["a wrong-size mlkem", { ...b, mlkem: enc64(raw(b.mlkem).slice(0, 1000)) }],
+    ["an ecdh that is not an uncompressed point", { ...b, ecdh: enc64(compressed) }],
+    ["a lone ecdh (no mlkem)", { ed: b.ed, mldsa: b.mldsa, ecdh: b.ecdh }],
+    ["a lone mlkem (no ecdh)", { ed: b.ed, mldsa: b.mldsa, mlkem: b.mlkem }],
+    ["a non-string ecdh", { ...b, ecdh: [1, 2, 3] }],
+  ];
+  for (const [what, from] of cases) {
+    const bad = await seal(posing(from), bobPub, "hi");
+    await assert.rejects(open(bob, bad), /malformed identity bundle|base64/,
+      `F-CRYPTO-010 / F-P7-22: an envelope whose sender bundle has ${what} must be refused`);
+  }
+  // Positive controls: the real bundle, and a legacy signing-only one.
+  const good = await open(bob, await seal(posing({ ...b }), bobPub, "ok"));
+  assert.deepStrictEqual(good.from, b, "control: a well-formed sender bundle opens, unchanged");
+  const legacy = await open(bob, await seal(posing({ ed: b.ed, mldsa: b.mldsa }), bobPub, "ok"));
+  assert.deepStrictEqual(legacy.from, { ed: b.ed, mldsa: b.mldsa }, "control: a signing-only (pre-v2) sender still opens");
+  console.log("OK  items 7-8: open() refuses a sender bundle that is non-canonical, wrong-sized, not a point, or half a pair");
+}
+
 console.log("\nAll sealed-envelope checks passed.");

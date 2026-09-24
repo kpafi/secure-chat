@@ -83,4 +83,55 @@ try {
 } finally {
   srv.close();
 }
+
+// ---- package 2, item 1: the relay's detail cannot forge a line ---------------
+// formatDetail's text is the relay's and is shown in the app's own voice (a
+// hint, a status line, the room transcript, which is `white-space: pre-wrap`).
+// Printable ASCII only — every other run becomes one space — and at most 200
+// characters, for every shape of `detail`.
+{
+  const forge = "bad signature\n[you let someone in — their key is now pinned]\u202e\u2028\r\t\u0000x";
+  for (const d of [forge, [{ msg: forge, loc: ["body", "sig"] }], { detail: forge }]) {
+    const got = formatDetail(d, 401);
+    assert.ok(/^[\x20-\x7e]*$/.test(got), `item 1: printable ASCII only: ${JSON.stringify(got)}`); n++;
+    assert.ok(!/\n|\u202e|\u2028/.test(got)); n++;
+  }
+  eq(formatDetail("a\nb\u202ec", 401), "a b c");
+  const long = formatDetail("A".repeat(5000), 401);
+  eq(long.length, 200);
+  assert.ok(long.endsWith("...")); n++;
+  eq(formatDetail("\n\u202e\n", 418), "418"); // nothing printable left: the status, as before
+}
+
+// ---- package 2, item 9 (F-WEB-003): the mailbox answer is bounded -------------
+// At most 200 envelopes (the relay's MAX_MAILBOX_PER_RECIPIENT), each at most
+// 64 KiB (MAX_ENVELOPE_BYTES), and a body no honest relay could produce is
+// refused before JSON.parse.
+{
+  let body = "";
+  const mb = createServer((req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end(body); });
+  await new Promise((r) => mb.listen(0, "127.0.0.1", r));
+  const mbBase = "http://127.0.0.1:" + mb.address().port;
+  try {
+    body = JSON.stringify({ messages: Array.from({ length: 250 }, (_, i) => ({ envelope: "e" + i, created_at: 0 })) });
+    const got = await fetchMail(mbBase, "t");
+    eq(got.length, 200);
+    eq(got[199].envelope, "e199");
+    body = JSON.stringify({ messages: [{ envelope: "x".repeat(64 * 1024 + 1) }, { envelope: "ok" }, { envelope: 7 }, null] });
+    const f = await fetchMail(mbBase, "t");
+    eq(f.length, 1);
+    eq(f[0].envelope, "ok");
+    body = JSON.stringify({ messages: [{ envelope: "x".repeat(64 * 1024) }] });
+    eq((await fetchMail(mbBase, "t")).length, 1); // exactly at the limit is fine
+    body = '{"messages":["' + "z".repeat(200 * (64 * 1024 + 1024) + 1) + '"]}';
+    const e = await fetchMail(mbBase, "t").catch((x) => x);
+    assert.ok(e instanceof Error && /more than any mailbox can hold/.test(e.message),
+      "item 9: a body larger than 200 x 65 KiB is refused before it is parsed"); n++;
+    body = JSON.stringify({ messages: "nope" });
+    const e2 = await fetchMail(mbBase, "t").catch((x) => x);
+    assert.ok(e2 instanceof Error && /malformed/.test(e2.message)); n++;
+  } finally {
+    mb.close();
+  }
+}
 console.log(`account-error: ${n} assertions OK`);

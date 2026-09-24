@@ -453,4 +453,39 @@ function compareBytes(a, b) {
   return a.length - b.length;
 }
 
+
+// A received public identity bundle, checked for SHAPE and returned in its one
+// canonical spelling — or a throw. Package 2, items 7 and 8 (F-P7-22,
+// F-CRYPTO-010): the sealed sender bundle's ed/mldsa were checked (by the
+// signature verify) but `ecdh`/`mlkem` reached the contact store verbatim —
+// any spelling, any length — and the handshake / knock bundles were only
+// size-checked when BOTH encryption keys were present (Identity._bundleBytes
+// skips a lone one, so a lone `ecdh` rode along outside the signed digest).
+// The rules, the same ones account.fetchBundle applies to the directory:
+//   * ed and mldsa present; ecdh and mlkem both present or both absent;
+//   * every key in canonical base64 (unb64 throws on any other spelling, H-1);
+//   * every key its algorithm's exact size; the ECDH point uncompressed (0x04,
+//     F-CRYPTO-003).
+// Anything PERSISTED or re-signed must go through this.
+export function canonicalPublicBundle(b) {
+  if (!b || typeof b !== "object") throw new Error("malformed identity bundle");
+  const has = (f) => b[f] !== undefined && b[f] !== null;
+  if (!has("ed") || !has("mldsa") || has("ecdh") !== has("mlkem")) {
+    throw new Error("malformed identity bundle");
+  }
+  const out = {};
+  for (const [f, want] of [["ed", ED25519_PUB_BYTES], ["mldsa", MLDSA65_PUB_BYTES],
+    ["ecdh", ECDH_PUB_BYTES], ["mlkem", MLKEM768_PUB_BYTES]]) {
+    if (!has(f)) continue;
+    if (typeof b[f] !== "string") throw new Error("malformed identity bundle");
+    const raw = unb64(b[f]); // throws on a non-canonical spelling
+    if (raw.length !== want) {
+      throw new Error(`malformed identity bundle: ${f} is ${raw.length} bytes, expected ${want}`);
+    }
+    if (f === "ecdh" && raw[0] !== 0x04) throw new Error("malformed identity bundle: ecdh is not an uncompressed point");
+    out[f] = b64(raw);
+  }
+  return out;
+}
+
 export { b64, unb64, concat };

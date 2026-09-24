@@ -21,7 +21,7 @@
 // store-and-forward without a live ratchet.
 
 import { ml_kem768 } from "@noble/post-quantum/ml-kem.js";
-import { Identity, b64, unb64, concat } from "./identity.js";
+import { Identity, b64, unb64, concat, canonicalPublicBundle } from "./identity.js";
 
 const DOMAIN = "secure-chat/sealed/v1";
 const enc = new TextEncoder();
@@ -99,6 +99,14 @@ export async function open(recipientIdentity, envelopeJson) {
   const myEdB64 = b64(recipientIdentity.edPubRaw);
   const ok = await Identity.verify(parsed.from, signBytes(myEdB64, env.eph, env.kem, core), sig);
   if (!ok) throw new Error("sender signature invalid — envelope forged or re-targeted");
+  // Package 2, items 7-8 (F-P7-22, F-CRYPTO-010): the signature proves the
+  // sender wrote `from`, not that it is well-formed — ed/mldsa were decoded
+  // canonically by the verify above, ecdh/mlkem were not looked at, and they
+  // are what the receiver stores and later SEALS TO. A non-canonical spelling
+  // (a second encoding of the same bytes, which contacts.js compares as
+  // strings), a wrong size, a compressed point or a lone encryption key is a
+  // malformed envelope.
+  const from = canonicalPublicBundle(parsed.from);
   // Whole signed body: {from, name, kind, msg?, mode?, ts, id, …}.
-  return { ...parsed, name: parsed.name || null, kind: parsed.kind || "msg" };
+  return { ...parsed, from, name: parsed.name || null, kind: parsed.kind || "msg" };
 }

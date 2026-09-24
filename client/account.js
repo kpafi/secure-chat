@@ -81,8 +81,18 @@ export function formatDetail(detail, status) {
   } catch {
     text = "";
   }
-  return typeof text === "string" && text.trim() ? text : status + "";
+  // Package 2, item 1 (transcript-line forgery): this text is the RELAY's,
+  // and it is shown in the app's own voice (a hint, the Users status, a line
+  // in the room transcript, which is `white-space: pre-wrap`). A relay-chosen
+  // "\n" started a line of its own there; a bidi override reordered one. So:
+  // printable ASCII only (every other run becomes one space) and at most
+  // FORMAT_DETAIL_MAX characters. Still total — nothing below can throw.
+  if (typeof text !== "string") text = "";
+  text = text.replace(/[^\x20-\x7e]+/g, " ").trim();
+  if (text.length > FORMAT_DETAIL_MAX) text = text.slice(0, FORMAT_DETAIL_MAX - 3) + "...";
+  return text ? text : String(status).replace(/[^\x20-\x7e]+/g, " ").slice(0, 16);
 }
+const FORMAT_DETAIL_MAX = 200;
 
 async function asError(res) {
   let detail = null;
@@ -312,6 +322,18 @@ export async function sendMail(base, handle, envelope) {
   return res.json();
 }
 
+// Package 2, item 9 (F-WEB-003): the relay's own bounds (backend/config.py):
+// at most MAX_MAILBOX_PER_RECIPIENT = 200 queued envelopes per inbox, each at
+// most MAX_ENVELOPE_BYTES = 64 KiB. Nothing an honest relay returns exceeds
+// them, so the client holds a response to them BEFORE parsing it: a hostile
+// relay could otherwise hand us an arbitrarily large body to JSON.parse and an
+// arbitrarily long batch to open (an ML-KEM decapsulation and two signature
+// verifies each). The body bound leaves room for the JSON framing and the
+// created_at field of every entry.
+export const MAX_MAILBOX_BATCH = 200;
+export const MAX_ENVELOPE_CHARS = 64 * 1024;
+const MAX_MAILBOX_BODY_CHARS = MAX_MAILBOX_BATCH * (MAX_ENVELOPE_CHARS + 1024);
+
 // Fetch AND consume my queued envelopes (requires login; the server deletes
 // what it returns). Returns [{envelope, created_at}].
 export async function fetchMail(base, sessionToken) {
@@ -326,7 +348,17 @@ export async function fetchMail(base, sessionToken) {
     err.status = status;
     throw err;
   }
-  return (await res.json()).messages;
+  const body = await res.text();
+  if (body.length > MAX_MAILBOX_BODY_CHARS) {
+    throw new Error("mailbox fetch failed: the relay returned more than any mailbox can hold");
+  }
+  const msgs = JSON.parse(body).messages;
+  if (!Array.isArray(msgs)) throw new Error("mailbox fetch failed: malformed answer");
+  // An oversized entry is not an envelope the relay could have accepted; the
+  // batch is bounded to what one inbox can hold.
+  return msgs
+    .filter((m) => m && typeof m.envelope === "string" && m.envelope.length <= MAX_ENVELOPE_CHARS)
+    .slice(0, MAX_MAILBOX_BATCH);
 }
 
 // Resolve a bearer token back to a username (sanity check / "who am I").

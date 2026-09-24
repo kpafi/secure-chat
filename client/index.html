@@ -396,6 +396,8 @@
         <p class="overline">Your identity on this device</p>
         <h2 class="title">Profile</h2>
       </header>
+      <!-- app.js hint() writes here while this view is on screen (F-P7-9). -->
+      <p class="hint" id="profileHint" aria-live="polite"></p>
 
       <section>
         <!-- The locked card (Profile, Users, Chats): one line, a "?", the
@@ -478,6 +480,8 @@
         <p class="overline">Known public keys &amp; trust</p>
         <h2 class="title">Users</h2>
       </header>
+      <!-- app.js hint() writes here while this view is on screen (F-P7-9). -->
+      <p class="hint" id="usersHint" aria-live="polite"></p>
 
       <section>
         <div id="usersLocked" class="panel locked">
@@ -556,6 +560,8 @@
         <p class="overline">Direct messages</p>
         <h2 class="title">Chats</h2>
       </header>
+      <!-- app.js hint() writes here while this view is on screen (F-P7-9). -->
+      <p class="hint" id="chatsHint" aria-live="polite"></p>
 
       <section id="chatsPanel">
         <div id="chatsLocked" class="panel locked">
