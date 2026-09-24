@@ -214,7 +214,7 @@ final class InPageTests: XCTestCase {
     /// shield, and the refusal screen.
     func test08NativeScreens() async throws {
         vc.promptForRelay(initial: false)
-        if let a = try await TestApp.presentedAlert() {
+        if let a = try await TestApp.presentedAlert(message: "Where your encrypted messages are passed on. The relay only ever sees ciphertext.") {
             TestApp.screenshot("08-relay-settings")
             a.dismiss(animated: false)
         } else {

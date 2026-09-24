@@ -285,8 +285,22 @@ final class MainViewController: UIViewController {
         }
         a.addAction(save)
         a.preferredAction = save
+        presentWhenSettled(a)
+    }
+
+    /// Present once no presentation or dismissal is animating (the same
+    /// lesson as ShellUIDelegate.show, CI runs 5 and 6: presenting over an
+    /// alert that is still animating away silently drops the new one).
+    private func presentWhenSettled(_ vc: UIViewController, attempt: Int = 0) {
         var top: UIViewController = navigationController ?? self
         while let next = top.presentedViewController { top = next }
-        top.present(a, animated: true)
+        if top.isBeingPresented || top.isBeingDismissed {
+            guard attempt < 30 else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                self?.presentWhenSettled(vc, attempt: attempt + 1)
+            }
+            return
+        }
+        top.present(vc, animated: true)
     }
 }
