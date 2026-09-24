@@ -390,7 +390,7 @@ await waitStatus(gGuest.page, "disconnected");
 await sleep(300);
 const m5 = await onScreen(gGuest.page, "#roomHint");
 check("P1: the key-confirmation refusal (replayed handshake) is on the room screen after the close",
-  /^Key confirmation failed: you and your contact do not hold the same session key/.test(m5.text) && m5.onTop &&
+  /^Key confirmation failed: this connection could not confirm that you and your contact hold the same session key/.test(m5.text) && m5.onTop &&
   /a handshake frame arrived AFTER both sides had confirmed/.test(await text(gGuest.page, "#log")),
   JSON.stringify({ ...m5, text: m5.text.slice(0, 50) }));
 await gOwner.page.evaluate(() => window.__SC_FAKE__({ type: "error", reason: "room closed" }));

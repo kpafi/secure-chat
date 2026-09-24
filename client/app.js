@@ -2968,9 +2968,12 @@ const keyConfirm = makeKeyConfirmation({
   fail: (why) => {
     addLine("sys", "", `[${why} — refusing to continue]`);
     // Phase 2a fix round (pentest P1): shown after the close, like the A2 refusals.
+    // F-P7-19 (Phase-7 §9 L-1): worded as what this end could not establish,
+    // not as a fault of the contact — the usual cause of a failed confirmation
+    // is a relay injecting, withholding or replaying key frames.
     closeWs(
-      "Key confirmation failed: you and your contact do not hold the same session key. " +
-      "Messages would silently fail to arrive. Disconnecting.",
+      "Key confirmation failed: this connection could not confirm that you and your contact hold the " +
+      "same session key — the relay may be interfering. Messages could silently fail to arrive. Disconnecting.",
     );
   },
   finish: () => finishSession(currentRoom),
