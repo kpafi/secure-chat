@@ -190,7 +190,7 @@ MAX_SESSIONS_PER_ACCOUNT = 5
 # --- Release version ---------------------------------------------------------
 # Reported by /healthz so "which build is running" is answered by one curl,
 # not by diffing files over ssh. Bump with the git tag (vX.Y.Z on master).
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 # --- Static web client -----------------------------------------------------
 # Served same-origin so the page, the WebSocket, and the (future) .onion all
