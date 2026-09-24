@@ -1011,8 +1011,8 @@ function refreshUsers() {
   renderMyHandle();
   applyPendingInvite();
   renderUserList();
-  if (storeNotice) usersStatus(storeNotice, true);
   if (retractNotice) { usersStatus(retractNotice, true); retractNotice = null; }
+  if (storeNotice) usersStatus(storeNotice, true); // a store warning outranks a vouch line
 }
 
 // My shareable handle (username#token) — only exists after registering, since
@@ -1324,11 +1324,15 @@ function sendRetract(name) {
     vouchNotice(`Could not retract your vouch for "${name}" — it may still be published.`);
   }).finally(() => { if (retractInflight.get(name) === token) retractInflight.delete(name); });
 }
-// "none" (no vouch of ours can exist), "sent", or "pending" (logged out).
+// "none" (no vouch of ours can exist), "unknown" (one may exist that this
+// page cannot name), "sent", or "pending" (logged out).
 function retractVouch(c) {
   const name = vouchedAs.get(c.username) ?? (canVouchFor(c) ? dirName(c) : null);
   vouchedAs.delete(c.username);
-  if (!name) return "none";
+  // A record saved by its typed name that later adopted a claim: a vouch made
+  // before this page loaded went out under the typed name, which the record
+  // no longer tells us for sure — say so rather than stay silent (pentest p8).
+  if (!name) return !c.auto && c.claimedName && c.verified ? "unknown" : "none";
   retractPending.set(name, { left: RETRACT_TRIES, nextAt: 0 });
   if (!apiToken) return "pending";
   // One already in flight (a re-verify and unverify in quick succession):
@@ -1336,6 +1340,9 @@ function retractVouch(c) {
   sendRetract(name);
   return "sent";
 }
+const RETRACT_UNKNOWN = (who) =>
+  `If you published a vouch for "${who}" before this page was opened, it may still be up — ` +
+  "this page cannot retract it for you.";
 const RETRACT_WAITING = (who) =>
   `Not logged in — your vouch for "${who}", if you published one, is retracted when you log in ` +
   "on this page (closing the page cancels that).";
@@ -1658,7 +1665,9 @@ els.contactVerify.addEventListener("click", async (e) => {
     } else {
       // Turned back to unverified — retract a published vouch if any. Not
       // logged in: say it will happen, instead of silently not (p5 L-3).
-      if (retractVouch(c) === "pending") statusMsg = RETRACT_WAITING(c.username);
+      const r = retractVouch(c);
+      if (r === "pending") statusMsg = RETRACT_WAITING(c.username);
+      else if (r === "unknown") statusMsg = RETRACT_UNKNOWN(c.username);
     }
   } finally {
     contactBusy = false;
@@ -1732,6 +1741,7 @@ els.contactRemove.addEventListener("click", async (e) => {
   }
   closeContact();
   if (retract === "pending") vouchNotice(RETRACT_WAITING(c.username)); // never silently (cold r6 MINOR-2)
+  else if (retract === "unknown") vouchNotice(RETRACT_UNKNOWN(c.username));
 });
 
 // Refresh the vouched marks: fetch vouches for unverified contacts and validate

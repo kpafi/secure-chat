@@ -55,7 +55,9 @@ A vouch landing after the Unverify's DELETE (honest relay slower than 15 s); a p
 lost on reload (said in the line); Remove/Unverify of a verified contact whose vouch was declined
 still sends one DELETE; another tab re-vouching while this tab's retraction waits; a 502 after the
 relay committed reads "could not publish"; a stale tab drops the rest of a mailbox batch
-(pre-existing, delete-on-read); a double click on a Users row opens the profile; Android back.
+(pre-existing, delete-on-read); a double click on a Users row opens the profile; Android back;
+a retraction DELETE not awaited before a quick re-vouch; after a reload, a vouch for a record that
+later adopted a claim is not retracted (the line says so — pass 8).
 
 ## Pass 7 on the simplified code (HEAD 48b0780) — and the follow-up fixes
 
@@ -77,3 +79,11 @@ Lows and an info, each a small correction to the new code, all taken:
   inside ten seconds — the line waits for the next Users/Chats render, and tries are 20 s apart.
 - Stated honestly in the code: a retraction DELETE is not awaited before a quick re-vouch, so a slow
   one can still land after it (added to the accepted list).
+
+Verification (pass 8, HEAD b8fb22c): every pass-7 PoC fixed, strangerdel-p4 and beacon-p6 hold,
+nothing Critical/High/Medium. One Low left, taken as a stated limit: the p7 L-3 memory is per page,
+so after a RELOAD a vouch made under the typed name for a record that later adopted a claim is not
+retracted — Unverify/Remove now say so ("If you published a vouch for "X" before this page was
+opened, it may still be up — this page cannot retract it for you."). The clean fix is a
+`vouchedAs` field in the encrypted contact record (an at-rest format change, for its own round).
+A store warning now outranks a deferred vouch line on the same render.
