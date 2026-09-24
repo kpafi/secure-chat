@@ -133,9 +133,23 @@ TRUSTED_PROXY_IPS = frozenset(
 
 # --- HTTP /api abuse bounds (account directory) ---------------------------
 # The /ws relay has its own token bucket; the HTTP account endpoints need their
-# own. Keyed per client host — behind Tor every request appears from loopback,
-# so this collapses to a single global throttle, which is exactly the meaningful
-# control there. Generous enough for normal register/login bursts.
+# own. Keyed per client host — behind Tor every request appears from loopback
+# (and on the shipped clearnet path no proxy is trusted, so there too), which
+# collapses this to ONE bucket for the whole relay.
+#
+# ACCEPTED service-wide limit, stated honestly (F-RELAY-003 residual, 2026-07-29
+# M-2): anyone, with no account, can hold this bucket empty with
+# API_RATE_REFILL_PER_SEC junk requests, and while they do, every route ON it
+# answers 429 for everybody: handle lookups (GET /users/{u}, /vouches), POST
+# and DELETE /vouch, /me and /auth/logout. Behind Tor client_key carries no
+# information to key on, so no tuning of this bucket can fix that; it is a
+# ceiling against runaway clients, not a fairness control. What was changed is
+# its REACH: login (challenge + verify) and registration are no longer on it
+# (accounts.auth_router), because they have dedicated buckets, so junk on the
+# directory routes cannot lock anyone out of logging in or registering. The
+# mailbox has its own buckets and was never on it. Every per-subject control
+# (lookup per target, vouch per voucher, fetch per user, post per recipient)
+# is charged AFTER its gate and cannot be drained without the gate's secret.
 API_RATE_CAPACITY = 60        # burst allowance (requests)
 API_RATE_REFILL_PER_SEC = 5.0 # sustained requests/second
 
@@ -153,8 +167,35 @@ API_RATE_REFILL_PER_SEC = 5.0 # sustained requests/second
 # targeted flood on one name locks out only that name (the attacker could
 # already do that before, via the shared bucket — the blast radius shrank,
 # it did not grow). Pending state itself is bounded by MAX_PENDING_CHALLENGES.
+#
+# Pentest 2026-08-08 item 19 (ported from phase7-local 40d132e; accepted, but
+# hardened): the per-username bucket IS a targeted, unauthenticated login
+# lockout — for an attacker whose goal is to silence one person, "denies that
+# one account" is the objective, not a rounding error. What it costs the
+# victim: nothing until their session token expires (TOKEN_TTL_SEC); live rooms
+# never touch the account API; after that sealed mail stops arriving (the
+# client retries autoLogin on a capped backoff and recovers once the flood
+# stops). Closing it needs proof-of-work or an authenticated pre-token — a
+# design change — so it is accepted; what is bounded here is the REACH.
+#
+# The per-HOST bucket is charged FIRST (accounts.challenge_rate_limit), so a
+# client's total spend is capped at CHALLENGE_HOST_RATE_REFILL_PER_SEC however
+# it is aimed, and holding one victim's bucket empty costs
+# CHALLENGE_RATE_REFILL_PER_SEC. So
+#
+#     simultaneous victims = CHALLENGE_HOST_RATE_REFILL_PER_SEC
+#                          / CHALLENGE_RATE_REFILL_PER_SEC = 20 / 2 = 10
+#
+# At the old 0.5/s it was 40. Making the per-username bucket LOOSER shrinks the
+# attacker's reach, because the binding constraint on them is the host ceiling.
+# It costs honest users nothing: a login spends one or two challenges and
+# autoLogin's backoff retries far slower than 2/s. Do not "tighten" it back
+# without redoing the division — and do not satisfy the ratio by lowering the
+# host ceiling either: that is the service-wide login DoS threshold (20
+# junk challenges/s behind Tor deny every login; accepted, see API_RATE_*).
+# tests/test_rate_limit_invariants.py pins both directions.
 CHALLENGE_RATE_CAPACITY = 10        # burst allowance per USERNAME (challenges)
-CHALLENGE_RATE_REFILL_PER_SEC = 0.5 # sustained challenges/second per username
+CHALLENGE_RATE_REFILL_PER_SEC = 2.0 # sustained challenges/second per username
 CHALLENGE_HOST_RATE_CAPACITY = 200        # burst allowance per host, all names
 CHALLENGE_HOST_RATE_REFILL_PER_SEC = 20.0 # sustained challenges/second per host
 
@@ -331,12 +372,13 @@ MAILBOX_RATE_REFILL_PER_SEC = 1.0     # sustained posts/second per inbox
 # Dedicated bucket for FETCHING mail (pentest 2026-07-26 P-11). GET used to have
 # no limiter at all; putting it on the shared /api bucket closed that but created
 # a worse problem — clients poll every 6 s, and behind Tor every client shares one
-# bucket, so ~30 concurrent users would have exhausted the general 5/s budget and
-# starved registration/lookup for everyone. This bucket is sized for polling
-# (~180 concurrent pollers) while still bounding a flood, and it cannot starve
-# the other endpoints because it is separate.
-MAILBOX_FETCH_RATE_CAPACITY = 120     # burst fetches
-MAILBOX_FETCH_RATE_REFILL_PER_SEC = 30.0  # sustained fetches/second
+# bucket. Phase-7 pentest 2026-09-16 F-P7-2: it is keyed PER AUTHENTICATED USER
+# and charged after `current_user` (it was per host, charged before the session
+# check — one shared bucket anyone with no account could drain). One account
+# polls every 6 s per session and holds at most MAX_SESSIONS_PER_ACCOUNT
+# sessions, so ~1/s sustained with a burst of 30 is ample.
+MAILBOX_FETCH_RATE_CAPACITY = 30          # burst fetches per user
+MAILBOX_FETCH_RATE_REFILL_PER_SEC = 1.0   # sustained fetches/second per user
 
 # --- Web-of-trust vouches --------------------------------------------------
 # A vouch is a dual-signed public statement "voucher has verified target's
@@ -352,12 +394,22 @@ MAX_VOUCHES_RETURNED = 50       # per lookup response
 # bundle by username AND token (the shareable handle is `username#token`), so
 # guessing a username without the token yields an indistinguishable 404 — the
 # username namespace is not enumerable. 18 bytes = 24 base64url chars (~144
-# bits), far beyond brute force under the lookup rate limit below.
+# bits), far beyond brute force under the /api rate limit.
 LOOKUP_TOKEN_BYTES = 18
 
 # The public bundle lookup is the one endpoint whose existence answer is
-# security-relevant, so it gets its own, stricter per-host token bucket on top
-# of the shared /api limiter. Behind Tor this collapses to a single global
-# throttle (see KeyedRateLimiter), which is the meaningful control there.
+# security-relevant, so it gets its own, stricter bucket on top of the shared
+# /api limiter. Phase-7 pentest 2026-09-16 F-P7-3: it is charged AFTER the token
+# gate and keyed on the TARGET handle (per authenticated voucher for POST
+# /vouch) — it used to be per host, charged before the gate, i.e. one global
+# bucket behind Tor that eleven garbage lookups drained. Guessing tokens is
+# therefore bounded by the shared /api limiter (5/s relay-wide), which at 144
+# bits is still far beyond brute force. See accounts._charge_lookup.
 LOOKUP_RATE_CAPACITY = 10        # burst allowance (lookups)
 LOOKUP_RATE_REFILL_PER_SEC = 0.5 # sustained lookups/second
+
+# POST /vouch per-host ceiling (6604d9e review L-3): accounts are free, so the
+# per-voucher bucket alone scales with throwaway accounts. Charged after the
+# session check, so a caller with no session cannot drain it.
+VOUCH_HOST_RATE_CAPACITY = 30
+VOUCH_HOST_RATE_REFILL_PER_SEC = 1.0

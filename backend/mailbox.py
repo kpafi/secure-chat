@@ -40,15 +40,22 @@ _ASCII_RE = re.compile(r"^[\x20-\x7e]+$")
 router = APIRouter(prefix="/api/mailbox", tags=["mailbox"])
 
 
-def _fetch_rate_limit(request: Request) -> None:
+def _fetch_rate_limit(username: str) -> None:
     # Pentest 2026-07-26 P-11: `GET /api/mailbox` was the only /api endpoint with
-    # NO limiter (POST had its own bucket; the accounts router limits everything
-    # it owns). Each fetch runs a full-table TTL prune plus a SELECT that can
-    # return up to MAX_MAILBOX_PER_RECIPIENT * MAX_ENVELOPE_BYTES (~12.8 MB), so
-    # an authenticated user could hammer it unthrottled. It gets its OWN generous
-    # bucket rather than the shared /api one, because clients poll this endpoint
-    # every 6 s and behind Tor they all share a single bucket.
-    if not _fetch_limiter.allow(client_key(request)):
+    # NO limiter. Each fetch runs a TTL prune plus a SELECT that can return a
+    # whole inbox, so an authenticated user could hammer it unthrottled. It gets
+    # its OWN bucket rather than the shared /api one, because clients poll this
+    # endpoint every 6 s.
+    #
+    # Phase-7 pentest 2026-09-16 F-P7-2 (ported from phase7-local 018652d +
+    # 6604d9e M-1): this bucket used to be keyed per HOST and charged as a
+    # `Depends` BEFORE `current_user` — behind Tor one bucket for everybody, so
+    # ~400 unauthenticated GETs made every honest poll 429 and sealed mail
+    # stopped arriving. It is now keyed per AUTHENTICATED user and called by the
+    # handler only after `current_user` resolved: a request without a valid
+    # session spends nothing. GET charges nothing before auth at all (the POST
+    # host ceiling is POST-only, so a POST flood cannot deny fetches either).
+    if not _fetch_limiter.allow("fetch:" + username):
         raise HTTPException(status_code=429, detail="rate limited")
 
 
@@ -117,7 +124,7 @@ def post_mail(recipient: str, req: PostReq, t: str = Query(default="", max_lengt
     return {"status": "queued"}
 
 
-@router.get("", dependencies=[Depends(_fetch_rate_limit)])
+@router.get("")
 def fetch_mail(username: str = Depends(current_user)) -> dict:
     """Return AND DELETE the queued envelopes for the authenticated user.
 
@@ -127,6 +134,7 @@ def fetch_mail(username: str = Depends(current_user)) -> dict:
     remove an envelope that arrived after the SELECT and was never returned,
     losing it silently.
     """
+    _fetch_rate_limit(username)  # F-P7-2: per user, after `current_user`
     with _db() as conn:
         _prune(conn)
         # Bound the response explicitly (P-11) rather than relying on the

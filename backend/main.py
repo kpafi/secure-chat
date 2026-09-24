@@ -102,6 +102,9 @@ connections = ConnectionLimiter()
 # Account directory (passwordless, key-based). Public keys only — see accounts.py.
 accounts.init_db()
 app.include_router(accounts.router)
+# Login + registration: off the shared /api bucket, each on its own (see
+# accounts.auth_router).
+app.include_router(accounts.auth_router)
 
 # Store-and-forward mailbox for sealed messages (opaque ciphertext only).
 mailbox.init_db()

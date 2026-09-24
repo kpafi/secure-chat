@@ -35,10 +35,12 @@ def _reset_rate_limiters():
     for limiter in (
         accounts._api_limiter,
         accounts._lookup_limiter,
+        accounts._vouch_host_limiter,
         accounts._challenge_limiter,
         accounts._challenge_host_limiter,
         accounts._register_limiter,
         mailbox._post_limiter,
+        mailbox._fetch_limiter,
     ):
         limiter._buckets.clear()
     yield

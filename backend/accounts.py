@@ -57,16 +57,32 @@ from relay import KeyedRateLimiter
 
 # Per-client-host rate limiter for the HTTP account endpoints. The /ws relay has
 # its own; these endpoints would otherwise be an unthrottled flood target.
+# Behind Tor (and on the shipped clearnet path, where no proxy is trusted) every
+# request shares one client_key, so this is ONE bucket for the whole relay: see
+# config.API_RATE_* for what that means and why login/register are NOT on it.
 _api_limiter = KeyedRateLimiter(config.API_RATE_CAPACITY, config.API_RATE_REFILL_PER_SEC)
 
 # A second, stricter bucket dedicated to the bundle lookup — the one endpoint
 # whose existence answer is security-relevant (anti-enumeration). Even with a
 # valid token, this bounds how fast the namespace can be probed.
+#
+# Phase-7 pentest 2026-09-16 F-P7-3 (ported from phase7-local 018652d/6604d9e):
+# this used to be a `Depends` keyed on the client host and charged BEFORE the
+# token gate, so eleven unauthenticated garbage lookups drained it and, at one
+# request every two seconds, nobody behind Tor could look up any handle (add by
+# handle, the Live-room bundle check, the vouch list, POST /vouch). It is now
+# charged INSIDE each handler, AFTER the token gate, keyed on the TARGET (or on
+# the authenticated voucher for POST /vouch) — see `_charge_lookup`.
 _lookup_limiter = KeyedRateLimiter(config.LOOKUP_RATE_CAPACITY, config.LOOKUP_RATE_REFILL_PER_SEC)
+
+# POST /vouch also gets a per-HOST ceiling: accounts are free, so a per-voucher
+# bucket alone scales with throwaway accounts (6604d9e, review L-3).
+_vouch_host_limiter = KeyedRateLimiter(config.VOUCH_HOST_RATE_CAPACITY, config.VOUCH_HOST_RATE_REFILL_PER_SEC)
 
 # Dedicated, stricter bucket for minting login challenges (M-03). Keyed on the
 # USERNAME (F-RELAY-003, see config), so one client cannot hold login shut for
-# every account; the per-host bucket beside it only bounds total churn.
+# every account; the per-host bucket beside it is the absolute ceiling and is
+# charged FIRST (item 19, see `challenge_rate_limit`).
 _challenge_limiter = KeyedRateLimiter(config.CHALLENGE_RATE_CAPACITY, config.CHALLENGE_RATE_REFILL_PER_SEC)
 _challenge_host_limiter = KeyedRateLimiter(
     config.CHALLENGE_HOST_RATE_CAPACITY, config.CHALLENGE_HOST_RATE_REFILL_PER_SEC
@@ -218,21 +234,55 @@ def rate_limit(request: Request) -> None:
 def challenge_rate_limit(request: Request, username: str) -> None:
     """Called from the handler (not a `Depends`) because the key is in the body.
 
-    Per-username bucket first (the strict one), then the wide per-host bound.
-    Order matters for the accounting: a request refused by the per-name bucket
-    must not also burn the shared one, or a flood at one name would still
-    drain the bound every other name depends on. A well-formed-but-nonexistent
-    name gets a challenge too (I1), so keying on it leaks nothing the handler
-    does not already say; the caller validates the name before this runs.
+    Pentest 2026-08-08 item 19 (ported from phase7-local 40d132e): the wide
+    per-host bucket is charged FIRST, then the strict per-username one. It used
+    to be the other way round, so a request refused by the per-name bucket cost
+    the sender nothing, and the per-host bucket was not a ceiling on what one
+    client could make this endpoint do.
+
+    With the host bucket first, every request is paid for out of one budget
+    however it is aimed. Holding one victim's name locked out costs
+    CHALLENGE_RATE_REFILL_PER_SEC, so the number of accounts one client can
+    hold offline at once is
+
+        CHALLENGE_HOST_RATE_REFILL_PER_SEC / CHALLENGE_RATE_REFILL_PER_SEC
+
+    which is why the per-username refill was RAISED (see config and
+    tests/test_rate_limit_invariants.py). The targeted lockout itself stays an
+    accepted residual: closing it needs proof-of-work or an authenticated
+    pre-token, a design change.
+
+    A well-formed-but-nonexistent name gets a challenge and a bucket too (I1),
+    so keying on it leaks nothing the handler does not already say; the caller
+    validates the name before this runs.
     """
-    if not _challenge_limiter.allow("u:" + username):
-        raise HTTPException(status_code=429, detail="rate limited")
     if not _challenge_host_limiter.allow(client_key(request)):
         raise HTTPException(status_code=429, detail="rate limited")
+    if not _challenge_limiter.allow("u:" + username):
+        raise HTTPException(status_code=429, detail="rate limited")
 
 
-def lookup_rate_limit(request: Request) -> None:
-    if not _lookup_limiter.allow(client_key(request)):
+def _charge_lookup(key: str) -> None:
+    """F-P7-3: the strict anti-enumeration bucket, charged AFTER the token gate.
+
+    Keyed on the lookup TARGET (`lookup:<name>`, shared by the bundle and the
+    vouch-list lookups of that name) or on the authenticated voucher
+    (`vouch:<name>`). Garbage without a valid token spends nothing; the per-host
+    `_api_limiter` on the router is the ceiling in front of the gate.
+
+    ACCEPTED (6604d9e, review L-4): a holder of a handle's lookup token can
+    exhaust THAT handle's bucket for every other holder (LOOKUP_RATE_CAPACITY
+    lookups, then LOOKUP_RATE_REFILL_PER_SEC to keep it there), so nobody can
+    look that one person up until they stop. Same trade as the per-recipient
+    mailbox bucket (F-RELAY-004): the harm is bounded to one handle its owner
+    shared, instead of every handle on the relay for anyone with no token.
+    """
+    if not _lookup_limiter.allow(key):
+        raise HTTPException(status_code=429, detail="rate limited")
+
+
+def vouch_host_rate_limit(request: Request) -> None:
+    if not _vouch_host_limiter.allow(client_key(request)):
         raise HTTPException(status_code=429, detail="rate limited")
 
 
@@ -241,8 +291,21 @@ def register_rate_limit(request: Request) -> None:
         raise HTTPException(status_code=429, detail="rate limited")
 
 
-# All /api routes share the rate-limit dependency.
+# Every accounts route shares the router-wide `_api_limiter`, EXCEPT the three
+# that make up login and registration, which live on `auth_router` below.
+#
+# Pentest 2026-07-29 M-2 / F-RELAY-003 residual (accepted; re-tuned here): the
+# router-wide bucket is keyed per host, which behind Tor is ONE bucket for the
+# relay, so ~70 junk lookups used to 429 login and registration for everybody.
+# Those three routes each have a dedicated bucket already (challenge: per-host
+# ceiling + per-username; register: per-host), and /auth/verify can do no
+# expensive work without a pending challenge (it pops the challenge before any
+# base64 or signature work, and each challenge buys exactly one verify), so the
+# challenge buckets bound it. Taking them off the shared bucket means junk
+# traffic on the directory routes can no longer deny login or registration.
+# New routes go on `router` (throttled) unless they have a bucket of their own.
 router = APIRouter(prefix="/api", tags=["accounts"], dependencies=[Depends(rate_limit)])
+auth_router = APIRouter(prefix="/api", tags=["accounts"])
 
 _USERNAME_RE = re.compile(r"^[a-z0-9_.-]+$")
 _B64_RE = re.compile(r"^[A-Za-z0-9+/]*={0,2}$")
@@ -538,7 +601,7 @@ def _check_username(u: str) -> None:
 
 # --- endpoints (sync defs run in a threadpool; sqlite stays off the loop) --
 
-@router.post("/register", dependencies=[Depends(register_rate_limit)])
+@auth_router.post("/register", dependencies=[Depends(register_rate_limit)])
 def register(req: RegisterReq) -> dict:
     # Pentest 2026-07-26 P-09: registration is the one endpoint that still
     # distinguishes an existing username (409) from a free one (200), so it is a
@@ -626,7 +689,7 @@ def register(req: RegisterReq) -> dict:
     return {"status": "registered", "username": req.username, "lookup_token": token}
 
 
-@router.get("/users/{username}", dependencies=[Depends(lookup_rate_limit)])
+@router.get("/users/{username}")
 def get_user(username: str, t: str = Query(default="", max_length=64)) -> dict:
     # Anti-enumeration (I1): a lookup must present the per-account token. A
     # missing user AND a wrong token return an IDENTICAL 404, so probing a
@@ -642,6 +705,7 @@ def get_user(username: str, t: str = Query(default="", max_length=64)) -> dict:
     stored = row["lookup_token"] if row is not None else secrets.token_urlsafe(config.LOOKUP_TOKEN_BYTES)
     if not token_matches(t, stored) or row is None:
         raise HTTPException(status_code=404, detail="no such user")
+    _charge_lookup("lookup:" + username)  # F-P7-3: after the gate, per target
     # The public identity bundle others will pin + verify in person. Encryption
     # keys (bundle v2) are included when the account has published them.
     out = {"username": username, "ed": row["ed_pub"], "mldsa": row["mldsa_pub"]}
@@ -651,7 +715,7 @@ def get_user(username: str, t: str = Query(default="", max_length=64)) -> dict:
     return out
 
 
-@router.post("/auth/challenge")
+@auth_router.post("/auth/challenge")
 def auth_challenge(req: ChallengeReq, request: Request) -> dict:
     _check_username(req.username)
     challenge_rate_limit(request, req.username)
@@ -668,7 +732,7 @@ def auth_challenge(req: ChallengeReq, request: Request) -> dict:
     return {"challenge": challenge}
 
 
-@router.post("/auth/verify")
+@auth_router.post("/auth/verify")
 def auth_verify(req: VerifyReq) -> dict:
     _check_username(req.username)
     with _store_lock:
@@ -782,8 +846,8 @@ class VouchReq(BaseModel):
     mldsa_sig: str  # voucher's ML-DSA-65 signature over the same message
 
 
-@router.post("/vouch", dependencies=[Depends(lookup_rate_limit)])
-def vouch(req: VouchReq, username: str = Depends(current_user)) -> dict:
+@router.post("/vouch")
+def vouch(req: VouchReq, request: Request, username: str = Depends(current_user)) -> dict:
     """Publish (or refresh) a dual-signed vouch for `target`.
 
     The server verifies both signatures against the VOUCHER's registered keys
@@ -791,6 +855,13 @@ def vouch(req: VouchReq, username: str = Depends(current_user)) -> dict:
     can only ever hold statements the voucher really signed about the target's
     real directory entry. Clients still re-verify against their own pins.
     """
+    # F-P7-3: both vouch buckets are charged only after `current_user` has
+    # resolved, so a caller with no session spends neither. First the per-host
+    # ceiling (accounts are free, so the per-voucher bound alone would scale
+    # with throwaway accounts), then the anti-enumeration bucket per
+    # AUTHENTICATED voucher (M-7's bound per prober).
+    vouch_host_rate_limit(request)
+    _charge_lookup("vouch:" + username)
     _check_username(req.target)
     if req.target == username:
         raise HTTPException(status_code=422, detail="cannot vouch for yourself")
@@ -811,8 +882,9 @@ def vouch(req: VouchReq, username: str = Depends(current_user)) -> dict:
     # acknowledges, consumes nothing, creates nothing, leaves no directory
     # trace and had no dedicated limiter.
     #
-    # Two changes: the route now shares `lookup_rate_limit`, the same
-    # anti-enumeration bucket `GET /users/{username}` uses; and the existence
+    # Two changes: the route is on the strict `_lookup_limiter`, the same
+    # anti-enumeration bucket `GET /users/{username}` uses (keyed per voucher
+    # since F-P7-3, see `_charge_lookup`); and the existence
     # answer is folded into the signature check below so that a missing target
     # and a bad signature are indistinguishable. A decoy bundle keeps the work
     # (and so the timing) the same either way — the same shape as `get_user`'s
@@ -867,7 +939,7 @@ def unvouch(target: str, username: str = Depends(current_user)) -> dict:
     return {"status": "removed", "target": target}
 
 
-@router.get("/users/{username}/vouches", dependencies=[Depends(lookup_rate_limit)])
+@router.get("/users/{username}/vouches")
 def get_vouches(username: str, t: str = Query(default="", max_length=64)) -> dict:
     """Vouches ABOUT `username`, gated by the same lookup token as the bundle.
 
@@ -884,6 +956,7 @@ def get_vouches(username: str, t: str = Query(default="", max_length=64)) -> dic
         stored = row["lookup_token"] if row is not None else secrets.token_urlsafe(config.LOOKUP_TOKEN_BYTES)
         if not token_matches(t, stored) or row is None:
             raise HTTPException(status_code=404, detail="no such user")
+        _charge_lookup("lookup:" + username)  # F-P7-3: after the gate, per target
         rows = conn.execute(
             """
             SELECT v.voucher, v.sig_ed, v.sig_mldsa, v.created_at, a.ed_pub, a.mldsa_pub

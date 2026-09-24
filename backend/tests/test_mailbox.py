@@ -74,6 +74,24 @@ def _auth(token):
     return {"Authorization": f"Bearer {token}"}
 
 
+def test_unauthenticated_fetch_flood_cannot_deny_authenticated_polling(monkeypatch):
+    """F-P7-2: the fetch bucket used to be keyed per HOST and charged BEFORE the
+    session check — behind Tor one bucket for everybody, drainable with no
+    account (~400 unauthenticated GETs made every honest poll 429). It is per
+    authenticated user now, charged after `current_user`."""
+    from relay import KeyedRateLimiter
+    monkeypatch.setattr(mailbox, "_fetch_limiter", KeyedRateLimiter(2, 0.001))
+    bob = _register("f2-bob")
+    tok = _login(bob)
+    flood = [client.get("/api/mailbox").status_code for _ in range(10)]
+    flood += [client.get("/api/mailbox", headers=_auth("nope")).status_code for _ in range(10)]
+    assert flood == [401] * 20, flood
+    codes = [client.get("/api/mailbox", headers=_auth(tok)).status_code for _ in range(3)]
+    assert codes == [200, 200, 429], codes  # bob's OWN bucket, untouched by the flood
+    alice = _register("f2-alice")
+    assert client.get("/api/mailbox", headers=_auth(_login(alice))).status_code == 200, "another user's bucket is separate"
+
+
 def test_post_fetch_delete_roundtrip():
     bob = _register("mb-bob")
     tok = _login(bob)
