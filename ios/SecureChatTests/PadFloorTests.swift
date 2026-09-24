@@ -99,6 +99,21 @@ final class PadFloorTests: XCTestCase {
         XCTAssertEqual(a.map { $0.withUnsafeBytes { Data($0) } }, b.map { $0.withUnsafeBytes { Data($0) } })
     }
 
+    func testRecordCountIsBounded() throws {
+        var dict: [String: String] = [:]
+        for i in 0..<PadFloor.maxRecords { dict["id\(i)"] = "junk" }
+        try write(dict)
+        XCTAssertEqual(floor.bump("fresh", 1), PadFloor.tampered, "no new id past the cap")
+    }
+
+    /// Pentest iOS-1 M-1: the web view's storage stays out of backups.
+    func testWebKitDataIsExcludedFromBackup() throws {
+        XCTAssertTrue(WebDataBackup.exclude())
+        let dir = try XCTUnwrap(WebDataBackup.directory)
+        let values = try dir.resourceValues(forKeys: [.isExcludedFromBackupKey])
+        XCTAssertEqual(values.isExcludedFromBackup, true)
+    }
+
     private func records() throws -> [String: String] {
         try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as! [String: String]
     }

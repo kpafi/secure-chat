@@ -50,6 +50,8 @@ jobs:
     needs: gate
     runs-on: macos-15
     timeout-minutes: 35
+    permissions:
+      contents: write   # only for the ci/ios-shots publish step below
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
@@ -152,6 +154,24 @@ jobs:
             SecureChat-unsigned.ipa
             SecureChat-unsigned.ipa.sha256
           retention-days: 30
+
+      # Screenshots (for the design review) and a short test summary go to an
+      # orphan branch, force-pushed: artifacts need a browser login to fetch,
+      # a branch is one `git fetch`. Nothing else is written to the repo.
+      - name: Publish screenshots + test summary to ci/ios-shots
+        if: always()
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          rm -rf /tmp/shots-branch && mkdir -p /tmp/shots-branch && cd /tmp/shots-branch
+          git init -q -b ci/ios-shots
+          cp -R "$GITHUB_WORKSPACE/shots/." . 2>/dev/null || true
+          { echo "run ${{ github.run_id }} sha ${{ github.sha }}";
+            grep -E "Test Case .*(passed|failed)|error:|TEST (SUCCEEDED|FAILED)|Executed" /tmp/xcodebuild-test.log 2>/dev/null | grep -v CHHaptic | head -300;
+          } > SUMMARY.txt
+          git -c user.name=ci -c user.email=ci@users.noreply.github.com add -A
+          git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "iOS CI ${{ github.run_id }} (${{ github.sha }})"
+          git push -qf "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git" ci/ios-shots
 
       - name: Collect failure logs
         if: failure()

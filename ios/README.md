@@ -46,7 +46,20 @@ iOS differs in two ways, both deliberate:
    key is 32 random bytes in the Keychain
    (`AfterFirstUnlockThisDeviceOnly`), which the app *process* can read; the
    Secure Enclave has no HMAC. The page cannot reach it. The records file is
-   excluded from backup, so a restore cannot bring an old floor back.
+   excluded from backup, so a restore cannot bring an old floor back. If the
+   records exist but the key is gone (e.g. a re-signed sideload with another
+   Keychain access group), no new key is minted: floors read TAMPERED until the
+   key is back, rather than being orphaned for good.
+
+## Backups (Android: allowBackup=false)
+The web view keeps the client's storage — the passphrase-encrypted identity,
+one-time pads, contact and chat stores — under `Library/WebKit`, which iOS
+would put into iCloud / Finder backups and a Quick Start transfer. The app
+marks that directory excluded from backup at every launch
+(`WebDataBackup.exclude()`), matching Android's "nothing leaves the device"
+(L-6): no second copy of a pad, no offline brute-force copy of the identity.
+Consequence, same as Android: a new phone starts empty; move an identity with
+its backup export, and exchange new pads.
 
 ## Screen protection (no FLAG_SECURE on iOS)
 - App switcher: a cover goes up on `sceneWillResignActive`, so the snapshot is

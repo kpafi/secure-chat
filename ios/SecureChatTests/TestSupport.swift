@@ -146,12 +146,18 @@ enum TestApp {
         handler(action)
     }
 
-    static func presentedAlert(timeout: TimeInterval = 5) async throws -> UIAlertController? {
+    /// The alert on screen, skipping one still being presented or dismissed
+    /// (a previous test's alert can linger for a frame), optionally the one
+    /// showing `message`.
+    static func presentedAlert(message: String? = nil, timeout: TimeInterval = 5) async throws -> UIAlertController? {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             var top = window?.rootViewController
             while let next = top?.presentedViewController { top = next }
-            if let alert = top as? UIAlertController, !alert.isBeingPresented { return alert }
+            if let alert = top as? UIAlertController, !alert.isBeingPresented, !alert.isBeingDismissed,
+               message == nil || alert.message == message {
+                return alert
+            }
             try await Task.sleep(nanoseconds: 100_000_000)
         }
         return nil

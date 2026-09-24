@@ -149,7 +149,7 @@ final class InPageTests: XCTestCase {
             setTimeout(() => { window.__promptResult = prompt('[secure-chat:secret] Enter the pad passphrase'); }, 50);
             return true;
             """)
-        let alert = try await TestApp.presentedAlert()
+        let alert = try await TestApp.presentedAlert(message: "Enter the pad passphrase")
         XCTAssertNotNil(alert, "no native prompt appeared")
         guard let alert = alert else { return }
         XCTAssertEqual(alert.message, "Enter the pad passphrase")
@@ -169,7 +169,7 @@ final class InPageTests: XCTestCase {
             setTimeout(() => { window.__plain = prompt('Name this pad'); }, 50);
             return true;
             """)
-        guard let alert = try await TestApp.presentedAlert() else { return XCTFail("no prompt") }
+        guard let alert = try await TestApp.presentedAlert(message: "Name this pad") else { return XCTFail("no prompt") }
         XCTAssertEqual(alert.textFields?.first?.isSecureTextEntry, false)
         let cancel = alert.actions.first { $0.style == .cancel }!
         alert.dismiss(animated: false)
@@ -181,12 +181,27 @@ final class InPageTests: XCTestCase {
             setTimeout(() => { window.__conf = confirm('Remove this identity from the device?'); }, 50);
             return true;
             """)
-        guard let c = try await TestApp.presentedAlert() else { return XCTFail("no confirm") }
+        guard let c = try await TestApp.presentedAlert(message: "Remove this identity from the device?") else { return XCTFail("no confirm") }
         TestApp.screenshot("06-confirm")
         let yes = c.actions.first { $0.style == .default }!
         c.dismiss(animated: false)
         TestApp.tap(yes)
         try await page.waitUntil("window.__conf === true", timeout: 5)
+    }
+
+    /// A prompt carrying the floor prefix is never shown, even malformed, and
+    /// answers TAMPERED (pentest iOS-1 coverage gap).
+    func test065MalformedFloorPromptIsNeverShown() async throws {
+        let r = try await page.eval("""
+            return [
+              prompt('\\u0001secure-chat-floor\\u0001drop\\u0001abc\\u00010'),
+              prompt('\\u0001secure-chat-floor\\u0001'),
+              prompt('\\u0001secure-chat-floor\\u0001read\\u0001a\\u0001b\\u00010'),
+            ];
+            """) as? [String]
+        XCTAssertEqual(r, ["-2", "-2", "-2"])
+        let alert = try await TestApp.presentedAlert(timeout: 1)
+        XCTAssertNil(alert, "a floor message reached the screen")
     }
 
     /// Marker for the cold-relaunch probe in CI (DebugHooks.SC_PERSIST_PROBE).

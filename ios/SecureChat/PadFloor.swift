@@ -32,7 +32,13 @@ import Security
 ///    old key is simply reused; values, not the key, are what reset.
 ///  * File access alone can delete the records file (every floor then reads
 ///    ABSENT, which the client treats as destruction where a floor is expected
-///    and fails closed) or edit it (the MAC fails: TAMPERED). It cannot rewind.
+///    and fails closed) or edit it (the MAC fails: TAMPERED). It cannot forge a
+///    lower value. It CAN replay an older copy of the whole file, because the
+///    MAC binds (id, value), not time — true of PadFloor.kt too (pentest
+///    iOS-1 I-1). An older copy never leaves the device (excluded from backup),
+///    so that takes a jailbroken device that kept one.
+///  * Size is bounded (`maxRecords`): page JS could otherwise bump fresh ids
+///    until every call parses a huge file (pentest iOS-1 I-2).
 ///
 /// A records file that exists but cannot be parsed makes EVERY read TAMPERED
 /// and refuses every write — a corrupted file must not be healed into a valid
@@ -47,6 +53,8 @@ final class PadFloor {
     private static let macContext = "secure-chat/otp-pad-floor/v1"
     private static let keychainService = "org.securechat.app.pad-floor"
     private static let keychainAccount = "hmac/v1"
+    /// The client keeps a handful of floors per pad and two per identity.
+    static let maxRecords = 4096
 
     private let fileURL: URL
     private let keyProvider: () -> SymmetricKey?
@@ -58,8 +66,15 @@ final class PadFloor {
             for: .applicationSupportDirectory, in: .userDomainMask,
             appropriateFor: nil, create: true
         ) else { return nil }
-        return PadFloor(fileURL: dir.appendingPathComponent("secure-chat-pad-floors.json"),
-                        keyProvider: PadFloor.keychainKey)
+        let file = dir.appendingPathComponent("secure-chat-pad-floors.json")
+        // Pentest iOS-1 L-1: if records exist, the key that signed them must
+        // exist too. Minting a fresh key then would turn every record
+        // permanently TAMPERED without anything having been tampered with;
+        // refuse instead (still TAMPERED, fail closed, but no new key is
+        // written, so restoring the Keychain restores the floors).
+        return PadFloor(fileURL: file, keyProvider: {
+            PadFloor.keychainKey(create: !FileManager.default.fileExists(atPath: file.path))
+        })
     }()
 
     init(fileURL: URL, keyProvider: @escaping () -> SymmetricKey?) {
@@ -86,6 +101,7 @@ final class PadFloor {
         if current == Self.tampered { return Self.tampered }
         let next = current == Self.absent ? value : max(current, value)
         if next == current { return current }
+        if current == Self.absent && records.count >= Self.maxRecords { return Self.tampered }
         guard let tag = tag(id: id, value: next) else { return Self.tampered }
         records[id] = "\(next):\(tag.base64EncodedString())"
         guard store(records) else { return Self.tampered }
@@ -154,7 +170,7 @@ final class PadFloor {
 
     /// The HMAC key, created on first use. nil if the Keychain is unavailable
     /// (e.g. before first unlock) — every operation then answers TAMPERED.
-    static func keychainKey() -> SymmetricKey? {
+    static func keychainKey(create: Bool = true) -> SymmetricKey? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
@@ -167,7 +183,7 @@ final class PadFloor {
         if status == errSecSuccess, let data = out as? Data, data.count == 32 {
             return SymmetricKey(data: data)
         }
-        guard status == errSecItemNotFound else { return nil }
+        guard status == errSecItemNotFound, create else { return nil }
 
         var bytes = [UInt8](repeating: 0, count: 32)
         guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else { return nil }

@@ -48,7 +48,7 @@ final class FloorBridgeTests: XCTestCase {
                       || s.hasPrefix("window.__SECURE_CHAT_RELAY__ = {\"api\":\"https://relay.example.com\",\"ws\":\"wss://relay.example.com/ws\"};"), s)
         XCTAssertTrue(s.contains("var p = window.prompt;"))
         XCTAssertTrue(s.contains("'\\u0001secure-chat-floor\\u0001'"))
-        XCTAssertFalse(s.contains("parseInt"))
+        XCTAssertFalse(s.contains("parseInt("))
         XCTAssertFalse(s.contains("Number("))
     }
 

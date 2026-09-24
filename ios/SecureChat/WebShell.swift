@@ -121,12 +121,12 @@ enum WebShell {
     @MainActor
     static func configuration(
         relay: @escaping () -> RelayUrls?,
-        dataStore: WKWebsiteDataStore = .default()
+        dataStore: WKWebsiteDataStore? = nil
     ) -> WKWebViewConfiguration {
         let config = WKWebViewConfiguration()
         let handler = AppSchemeHandler(root: webRoot, csp: { WebShell.csp(relay: relay()) })
         config.setURLSchemeHandler(handler, forURLScheme: AppOrigin.scheme)
-        config.websiteDataStore = dataStore
+        config.websiteDataStore = dataStore ?? .default()
         config.preferences.javaScriptCanOpenWindowsAutomatically = false
         config.dataDetectorTypes = []
         config.allowsInlineMediaPlayback = false

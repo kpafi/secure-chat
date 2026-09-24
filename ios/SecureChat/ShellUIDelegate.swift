@@ -23,11 +23,16 @@ final class ShellUIDelegate: NSObject, WKUIDelegate {
         self.floor = floor
     }
 
-    /// Where to present: the top of the presenter's chain, if on screen.
+    /// Where to present: the top of the presenter's chain, if on screen and
+    /// able to present right now. nil means "answer the page without UI"
+    /// (cancel / false / null): a refused `present` would drop the alert and,
+    /// with it, WebKit's completion handler (pentest iOS-1 L-2).
     private func top() -> UIViewController? {
         var vc = presenter
-        while let next = vc?.presentedViewController, !next.isBeingDismissed { vc = next }
-        return vc?.viewIfLoaded?.window == nil ? nil : vc
+        while let next = vc?.presentedViewController { vc = next }
+        guard let top = vc, top.viewIfLoaded?.window != nil,
+              !top.isBeingPresented, !top.isBeingDismissed else { return nil }
+        return top
     }
 
     // No pop-ups, ever: window.open / target=_blank get nothing.
