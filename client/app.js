@@ -762,9 +762,7 @@ async function forgetIdentity() {
 
   localStorage.removeItem(LS_IDENTITY);
   closeContact(false); // it shows a record that is about to be gone
-  vouchUnsure.clear();   // they belonged to this identity's account
-  vouchGen.clear();
-  retractPending.clear();
+  retractPending.clear(); // they belonged to this identity's account
   contactsStale = false; // nothing of this identity is left to reload (cold r5 MINOR-B)
   contactsError = null;
   contacts.wipe(); // bound to the identity passphrase; unusable without it
@@ -997,7 +995,7 @@ function refreshUsers() {
   els.usersLocked.hidden = unlocked;
   els.usersUnlocked.hidden = !unlocked;
   if (!unlocked) {
-    els.usersLocked.querySelector("p").textContent = contactsStale ? STALE_LINE : contactsError
+    els.usersLocked.querySelector("p").textContent = contactsStale && identity ? STALE_LINE : contactsError
       ? "Contact store error: " + contactsError +
         (contactsAdoptable ? "" :
           " (Forget + recreate the identity resets it — contacts are bound to the identity passphrase.)")
@@ -1276,56 +1274,54 @@ let contactKeys = null;    // the keys the fingerprint on screen is (being) comp
 let contactFpReady = false;
 let contactBusy = false;   // a Verify/Unverify (and its vouch) is running: further clicks are refused (pentest L-1)
 const VOUCH_TIMEOUT_MS = 15000; // a relay that never answers must not hold contactBusy (pentest pass 2)
-// Vouches the relay may hold although we never heard it say so (a vouch POST
-// that got no answer: pentest p3 L-1), and retractions the user asked for
-// that could not be sent yet (not logged in, or the DELETE failed: pentest
-// p5 L-3). Keyed like the relay keys a vouch — by the DIRECTORY name, for
-// this identity — not by our local label (pentest p5 L-2). In memory only.
-//
-// Nothing retracts on its own from what the relay LISTS: that let a
-// stranger's claimed handle delete our real vouches (pentest p4 M-1). Every
-// retraction here starts from the user's own Unverify or Remove.
-const vouchUnsure = new Set();   // dirNames
-const vouchGen = new Map();      // dirName -> vouch POSTs sent this session
-const retractPending = new Set(); // dirNames the user un-trusted; DELETE not yet delivered
-// Another saved record we still trust under the same directory name (an
-// automatic contact claims a real user's name): its vouch is the wanted one.
-const trustedUnder = (name) => contacts.isUnlocked() &&
-  contacts.list().some((o) => o.verified && dirName(o) === name);
+// Vouch retraction — deliberately simple. Six pentest passes showed every
+// extra rule here (an "unsure" set, a delayed second DELETE, a skip while a
+// record under the same name is trusted, unbounded retries) opened a new edge
+// (design/research/reviews/profile-fix-round-6.md). What is left:
+// - we vouch only for a contact whose directory name the user typed (added
+//   by handle), never for one whose name came from a claim (an automatic
+//   contact, or an adopted claimedName) — so a DELETE never names a claim;
+// - a retraction starts only from the user's own Unverify or Remove (nothing
+//   retracts because of what the relay lists: pentest p4 M-1);
+// - it is sent at once; logged out, or on failure, it waits in memory for
+//   this page and is tried at most RETRACT_TRIES times on the mailbox tick;
+//   the user is told when it waits and when it gives up. A reload forgets it,
+//   and the status line says so.
+const RETRACT_TRIES = 3;
+const canVouchFor = (c) => !c.auto && !c.claimedName;
+const retractPending = new Map(); // dirName -> tries left
+const retractInflight = new Set();
+function vouchNotice(text) {
+  if (!els.viewUsers.hidden) usersStatus(text, true);
+  else if (!els.viewChats.hidden) chatsStatus(text, true);
+}
 function sendRetract(name) {
-  if (trustedUnder(name)) { retractPending.delete(name); return true; }
-  if (!apiToken) return false; // stays pending: the next logged-in tick sends it
-  const token = apiToken, gen = vouchGen.get(name) || 0;
-  retractPending.add(name);
-  account.unvouch(API_BASE, token, name).then(() => {
-    if ((vouchGen.get(name) || 0) === gen) retractPending.delete(name);
-  }).catch(() => { /* stays pending; retried on the next mailbox tick */ });
-  return true;
+  if (!apiToken || retractInflight.has(name)) return;
+  retractInflight.add(name);
+  account.unvouch(API_BASE, apiToken, name).then(() => {
+    retractPending.delete(name);
+  }).catch(() => {
+    const left = (retractPending.get(name) ?? RETRACT_TRIES) - 1;
+    if (left > 0) { retractPending.set(name, left); return; }
+    retractPending.delete(name);
+    vouchNotice(`Could not retract your vouch for "${name}" — it may still be published.`);
+  }).finally(() => retractInflight.delete(name));
 }
-// Returns false when the retraction could not be sent now (not logged in).
+// "none" (no vouch of ours can exist), "sent", or "pending" (logged out).
 function retractVouch(c) {
+  if (!canVouchFor(c)) return "none";
   const name = dirName(c);
-  if (trustedUnder(name)) return true;
-  retractPending.add(name);
-  const sent = sendRetract(name);
-  if (vouchUnsure.delete(name)) {
-    const gen = vouchGen.get(name) || 0;
-    setTimeout(() => {
-      if ((vouchGen.get(name) || 0) !== gen) return; // vouched again since: that one is wanted
-      if (trustedUnder(name)) return;
-      sendRetract(name);
-    }, VOUCH_TIMEOUT_MS + 5000);
-  }
-  return sent;
+  retractPending.set(name, RETRACT_TRIES);
+  if (!apiToken) return "pending";
+  sendRetract(name);
+  return "sent";
 }
-// The mailbox tick (every few seconds while logged in) delivers what is
-// pending; a newer vouch for the name cancels it.
+const RETRACT_WAITING = (who) =>
+  `Not logged in — your vouch for "${who}", if you published one, is retracted when you log in ` +
+  "on this page (closing the page cancels that).";
 function flushRetractions() {
   if (!apiToken) return;
-  for (const name of [...retractPending]) {
-    if (trustedUnder(name)) { retractPending.delete(name); continue; }
-    sendRetract(name);
-  }
+  for (const name of retractPending.keys()) sendRetract(name);
 }
 let contactShownAt = 0;    // when the sheet appeared (the 500 ms rule below)
 
@@ -1610,14 +1606,12 @@ els.contactVerify.addEventListener("click", async (e) => {
     if (wantVerified) {
       // Just turned verified — offer to publish a signed vouch so users who
       // verified YOU can see this contact as "vouched by you". Opt-in.
-      if (apiToken && identity && confirm(
+      if (apiToken && identity && canVouchFor(c) && confirm(
         `Also publish a signed vouch for "${c.username}"? Anyone who has verified YOU ` +
         "will then see them as vouched-by-you. (This reveals publicly that you know them.)",
       )) {
         contactStatus("Publishing the vouch…");
-        const name = dirName(c), who = identity;
-        vouchGen.set(name, (vouchGen.get(name) || 0) + 1);
-        retractPending.delete(name); // this vouch is the wanted state now
+        retractPending.delete(dirName(c)); // this vouch is the wanted state now
         try {
           // Vouch over the FULL in-person-verified bundle incl. encryption
           // keys (H-01) so the vouched mark attests the keys used to seal async
@@ -1630,9 +1624,6 @@ els.contactVerify.addEventListener("click", async (e) => {
           // the relay may have acted (pentest p3 L-1, p4 L-4). Only an HTTP
           // error response means it refused.
           if (err && (err.name === "TimeoutError" || err.name === "AbortError" || err instanceof TypeError)) {
-            // Only for the identity that sent it: a Forget during the round
-            // trip must not hand the next identity a retraction (p5 L-1).
-            if (identity === who) vouchUnsure.add(name);
             statusMsg = `No answer from the relay about the vouch for "${c.username}" — it may still have been ` +
               "published. Unverify retracts it.";
           } else {
@@ -1645,9 +1636,7 @@ els.contactVerify.addEventListener("click", async (e) => {
     } else {
       // Turned back to unverified — retract a published vouch if any. Not
       // logged in: say it will happen, instead of silently not (p5 L-3).
-      if (!retractVouch(c)) {
-        statusMsg = `Not logged in — any vouch you published for "${c.username}" will be retracted once you are.`;
-      }
+      if (retractVouch(c) === "pending") statusMsg = RETRACT_WAITING(c.username);
     }
   } finally {
     contactBusy = false;
@@ -1671,11 +1660,22 @@ els.contactVerify.addEventListener("click", async (e) => {
 // The store locked itself under the sheet (it refused a write another tab
 // made stale): close the sheet, show the view's locked panel — which carries
 // the reason (contactsError) — and put focus in its passphrase field.
-function contactStoreLost(err = null) {
-  contactsStale = !err || err.code === "STALE";
+// `background`: raised by the vouch refresh or mail filing while the user may
+// be typing elsewhere — focus goes to the panel's line, never into the
+// passphrase field, where the rest of a sentence would land masked and be
+// submitted as an unlock attempt (cold r6 MINOR-1).
+function contactStoreLost(err = null, { background = false } = {}) {
+  // Stale only with an identity (a Forget in flight is not "another tab":
+  // pentest p6 L-3), and a later "store is locked" never relabels a stale
+  // lock as a store error with the Forget advice (p6 L-2).
+  contactsStale = !!identity && (contactsStale || !err || err.code === "STALE");
   closeContact(false);
-  if (!els.viewUsers.hidden) { refreshUsers(); els.usersUnlockPass.focus(); }
-  else if (!els.viewChats.hidden) { refreshChats(); els.chatsUnlockPass.focus(); }
+  const users = !els.viewUsers.hidden, chats = !users && !els.viewChats.hidden;
+  if (users) refreshUsers(); else if (chats) refreshChats(); else return;
+  if (!background) { (users ? els.usersUnlockPass : els.chatsUnlockPass).focus(); return; }
+  const line = (users ? els.usersLocked : els.chatsLocked).querySelector("p");
+  line.tabIndex = -1;
+  line.focus({ preventScroll: true });
 }
 
 els.contactRemove.addEventListener("click", async (e) => {
@@ -1693,9 +1693,9 @@ els.contactRemove.addEventListener("click", async (e) => {
     return;
   }
   // A vouch of ours for them would outlive the contact (pentest p3 I-2).
-  // Only where one can exist (verified, or a vouch we are unsure about): a
-  // DELETE for anyone else would tell the relay who we had saved.
-  if (c.verified || vouchUnsure.has(dirName(c))) retractVouch(c);
+  // Only where one can exist (a verified contact): a DELETE for anyone else
+  // would tell the relay whom we had saved.
+  const retract = c.verified ? retractVouch(c) : "none";
   // Re-render first: the render finds the contact gone and closes the sheet,
   // and focus then goes where the removed row's neighbours are, not into a
   // row that is about to be replaced.
@@ -1706,6 +1706,7 @@ els.contactRemove.addEventListener("click", async (e) => {
     refreshChats();
   }
   closeContact();
+  if (retract === "pending") vouchNotice(RETRACT_WAITING(c.username)); // never silently (cold r6 MINOR-2)
 });
 
 // Refresh the vouched marks: fetch vouches for unverified contacts and validate
@@ -1758,7 +1759,11 @@ async function refreshVouchMarks() {
       } catch (err) {
         // The usual first write in an old tab: another tab wrote meanwhile,
         // the store locked itself (pentest p5 L-4) — show that, not a dead list.
-        if (!contacts.isUnlocked()) { contactsError = err.message; contactStoreLost(err); return; }
+        if (!contacts.isUnlocked()) {
+          if (err.code === "STALE") contactsError = err.message;
+          contactStoreLost(err, { background: true });
+          return;
+        }
         throw err;
       }
     }
@@ -2156,6 +2161,7 @@ async function sendChatMessage(e) {
 // reply token; an existing contact keyed by the same bundle always wins.
 async function pollMailbox() {
   if (!identity || !chats.isUnlocked() || !contacts.isUnlocked()) return;
+  const pollWho = identity;
   // Fix review round 2 (M-1): re-authenticate from HERE, not only from the 401
   // branch below.
   //
@@ -2200,7 +2206,8 @@ async function pollMailbox() {
   }
   // Filing a mail writes the store; a write refused because another tab wrote
   // first locks it — say so instead of leaving a dead list (pentest p5 L-4).
-  if (!contacts.isUnlocked()) { contactStoreLost(); return; }
+  if (identity !== pollWho) return; // a Forget ran meanwhile: nothing of it to show
+  if (!contacts.isUnlocked()) { contactStoreLost(null, { background: true }); return; }
   if (changed && !els.viewChats.hidden) refreshChats();
   if (changed) contactsChanged(); // a mail can re-key or re-address a saved user
 }

@@ -135,13 +135,16 @@ added: a double click that verified then silently unverified (pass 1), a vouch t
 answers blocking every later Verify (pass 2), an aborted vouch that could still be published while
 the UI said it was not (pass 3), and — the one Medium, pass 4 — round 3's "backstop" that retracted
 any vouch of ours the relay listed for an unverified contact, which let a stranger's mail claiming a
-friend's handle delete our real vouch for that friend. It was removed, not patched, and pass 5's
-diagnosis (the retraction bookkeeping was keyed on our local label, the relay keys a vouch on the
-directory name) drove round 5. contact-profile.mjs grew from 27 to 60 checks, each added check
-proven against a mutant of the fix it guards.
+friend's handle delete our real vouch for that friend. It was removed, not patched. Passes 5 and 6
+kept finding edges in the retraction bookkeeping that replaced it (keyed on our local label while
+the relay keys a vouch on the directory name; a "trusted under the same name" skip a verified
+contact's later claim could switch on), so round 6 removed that bookkeeping too: we vouch only for
+contacts added by handle, a retraction starts only from the user's own Unverify/Remove, and while
+logged out it waits for this page with a line that says so. contact-profile.mjs grew from 27 to 61
+checks.
 
-Known and accepted (see the round files): a double click on a Users row opens the profile; the
-Android back button does not close the sheet; Remove of a verified contact whose vouch was declined
-still sends one DELETE (no persisted "vouched" bit); another tab re-vouching inside this tab's 20 s
-delayed retraction; a 502 after the relay committed reads as "could not publish". A complete fix
-for the last three needs a relay change (a DELETE naming the exact vouch).
+Known and accepted: the list at the end of `reviews/profile-fix-round-6.md` (a vouch landing
+after the Unverify's DELETE when an honest relay is slower than 15 s; a pending retraction lost on
+reload, said on screen; a double click on a Users row opens the profile; the Android back button
+does not close the sheet; and a few more). Most of the vouch items need a relay change — a DELETE
+that names the exact vouch.

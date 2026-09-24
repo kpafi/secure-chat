@@ -275,8 +275,18 @@ check("Verify (clicked twice) marks bob verified once: the sheet and the row say
     before.includes(alice.username) && after.includes(alice.username) && deletes.length === 0,
     JSON.stringify({ before, after, deletes }));
   await alice.page.evaluate(async () => { await (await import("./contacts.js")).remove("unknown-claimsbob01"); });
+  // Unverify retracts the real vouch; then verify (and vouch) again for 3.
   await alice.page.click(`${rowOf(bob.username)} > .u-open`);
   await waitSheet(alice.page);
+  await alice.page.click("#contactVerify"); // Unverify, accepted
+  await alice.page.waitForFunction(() => document.querySelector("#contactVerify").textContent === "Verified in person\u00a0✓", { timeout: 10000 }).catch(() => {});
+  await sleep(1200);
+  const retracted = await vouchesAboutBob();
+  check("Unverify retracts the vouch from the relay", !retracted.includes(alice.username), JSON.stringify(retracted));
+  await sleep(600);
+  await alice.page.click("#contactVerify"); // verify + vouch again
+  await alice.page.waitForFunction(() => document.querySelector("#contactVerify").textContent === "Unverify", { timeout: 15000 }).catch(() => {});
+  await sleep(1500);
 }
 
 // --- 3. Message → Chats; the conversation's name opens the profile -----------
@@ -629,22 +639,24 @@ if (auto) {
     s.warn === "claims the handle below — unverified, they chose this name themselves" &&
     rowClaim === `claims to be "${carol.handle}" — unverified, they chose this name themselves`,
     JSON.stringify({ label: s.handleLabel, handle: s.handle, shown, warn: s.warn, rowClaim }));
-  // A real vouch (carol's own keys), then Unverify: the relay must hold none
-  // of alice's vouches for her afterwards.
+  // A contact whose name came from a claim is never vouched for (so no
+  // retraction can ever name a claim): Verify asks once, no vouch prompt.
   const vouchesAbout = () => alice.page.evaluate(async (h) => {
     const account = await import("./account.js");
     return (await account.fetchVouches("", h)).map((v) => v.voucher);
   }, carol.handle);
   await waitFp(alice.page);
-  await alice.page.click("#contactVerify"); // verify + vouch, both accepted
-  await alice.page.waitForFunction(() => /published/.test(document.querySelector("#contactStatus").textContent), { timeout: 15000 }).catch(() => {});
+  const nV = alice.page.dialogs.length;
+  await alice.page.click("#contactVerify"); // verify (one confirm)
+  await alice.page.waitForFunction(() => document.querySelector("#contactVerify").textContent === "Unverify", { timeout: 15000 }).catch(() => {});
+  await sleep(800);
+  const asked = alice.page.dialogs.slice(nV);
   const vouchedNow = await vouchesAbout();
+  check("verifying a contact whose handle is only claimed offers no vouch and publishes none",
+    asked.length === 1 && /^Mark "/.test(asked[0]) && !vouchedNow.includes(alice.username), JSON.stringify({ asked, vouchedNow }));
   await sleep(600);
   await alice.page.click("#contactVerify"); // Unverify, accepted
-  await sleep(1500);
-  const vouchedAfter = await vouchesAbout();
-  check("a vouch published from the sheet is on the relay, and Unverify retracts it",
-    vouchedNow.includes(alice.username) && !vouchedAfter.includes(alice.username), JSON.stringify({ vouchedNow, vouchedAfter }));
+  await sleep(1000);
   // Remove of a contact that is not verified sends no vouch DELETE: it would
   // tell the relay whom we had saved (pentest p3 I-2 / p4 L-3).
   const deletes = [];

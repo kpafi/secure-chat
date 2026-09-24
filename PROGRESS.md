@@ -15,16 +15,18 @@ signal; `contacts.js` tags its stale-tab refusal `err.code = "STALE"`).
 
 **How it was built.** Brief → Claude Design canvas ("Contact profile" row, updated after the
 reviews) → implementation → hot critic, cold critic and pentest in rounds until clean; decisions
-and triage in `design/research/reviews/profile-brief.md` and `profile-fix-round-1..5.md`, summary
-in `design/research/reviews.md`. e2e `contact-profile.mjs` (60 checks) beside the five existing
+and triage in `design/research/reviews/profile-brief.md` and `profile-fix-round-1..6.md`, summary
+in `design/research/reviews.md`. e2e `contact-profile.mjs` (61 checks) beside the five existing
 runs; all green at the last commit, plus `npm test` and pytest 162.
 
 **Honest notes for the reviewer.** The trust core (Verify marks only the keys on screen) held from
 the first pentest pass. Most later findings were in the vouch-retraction bookkeeping the fix rounds
 added themselves; one of them (pass 4) was a Medium — a stranger's claimed handle could make us
-delete our real vouch — fixed by removing that code, with a mutation-proven regression check. The
-remaining known limits are listed at the end of the reviews.md section; the clean fix for them is a
-relay-side DELETE that names the exact vouch.
+delete our real vouch — fixed by removing that code, with a mutation-proven regression check;
+round 6 then removed the rest of the retraction bookkeeping (vouch only for contacts added by
+handle; retract only on the user's own Unverify/Remove). Known limits: end of
+`profile-fix-round-6.md`; the clean fix for the vouch ones is a relay-side DELETE that names the
+exact vouch.
 
 **Delivery.** Nothing deployed. Review the branch, merge, then relay + client + APK as usual (no
 relay change, so the APK is not forced by this change). On the phone: open a contact from each of
