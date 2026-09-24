@@ -80,3 +80,33 @@ def test_healthz_reports_the_release_version():
     assert r.status_code == 200
     assert r.json()["status"] == "ok"
     assert re.fullmatch(r"\d+\.\d+\.\d+", r.json()["version"]), r.json()
+
+
+# ---- Home Screen web app ---------------------------------------------------
+
+def test_web_app_manifest_is_served_as_a_manifest():
+    import json
+
+    resp = client.get("/manifest.webmanifest")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/manifest+json")
+    m = json.loads(resp.text)
+    assert m["display"] == "standalone" and m["start_url"] == "./" and m["scope"] == "./"
+    # Every icon it names is actually served, as a PNG, from this origin.
+    for icon in m["icons"]:
+        assert not icon["src"].startswith(("http:", "https:", "//")), icon
+        r = client.get("/" + icon["src"])
+        assert r.status_code == 200 and r.headers["content-type"] == "image/png", icon
+    assert client.get("/icons/icon-180.png").headers["content-type"] == "image/png"
+
+
+def test_csp_allows_the_manifest_and_nothing_more():
+    csp = client.get("/index.html").headers["content-security-policy"]
+    directives = {d.strip().split(" ", 1)[0]: d.strip() for d in csp.split(";") if d.strip()}
+    assert directives["manifest-src"] == "manifest-src 'self'"
+    assert directives["default-src"] == "default-src 'none'"
+    # Service workers are explicitly OFF: an absent worker-src falls back to
+    # script-src 'self' and would ALLOW a persistent worker (pentest dist-1 F3).
+    assert directives["worker-src"] == "worker-src 'none'"
+    assert "child-src" not in directives and "frame-src" not in directives
+    assert "http" not in csp and "*" not in csp and "unsafe" not in csp

@@ -71,3 +71,37 @@ def test_android_importmap_hash_matches():
         "map. Regenerate it to match index.html or the app's CSP will block the "
         "inline import map and the app will break."
     )
+
+
+# The iOS shell (ios/SecureChat/WebShell.swift) stamps its own CSP too and pins
+# the same hash in Swift. Same drift guard, same skip rule.
+_WEB_SHELL = Path(config.CLIENT_DIR, "..", "ios", "SecureChat", "WebShell.swift")
+_SWIFT_HASH_RE = re.compile(r'importMapHash\s*=\s*"([^"]+)"')
+
+
+def test_ios_importmap_hash_matches():
+    if not _WEB_SHELL.exists():
+        import pytest
+
+        pytest.skip("ios/ module not present")
+    swift = _WEB_SHELL.read_text(encoding="utf-8")
+    match = _SWIFT_HASH_RE.search(swift)
+    assert match, "WebShell.swift must declare importMapHash"
+    assert match.group(1) == _importmap_hash(), (
+        "WebShell.swift importMapHash has drifted from the web client's import "
+        "map. Regenerate it to match index.html or the iOS app's CSP will block "
+        "the inline import map and the app will break."
+    )
+
+
+def test_ios_origin_matches_relay_allow_list():
+    if not _WEB_SHELL.exists():
+        import pytest
+
+        pytest.skip("ios/ module not present")
+    swift = _WEB_SHELL.read_text(encoding="utf-8")
+    match = re.search(r'static let origin\s*=\s*"([^"]+)"', swift)
+    assert match, "WebShell.swift must declare AppOrigin.origin"
+    assert match.group(1) == config.IOS_WEBVIEW_ORIGIN
+    assert config.IOS_WEBVIEW_ORIGIN in config.ALLOWED_WS_ORIGINS
+    assert config.IOS_WEBVIEW_ORIGIN in config.ALLOWED_HTTP_ORIGINS

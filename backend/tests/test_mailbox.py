@@ -172,9 +172,14 @@ def test_unauthenticated_posts_cannot_burn_the_mailbox_bucket():
     assert r.status_code == 200, r.text
 
 
-def test_mailbox_post_bucket_is_per_recipient():
+def test_mailbox_post_bucket_is_per_recipient(monkeypatch):
     """Flooding one inbox (with its token) throttles that inbox only."""
     mailbox._post_limiter._buckets.clear()
+    # Freeze the refill: at 1 token/s, a slow CI runner that needs over a
+    # second for the burst below earned one extra token and failed with 31
+    # accepted posts instead of 30. The test is about the per-recipient key,
+    # not about refill timing.
+    monkeypatch.setattr(mailbox._post_limiter, "_refill", 0.0)
     bob = _register("flood-bob")
     carol = _register("flood-carol")
     codes = [

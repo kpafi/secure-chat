@@ -1,0 +1,365 @@
+# iOS build + simulator tests + unsigned IPA.
+#
+# COST NOTE: this repository is private, and GitHub bills macOS runner minutes
+# at 10x. A full run is roughly 10-15 real minutes = 100-150 of the monthly
+# free minutes. So it runs only when the iOS shell itself changes (or by hand),
+# never on client/backend-only pushes, and a newer push cancels an older run.
+name: iOS
+
+on:
+  push:
+    # A tag ios-vX.Y.Z also builds the SideStore/AltStore download bundle and a
+    # GitHub release (path filters are not applied to tag pushes).
+    # `branches` must be listed too: with only `tags`, GitHub stops running
+    # the workflow for branch pushes at all (pentest dist-1 F1).
+    branches:
+      - "**"
+    tags:
+      - "ios-v*"
+    paths:
+      - "ios/**"
+      - "!ios/**/*.md"
+      - ".github/workflows/ios.yml"
+      # The relay's origin allow-list, which the app cannot connect without.
+      - "backend/config.py"
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Cheap Linux gate first (1x minutes): the relay suite (incl. the iOS
+  # origin + import-map drift guards) and the client unit tests. The macOS job
+  # does not start if these fail.
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Only the relay tests the iOS app depends on (origin allow-list, CSP
+      # hash + drift guards), to keep this gate fast; the full relay + client
+      # suites run in .github/workflows/backend.yml (Linux, 1x billing).
+      - name: Relay tests (iOS-relevant)
+        timeout-minutes: 5
+        working-directory: backend
+        run: |
+          python -m pip install -q -r requirements.txt
+          python -m pytest -q -p no:cacheprovider tests/test_csp_hash.py \
+            tests/test_ws.py -k "origin or ios or importmap or csp"
+      - name: iOS release tooling + workflow trigger lint
+        timeout-minutes: 2
+        run: python3 ios/scripts/test_dist.py
+
+      - name: Client unit tests
+        timeout-minutes: 5
+        working-directory: client
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+
+  ios:
+    needs: gate
+    runs-on: macos-15
+    timeout-minutes: 35
+    permissions:
+      contents: read    # pentest iOS-2 L-A: third-party tools run in this job
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Start a local relay (loopback, scratch DB)
+        run: |
+          python3 -m venv /tmp/relay-venv
+          /tmp/relay-venv/bin/pip install -q -r backend/requirements.txt
+          cd backend
+          SECURE_CHAT_DB=/tmp/sc-ci.db nohup /tmp/relay-venv/bin/python -m uvicorn main:app \
+            --host 127.0.0.1 --port 8000 --no-server-header --no-proxy-headers \
+            --no-access-log --log-level warning --ws-max-size 66560 > /tmp/relay.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/healthz && exit 0
+            sleep 1
+          done
+          cat /tmp/relay.log; exit 1
+
+      - name: Generate the Xcode project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Pick a simulator
+        id: sim
+        timeout-minutes: 6
+        run: |
+          SDK=$(xcrun --sdk iphonesimulator --show-sdk-version)
+          UDID=$(xcrun simctl list devices available -j | python3 ios/scripts/pick-simulator.py "$SDK")
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          # Boot it here: a simulator xcodebuild boots itself is shut down again
+          # after the tests, and simctl calls against the re-booted device hung
+          # in the cold-relaunch step (CI runs 13, 14). One it did not boot, it
+          # leaves running.
+          perl -e 'alarm shift; exec @ARGV' 60 xcrun simctl boot "$UDID" || true
+          perl -e 'alarm shift; exec @ARGV' 240 xcrun simctl bootstatus "$UDID" -b
+
+      - name: Build and test on the simulator
+        timeout-minutes: 20
+        env:
+          TEST_RUNNER_SC_TEST_RELAY: http://127.0.0.1:8000
+          TEST_RUNNER_SC_SHOT_DIR: ${{ github.workspace }}/shots
+        run: |
+          mkdir -p shots
+          set -o pipefail
+          xcodebuild test \
+            -project ios/SecureChat.xcodeproj -scheme SecureChat \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -resultBundlePath /tmp/SecureChat.xcresult \
+            -parallel-testing-enabled NO \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 180 \
+            -maximum-test-execution-time-allowance 300 \
+            CODE_SIGN_IDENTITY=- \
+            | tee /tmp/xcodebuild-test.log | grep -E "^(Test Case|Test Suite|.*error:|.*warning: .*Swift|\*\*)" || true
+          grep -q "\*\* TEST SUCCEEDED \*\*" /tmp/xcodebuild-test.log
+
+      - name: Cold relaunch keeps the client's storage
+        timeout-minutes: 8
+        run: |
+          UDID=${{ steps.sim.outputs.udid }}
+          # Every simctl call gets its own limit: in CI run 13 the simulator had
+          # shut down after the tests, bootstatus rebooted it, and the next
+          # simctl call blocked until the step timeout (SpringBoard not ready).
+          # macOS has no timeout(1); perl's alarm does the same.
+          lim() { local s=$1; shift; perl -e 'alarm shift; exec @ARGV' "$s" "$@"; }
+          lim 180 xcrun simctl bootstatus "$UDID" -b
+          sleep 10
+          lim 30 xcrun simctl terminate "$UDID" org.securechat.app || true
+          lim 15 xcrun simctl list devices | grep "$UDID" || true
+          DATA=$(lim 30 xcrun simctl get_app_container "$UDID" org.securechat.app data) || DATA=
+          if [ -z "$DATA" ]; then
+            # Same directory, read from disk: the container's metadata plist names the bundle id.
+            META=$(grep -l org.securechat.app "$HOME/Library/Developer/CoreSimulator/Devices/$UDID/data/Containers/Data/Application"/*/.com.apple.mobile_container_manager.metadata.plist 2>/dev/null | head -1 || true)
+            [ -n "$META" ] && DATA=$(dirname "$META")
+          fi
+          echo "data container: $DATA"
+          [ -d "$DATA/Documents" ] || { echo "no data container"; exit 1; }
+          rm -f "$DATA/Documents/persist-probe.txt"
+          launched=
+          for attempt in 1 2 3; do
+            if SIMCTL_CHILD_SC_PERSIST_PROBE=1 lim 45 xcrun simctl launch "$UDID" org.securechat.app; then
+              launched=1; break
+            fi
+            echo "launch attempt $attempt did not return; retrying"
+            lim 30 xcrun simctl terminate "$UDID" org.securechat.app || true
+            sleep 5
+          done
+          [ -n "$launched" ] || { echo "app never launched"; exit 1; }
+          # 90 s, like the tests' first load: a cold launch right after a boot is slow.
+          for i in $(seq 1 90); do
+            [ -f "$DATA/Documents/persist-probe.txt" ] && break
+            sleep 1
+          done
+          sleep 2
+          lim 30 xcrun simctl io "$UDID" screenshot shots/20-cold-launch.png || true
+          echo "probe: $(cat "$DATA/Documents/persist-probe.txt" 2>/dev/null)"
+          test "$(cat "$DATA/Documents/persist-probe.txt")" = "persist-ok"
+
+      # The web version in real Mobile Safari, for the design review (the
+      # standalone Home Screen mode cannot be scripted). Non-blocking.
+      - name: Mobile Safari screenshot of the web version
+        timeout-minutes: 3
+        run: |
+          UDID=${{ steps.sim.outputs.udid }}
+          lim() { local s=$1; shift; perl -e 'alarm shift; exec @ARGV' "$s" "$@"; }
+          lim 45 xcrun simctl openurl "$UDID" http://127.0.0.1:8000/ || true
+          sleep 12
+          lim 30 xcrun simctl io "$UDID" screenshot shots/31-mobile-safari.png || true
+
+      - name: Build the unsigned device IPA (Release)
+        timeout-minutes: 10
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project ios/SecureChat.xcodeproj -scheme SecureChat -configuration Release \
+            -sdk iphoneos -destination "generic/platform=iOS" \
+            SYMROOT=/tmp/sc-release CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            | tail -n 5
+          APP=/tmp/sc-release/Release-iphoneos/SecureChat.app
+          # The Release binary must not carry the debug-only test hooks.
+          if strings "$APP/SecureChat" | grep -q "SC_PERSIST_PROBE\|SC_TEST_RELAY\|DebugHooks\|persist-probe"; then
+            echo "debug hooks leaked into Release"; exit 1
+          fi
+          test -f "$APP/web/index.html"
+          if find "$APP/web" -name "*.test.mjs" -o -name "package*.json" | grep -q .; then
+            echo "test files or manifests bundled"; exit 1
+          fi
+          mkdir -p /tmp/ipa/Payload && cp -R "$APP" /tmp/ipa/Payload/
+          (cd /tmp/ipa && zip -qry "$GITHUB_WORKSPACE/SecureChat-unsigned.ipa" Payload)
+          shasum -a 256 SecureChat-unsigned.ipa | tee SecureChat-unsigned.ipa.sha256
+
+      # Release only: the bundle the relay's web server serves under /ios/
+      # (deploy/README.md). The tag must match MARKETING_VERSION in project.yml.
+      - name: SideStore/AltStore bundle (tags only)
+        if: startsWith(github.ref, 'refs/tags/ios-v')
+        env:
+          TAG: ${{ github.ref_name }}
+          BASE_URL: ${{ vars.IOS_DIST_BASE_URL || 'https://138-199-144-35.sslip.io/ios' }}
+        run: |
+          set -eu
+          VERSION="${TAG#ios-v}"
+          MV=$(sed -n 's/^ *MARKETING_VERSION: *"\(.*\)"$/\1/p' ios/project.yml)
+          BUILD=$(sed -n 's/^ *CURRENT_PROJECT_VERSION: *"\(.*\)"$/\1/p' ios/project.yml)
+          if [ "$VERSION" != "$MV" ]; then
+            echo "tag $TAG does not match MARKETING_VERSION $MV in ios/project.yml"; exit 1
+          fi
+          python3 ios/scripts/make-dist.py --ipa SecureChat-unsigned.ipa \
+            --version "$VERSION" --build "$BUILD" --base-url "$BASE_URL" \
+            --icon ios/SecureChat/Assets.xcassets/AppIcon.appiconset/icon-1024.png \
+            --out ios-dist
+
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/ios-v')
+        with:
+          name: ios-dist
+          path: ios-dist/
+          retention-days: 90
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SecureChat-unsigned-ipa
+          path: |
+            SecureChat-unsigned.ipa
+            SecureChat-unsigned.ipa.sha256
+          retention-days: 30
+
+      - name: Test summary for ci/ios-shots
+        if: always()
+        env:
+          REF_NAME: ${{ github.ref_name }}   # never interpolated into shell (pentest iOS-3 I-1)
+        run: |
+          mkdir -p shots
+          { echo "run ${{ github.run_id }} sha ${{ github.sha }} ref $REF_NAME";
+            grep -E "Test Case .*(passed|failed)|error:|TEST (SUCCEEDED|FAILED)|Executed" /tmp/xcodebuild-test.log 2>/dev/null | grep -v CHHaptic | head -300;
+          } > shots/SUMMARY.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-screenshots
+          path: shots/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Collect failure logs
+        if: failure()
+        run: |
+          mkdir -p failure
+          cp /tmp/relay.log /tmp/xcodebuild-test.log failure/ 2>/dev/null || true
+          grep -E "error:|failed|XCTAssert|Fatal" /tmp/xcodebuild-test.log | head -200 > failure/summary.txt || true
+          (cd /tmp && zip -qry "$GITHUB_WORKSPACE/failure/xcresult.zip" SecureChat.xcresult) || true
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ios-failure-logs
+          path: failure/
+          retention-days: 7
+
+  # Screenshots (for the design review) and the test summary go to an orphan
+  # branch, force-pushed: artifacts need a browser login to fetch, a branch is
+  # one `git fetch`. This job alone holds a write token and runs nothing but
+  # git on files it downloaded — no checkout, no third-party tools (pentest
+  # iOS-2 L-A: the macOS job, which runs brew/pip/xcodebuild, stays read-only).
+  publish-shots:
+    needs: ios
+    if: always() && needs.ios.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-screenshots
+          path: shots
+      # The artifact comes from the macOS job, which runs third-party code, so
+      # it is treated as hostile (pentest iOS-3 F1: a planted .git/ with hooks,
+      # fsmonitor or insteadOf ran code with this token and rewrote the push
+      # URL). Only PNGs and SUMMARY.txt, size-capped, are copied into a fresh
+      # tree; git's own directory lives outside it; hooks and fsmonitor are off.
+      - name: Push to ci/ios-shots
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          rm -rf /tmp/pub /tmp/pub.git && mkdir /tmp/pub
+          find shots -maxdepth 1 -type f \( -name '*.png' -o -name 'SUMMARY.txt' \) -size -8M \
+            | while read -r f; do
+                n=$(basename "$f")
+                case "$n" in *[!A-Za-z0-9._-]*) continue ;; esac
+                cp "$f" "/tmp/pub/$n"
+              done
+          G="git --git-dir=/tmp/pub.git --work-tree=/tmp/pub -c core.hooksPath=/dev/null -c core.fsmonitor=false -c user.name=ci -c user.email=ci@users.noreply.github.com"
+          git init -q --bare -b ci/ios-shots /tmp/pub.git
+          $G add -A
+          $G commit -qm "iOS CI ${{ github.run_id }} (${{ github.sha }})"
+          $G push -qf "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git" HEAD:refs/heads/ci/ios-shots
+
+  # Tags only: a GitHub release carrying the bundle, for the operator to fetch
+  # and copy to the relay server (the repository is private, so its release
+  # assets are NOT a public download link — the relay's /ios/ is). Like
+  # publish-shots, the artifact comes from the macOS job and is treated as
+  # hostile: allow-listed names only, no checkout, no git.
+  release:
+    needs: ios
+    if: startsWith(github.ref, 'refs/tags/ios-v') && needs.ios.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-dist
+          path: dist
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          V="${TAG#ios-v}"
+          files=""
+          for n in "SecureChat-$V.ipa" "SecureChat-$V.ipa.sha256" apps.json icon.png; do
+            f="dist/$n"
+            [ -f "$f" ] && [ ! -L "$f" ] || { echo "missing $n"; exit 1; }
+            files="$files $f"
+          done
+          # Recompute: the .sha256 file came from the same untrusted job. This
+          # only makes the notes match the uploaded IPA; it cannot vouch for a
+          # build job that was itself compromised.
+          set -o pipefail
+          SUM=$(sha256sum "dist/SecureChat-$V.ipa" | cut -d' ' -f1)
+          case "$SUM" in *[!0-9a-f]*) echo "bad checksum"; exit 1 ;; esac
+          [ "${#SUM}" -eq 64 ] || { echo "bad checksum"; exit 1; }
+          [ "$SUM" = "$(cut -d' ' -f1 "dist/SecureChat-$V.ipa.sha256")" ] || { echo "checksum file does not match the IPA"; exit 1; }
+          gh release create "$TAG" $files --repo "$REPO" --title "iOS $V (unsigned)" \
+            --notes "Unsigned iOS build for SideStore/AltStore. SHA-256 of SecureChat-$V.ipa: $SUM. Copy all four files to the relay's /ios/ directory (deploy/README.md)."
+

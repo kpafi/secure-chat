@@ -1,0 +1,55 @@
+# Relay + client test suites on Linux (billed 1x). The iOS workflow runs only
+# the few relay tests the app depends on; this is the full gate.
+name: Backend
+
+on:
+  push:
+    paths:
+      - "backend/**"
+      - "client/**"
+      - ".github/workflows/**"
+      - "ios/scripts/**"
+  workflow_dispatch:
+
+concurrency:
+  group: backend-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Relay tests (full suite)
+        timeout-minutes: 8
+        working-directory: backend
+        run: |
+          python -m pip install -q -r requirements.txt
+          # faulthandler: a test stuck for 60 s dumps every thread's stack
+          # instead of silently eating the job's timeout.
+          python -m pytest -q -p no:cacheprovider -o faulthandler_timeout=60
+      # Lints ios.yml's trigger from OUTSIDE ios.yml: a push that breaks that
+      # trigger does not run ios.yml at all, so the check cannot live only
+      # there (pentest dist-2 L2). Also tests the iOS release tooling.
+      - name: iOS release tooling + ios.yml trigger lint
+        timeout-minutes: 2
+        run: python3 ios/scripts/test_dist.py
+
+      - name: Client unit tests
+        timeout-minutes: 5
+        working-directory: client
+        run: |
+          npm ci --no-audit --no-fund
+          npm test

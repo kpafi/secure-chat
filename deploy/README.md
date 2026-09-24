@@ -182,3 +182,47 @@ of the web client".
 public clearnet site on the same host, so anyone who knows both can correlate
 them, and the clearnet site remains an attack surface into the same box. A
 location-anonymous deployment needs a host with no clearnet service on it.
+
+## iOS app downloads (SideStore / AltStore)
+
+> **Not yet on the box.** The `/ios/` block in `Caddyfile` was added with the
+> iOS distribution and has not been deployed; until it is, the file in this
+> directory is ahead of the live one.
+
+The relay's clearnet host also serves the iOS download bundle, as static files,
+under `https://<host>/ios/`. The repository is private, so GitHub release
+assets are not a public download — this server is the distribution point.
+
+1. Bump `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` in `ios/project.yml`,
+   merge, then tag: `git tag ios-v0.3.0 && git push origin ios-v0.3.0`.
+2. The iOS workflow builds the unsigned IPA and a release `ios-v0.3.0` with four
+   files: `SecureChat-0.3.0.ipa`, `SecureChat-0.3.0.ipa.sha256`, `apps.json`,
+   `icon.png`. `apps.json` points at `https://138-199-144-35.sslip.io/ios`
+   unless the repository variable `IOS_DIST_BASE_URL` says otherwise.
+3. Check the IPA against the hash in the **GitHub release notes** (the
+   release job computed it; the `.sha256` file only proves the bundle agrees
+   with itself), then copy the files to the box:
+   ```bash
+   echo "<hash from the release notes>  SecureChat-0.3.0.ipa" | sha256sum -c
+   sudo mkdir -p /srv/secure-chat-ios
+   sudo cp SecureChat-0.3.0.ipa SecureChat-0.3.0.ipa.sha256 apps.json icon.png /srv/secure-chat-ios/
+   sudo chown -R root:root /srv/secure-chat-ios && sudo chmod 644 /srv/secure-chat-ios/*
+   sudo systemctl reload caddy
+   ```
+4. Send users the **version and the full SHA-256** through a channel other
+   than this server, and the download link; they verify and install from the
+   file (`ios/README.md`, Option A, step 5). `apps.json` is there for
+   SideStore's update notice only — users are told not to install from it.
+   Publish only the current version's hash, so an old IPA cannot pass.
+
+Keep old IPAs out of the directory once a new one is published — `apps.json`
+lists one version, and a stale file is just attack surface. The Onion does not
+serve `/ios/` (Tor forwards straight to the relay); SideStore has no Tor.
+
+**Publish the SHA-256 somewhere other than this server** (e.g. in the chat
+where you hand out the address), and take it from the GitHub release notes —
+the release job recomputes it from the IPA — not from files on the box.
+Whoever controls `/srv/secure-chat-ios/` can replace the IPA *and* `apps.json`
+together, including the `sha256` SideStore checks; only users hashing the file
+they downloaded and comparing with your second channel catches that
+(`ios/README.md`, Option A, step 5).

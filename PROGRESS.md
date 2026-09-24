@@ -25,6 +25,57 @@ updated (no `/design-login` from a non-interactive session) — re-sync the desi
 09-24 deploy script with the marker `justify-content: center` on `.contact-remove-row`), deploy,
 rebuild the APK. Then decide the master/Phase-7 divergence and the `[object Object]` fixes.
 
+## ⮕ RESUME HERE (2026-09-24, iOS app — branch `claude/vigilant-keller-s9sgs4`, NOT merged, NOT deployed)
+
+**What it is.** An iOS twin of the Android app: `ios/` — a WKWebView shell around the same bundled
+client (`../client`, synced into the app at build time), served from `secure-chat://app` by a
+`WKURLSchemeHandler`, with the relay config + a frozen pad-floor bridge injected at document start
+and the CSP stamped on index.html. Read `ios/README.md` for how it differs from Android: the floor
+reaches native code through `window.prompt` (the only synchronous JS→native call WKWebView has),
+the HMAC key lives in the Keychain (app-readable, unlike the AndroidKeyStore), `Library/WebKit` is
+excluded from backup (Android's allowBackup=false), no FLAG_SECURE (privacy shield window instead;
+screenshots cannot be blocked).
+
+**Relay change (must deploy before the app can connect):** `IOS_WEBVIEW_ORIGIN = "secure-chat://app"`
+in `backend/config.py` (WS allow-list + CORS), with tests and drift guards (`test_csp_hash.py`
+checks the Swift import-map hash and origin constant).
+
+**How it was built.** No Mac here: everything compiles and runs in `.github/workflows/ios.yml`
+(Linux gate → macOS: xcodegen, local relay, simulator tests, cold-relaunch storage probe, unsigned
+Release IPA; screenshots + test summary force-pushed to `ci/ios-shots` by a separate job). Tests:
+unit (relay parsing, floor, scheme handler, bridge protocol), in-page in real WebKit (secure
+context + Ed25519, floor bridge incl. poisoning, CSP enforcement, relay reachability, native
+dialogs, navigation lock) and a two-user e2e (onboard, register, add by handle, sealed chat both
+ways). Reviews: cold critic (correctness/a11y) r1; hot design critic r1–r2 ("meets the bar");
+pentest passes 1–4 (`pentest-new-code`), each on the previous pass's fixes. Design rows in the
+Claude Design canvas (https://claude.ai/artifact/NhVZuUXfC2FsJf93NBn5H2, "iOS app" row).
+
+**Honest notes.** No finding above Medium in any pass; the one Medium (WebKit storage in iCloud
+backups) is fixed. Two of my own fixes regressed and were caught by the next pass (a dialog guard
+that silently cancelled a confirm; a crash counter reset that disabled the crash-loop limit) —
+both now have tests. Unverified without a device: backup exclusion in a real backup/Quick Start,
+whether the app-switcher snapshot contains the keyboard, keychain behaviour under re-signing.
+Known design debt and CI notes: end of `ios/README.md`.
+
+**Relay test hangs fixed (same branch).** `backend/tests/test_ws.py` hung intermittently (120 s
+to 15+ min, also on master). Two test-harness bugs, both shown by faulthandler stack dumps, neither
+in the relay: every test socket had its own event loop (cross-loop wake-ups were lost until a read
+timeout fired), and Starlette cancelled the server task on disconnect before the relay's `finally`
+could send its notices. Fixed in the harness (shared loop; sessions wait for the handler before
+the cancel). 40 consecutive runs of test_ws.py clean (~12 s each). Also a boot-time flake in
+`test_accounts.py` (0.0 prune sentinel vs monotonic time). New `.github/workflows/backend.yml`
+runs the full relay + client suites on Linux for `backend/` and `client/` changes.
+
+**CI state at hand-off.** Run 9 (0ac36bb): gate green, 41/41 simulator tests, cold relaunch keeps
+storage, unsigned Release IPA built (debug hooks absent), screenshots published. 9 runs used about
+55 real macOS minutes ≈ 550 billed (10×). Reviews: `design/research/reviews/ios-*.md`.
+
+**Delivery.** CI builds an UNSIGNED IPA (artifact `SecureChat-unsigned-ipa`). Installing needs
+either sideloading (AltStore/Sideloadly, free Apple ID, 7-day re-sign) or an Apple Developer
+account wired in as signing secrets — the owner's decision. Private repo: macOS minutes bill 10×
+(~70–110 billed per run); the workflow only runs on `ios/**`, the workflow file and
+`backend/config.py`.
+
 ## ⮕ RESUME HERE (2026-09-24, contact profile — branch `claude/user-profile-view-e7qr9y`, NOT merged, NOT deployed)
 
 **What it is.** The owner's ask after testing 0.2.0: tap a saved user's row in Users, the avatar
