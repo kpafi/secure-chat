@@ -43,6 +43,7 @@ final class WebVersionTests: XCTestCase {
               touchIcon: document.querySelector('link[rel=apple-touch-icon]')?.getAttribute('href'),
               theme: document.querySelector('meta[name=theme-color]')?.content,
               capable: document.querySelector('meta[name=apple-mobile-web-app-capable]')?.content,
+              viewport: document.querySelector('meta[name=viewport]')?.content,
             };
             try {
               const k = await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']);
@@ -68,6 +69,9 @@ final class WebVersionTests: XCTestCase {
         XCTAssertEqual(r?["touchIcon"] as? String, "icons/icon-180.png")
         XCTAssertEqual(r?["theme"] as? String, "#0d1117")
         XCTAssertEqual(r?["capable"] as? String, "yes")
+        // Without viewport-fit=cover every env(safe-area-inset-*) is 0 and the
+        // tab bar would sit under the home indicator in standalone mode.
+        XCTAssertTrue((r?["viewport"] as? String)?.contains("viewport-fit=cover") == true, "\(String(describing: r?["viewport"]))")
         XCTAssertTrue((r?["csp"] as? String)?.contains("manifest-src 'self'") == true, "\(String(describing: r?["csp"]))")
         XCTAssertTrue((r?["manifestType"] as? String)?.hasPrefix("application/manifest+json") == true)
         XCTAssertEqual(r?["display"] as? String, "standalone")

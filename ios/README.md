@@ -191,7 +191,12 @@ Problems, stated plainly:
   compromised relay did plant would keep serving its code after the relay is
   cleaned up. Recovery then means deleting the web app (and its data):
   keep the identity backup.
-- No offline mode: without the relay there is no client.
+- No offline mode: without the relay there is no client; the Home Screen
+  app opened offline shows Safari's own error page.
+- The status bar in Home Screen mode is plain black above the page's
+  near-black header (a deliberate trade-off: a translucent bar would let the
+  scrolling page slide under the clock). iOS ignores the manifest's portrait
+  lock, so the web app can rotate; landscape works but is the desktop layout.
 
 ### With an Apple Developer account (not set up)
 
