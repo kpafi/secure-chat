@@ -120,13 +120,12 @@ final class TwoUserE2ETests: XCTestCase {
 
         let aliceGot = try await waitForMessage(alice, "hi alice, got it on iOS")
         XCTAssertTrue(aliceGot.contains("hi alice, got it on iOS"), "\(aliceGot)")
+        TestApp.screenshot("12-alice-conversation-keyboard")
+        // And without the keyboard, for the design review.
+        try await alice.eval("document.activeElement && document.activeElement.blur(); return true;")
+        TestApp.window?.endEditing(true)
         try await Task.sleep(nanoseconds: 800_000_000)
         TestApp.screenshot("12-alice-conversation")
 
-        // Bob's view, for the design review.
-        wv.superview?.bringSubviewToFront(wv)
-        try await Task.sleep(nanoseconds: 500_000_000)
-        TestApp.screenshot("13-bob-conversation")
-        window.sendSubviewToBack(wv)
     }
 }

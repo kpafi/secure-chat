@@ -10,11 +10,16 @@ import UIKit
 ///    cover goes up there and comes down on `sceneDidBecomeActive`;
 ///  * while the screen is being recorded, mirrored or AirPlayed
 ///    (`UIScreen.isCaptured`), the cover stays up;
+///  * the cover is a separate window at alert level + 1, so alerts and the
+///    keyboard are behind it too;
 ///  * a SCREENSHOT cannot be prevented or even announced beforehand — the OS
 ///    only reports it after the fact. Not covered.
 final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     var window: UIWindow?
-    private var shield: UIView?
+    /// Its own window above alerts and the keyboard (hot review B2): a
+    /// subview of the app window would leave a page alert, the relay alert
+    /// or the keyboard with its suggestions drawn on top of the cover.
+    private(set) var shieldWindow: UIWindow?
     private var captureObserver: NSObjectProtocol?
 
     func scene(_ scene: UIScene, willConnectTo session: UISceneSession,
@@ -24,7 +29,7 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         let nav = UINavigationController(rootViewController: MainViewController())
         let appearance = UINavigationBarAppearance()
         appearance.configureWithOpaqueBackground()
-        appearance.backgroundColor = Theme.bgTop
+        appearance.backgroundColor = Theme.bg  // the page head is --bg (hot review B1)
         appearance.shadowColor = .clear
         nav.navigationBar.standardAppearance = appearance
         nav.navigationBar.scrollEdgeAppearance = appearance
@@ -58,28 +63,26 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     }
 
     private func showShield() {
-        guard let window = window else { return }
-        if let shield = shield {
-            // Already up: keep the label current (recording may have started).
-            (shield.subviews.first(where: { $0 is UILabel }) as? UILabel)?.isHidden = !isCaptured
-            shield.accessibilityLabel = shieldLabel
+        guard let scene = window?.windowScene else { return }
+        if let shield = shieldWindow {
+            // Already up: keep the note and label current (recording may
+            // have started or stopped since).
+            (shield.rootViewController?.view.subviews.first(where: { $0 is UILabel }) as? UILabel)?.isHidden = !isCaptured
+            shield.rootViewController?.view.accessibilityLabel = shieldLabel
             return
         }
-        let v = UIView(frame: window.bounds)
-        v.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        window?.endEditing(true)
+
+        let vc = UIViewController()
+        let v = vc.view!
         v.backgroundColor = Theme.bg
-        let lock = UIImageView(image: UIImage(systemName: "lock.fill"))
+        // The app icon's own padlock (a vector template asset), not SF lock.
+        let lock = UIImageView(image: UIImage(named: "Padlock"))
         lock.tintColor = Theme.accent
         lock.contentMode = .scaleAspectFit
         lock.translatesAutoresizingMaskIntoConstraints = false
         lock.isAccessibilityElement = false
         v.addSubview(lock)
-        NSLayoutConstraint.activate([
-            lock.centerXAnchor.constraint(equalTo: v.centerXAnchor),
-            lock.centerYAnchor.constraint(equalTo: v.centerYAnchor),
-            lock.widthAnchor.constraint(equalToConstant: 44),
-            lock.heightAnchor.constraint(equalToConstant: 44),
-        ])
         // While recording/mirroring the user is looking at this: say why.
         let note = UILabel()
         note.text = "Hidden while the screen is being recorded or shared"
@@ -92,7 +95,11 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         note.translatesAutoresizingMaskIntoConstraints = false
         v.addSubview(note)
         NSLayoutConstraint.activate([
-            note.topAnchor.constraint(equalTo: lock.bottomAnchor, constant: 16),
+            lock.centerXAnchor.constraint(equalTo: v.centerXAnchor),
+            lock.centerYAnchor.constraint(equalTo: v.centerYAnchor, constant: -16),
+            lock.widthAnchor.constraint(equalToConstant: 64),
+            lock.heightAnchor.constraint(equalToConstant: 64),
+            note.topAnchor.constraint(equalTo: lock.bottomAnchor, constant: 20),
             note.leadingAnchor.constraint(equalTo: v.readableContentGuide.leadingAnchor),
             note.trailingAnchor.constraint(equalTo: v.readableContentGuide.trailingAnchor),
         ])
@@ -100,8 +107,14 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         v.accessibilityViewIsModal = true
         v.isAccessibilityElement = true
         v.accessibilityLabel = shieldLabel
-        window.addSubview(v)
-        shield = v
+
+        let w = UIWindow(windowScene: scene)
+        w.windowLevel = .alert + 1
+        w.overrideUserInterfaceStyle = .dark
+        w.backgroundColor = Theme.bg
+        w.rootViewController = vc
+        w.isHidden = false
+        shieldWindow = w
         UIAccessibility.post(notification: .screenChanged, argument: v)
     }
 
@@ -110,9 +123,9 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     }
 
     private func hideShield() {
-        guard let shield = shield else { return }
-        shield.removeFromSuperview()
-        self.shield = nil
+        guard let w = shieldWindow else { return }
+        w.isHidden = true
+        shieldWindow = nil
         UIAccessibility.post(notification: .screenChanged, argument: nil)
     }
 }

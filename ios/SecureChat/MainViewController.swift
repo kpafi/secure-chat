@@ -43,8 +43,24 @@ final class MainViewController: UIViewController {
         }
     }
 
+    /// The zoom actually applied: the Dynamic Type factor, capped so the page
+    /// never gets narrower than 320 CSS px — the width the web UI was reviewed
+    /// down to (hot review M3; 2.0 on a 393pt phone left 196 px).
+    static func appliedZoom(for category: UIContentSizeCategory, width: CGFloat) -> CGFloat {
+        let wanted = pageZoom(for: category)
+        guard width > 0 else { return min(wanted, 1) }
+        return min(wanted, max(1, width / 320))
+    }
+
     private func applyTextSize() {
-        webView?.pageZoom = Self.pageZoom(for: traitCollection.preferredContentSizeCategory)
+        guard let wv = webView else { return }
+        let z = Self.appliedZoom(for: traitCollection.preferredContentSizeCategory, width: wv.bounds.width)
+        if abs(wv.pageZoom - z) > 0.001 { wv.pageZoom = z }
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        applyTextSize()
     }
 
     override func viewDidLoad() {
@@ -65,6 +81,12 @@ final class MainViewController: UIViewController {
         wv.uiDelegate = uiDelegate
         wv.navigationDelegate = navDelegate
         wv.translatesAutoresizingMaskIntoConstraints = false
+        // An app, not a page: no pinch or double-tap zoom (text size follows
+        // Dynamic Type instead), and no white overscroll behind the page.
+        wv.underPageBackgroundColor = Theme.bg
+        wv.scrollView.pinchGestureRecognizer?.isEnabled = false
+        wv.scrollView.minimumZoomScale = 1
+        wv.scrollView.maximumZoomScale = 1
         view.addSubview(wv)
         // Inside the safe area: the page does not use viewport-fit=cover, so
         // the notch and home-indicator strips are native bg, not page.
@@ -131,47 +153,30 @@ final class MainViewController: UIViewController {
         webView = nil
         navigationItem.rightBarButtonItem = nil
 
-        let title = UILabel()
-        title.text = "Cannot start securely"
-        title.font = .preferredFont(forTextStyle: .title2)
-        title.adjustsFontForContentSizeCategory = true
-        title.textColor = Theme.fg
-        title.numberOfLines = 0
-        title.accessibilityTraits = .header
-        let body = UILabel()
-        body.text = "The app sets up the encrypted client before any page code runs, and that " +
+        // A native empty state (hot review M5), bar hidden: there is nothing
+        // left to operate. UIContentUnavailableView scrolls and follows
+        // Dynamic Type by itself.
+        navigationController?.setNavigationBarHidden(true, animated: false)
+        var config = UIContentUnavailableConfiguration.empty()
+        config.image = UIImage(systemName: "lock.trianglebadge.exclamationmark")
+        config.imageProperties.tintColor = Theme.muted
+        config.text = "Cannot start securely"
+        config.textProperties.color = Theme.fg
+        config.secondaryText = "The app sets up the encrypted client before any page code runs, and that " +
             "step did not complete on this device. Continuing would load a client that cannot " +
             "reach the relay or protect one-time pads, so secure-chat has stopped. Update iOS " +
             "and reinstall the app."
-        body.font = .preferredFont(forTextStyle: .body)
-        body.adjustsFontForContentSizeCategory = true
-        body.textColor = Theme.muted
-        body.numberOfLines = 0
-        let stack = UIStackView(arrangedSubviews: [title, body])
-        stack.axis = .vertical
-        stack.spacing = 12
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        // Scrollable, so the largest accessibility text sizes still fit.
-        let scroll = UIScrollView()
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.alwaysBounceVertical = false
-        view.addSubview(scroll)
-        scroll.addSubview(stack)
-        let centre = stack.centerYAnchor.constraint(equalTo: scroll.frameLayoutGuide.centerYAnchor)
-        centre.priority = .defaultLow
+        config.secondaryTextProperties.color = Theme.muted
+        let empty = UIContentUnavailableView(configuration: config)
+        empty.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(empty)
         NSLayoutConstraint.activate([
-            scroll.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            scroll.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
-            scroll.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            stack.leadingAnchor.constraint(equalTo: view.readableContentGuide.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: view.readableContentGuide.trailingAnchor),
-            stack.topAnchor.constraint(greaterThanOrEqualTo: scroll.contentLayoutGuide.topAnchor, constant: 24),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: scroll.contentLayoutGuide.bottomAnchor, constant: -24),
-            scroll.contentLayoutGuide.heightAnchor.constraint(greaterThanOrEqualTo: scroll.frameLayoutGuide.heightAnchor),
-            centre,
+            empty.topAnchor.constraint(equalTo: view.topAnchor),
+            empty.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            empty.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            empty.trailingAnchor.constraint(equalTo: view.trailingAnchor),
         ])
-        UIAccessibility.post(notification: .screenChanged, argument: title)
+        UIAccessibility.post(notification: .screenChanged, argument: empty)
     }
 
     private func makeMenu() -> UIMenu {
@@ -180,7 +185,7 @@ final class MainViewController: UIViewController {
                 guard let self = self, !self.refusedToRun else { return }
                 if let relay = Prefs.relay() { self.load(relay) } else { self.promptForRelay(initial: true) }
             },
-            UIAction(title: "Relay settings", image: UIImage(systemName: "server.rack")) { [weak self] _ in
+            UIAction(title: "Relay settings…", image: UIImage(systemName: "server.rack")) { [weak self] _ in
                 self?.promptForRelay(initial: false)
             },
         ])
@@ -190,9 +195,9 @@ final class MainViewController: UIViewController {
     /// cannot do anything without one.
     func promptForRelay(initial: Bool, text: String? = nil, error: String? = nil) {
         guard !refusedToRun else { return }
-        let message = (error.map { $0 + "\n\n" } ?? "") +
-            "The relay only ever sees opaque ciphertext. It must use https (TLS); " +
-            "http:// works only for a loopback address (127.0.0.1) when testing."
+        // Short by default (hot review m3); the transport rule only when the
+        // typed address broke it.
+        let message = error ?? "Where your encrypted messages are passed on. The relay only ever sees ciphertext."
         let a = UIAlertController(title: "Relay address", message: message, preferredStyle: .alert)
         a.addTextField { f in
             f.placeholder = "https://relay.example.com"
@@ -215,7 +220,7 @@ final class MainViewController: UIViewController {
                 // UIAlertController always dismisses on a tap, so re-ask with
                 // the typed text and the reason, rather than lose both.
                 self.promptForRelay(initial: initial, text: typed,
-                                    error: "That is not a relay address this app can use: enter https://host (no path).")
+                                    error: "Use https://host (no path). http:// works only for 127.0.0.1 or localhost, when testing.")
                 return
             }
             Prefs.setRelay(relay)

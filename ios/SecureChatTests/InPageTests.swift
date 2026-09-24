@@ -224,9 +224,14 @@ final class InPageTests: XCTestCase {
 
         if let scene = TestApp.window?.windowScene, let sd = TestApp.sceneDelegate {
             sd.sceneWillResignActive(scene)
-            TestApp.screenshot("08-privacy-shield")
-            XCTAssertTrue(TestApp.window?.subviews.last?.accessibilityViewIsModal == true, "shield not on top")
+            let shield = try XCTUnwrap(sd.shieldWindow, "no shield window")
+            XCTAssertFalse(shield.isHidden)
+            // Above alerts and the keyboard (hot review B2).
+            XCTAssertGreaterThan(shield.windowLevel.rawValue, UIWindow.Level.alert.rawValue)
+            XCTAssertEqual(shield.rootViewController?.view.accessibilityViewIsModal, true)
+            TestApp.screenshot("08-privacy-shield", view: shield)
             sd.sceneDidBecomeActive(scene)
+            XCTAssertNil(sd.shieldWindow)
         }
 
         let refused = MainViewController()

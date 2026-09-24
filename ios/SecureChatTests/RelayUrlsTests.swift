@@ -69,4 +69,14 @@ final class RelayUrlsTests: XCTestCase {
         XCTAssertGreaterThan(MainViewController.pageZoom(for: .accessibilityExtraExtraExtraLarge), 1.5)
         XCTAssertLessThan(MainViewController.pageZoom(for: .extraSmall), 1.0)
     }
+
+    /// Hot review M3: never narrower than the 320 px the web UI was reviewed at.
+    @MainActor
+    func testAppliedZoomKeepsA320PxViewport() {
+        XCTAssertEqual(MainViewController.appliedZoom(for: .large, width: 393), 1.0)
+        let z = MainViewController.appliedZoom(for: .accessibilityExtraExtraExtraLarge, width: 393)
+        XCTAssertGreaterThanOrEqual(393 / z, 320 - 0.001)
+        XCTAssertGreaterThan(z, 1.2)
+        XCTAssertEqual(MainViewController.appliedZoom(for: .extraSmall, width: 393), 0.85)
+    }
 }

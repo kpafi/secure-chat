@@ -113,7 +113,8 @@ final class ShellUIDelegate: NSObject, WKUIDelegate {
             field.spellCheckingType = .no
             field.smartDashesType = .no
             field.smartQuotesType = .no
-            field.accessibilityLabel = secret ? "Secret" : "Answer"
+            field.placeholder = secret ? "Passphrase" : nil
+            field.accessibilityLabel = secret ? "Passphrase" : "Answer"
         }
         a.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in done.run(nil) })
         a.addAction(UIAlertAction(title: "OK", style: .default) { [weak a] _ in
