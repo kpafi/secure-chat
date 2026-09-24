@@ -5,6 +5,7 @@ wrong token / unknown user), fetch requires login and deletes what it returns,
 and every bound (envelope size, per-inbox cap, TTL) is enforced.
 """
 import base64
+import logging
 import os
 import sys
 import tempfile
@@ -503,12 +504,44 @@ def test_sqlite_waits_for_the_lock_and_maps_failure_to_a_bare_503(monkeypatch, c
     tok = _login(bob)
 
     def locked():
-        raise sqlite3.OperationalError("database is locked")
+        exc = sqlite3.OperationalError("database is locked")
+        exc.sqlite_errorname = "SQLITE_BUSY"  # what sqlite3 sets on a real one
+        raise exc
 
     monkeypatch.setattr(mailbox, "_db", locked)
-    r = client.get("/api/mailbox", headers=_auth(tok))
+    with caplog.at_level(logging.DEBUG):
+        r = client.get("/api/mailbox", headers=_auth(tok))
     assert (r.status_code, r.text) == (503, "busy"), (r.status_code, r.text)
-    assert "database is locked" not in caplog.text, "the failure must not be logged with its traceback"
+    assert not [rec for rec in caplog.records if rec.levelno >= logging.WARNING], (
+        "lock contention is routine: it must not be logged at all")
+
+
+def test_other_sqlite_failures_are_not_silent_but_log_only_their_name(monkeypatch, caplog):
+    """Fix review F4: the busy handler mapped EVERY OperationalError (disk
+    full, I/O error, malformed DB, missing table) to the same silent 503, so a
+    relay that lost its storage looked quiet to its operator. Non-contention
+    errors are a 500 plus ONE log line with only sqlite's error name — no
+    request data (I2) — rate-limited per name."""
+    import sqlite3
+    import main
+    monkeypatch.setattr(main, "_sqlite_logged_at", {})
+    bob = _register("f4-disk")
+    tok = _login(bob)
+
+    def broken():
+        exc = sqlite3.OperationalError("disk I/O error")
+        exc.sqlite_errorname = "SQLITE_IOERR"
+        raise exc
+
+    monkeypatch.setattr(mailbox, "_db", broken)
+    with caplog.at_level(logging.DEBUG):
+        codes = [client.get("/api/mailbox", headers=_auth(tok)).status_code for _ in range(3)]
+    assert codes == [500] * 3, codes
+    lines = [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.WARNING]
+    assert lines == ["sqlite error SQLITE_IOERR"], lines  # once, not three times
+    server_side = " ".join(rec.getMessage() for rec in caplog.records if not rec.name.startswith(("httpx", "asyncio")))
+    for secret in (tok, "f4-disk", "/api/mailbox", "disk I/O error"):
+        assert secret not in server_side, f"request data or message text leaked into the log: {secret!r}"
 
 
 def test_per_inbox_cap_holds_under_concurrent_posts(monkeypatch):

@@ -159,7 +159,7 @@ app.add_middleware(_ApiBodyLimit)
 
 # CORS is shut for the web client (served same-origin via the .onion) and opened
 # to exactly one extra origin: the Android app's bundled-client origin, whose
-# /api directory fetches are cross-origin. Only GET/POST + the two headers the
+# /api directory fetches are cross-origin. Only GET/POST/DELETE + the two headers the
 # client actually sends are allowed; no credentials mode (auth is an explicit
 # Bearer token, never a cookie). The WS handshake is guarded separately by the
 # origin allow-list in ws_endpoint.
@@ -168,7 +168,11 @@ app.add_middleware(_ApiBodyLimit)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.ALLOWED_HTTP_ORIGINS,
-    allow_methods=["GET", "POST"],
+    # DELETE: the apps' unvouch is DELETE /api/vouch/{target} (client
+    # account.js), and without it here the cross-origin preflight from the
+    # Android/iOS shells failed, so "remove vouch" never reached the relay
+    # there (fix review F5, pre-existing on master).
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["content-type", "authorization"],
 )
 
@@ -225,12 +229,35 @@ def _is_blocked_static(path: str) -> bool:
     )
 
 
+# Fix review F4: which sqlite failures are routine contention (silent) and how
+# often a real one may be logged. The window is per error name, process-wide.
+_SQLITE_CONTENTION = ("SQLITE_BUSY", "SQLITE_LOCKED")  # incl. extended codes (SQLITE_BUSY_SNAPSHOT, ...)
+_SQLITE_LOG_WINDOW_SEC = 60.0
+_sqlite_logged_at: dict[str, float] = {}
+
+
 @app.exception_handler(sqlite3.OperationalError)
 async def _sqlite_busy(request: Request, exc: sqlite3.OperationalError) -> Response:
     # §9 L-2 (ported from phase7-local 6604d9e): "database is locked" under
     # load used to escape as a 500 with a traceback in the journal (I2). A bare
     # 503 says "try again" and writes nothing.
-    return Response(status_code=503, content="busy", media_type="text/plain")
+    #
+    # Fix review F4: that mapping swallowed EVERY OperationalError — disk full,
+    # I/O error, a malformed database, a missing table — as the same silent
+    # "busy", so a relay that had lost its storage looked, to its operator,
+    # like a quiet one. Only lock contention is silent now. Anything else is a
+    # 500 plus ONE log line carrying only sqlite's error NAME (no path, no
+    # query, no request data — I2), at most once per name per minute so a
+    # failing disk cannot become a log flood.
+    name = getattr(exc, "sqlite_errorname", None) or "SQLITE_UNKNOWN"
+    if name.startswith(_SQLITE_CONTENTION):
+        return Response(status_code=503, content="busy", media_type="text/plain")
+    now = asyncio.get_running_loop().time()
+    last = _sqlite_logged_at.get(name)
+    if last is None or now - last >= _SQLITE_LOG_WINDOW_SEC:
+        _sqlite_logged_at[name] = now
+        log.error("sqlite error %s", name)
+    return Response(status_code=500, content="internal error", media_type="text/plain")
 
 
 @app.exception_handler(RequestValidationError)
@@ -240,7 +267,17 @@ async def _validation_without_echo(request: Request, exc: RequestValidationError
     # was the whole body, for a mistyped envelope the ciphertext reflected.
     # Keep loc/msg/type (the client's formatDetail renders exactly those),
     # drop `input` and `ctx`.
-    detail = [{k: v for k, v in e.items() if k in ("loc", "msg", "type")} for e in exc.errors()]
+    #
+    # Fix review F3: for an unknown key (`extra_forbidden`) the LAST element of
+    # `loc` is the attacker-chosen key itself, so the key was still reflected.
+    # Drop it: the location becomes its container (["body"]), which is all the
+    # client needs to render "Extra inputs are not permitted (body)".
+    detail = []
+    for e in exc.errors():
+        item = {k: v for k, v in e.items() if k in ("loc", "msg", "type")}
+        if e.get("type") == "extra_forbidden":
+            item["loc"] = list(e.get("loc", ()))[:-1] or ["body"]
+        detail.append(item)
     return JSONResponse(status_code=422, content={"detail": detail})
 
 

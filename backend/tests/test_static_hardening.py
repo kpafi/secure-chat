@@ -19,6 +19,7 @@ from pathlib import Path
 os.environ.setdefault("SECURE_CHAT_DB", os.path.join(tempfile.mkdtemp(), "static.db"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import pytest  # noqa: E402
 import starlette  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -263,3 +264,38 @@ def test_only_the_import_closure_is_vendored():
     assert not unused, f"vendored but never imported (served for nothing): {unused}"
     missing = sorted(str(p.relative_to(root)) for p in reached - vendored)
     assert not missing, f"imported but not vendored: {missing}"
+
+
+def test_extra_forbidden_does_not_echo_the_key():
+    """Fix review F3: the no-echo 422 still reflected an unknown key through
+    `loc` (["body", "<attacker key>"]). The key is dropped from the location."""
+    marker = "KKKK_marker_9f2c<script>"
+    r = client.post("/api/auth/challenge", json={"username": "alice", marker: 1})
+    assert r.status_code == 422, r.text
+    assert "marker_9f2c" not in r.text, r.text
+    extra = [e for e in r.json()["detail"] if e["type"] == "extra_forbidden"]
+    assert extra and extra[0]["loc"] == ["body"], r.text
+    # Ordinary field errors keep their (server-defined) location.
+    r = client.post("/api/auth/challenge", json={"username": 5})
+    assert r.json()["detail"][0]["loc"] == ["body", "username"], r.text
+
+
+@pytest.mark.parametrize("origin", [config.APP_WEBVIEW_ORIGIN, config.IOS_WEBVIEW_ORIGIN])
+def test_app_origins_may_preflight_delete(origin):
+    """Fix review F5 (pre-existing): CORS allowed GET/POST only, so the apps'
+    unvouch (DELETE /api/vouch/{target}) failed its preflight."""
+    r = client.options("/api/vouch/bob", headers={
+        "Origin": origin, "Access-Control-Request-Method": "DELETE",
+        "Access-Control-Request-Headers": "authorization"})
+    assert r.status_code == 200, r.text
+    assert "DELETE" in r.headers.get("access-control-allow-methods", ""), r.headers
+    assert r.headers.get("access-control-allow-origin") == origin
+
+
+def test_foreign_origin_still_cannot_preflight_delete():
+    r = client.options("/api/vouch/bob", headers={
+        "Origin": "https://evil.example", "Access-Control-Request-Method": "DELETE",
+        "Access-Control-Request-Headers": "authorization"})
+    assert r.status_code == 400, r.status_code
+    assert "access-control-allow-origin" not in r.headers
+
