@@ -26,3 +26,8 @@ e2e/node_modules
 # Personal Claude Code settings — keep deploy/SSH permission rules for the
 # Hetzner box OUT of the committed repo. .claude/agents/ IS committed.
 .claude/settings.local.json
+
+# iOS: the Xcode project is generated from ios/project.yml by XcodeGen
+ios/SecureChat.xcodeproj/
+ios/build/
+ios/DerivedData/
