@@ -23,11 +23,12 @@ final class MainViewController: UIViewController {
     private var crashTimes: [Date] = []
     private var reloadWhenActive = false
     private var crashView: UIView?
+    var isShowingCrashLoop: Bool { crashView != nil }
 
     @objc private func appBecameActive() {
         guard reloadWhenActive, !refusedToRun, let relay = Prefs.relay() else { return }
         reloadWhenActive = false
-        load(relay)
+        load(relay, userInitiated: false)
     }
 
     /// The page's process died repeatedly in the foreground. Not the
@@ -172,7 +173,7 @@ final class MainViewController: UIViewController {
             let now = Date()
             self.crashTimes = self.crashTimes.filter { now.timeIntervalSince($0) < 60 } + [now]
             if self.crashTimes.count > 3 { self.showCrashLoop(); return }
-            self.load(relay)
+            self.load(relay, userInitiated: false)
         }
         NotificationCenter.default.addObserver(
             self, selector: #selector(appBecameActive),
@@ -187,14 +188,18 @@ final class MainViewController: UIViewController {
     }
 
     /// Point the client at `relay`, (re)install the document-start script, load.
-    func load(_ relay: RelayUrls) {
+    /// `userInitiated`: Reload, a saved relay, Try again, first launch. Only
+    /// those clear the crash-loop state; the automatic reload after a process
+    /// death must not, or the limit never trips (pentest iOS-3 F2).
+    func load(_ relay: RelayUrls, userInitiated: Bool = true) {
         guard !refusedToRun, let wv = webView else { return }
-        // Any load (Reload, a new relay, Try again) leaves the crash-loop
-        // screen behind (hot review r2 M2).
-        crashView?.removeFromSuperview()
-        crashView = nil
-        crashTimes = []
-        wv.isHidden = false
+        if userInitiated {
+            // Leave the crash-loop screen behind (hot review r2 M2).
+            crashView?.removeFromSuperview()
+            crashView = nil
+            crashTimes = []
+            wv.isHidden = false
+        }
         WebShell.install(relay: relay, into: wv.configuration.userContentController)
         wv.load(URLRequest(url: AppOrigin.indexURL, cachePolicy: .reloadIgnoringLocalCacheData))
     }
@@ -298,6 +303,7 @@ final class MainViewController: UIViewController {
     /// lesson as ShellUIDelegate.show, CI runs 5 and 6: presenting over an
     /// alert that is still animating away silently drops the new one).
     private func presentWhenSettled(_ vc: UIViewController, attempt: Int = 0) {
+        guard !refusedToRun else { return }   // pentest iOS-3 I-2
         var top: UIViewController = navigationController ?? self
         while let next = top.presentedViewController { top = next }
         if top.isBeingPresented || top.isBeingDismissed {

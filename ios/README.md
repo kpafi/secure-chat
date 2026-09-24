@@ -120,5 +120,7 @@ Compare the IPA's SHA-256 (next to it in the artifact) before sideloading.
   too), which must not burn this pipeline's timeout. The full relay suite
   runs in `deploy/deploy-*.sh`.
 - Screenshots and a test summary go to the `ci/ios-shots` branch from a
-  separate job; the macOS job itself holds a read-only token.
+  separate job; the macOS job itself holds a read-only token. The publish
+  job treats the artifact as hostile (allow-listed PNGs + SUMMARY.txt copied
+  into a fresh tree, git dir outside it, hooks and fsmonitor off).
 

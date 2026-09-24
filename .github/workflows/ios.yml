@@ -171,9 +171,11 @@ jobs:
 
       - name: Test summary for ci/ios-shots
         if: always()
+        env:
+          REF_NAME: ${{ github.ref_name }}   # never interpolated into shell (pentest iOS-3 I-1)
         run: |
           mkdir -p shots
-          { echo "run ${{ github.run_id }} sha ${{ github.sha }} ref ${{ github.ref_name }}";
+          { echo "run ${{ github.run_id }} sha ${{ github.sha }} ref $REF_NAME";
             grep -E "Test Case .*(passed|failed)|error:|TEST (SUCCEEDED|FAILED)|Executed" /tmp/xcodebuild-test.log 2>/dev/null | grep -v CHHaptic | head -300;
           } > shots/SUMMARY.txt
 
@@ -217,12 +219,25 @@ jobs:
         with:
           name: ios-screenshots
           path: shots
+      # The artifact comes from the macOS job, which runs third-party code, so
+      # it is treated as hostile (pentest iOS-3 F1: a planted .git/ with hooks,
+      # fsmonitor or insteadOf ran code with this token and rewrote the push
+      # URL). Only PNGs and SUMMARY.txt, size-capped, are copied into a fresh
+      # tree; git's own directory lives outside it; hooks and fsmonitor are off.
       - name: Push to ci/ios-shots
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cd shots
-          git init -q -b ci/ios-shots
-          git -c user.name=ci -c user.email=ci@users.noreply.github.com add -A
-          git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "iOS CI ${{ github.run_id }} (${{ github.sha }})"
-          git push -qf "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git" ci/ios-shots
+          set -eu
+          rm -rf /tmp/pub /tmp/pub.git && mkdir /tmp/pub
+          find shots -maxdepth 1 -type f \( -name '*.png' -o -name 'SUMMARY.txt' \) -size -8M \
+            | while read -r f; do
+                n=$(basename "$f")
+                case "$n" in *[!A-Za-z0-9._-]*) continue ;; esac
+                cp "$f" "/tmp/pub/$n"
+              done
+          G="git --git-dir=/tmp/pub.git --work-tree=/tmp/pub -c core.hooksPath=/dev/null -c core.fsmonitor=false -c user.name=ci -c user.email=ci@users.noreply.github.com"
+          git init -q --bare -b ci/ios-shots /tmp/pub.git
+          $G add -A
+          $G commit -qm "iOS CI ${{ github.run_id }} (${{ github.sha }})"
+          $G push -qf "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git" HEAD:refs/heads/ci/ios-shots
