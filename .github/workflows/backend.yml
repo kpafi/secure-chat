@@ -7,7 +7,8 @@ on:
     paths:
       - "backend/**"
       - "client/**"
-      - ".github/workflows/backend.yml"
+      - ".github/workflows/**"
+      - "ios/scripts/**"
   workflow_dispatch:
 
 concurrency:
@@ -39,6 +40,13 @@ jobs:
           # faulthandler: a test stuck for 60 s dumps every thread's stack
           # instead of silently eating the job's timeout.
           python -m pytest -q -p no:cacheprovider -o faulthandler_timeout=60
+      # Lints ios.yml's trigger from OUTSIDE ios.yml: a push that breaks that
+      # trigger does not run ios.yml at all, so the check cannot live only
+      # there (pentest dist-2 L2). Also tests the iOS release tooling.
+      - name: iOS release tooling + ios.yml trigger lint
+        timeout-minutes: 2
+        run: python3 ios/scripts/test_dist.py
+
       - name: Client unit tests
         timeout-minutes: 5
         working-directory: client

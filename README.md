@@ -42,6 +42,13 @@ certificate authority and no DNS, and the relay never learns a client IP. It
 does **not** close the gap above, because the onion still serves the
 JavaScript. Only the app does that.
 
+## On an iPhone
+Two ways, with different guarantees — the iOS app (sideloaded with SideStore,
+client code fixed inside the app) or the Home Screen web app (Safari → Add to
+Home Screen; the web client with an icon, code from the relay on every start).
+The comparison and the problems of each are in `ios/README.md`,
+"Getting it onto an iPhone".
+
 ## Architecture (current)
 ```
 Client A --[ciphertext]--> Relay server --[ciphertext]--> Client B

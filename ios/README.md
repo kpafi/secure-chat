@@ -86,16 +86,125 @@ Cost: the repository is private, so macOS minutes are billed 10×; one run is
 about 100–150 billed minutes. The workflow therefore runs only when `ios/**` or
 the workflow changes (or by hand).
 
-## Installing on an iPhone
-The CI build is **unsigned**; iOS will not install it as is. Options:
-- **Sideload** (AltStore / Sideloadly with a free Apple ID): re-signs the IPA
-  for 7 days at a time.
-- **Apple Developer Program** (99 USD/year): add a signing certificate and
-  provisioning profile as repository secrets and the workflow can produce a
-  signed ad-hoc or TestFlight build. Not wired up yet — needs the owner's
-  account.
+## Getting it onto an iPhone
 
-Compare the IPA's SHA-256 (next to it in the artifact) before sideloading.
+There is no "download the APK and install it" on iOS: the system installs and
+starts only apps signed with a certificate Apple trusts. Without a paid Apple
+Developer account (99 USD/year, not used here) there are two ways, and they
+make **different security promises**. Pick per person, and tell them which one
+they have.
+
+| | **iOS app via SideStore** | **Home Screen web app** |
+| --- | --- | --- |
+| Where the client code comes from | inside the app, fixed at install | the relay, **on every start** |
+| A compromised relay can… | only offer a malicious *update*; you must accept it — but an accepted update gets the app's data and keys | ship different code the next time you open it |
+| One-time-pad rollback protection | native floor (Keychain + HMAC) | browser residual (see the main README) |
+| Setup | ~20 min, a computer once, a free Apple ID | ~30 s, nothing to install |
+| Upkeep | re-sign every 7 days (SideStore can do it in the background, when its helper VPN is on and iOS lets it run) | none |
+| Fits | people who want the app's guarantee and can handle sideloading | everyone else, who trusts the relay operator |
+
+### Option A — the iOS app via SideStore
+
+What the user does (the tools change; **docs.sidestore.io** is authoritative):
+
+1. **Once, on a computer:** install SideStore on the iPhone with the installer
+   the SideStore guide recommends; it signs SideStore with the user's own
+   Apple ID and creates a *pairing file*.
+2. **iPhone:** Settings → General → VPN & Device Management → trust the Apple
+   ID; Settings → Privacy & Security → **Developer Mode** on (restart).
+3. Install the small helper "VPN" the guide names (it only lets SideStore
+   talk to the phone itself, for signing without a computer).
+4. Open SideStore, sign in, import the pairing file.
+5. **Verify, then install that exact file.** The operator sends you, through
+   a **different channel** than the relay (a chat, in person), the **version**
+   and the **full SHA-256** of the current IPA. Download
+   `https://<your relay host>/ios/SecureChat-<version>.ipa`, then check it
+   **mechanically** — never by eye, a server can make the first and last few
+   characters match:
+   - on a computer: `echo "<hash>  SecureChat-<version>.ipa" | shasum -a 256 -c`
+     must print `OK`;
+   - on the iPhone: a Shortcut with *Receive files from Share Sheet* →
+     *Generate Hash* (SHA-256) → *If* the hash *is* `<paste the hash>` →
+     *Show "OK"*, otherwise *Show "MISMATCH"*; share the downloaded file to it.
+
+   Only if it says OK: in SideStore tap **+** and pick **that file**. Check the
+   version too — an old, genuine IPA also has a genuine hash.
+6. **Do not add the source for installing, and never tap *Update* in
+   SideStore.** SideStore checks a source download only against a hash from
+   the same server, so a hostile server can serve a matching pair; any hash in
+   the description is informational. Updates arrive the same way as step 5:
+   the operator announces version + hash through the second channel, you
+   repeat step 5.
+7. Open secure-chat, enter the relay address (`https://…`).
+
+Problems, stated plainly:
+- **Every 7 days** SideStore must refresh the signature (helper VPN on,
+  "Refresh All"; an iOS Shortcut can automate it). Missed it → the app will
+  not start until refreshed. Chats and keys stay.
+- A free Apple ID signs at most **3 apps** at a time; SideStore is one of them.
+- SideStore logs in to Apple with that Apple ID through a helper service —
+  use a **separate Apple ID**, not the main one.
+- Developer Mode, a trusted developer profile and a helper VPN are real
+  hurdles; non-technical users give up here.
+- The download server (the relay host, `deploy/README.md`) can replace the
+  IPA *and* `apps.json` together. The app's guarantee starts after install;
+  **hashing the downloaded file yourself and comparing with a second
+  channel** is what protects the install — and every update, because an
+  accepted update replaces the app in place with full access to its data and
+  Keychain (identity, contacts, pad floor).
+- There is no Apple review: SideStore re-signs the IPA with the development
+  certificate of the user's own Apple ID, and the user runs what the operator
+  built. That is the point — and the responsibility. SideStore's app
+  permission check is off by default; it would not stop a changed app anyway.
+- The IPA is built on a GitHub-hosted runner that also runs third-party tools
+  (Homebrew, pip); the build is not reproducible yet. The guarantee is "the
+  code the operator's CI built", not "code you could rebuild bit for bit".
+
+### Option B — the Home Screen web app
+
+What the user does: open `https://<your relay host>/` in **Safari** →
+Share → **Add to Home Screen**. It gets the secure-chat icon, opens full
+screen, no Safari bars.
+
+Problems, stated plainly:
+- **It is the web client with an icon.** Its code is fetched from the relay on
+  every start, so the web client's trust boundary applies unchanged (main
+  README, "Trust boundary of the web client"): whoever controls the relay
+  controls the code. For a self-hosted relay run by someone you trust, that
+  may be fine; it is not the app's guarantee.
+- **No native rollback floor** for one-time pads and the at-rest stores; the
+  browser residual documented in the main README applies.
+- **Separate storage.** The Home Screen web app does not share storage with
+  Safari: an identity created in Safari is not there. Move it with the
+  identity backup (Copy backup → restore) or create it in the web app.
+- **iOS may drop website data** under storage pressure; Home Screen web apps
+  are exempt from Safari's 7-day deletion of unused sites, but a device-wide
+  cleanup or deleting the icon wipes the identity. Keep the backup.
+- Needs **https** (a clearnet relay with TLS); the `.onion` does not work in
+  Safari.
+- **Invite links open in Safari**, not in the Home Screen web app, and
+  Safari's storage is separate — so an invite lands where the identity is not.
+  Paste the handle into the web app instead.
+- No service workers (`worker-src 'none'` in the relay's CSP). That stops a
+  stray same-origin script from planting a worker; it does **not** protect
+  against a compromised relay, which sets its own headers — and a worker a
+  compromised relay did plant would keep serving its code after the relay is
+  cleaned up. Recovery then means deleting the web app (and its data):
+  keep the identity backup.
+- No offline mode: without the relay there is no client; the Home Screen
+  app opened offline shows Safari's own error page.
+- The status bar in Home Screen mode is plain black above the page's
+  near-black header (a deliberate trade-off: a translucent bar would let the
+  scrolling page slide under the clock). iOS ignores the manifest's portrait
+  lock, so the web app can rotate; landscape works but is the desktop layout.
+
+### With an Apple Developer account (not set up)
+
+TestFlight (a public link, builds expire after 90 days) or ad-hoc installs
+from the relay (≤ 100 registered devices) would remove the 7-day refresh and
+the sideloading steps. Needs the account's signing certificate, profile or
+App Store Connect API key as repository secrets; the CI can then upload or
+build signed installs.
 
 ## Known limits
 - Invite links (`#add=` in `location`) point at `secure-chat://app/...`; the

@@ -2491,3 +2491,17 @@ button.peer-open:disabled:hover { opacity: 1; cursor: default; background: trans
   to { pointer-events: none; }
 }
 @keyframes fade-in { from { opacity: 0; } }
+
+/* Home Screen web app / Safari with viewport-fit=cover: env(safe-area-inset-*)
+   now reports the notch and home indicator (it was 0 before, so the tab bar's
+   existing bottom padding never applied). In landscape Safari stops
+   letterboxing, so keep content clear of the notch at the sides. Everything is
+   env()-gated: 0 in desktop browsers and in the Android/iOS app shells, whose
+   web views sit inside the safe area already. */
+@media (orientation: landscape) {
+  body {
+    padding-left: env(safe-area-inset-left, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
+  }
+}
+

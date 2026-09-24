@@ -29,6 +29,11 @@ import posixpath
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+import mimetypes
+
+# StaticFiles types files via `mimetypes`, which does not know .webmanifest on
+# every platform; with nosniff a text/plain manifest can be refused.
+mimetypes.add_type("application/manifest+json", ".webmanifest")
 from pydantic import ValidationError
 from starlette.requests import Request
 from starlette.responses import Response
@@ -169,6 +174,15 @@ async def security_headers(request: Request, call_next):
         "style-src 'self'; "
         "connect-src 'self'; "
         "img-src 'self' data:; "
+        # Home Screen web app: the browser fetches manifest.webmanifest under
+        # manifest-src, which default-src 'none' would block. Same origin only.
+        "manifest-src 'self'; "
+        # No workers: without this, worker-src falls back to script-src 'self',
+        # so a same-origin script the relay never meant to serve (a write to
+        # client/, a future injection bug) could register a service worker that
+        # outlives the fix. It does NOT stop a compromised relay, which writes
+        # its own headers. The client uses no workers (pentest dist-1 F3/2 L1).
+        "worker-src 'none'; "
         "base-uri 'none'; "
         "form-action 'none'; "
         "frame-ancestors 'none'"

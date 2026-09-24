@@ -133,8 +133,11 @@ enum TestApp {
         UIApplication.shared.connectedScenes.first?.delegate as? SceneDelegate
     }
 
-    /// The app's own view controller, once its client has loaded.
-    static func mainPage(timeout: TimeInterval = 30) async throws -> (MainViewController, Page) {
+    /// The app's own view controller, once its client has loaded. 90 s: the
+    /// first test runs right after a cold simulator boot, and in CI run 11 the
+    /// first load alone took longer than the earlier 30 s (all 41 later
+    /// tests, on the same page, passed).
+    static func mainPage(timeout: TimeInterval = 90) async throws -> (MainViewController, Page) {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if let nav = window?.rootViewController as? UINavigationController,

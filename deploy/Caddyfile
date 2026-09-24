@@ -1,5 +1,20 @@
 138-199-144-35.sslip.io {
-	reverse_proxy 127.0.0.1:8000
+	# iOS download bundle for SideStore/AltStore (IPA, checksum, apps.json,
+	# icon) — static files only, copied here per release (deploy/README.md,
+	# "iOS app downloads"). Never proxied to the relay.
+	handle_path /ios/* {
+		root * /srv/secure-chat-ios
+		file_server
+		header {
+			Cache-Control "no-cache"
+			X-Content-Type-Options "nosniff"
+			Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; form-action 'none'; sandbox"
+			-Server
+		}
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8000
+	}
 	log {
 		output discard
 	}

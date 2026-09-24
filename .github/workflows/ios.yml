@@ -8,6 +8,14 @@ name: iOS
 
 on:
   push:
+    # A tag ios-vX.Y.Z also builds the SideStore/AltStore download bundle and a
+    # GitHub release (path filters are not applied to tag pushes).
+    # `branches` must be listed too: with only `tags`, GitHub stops running
+    # the workflow for branch pushes at all (pentest dist-1 F1).
+    branches:
+      - "**"
+    tags:
+      - "ios-v*"
     paths:
       - "ios/**"
       - "!ios/**/*.md"
@@ -48,6 +56,10 @@ jobs:
           python -m pip install -q -r requirements.txt
           python -m pytest -q -p no:cacheprovider tests/test_csp_hash.py \
             tests/test_ws.py -k "origin or ios or importmap or csp"
+      - name: iOS release tooling + workflow trigger lint
+        timeout-minutes: 2
+        run: python3 ios/scripts/test_dist.py
+
       - name: Client unit tests
         timeout-minutes: 5
         working-directory: client
@@ -95,10 +107,17 @@ jobs:
 
       - name: Pick a simulator
         id: sim
+        timeout-minutes: 6
         run: |
           SDK=$(xcrun --sdk iphonesimulator --show-sdk-version)
           UDID=$(xcrun simctl list devices available -j | python3 ios/scripts/pick-simulator.py "$SDK")
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          # Boot it here: a simulator xcodebuild boots itself is shut down again
+          # after the tests, and simctl calls against the re-booted device hung
+          # in the cold-relaunch step (CI runs 13, 14). One it did not boot, it
+          # leaves running.
+          perl -e 'alarm shift; exec @ARGV' 60 xcrun simctl boot "$UDID" || true
+          perl -e 'alarm shift; exec @ARGV' 240 xcrun simctl bootstatus "$UDID" -b
 
       - name: Build and test on the simulator
         timeout-minutes: 20
@@ -120,22 +139,57 @@ jobs:
           grep -q "\*\* TEST SUCCEEDED \*\*" /tmp/xcodebuild-test.log
 
       - name: Cold relaunch keeps the client's storage
-        timeout-minutes: 5
+        timeout-minutes: 8
         run: |
           UDID=${{ steps.sim.outputs.udid }}
-          xcrun simctl bootstatus "$UDID" -b
-          xcrun simctl terminate "$UDID" org.securechat.app || true
-          DATA=$(xcrun simctl get_app_container "$UDID" org.securechat.app data)
+          # Every simctl call gets its own limit: in CI run 13 the simulator had
+          # shut down after the tests, bootstatus rebooted it, and the next
+          # simctl call blocked until the step timeout (SpringBoard not ready).
+          # macOS has no timeout(1); perl's alarm does the same.
+          lim() { local s=$1; shift; perl -e 'alarm shift; exec @ARGV' "$s" "$@"; }
+          lim 180 xcrun simctl bootstatus "$UDID" -b
+          sleep 10
+          lim 30 xcrun simctl terminate "$UDID" org.securechat.app || true
+          lim 15 xcrun simctl list devices | grep "$UDID" || true
+          DATA=$(lim 30 xcrun simctl get_app_container "$UDID" org.securechat.app data) || DATA=
+          if [ -z "$DATA" ]; then
+            # Same directory, read from disk: the container's metadata plist names the bundle id.
+            META=$(grep -l org.securechat.app "$HOME/Library/Developer/CoreSimulator/Devices/$UDID/data/Containers/Data/Application"/*/.com.apple.mobile_container_manager.metadata.plist 2>/dev/null | head -1 || true)
+            [ -n "$META" ] && DATA=$(dirname "$META")
+          fi
+          echo "data container: $DATA"
+          [ -d "$DATA/Documents" ] || { echo "no data container"; exit 1; }
           rm -f "$DATA/Documents/persist-probe.txt"
-          SIMCTL_CHILD_SC_PERSIST_PROBE=1 xcrun simctl launch "$UDID" org.securechat.app
-          for i in $(seq 1 30); do
+          launched=
+          for attempt in 1 2 3; do
+            if SIMCTL_CHILD_SC_PERSIST_PROBE=1 lim 45 xcrun simctl launch "$UDID" org.securechat.app; then
+              launched=1; break
+            fi
+            echo "launch attempt $attempt did not return; retrying"
+            lim 30 xcrun simctl terminate "$UDID" org.securechat.app || true
+            sleep 5
+          done
+          [ -n "$launched" ] || { echo "app never launched"; exit 1; }
+          # 90 s, like the tests' first load: a cold launch right after a boot is slow.
+          for i in $(seq 1 90); do
             [ -f "$DATA/Documents/persist-probe.txt" ] && break
             sleep 1
           done
           sleep 2
-          xcrun simctl io "$UDID" screenshot shots/20-cold-launch.png || true
+          lim 30 xcrun simctl io "$UDID" screenshot shots/20-cold-launch.png || true
           echo "probe: $(cat "$DATA/Documents/persist-probe.txt" 2>/dev/null)"
           test "$(cat "$DATA/Documents/persist-probe.txt")" = "persist-ok"
+
+      # The web version in real Mobile Safari, for the design review (the
+      # standalone Home Screen mode cannot be scripted). Non-blocking.
+      - name: Mobile Safari screenshot of the web version
+        timeout-minutes: 3
+        run: |
+          UDID=${{ steps.sim.outputs.udid }}
+          lim() { local s=$1; shift; perl -e 'alarm shift; exec @ARGV' "$s" "$@"; }
+          lim 45 xcrun simctl openurl "$UDID" http://127.0.0.1:8000/ || true
+          sleep 12
+          lim 30 xcrun simctl io "$UDID" screenshot shots/31-mobile-safari.png || true
 
       - name: Build the unsigned device IPA (Release)
         timeout-minutes: 10
@@ -158,6 +212,33 @@ jobs:
           mkdir -p /tmp/ipa/Payload && cp -R "$APP" /tmp/ipa/Payload/
           (cd /tmp/ipa && zip -qry "$GITHUB_WORKSPACE/SecureChat-unsigned.ipa" Payload)
           shasum -a 256 SecureChat-unsigned.ipa | tee SecureChat-unsigned.ipa.sha256
+
+      # Release only: the bundle the relay's web server serves under /ios/
+      # (deploy/README.md). The tag must match MARKETING_VERSION in project.yml.
+      - name: SideStore/AltStore bundle (tags only)
+        if: startsWith(github.ref, 'refs/tags/ios-v')
+        env:
+          TAG: ${{ github.ref_name }}
+          BASE_URL: ${{ vars.IOS_DIST_BASE_URL || 'https://138-199-144-35.sslip.io/ios' }}
+        run: |
+          set -eu
+          VERSION="${TAG#ios-v}"
+          MV=$(sed -n 's/^ *MARKETING_VERSION: *"\(.*\)"$/\1/p' ios/project.yml)
+          BUILD=$(sed -n 's/^ *CURRENT_PROJECT_VERSION: *"\(.*\)"$/\1/p' ios/project.yml)
+          if [ "$VERSION" != "$MV" ]; then
+            echo "tag $TAG does not match MARKETING_VERSION $MV in ios/project.yml"; exit 1
+          fi
+          python3 ios/scripts/make-dist.py --ipa SecureChat-unsigned.ipa \
+            --version "$VERSION" --build "$BUILD" --base-url "$BASE_URL" \
+            --icon ios/SecureChat/Assets.xcassets/AppIcon.appiconset/icon-1024.png \
+            --out ios-dist
+
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/ios-v')
+        with:
+          name: ios-dist
+          path: ios-dist/
+          retention-days: 90
 
       - uses: actions/upload-artifact@v4
         with:
@@ -239,3 +320,46 @@ jobs:
           $G add -A
           $G commit -qm "iOS CI ${{ github.run_id }} (${{ github.sha }})"
           $G push -qf "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git" HEAD:refs/heads/ci/ios-shots
+
+  # Tags only: a GitHub release carrying the bundle, for the operator to fetch
+  # and copy to the relay server (the repository is private, so its release
+  # assets are NOT a public download link — the relay's /ios/ is). Like
+  # publish-shots, the artifact comes from the macOS job and is treated as
+  # hostile: allow-listed names only, no checkout, no git.
+  release:
+    needs: ios
+    if: startsWith(github.ref, 'refs/tags/ios-v') && needs.ios.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-dist
+          path: dist
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          V="${TAG#ios-v}"
+          files=""
+          for n in "SecureChat-$V.ipa" "SecureChat-$V.ipa.sha256" apps.json icon.png; do
+            f="dist/$n"
+            [ -f "$f" ] && [ ! -L "$f" ] || { echo "missing $n"; exit 1; }
+            files="$files $f"
+          done
+          # Recompute: the .sha256 file came from the same untrusted job. This
+          # only makes the notes match the uploaded IPA; it cannot vouch for a
+          # build job that was itself compromised.
+          set -o pipefail
+          SUM=$(sha256sum "dist/SecureChat-$V.ipa" | cut -d' ' -f1)
+          case "$SUM" in *[!0-9a-f]*) echo "bad checksum"; exit 1 ;; esac
+          [ "${#SUM}" -eq 64 ] || { echo "bad checksum"; exit 1; }
+          [ "$SUM" = "$(cut -d' ' -f1 "dist/SecureChat-$V.ipa.sha256")" ] || { echo "checksum file does not match the IPA"; exit 1; }
+          gh release create "$TAG" $files --repo "$REPO" --title "iOS $V (unsigned)" \
+            --notes "Unsigned iOS build for SideStore/AltStore. SHA-256 of SecureChat-$V.ipa: $SUM. Copy all four files to the relay's /ios/ directory (deploy/README.md)."
+
