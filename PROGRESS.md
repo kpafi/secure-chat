@@ -3,6 +3,28 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
+## ⮕ RESUME HERE (2026-09-24, 0.3.0 DEPLOYED + the Remove-row fix on `fix/contact-remove-row`, NOT deployed)
+
+**Shipped today.** The contact profile went out as release 0.3.0: PR #1 merged (`963b402`), version
+bump + `deploy/deploy-2026-09-24.sh` + `deploy/release-2026-09-24.md` (`829b509`), merged as `a54315f`
+= tag `v0.3.0`. Deploy script clean (accounts 31 = 31, public `/healthz` 0.3.0), debug APK
+(versionCode 3) installed on the phone with its data kept. 0.2.0 had gone out the day before the
+same way (`b9ff13e` = `v0.2.0`). Both are client-only releases; the two `[object Object]` client
+fixes on `android-ondevice-2026-09-21` (`c7c9ccc`, `dfadca9`) are still NOT on master.
+
+**The fix on this branch.** The owner opened a verified contact on the phone: the lone Remove,
+right-aligned under Message/Unverify, looked off centre. Now centred (and the lone Unverify when
+opened from a conversation, which has no Message); the e2e gained three checks (64) that measure
+Remove's centre AND its clearance under the decision row in both phone arms, each shown to bind
+by a hand-run mutant. Design critic and pentest pass 7 as agents: no blocker/major, nothing above
+Low; record in `design/research/reviews/profile-fix-round-7.md`. Claude Design's canvas was not
+updated (no `/design-login` from a non-interactive session) — re-sync the design system from
+`client/style.css` when a session with it is available.
+
+**Next.** Merge `fix/contact-remove-row`, release as 0.3.1 (VERSION, versionCode 4, a copy of the
+09-24 deploy script with the marker `justify-content: center` on `.contact-remove-row`), deploy,
+rebuild the APK. Then decide the master/Phase-7 divergence and the `[object Object]` fixes.
+
 ## ⮕ RESUME HERE (2026-09-24, contact profile — branch `claude/user-profile-view-e7qr9y`, NOT merged, NOT deployed)
 
 **What it is.** The owner's ask after testing 0.2.0: tap a saved user's row in Users, the avatar
