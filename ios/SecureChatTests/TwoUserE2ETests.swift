@@ -103,7 +103,7 @@ final class TwoUserE2ETests: XCTestCase {
         try await alice.click("#chatSend")
 
         try await bob.view("chats")
-        let bobGot = try await waitForMessage(bob, "hello bob, from the iOS app")
+        let bobGot = try await waitForMessage(bob, "hello bob, from the iOS app", timeout: 90)
         XCTAssertTrue(bobGot.contains("hello bob, from the iOS app"), "\(bobGot)")
 
         // Bob adds Alice and replies.
@@ -118,8 +118,12 @@ final class TwoUserE2ETests: XCTestCase {
         try await bob.type("#chatText", "hi alice, got it on iOS")
         try await bob.click("#chatSend")
 
-        let aliceGot = try await waitForMessage(alice, "hi alice, got it on iOS")
-        XCTAssertTrue(aliceGot.contains("hi alice, got it on iOS"), "\(aliceGot)")
+        // Sent first, then received — so a failure says which half broke
+        // (CI run 12 only said "not received" on a slow runner).
+        let bobSent = try await waitForMessage(bob, "hi alice, got it on iOS", timeout: 30)
+        XCTAssertTrue(bobSent.contains("hi alice, got it on iOS"), "bob's reply is not in bob's own chat: \(bobSent)")
+        let aliceGot = try await waitForMessage(alice, "hi alice, got it on iOS", timeout: 90)
+        XCTAssertTrue(aliceGot.contains("hi alice, got it on iOS"), "sent by bob, not received by alice in 90 s: \(aliceGot)")
         TestApp.screenshot("12-alice-conversation-keyboard")
         // And without the keyboard, for the design review.
         try await alice.eval("document.activeElement && document.activeElement.blur(); return true;")
