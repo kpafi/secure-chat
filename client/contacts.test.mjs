@@ -472,8 +472,17 @@ console.log("OK  L-3: a concurrent second-tab write is refused, not silently los
     await contacts.setVouches("carol", ["bob"], { ed: "E2==", mldsa: "M2==", ecdh: "C3==", mlkem: "K3==" }),
     true);
   assert.deepStrictEqual(contacts.get("carol").vouchedBy, ["bob"]);
+  // Package 2, item 11 (F-PROTO-005, the rest): `forKeys` used to default to
+  // null, and null SKIPPED the check — the unbound write, one forgotten
+  // argument away. Without the keys the vouches were verified against, the
+  // write is refused outright, and nothing is written.
+  for (const missing of [undefined, null, {}, { ed: "E2==" }]) {
+    await assert.rejects(contacts.setVouches("carol", ["mallory"], missing), /verified against/,
+      `item 11: setVouches without the verified keys (${JSON.stringify(missing)}) must throw`);
+  }
+  assert.deepStrictEqual(contacts.get("carol").vouchedBy, ["bob"], "item 11: ...and write nothing");
 }
-console.log("OK  F-PROTO-005: a vouch result for superseded keys is discarded");
+console.log("OK  F-PROTO-005: a vouch result for superseded keys is discarded; the keys are required");
 
 // ---- Pentest 2026-08-07 F-ATREST-007: Unverify / Remove revoke the pin ------
 {

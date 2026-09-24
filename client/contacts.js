@@ -674,11 +674,19 @@ function revokePin(username) {
 // result is discarded (returns false) and the next refresh redoes it against
 // the current keys. The check and the mutation are synchronous, so there is
 // no second window between them.
-export async function setVouches(username, names, forKeys = null) {
+//
+// Package 2, item 11 (F-PROTO-005, the rest): `forKeys` used to default to
+// null, and null skipped the check — the unbound write F-PROTO-005 is about,
+// one forgotten argument away. It is required now: a call without the keys the
+// vouches were verified against is a programming error and throws.
+export async function setVouches(username, names, forKeys) {
   if (!contacts) throw new Error("contact store is locked");
+  if (!forKeys || typeof forKeys !== "object" || !forKeys.ed || !forKeys.mldsa) {
+    throw new Error("setVouches needs the keys the vouches were verified against");
+  }
   const cur = contacts.find((c) => c.username === username);
   if (!cur) return false;
-  if (forKeys && (
+  if ((
     cur.ed !== forKeys.ed || cur.mldsa !== forKeys.mldsa ||
     (cur.ecdh ?? null) !== (forKeys.ecdh ?? null) ||
     (cur.mlkem ?? null) !== (forKeys.mlkem ?? null)
