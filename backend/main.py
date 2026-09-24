@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import posixpath
+import sqlite3
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -147,6 +148,14 @@ def _is_blocked_static(path: str) -> bool:
         or basename.startswith(".")
         or basename.endswith(".test.mjs")
     )
+
+
+@app.exception_handler(sqlite3.OperationalError)
+async def _sqlite_busy(request: Request, exc: sqlite3.OperationalError) -> Response:
+    # §9 L-2 (ported from phase7-local 6604d9e): "database is locked" under
+    # load used to escape as a 500 with a traceback in the journal (I2). A bare
+    # 503 says "try again" and writes nothing.
+    return Response(status_code=503, content="busy", media_type="text/plain")
 
 
 @app.middleware("http")

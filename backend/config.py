@@ -356,7 +356,25 @@ TOKEN_TTL_SEC = 3600         # issued session-token lifetime
 # session token and DELETES what it returns. Everything is bounded.
 MAX_ENVELOPE_BYTES = 64 * 1024        # one sealed envelope (matches WS frame cap)
 MAX_MAILBOX_PER_RECIPIENT = 200       # queued envelopes per inbox
-MAX_MAILBOX_TOTAL = 100_000           # queued envelopes server-wide
+# Pentest F-RELAY-008 / Phase-7 F-P7-1 (ported from phase7-local 018652d ->
+# 6604d9e): the server-wide cap counted ROWS and a full table was a relay-wide
+# 503 "storage full", so ~500 throwaway accounts x 200 one-byte envelopes shut
+# off sealed mail for everyone for the 14-day TTL. Now:
+#   * envelopes have a realistic MINIMUM size — the only sender, the client's
+#     sealed.seal, always carries an ML-KEM-768 ciphertext (1088 B -> 1452
+#     base64 chars) plus the ephemeral key, IV and AES-GCM body, so a genuine
+#     envelope is well over 1.5 KiB and 256 B refuses nothing real;
+#   * each inbox has a hard BYTE share beside its row cap (429, the owner can
+#     fetch);
+#   * the server-wide budget is BYTES, the row cap only bounds table size (and
+#     the cost of the budget query), and when either is full the OLDEST queued
+#     mail is EVICTED instead of refusing new mail. Under a sustained flood
+#     retention degrades (mail must be fetched sooner) but delivery never
+#     stops; with free registration that is the honest limit (mailbox.py).
+MIN_ENVELOPE_BYTES = 256
+MAX_MAILBOX_TOTAL = 100_000                        # rows server-wide (evict-oldest)
+MAX_MAILBOX_TOTAL_BYTES = 256 * 1024 * 1024        # queued bytes server-wide (evict-oldest)
+MAX_MAILBOX_PER_RECIPIENT_BYTES = 4 * 1024 * 1024  # queued bytes per inbox (hard, 429)
 MAILBOX_TTL_SEC = 14 * 24 * 3600      # unfetched mail expires
 # Pentest 2026-08-07 F-RELAY-004: the POST bucket was keyed per host and ran
 # BEFORE the recipient-token gate, so an unauthenticated client (no handle, no
@@ -364,10 +382,20 @@ MAILBOX_TTL_SEC = 14 * 24 * 3600      # unfetched mail expires
 # It is now keyed per RECIPIENT inbox and consumed only AFTER the token gate:
 # a request without the recipient's lookup token is an identical 404 that
 # touches no bucket at all, and a flood at one inbox throttles only that inbox.
-# Service-wide volume is bounded by the general /api limiter and the storage
-# caps below, not by this bucket.
+# (This comment used to say service-wide volume was "bounded by the general
+# /api limiter". It was not: the mailbox router was never on that limiter, and
+# POST had no pre-gate bound at all. See MAILBOX_POST_HOST_RATE_* below.)
 MAILBOX_RATE_CAPACITY = 30            # burst posts per recipient inbox
 MAILBOX_RATE_REFILL_PER_SEC = 1.0     # sustained posts/second per inbox
+
+# The one per-host ceiling on mailbox POST, charged BEFORE the token gate
+# (ported from phase7-local 6604d9e). Behind Tor this is one bucket for
+# everybody, so it is a backstop against runaway clients and nothing more —
+# anyone can hold it empty at this rate and deny mail POSTs relay-wide
+# (accepted; same class as API_RATE_*). POST-only: GET charges nothing before
+# auth, so a POST flood cannot deny fetching.
+MAILBOX_POST_HOST_RATE_CAPACITY = 600
+MAILBOX_POST_HOST_RATE_REFILL_PER_SEC = 50.0
 
 # Dedicated bucket for FETCHING mail (pentest 2026-07-26 P-11). GET used to have
 # no limiter at all; putting it on the shared /api bucket closed that but created

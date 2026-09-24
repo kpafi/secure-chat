@@ -498,6 +498,11 @@ def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(config.DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    # §9 L-2 (ported from phase7-local 6604d9e): under a flood, overlapping
+    # writers hit "database is locked" after sqlite's default 5 s and each one
+    # was a 500 plus a traceback on disk (against I2). Wait longer; main.py maps
+    # whatever still fails to a bare 503.
+    conn.execute("PRAGMA busy_timeout=15000")
     return conn
 
 

@@ -41,6 +41,7 @@ def _reset_rate_limiters():
         accounts._register_limiter,
         mailbox._post_limiter,
         mailbox._fetch_limiter,
+        mailbox._post_host_limiter,
     ):
         limiter._buckets.clear()
     yield
