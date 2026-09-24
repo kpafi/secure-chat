@@ -105,7 +105,8 @@ def test_csp_allows_the_manifest_and_nothing_more():
     directives = {d.strip().split(" ", 1)[0]: d.strip() for d in csp.split(";") if d.strip()}
     assert directives["manifest-src"] == "manifest-src 'self'"
     assert directives["default-src"] == "default-src 'none'"
-    # No worker, no frames, no remote anything came along with it.
-    assert "worker-src" not in directives and "child-src" not in directives
-    assert "frame-src" not in directives
+    # Service workers are explicitly OFF: an absent worker-src falls back to
+    # script-src 'self' and would ALLOW a persistent worker (pentest dist-1 F3).
+    assert directives["worker-src"] == "worker-src 'none'"
+    assert "child-src" not in directives and "frame-src" not in directives
     assert "http" not in csp and "*" not in csp and "unsafe" not in csp

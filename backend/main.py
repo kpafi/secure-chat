@@ -177,6 +177,11 @@ async def security_headers(request: Request, call_next):
         # Home Screen web app: the browser fetches manifest.webmanifest under
         # manifest-src, which default-src 'none' would block. Same origin only.
         "manifest-src 'self'; "
+        # No service workers: without this, worker-src falls back to
+        # script-src 'self', and one hostile response could register a worker
+        # that keeps serving its code after the relay is cleaned up. The client
+        # uses no workers (pentest dist-1 F3).
+        "worker-src 'none'; "
         "base-uri 'none'; "
         "form-action 'none'; "
         "frame-ancestors 'none'"

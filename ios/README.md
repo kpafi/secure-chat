@@ -97,10 +97,10 @@ they have.
 | | **iOS app via SideStore** | **Home Screen web app** |
 | --- | --- | --- |
 | Where the client code comes from | inside the app, fixed at install | the relay, **on every start** |
-| A compromised relay can… | only offer a malicious *update* (you must accept it) | ship different code the next time you open it |
+| A compromised relay can… | only offer a malicious *update*; you must accept it — but an accepted update gets the app's data and keys | ship different code the next time you open it |
 | One-time-pad rollback protection | native floor (Keychain + HMAC) | browser residual (see the main README) |
 | Setup | ~20 min, a computer once, a free Apple ID | ~30 s, nothing to install |
-| Upkeep | re-sign every 7 days (automatic in SideStore) | none |
+| Upkeep | re-sign every 7 days (SideStore can do it in the background, when its helper VPN is on and iOS lets it run) | none |
 | Fits | people who want the app's guarantee and can handle sideloading | everyone else, who trusts the relay operator |
 
 ### Option A — the iOS app via SideStore
@@ -115,10 +115,17 @@ What the user does (the tools change; **docs.sidestore.io** is authoritative):
 3. Install the small helper "VPN" the guide names (it only lets SideStore
    talk to the phone itself, for signing without a computer).
 4. Open SideStore, sign in, import the pairing file.
-5. SideStore → Sources → **+** → `https://<your relay host>/ios/apps.json`
-   → install **secure-chat**. (Or install the `.ipa` file directly.)
-6. **Compare the SHA-256** SideStore/the source shows with the one the relay
-   operator sent you through a different channel.
+5. **Verify, then install that exact file.** Download
+   `https://<your relay host>/ios/SecureChat-<version>.ipa`, compute its
+   SHA-256 yourself (on a computer: `shasum -a 256 SecureChat-*.ipa`, or an iOS
+   Shortcut), compare it with the value the operator sent you through a
+   **different channel** (not this server), then in SideStore tap **+** and
+   pick that file.
+6. Optional, for update notices: SideStore → Sources → **+** →
+   `https://<your relay host>/ios/apps.json`. **Do not treat a source install
+   as verified**: SideStore checks the download against a hash that comes from
+   the same server, so a hostile server can serve a matching pair. Any hash in
+   the description text is informational only. Repeat step 5 for every update.
 7. Open secure-chat, enter the relay address (`https://…`).
 
 Problems, stated plainly:
@@ -132,9 +139,17 @@ Problems, stated plainly:
   hurdles; non-technical users give up here.
 - The download server (the relay host, `deploy/README.md`) can replace the
   IPA *and* `apps.json` together. The app's guarantee starts after install;
-  **the checksum from a second channel** is what protects the install itself.
-- Apple re-signing is not involved, but neither is any review: the user runs
-  what the operator built. That is the point — and the responsibility.
+  **hashing the downloaded file yourself and comparing with a second
+  channel** is what protects the install — and every update, because an
+  accepted update replaces the app in place with full access to its data and
+  Keychain (identity, contacts, pad floor).
+- There is no Apple review: SideStore re-signs the IPA with the development
+  certificate of the user's own Apple ID, and the user runs what the operator
+  built. That is the point — and the responsibility. SideStore's app
+  permission check is off by default; it would not stop a changed app anyway.
+- The IPA is built on a GitHub-hosted runner that also runs third-party tools
+  (Homebrew, pip); the build is not reproducible yet. The guarantee is "the
+  code the operator's CI built", not "code you could rebuild bit for bit".
 
 ### Option B — the Home Screen web app
 
@@ -158,8 +173,13 @@ Problems, stated plainly:
   cleanup or deleting the icon wipes the identity. Keep the backup.
 - Needs **https** (a clearnet relay with TLS); the `.onion` does not work in
   Safari.
-- No offline mode: without the relay there is no client (no service worker, on
-  purpose — it would not close the trust gap and adds an update channel).
+- **Invite links open in Safari**, not in the Home Screen web app, and
+  Safari's storage is separate — so an invite lands where the identity is not.
+  Paste the handle into the web app instead.
+- No service workers, deliberately and enforced (`worker-src 'none'` in the
+  relay's CSP): a worker would outlive a cleaned-up relay and keep serving
+  its code.
+- No offline mode: without the relay there is no client.
 
 ### With an Apple Developer account (not set up)
 

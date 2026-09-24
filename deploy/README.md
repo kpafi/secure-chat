@@ -215,6 +215,9 @@ lists one version, and a stale file is just attack surface. The Onion does not
 serve `/ios/` (Tor forwards straight to the relay); SideStore has no Tor.
 
 **Publish the SHA-256 somewhere other than this server** (e.g. in the chat
-where you hand out the source URL). Whoever controls `/srv/secure-chat-ios/`
-can replace the IPA *and* `apps.json` together; a checksum users compare
-against a second channel is what catches that.
+where you hand out the address), and take it from the GitHub release notes —
+the release job recomputes it from the IPA — not from files on the box.
+Whoever controls `/srv/secure-chat-ios/` can replace the IPA *and* `apps.json`
+together, including the `sha256` SideStore checks; only users hashing the file
+they downloaded and comparing with your second channel catches that
+(`ios/README.md`, Option A, step 5).

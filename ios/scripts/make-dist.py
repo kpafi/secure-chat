@@ -43,14 +43,21 @@ def main() -> int:
     ap.add_argument("--date", default=dt.date.today().isoformat())
     a = ap.parse_args()
 
-    if not re.fullmatch(r"\d+\.\d+\.\d+", a.version):
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", a.date):
+        sys.exit(f"date must be YYYY-MM-DD, got {a.date!r}")
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", a.version):
         sys.exit(f"version must be X.Y.Z, got {a.version!r}")
-    if not re.fullmatch(r"\d+", a.build):
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", a.date):
+        sys.exit(f"date must be YYYY-MM-DD, got {a.date!r}")
+    if not re.fullmatch(r"[0-9]+", a.build):
         sys.exit(f"build must be an integer, got {a.build!r}")
     # The URL lands in a JSON file users' devices fetch; keep it a plain https
     # origin + path so nothing odd can ride along.
     base = a.base_url.rstrip("/")
-    if not re.fullmatch(r"https://[A-Za-z0-9.-]+(:\d{1,5})?(/[A-Za-z0-9._~-]+)*", base):
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", a.date):
+        sys.exit(f"date must be YYYY-MM-DD, got {a.date!r}")
+    if not re.fullmatch(r"https://[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*"
+                        r"(:[0-9]{1,5})?(/[A-Za-z0-9_~-][A-Za-z0-9._~-]*)*", base) or "/.." in base:
         sys.exit(f"base URL must be https://host[/path], got {a.base_url!r}")
 
     a.out.mkdir(parents=True, exist_ok=True)
@@ -62,9 +69,14 @@ def main() -> int:
     (a.out / f"{ipa_name}.sha256").write_text(f"{digest}  {ipa_name}\n")
     shutil.copyfile(a.icon, a.out / "icon.png")
 
+    # No hash in the description (pentest dist-1 F2): SideStore shows this
+    # free text, but verifies the separate `sha256` field — a hostile server
+    # could print the genuine hash here and serve a different file. Users
+    # verify by hashing the downloaded .ipa themselves (ios/README.md).
     notes = (
         "Unsigned build: SideStore/AltStore signs it with your own Apple ID. "
-        f"SHA-256 {digest} — compare it with the value the relay operator publishes."
+        "To verify it, hash the downloaded .ipa yourself and compare with the "
+        "value the operator sent you through another channel."
     )
     source = {
         "name": "secure-chat",
