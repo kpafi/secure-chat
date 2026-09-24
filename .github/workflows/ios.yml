@@ -12,6 +12,8 @@ on:
       - "ios/**"
       - "!ios/**/*.md"
       - ".github/workflows/ios.yml"
+      # The relay's origin allow-list, which the app cannot connect without.
+      - "backend/config.py"
   workflow_dispatch:
 
 concurrency:
