@@ -174,3 +174,43 @@ def test_replayed_v1_registration_cannot_strip_published_enc_keys():
     # A replay of the v2 registration itself is a harmless no-op refresh.
     r4 = client.post("/api/register", json=_v2_body("strip-frank", ident, enc))
     assert r4.status_code == 200 and r4.json()["lookup_token"] == token
+
+
+
+# Phase-7 pentest 2026-09-16, F-P7-A4 (test only; ported from phase7-local
+# 1d240d0). test_accounts.py respells only the v1 fields (ed, mldsa, sig); ecdh
+# (65 bytes) and mlkem (1184 bytes) are both = 2 (mod 3) and so have four base64
+# spellings each — and NOTHING pinned that the relay refuses the non-canonical
+# ones. That is load-bearing: `_vouch_message` builds from the STORED string
+# while the client builds from its canonical copy, so a non-canonical stored key
+# would silently kill every vouch mark for that account (H-1's failure mode).
+_B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+
+def _respell_enc(canonical: str) -> str:
+    """Another base64 string for the same bytes (flip a discarded slack bit)."""
+    body = canonical.rstrip("=")
+    pad = canonical[len(body):]
+    assert pad, "a field with no padding has no slack bits to respell"
+    last = body[-1]
+    alt = _B64_ALPHABET[_B64_ALPHABET.index(last) ^ 1]
+    respelled = body[:-1] + alt + pad
+    assert respelled != canonical
+    assert base64.b64decode(respelled, validate=True) == base64.b64decode(canonical, validate=True)
+    return respelled
+
+
+def test_register_rejects_non_canonical_encryption_keys():
+    ident, enc = _new_identity(), _enc_keys()
+    for field in ("ecdh", "mlkem"):
+        # Signed OVER the respelled string, so the signature is valid and the
+        # canonical-base64 check is the only thing that can refuse it.
+        body = _v2_body("noncanon-enc", ident, dict(enc, **{field: _respell_enc(enc[field])}))
+        r = client.post("/api/register", json=body)
+        assert r.status_code == 422, (field, r.text)
+        assert "canonical" in r.text, (field, r.text)
+    # ...and the canonical original is still accepted, unchanged.
+    r = client.post("/api/register", json=_v2_body("noncanon-enc", ident, enc))
+    assert r.status_code == 200, r.text
+    served = client.get("/api/users/noncanon-enc", params={"t": r.json()["lookup_token"]}).json()
+    assert served["ecdh"] == enc["ecdh"] and served["mlkem"] == enc["mlkem"]

@@ -617,3 +617,45 @@ def test_verify_unknown_user_does_the_same_work_as_known_user():
     assert len(base64.b64decode(accounts._DECOY_MLDSA_PUB_B64)) == config.MLDSA65_PUB_BYTES
     ch = client.post("/api/auth/challenge", json={"username": "ghost-timing"}).json()["challenge"]
     assert client.post("/api/auth/verify", json=_login_body("ghost-timing", _new_identity(), ch)).status_code == 401
+
+
+# --- Phase-7 pentest 2026-09-16 F-P7-12: every request string is bounded -------
+
+@pytest.mark.parametrize("field", ["ed", "mldsa", "sig", "mldsa_sig", "ecdh", "mlkem"])
+def test_register_fields_are_length_bounded(field):
+    ident = _new_identity()
+    body = _register_body("bounded-user", ident)
+    body[field] = "A" * 5000
+    r = client.post("/api/register", json=body)
+    assert r.status_code == 422, r.text
+    assert any(e.get("type") == "string_too_long" for e in r.json()["detail"]), r.text
+
+
+@pytest.mark.parametrize("field", ["challenge", "sig", "mldsa_sig"])
+def test_verify_fields_are_length_bounded(field):
+    body = {"username": "whoever", "challenge": "A" * 44, "sig": "A" * 88, "mldsa_sig": "A" * 4412}
+    body[field] = "A" * 5000
+    r = client.post("/api/auth/verify", json=body)
+    assert r.status_code == 422, r.text
+    assert any(e.get("type") == "string_too_long" for e in r.json()["detail"]), r.text
+
+
+def test_db_connections_are_closed_after_use():
+    """Every `with _db() as conn:` used to leave the connection (an fd plus a
+    WAL read mark) to the garbage collector. The block now closes it — and
+    still commits on success and rolls back on an exception."""
+    import sqlite3
+    with accounts._db() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS _closetest (x INTEGER)")
+        conn.execute("INSERT INTO _closetest VALUES (1)")
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
+    with pytest.raises(RuntimeError):
+        with accounts._db() as conn2:
+            conn2.execute("INSERT INTO _closetest VALUES (2)")
+            raise RuntimeError("abort")
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn2.execute("SELECT 1")
+    with accounts._db() as conn3:
+        assert [r[0] for r in conn3.execute("SELECT x FROM _closetest")] == [1]
+        conn3.execute("DROP TABLE _closetest")

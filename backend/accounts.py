@@ -177,10 +177,16 @@ def _client_addr_was_rewritten(request: Request) -> bool:
     Deliberately one-directional, and that asymmetry is what makes it safe to
     act on rather than merely log:
 
-      * NO false positives. Nothing a remote client can send produces port 0, so
-        this cannot be provoked — that is L-9 closed, and it is why `client_key`
-        may collapse to the shared bucket here without handing an attacker a way
-        to move themselves out of the honest bucket.
+      * No REMOTELY PROVOKABLE false positives in the deployed topology (TCP
+        via Tor / Caddy on loopback): a connected TCP socket cannot have source
+        port 0, so no header a client sends can trip this — that is L-9 closed,
+        and it is why `client_key` may collapse to the shared bucket here
+        without handing an attacker a way out of the honest bucket. That is an
+        argument about this topology, NOT a proof for every ASGI server or
+        transport (2026-07-29 M-B): a server or proxy layer that reports port 0
+        for a genuine peer would read as "rewritten" and be collapsed into the
+        shared bucket — throttled-but-shared, the safe direction, never a way
+        to gain a private bucket.
       * There ARE false negatives: a forged `X-Forwarded-For: 1.2.3.4:5678`
         keeps its port and stays quiet. So this is defence in depth, NOT the
         control. The control is `--no-proxy-headers` on every launch path, which
@@ -494,8 +500,25 @@ def _vouch_message(target: str, ed: str, mldsa: str, ecdh: str = "", mlkem: str 
 
 # --- storage ---------------------------------------------------------------
 
+class _Conn(sqlite3.Connection):
+    """A connection whose `with` block also CLOSES it.
+
+    sqlite3.Connection's own context manager only commits or rolls back; every
+    `with _db() as conn:` left its connection (a file descriptor plus the WAL
+    read mark) to the garbage collector. Closing on exit keeps the semantics
+    callers rely on (commit on success, rollback on an exception such as the
+    token gate's 404) and releases the handle deterministically.
+    """
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+
+
 def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(config.DB_PATH)
+    conn = sqlite3.connect(config.DB_PATH, factory=_Conn)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     # §9 L-2 (ported from phase7-local 6604d9e): under a flood, overlapping
@@ -571,16 +594,28 @@ def _prune(store: dict[str, tuple[str, float]]) -> None:
 
 # --- request/response models (strict) --------------------------------------
 
+def _b64_len(n: int) -> int:
+    """Length of the canonical (padded) base64 encoding of n bytes."""
+    return 4 * ((n + 2) // 3)
+
+
+# Phase-7 pentest 2026-09-16 F-P7-12: every string field is bounded in the
+# model, so a huge value is refused by pydantic before any handler work, and a
+# chunked body that slips the declared-length check still cannot deliver an
+# unbounded key or signature. Each bound is the exact canonical length
+# `_b64decode_fixed` accepts, so nothing valid is refused.
 class RegisterReq(BaseModel):
     model_config = ConfigDict(extra="forbid")
     username: str = Field(min_length=config.USERNAME_MIN, max_length=config.USERNAME_MAX)
-    ed: str
-    mldsa: str
-    sig: str        # Ed25519 signature over the register message
-    mldsa_sig: str  # ML-DSA-65 signature over the same message (PQ ownership proof)
+    ed: str = Field(max_length=_b64_len(config.ED25519_PUB_BYTES))
+    mldsa: str = Field(max_length=_b64_len(config.MLDSA65_PUB_BYTES))
+    # Ed25519 signature over the register message
+    sig: str = Field(max_length=_b64_len(config.ED25519_SIG_BYTES))
+    # ML-DSA-65 signature over the same message (PQ ownership proof)
+    mldsa_sig: str = Field(max_length=_b64_len(config.MLDSA65_SIG_BYTES))
     # Bundle v2 (both or neither): public encryption keys for sealed messages.
-    ecdh: str | None = None
-    mlkem: str | None = None
+    ecdh: str | None = Field(default=None, max_length=_b64_len(config.ECDH_PUB_BYTES))
+    mlkem: str | None = Field(default=None, max_length=_b64_len(config.MLKEM768_PUB_BYTES))
 
 
 class ChallengeReq(BaseModel):
@@ -591,9 +626,11 @@ class ChallengeReq(BaseModel):
 class VerifyReq(BaseModel):
     model_config = ConfigDict(extra="forbid")
     username: str = Field(min_length=config.USERNAME_MIN, max_length=config.USERNAME_MAX)
-    challenge: str
-    sig: str        # Ed25519 signature over the login message
-    mldsa_sig: str  # ML-DSA-65 signature over the same message (F-RELAY-006)
+    challenge: str = Field(max_length=_b64_len(32))
+    # Ed25519 signature over the login message
+    sig: str = Field(max_length=_b64_len(config.ED25519_SIG_BYTES))
+    # ML-DSA-65 signature over the same message (F-RELAY-006)
+    mldsa_sig: str = Field(max_length=_b64_len(config.MLDSA65_SIG_BYTES))
 
 
 def _check_username(u: str) -> None:
@@ -847,8 +884,10 @@ def me(username: str = Depends(current_user)) -> dict:
 class VouchReq(BaseModel):
     model_config = ConfigDict(extra="forbid")
     target: str = Field(min_length=config.USERNAME_MIN, max_length=config.USERNAME_MAX)
-    sig: str        # voucher's Ed25519 signature over the vouch message
-    mldsa_sig: str  # voucher's ML-DSA-65 signature over the same message
+    # voucher's Ed25519 signature over the vouch message
+    sig: str = Field(max_length=_b64_len(config.ED25519_SIG_BYTES))
+    # voucher's ML-DSA-65 signature over the same message
+    mldsa_sig: str = Field(max_length=_b64_len(config.MLDSA65_SIG_BYTES))
 
 
 @router.post("/vouch")
@@ -914,10 +953,13 @@ def vouch(req: VouchReq, request: Request, username: str = Depends(current_user)
     # Both verifications always run, and the verdict is combined afterwards, so
     # neither the status code nor the number of expensive operations depends on
     # whether the target exists.
-    if missing_target or not ed_ok:
+    # Phase-7 pentest 2026-09-16 F-P7-11 (ported from 4b9d2c6): two different
+    # strings told a holder of the target's bundle whether the target exists —
+    # a valid Ed25519 vouch with junk ML-DSA answered "post-quantum ... invalid"
+    # only for a REAL target (a missing one always failed the Ed25519 check
+    # first). M-7's oracle, without the lookup token. One message for all three.
+    if missing_target or not ed_ok or not mldsa_ok:
         raise HTTPException(status_code=400, detail="vouch signature invalid")
-    if not mldsa_ok:
-        raise HTTPException(status_code=400, detail="post-quantum vouch signature invalid")
 
     with _db() as conn:
         total = conn.execute("SELECT COUNT(*) FROM vouches").fetchone()[0]

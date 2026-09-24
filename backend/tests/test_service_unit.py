@@ -73,7 +73,6 @@ def test_execstart_keeps_the_other_hardening_flags(unit):
         "--no-server-header",    # no version banner
         "--no-access-log",       # I2: no who-connected-when on disk
         "--log-level warning",
-        "--ws-max-size 66560",   # frame cap the relay's validation assumes
     ):
         assert flag in exec_start, f"production launcher lost {flag!r}"
 
@@ -121,3 +120,21 @@ def test_sandboxing_directives_are_present(unit):
         "PrivateDevices=yes",
     ):
         assert directive in unit, f"production unit lost {directive}"
+
+
+
+def test_ws_max_size_matches_the_frame_cap_everywhere(unit):
+    """Phase-7 pentest 2026-09-16 F-P7-26: `66560` was a literal in run.sh, the
+    production unit, the iOS CI relay and this test, while main.py computes
+    MAX_FRAME_BYTES + 1024. Changing the frame cap would have left every
+    launcher on the old value with this test still green. All derive from
+    config now."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import config
+    flag = f"--ws-max-size {config.MAX_FRAME_BYTES + 1024}"
+    root = Path(__file__).resolve().parents[2]
+    assert flag in _exec_start(unit), f"production unit lost {flag!r}"
+    assert flag in (root / "backend" / "run.sh").read_text(), f"run.sh lost {flag!r}"
+    assert flag in (root / ".github" / "workflows" / "ios.yml").read_text(), f"iOS CI relay lost {flag!r}"
+    assert "ws_max_size=config.MAX_FRAME_BYTES + 1024" in (root / "backend" / "main.py").read_text()

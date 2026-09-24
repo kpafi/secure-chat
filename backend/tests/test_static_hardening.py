@@ -22,6 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import starlette  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+import config  # noqa: E402
+import main  # noqa: E402
 from main import app  # noqa: E402
 
 client = TestClient(app)
@@ -110,3 +112,154 @@ def test_csp_allows_the_manifest_and_nothing_more():
     assert directives["worker-src"] == "worker-src 'none'"
     assert "child-src" not in directives and "frame-src" not in directives
     assert "http" not in csp and "*" not in csp and "unsafe" not in csp
+
+
+# ---- Phase-7 pentest 2026-09-16 Lows (ported from phase7-local) --------------
+
+def test_api_paths_are_not_shadowed_by_the_static_gate():
+    """F-P7-16: the static gate runs on the static mount only. A legal username
+    that looks like a blocked file must stay reachable through /api."""
+    assert main._is_blocked_static("/x.test.mjs")
+    for name in (".alice", "evil.test.mjs", "package.json"):
+        r = client.get(f"/api/users/{name}", params={"t": "x"})
+        assert r.status_code == 404 and r.json() == {"detail": "no such user"}, (name, r.text)  # the API answered
+
+
+def test_blocked_static_404_carries_the_security_headers():
+    """F-P7-25: the gate's 404 returned before the headers were set."""
+    for path in BLOCKED:
+        r = client.get(path)
+        assert r.status_code == 404, path
+        for h in ("Content-Security-Policy", "X-Content-Type-Options", "X-Frame-Options",
+                  "Referrer-Policy", "Cache-Control", "Cross-Origin-Opener-Policy",
+                  "Cross-Origin-Resource-Policy"):
+            assert h in r.headers, (path, h)
+
+
+def test_cross_origin_isolation_headers():
+    """2026-07-26 Info: COOP everywhere, CORP same-origin on everything but
+    /api (the Android/iOS shells reach /api cross-origin under CORS and never
+    load relay static files). No COEP."""
+    page = client.get("/")
+    assert page.headers["Cross-Origin-Opener-Policy"] == "same-origin"
+    assert page.headers["Cross-Origin-Resource-Policy"] == "same-origin"
+    assert client.get("/app.js").headers["Cross-Origin-Resource-Policy"] == "same-origin"
+    api = client.get("/api/users/nobody", params={"t": "x"},
+                     headers={"Origin": config.APP_WEBVIEW_ORIGIN})
+    assert api.headers["Cross-Origin-Opener-Policy"] == "same-origin"
+    assert "Cross-Origin-Resource-Policy" not in api.headers, "CORP stays off /api"
+    assert api.headers.get("access-control-allow-origin") == config.APP_WEBVIEW_ORIGIN
+    assert "Cross-Origin-Embedder-Policy" not in page.headers
+
+
+def test_oversize_api_bodies_are_refused_and_422s_do_not_echo():
+    """F-P7-12: a 40 MB envelope was parsed and then echoed back inside the
+    422. Declared bodies past MAX_API_BODY_BYTES are 413 before being read; a
+    validation error never reflects the input."""
+    big = b"A" * (config.MAX_API_BODY_BYTES + 1024)
+    r = client.post("/api/mailbox/nobody", params={"t": "x"}, content=big,
+                    headers={"content-type": "application/json"})
+    assert r.status_code == 413, r.status_code
+    assert r.headers.get("X-Content-Type-Options") == "nosniff", "the 413 still carries the security headers"
+    r = client.post("/api/mailbox/nobody", params={"t": "x"},
+                    json={"envelope": "A" * 300, "extra": "MARKER_do_not_echo_9f2c"})
+    assert r.status_code == 422, r.text
+    assert "MARKER_do_not_echo_9f2c" not in r.text, "F-P7-12: the 422 must not reflect the request body"
+    assert r.json()["detail"][0]["type"], "...but still says what was wrong"
+    r = client.post("/api/register", json={"username": "echo-me", "ed": "MARKER_ed_9f2c" * 10,
+                                            "mldsa": "x", "sig": "x", "mldsa_sig": "x"})
+    assert r.status_code == 422 and "MARKER_ed_9f2c" not in r.text, r.text
+
+
+def test_declared_oversize_body_is_refused_before_it_is_read():
+    """F-P7-12: a declared Content-Length past the cap is answered 413 without
+    reading a single body byte or running the app (not merely by counting the
+    bytes as they arrive)."""
+    import asyncio
+
+    async def app_must_not_run(scope, receive, send):
+        raise AssertionError("the app ran for an oversize declared body")
+
+    async def receive_must_not_be_called():
+        raise AssertionError("the body was read")
+
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {"type": "http", "path": "/api/mailbox/x", "method": "POST",
+             "headers": [(b"content-length", str(config.MAX_API_BODY_BYTES + 1).encode())]}
+    asyncio.run(main._ApiBodyLimit(app_must_not_run)(scope, receive_must_not_be_called, send))
+    assert sent[0]["type"] == "http.response.start" and sent[0]["status"] == 413, sent
+
+
+def test_chunked_api_bodies_are_capped_too():
+    """F-P7-12, the half phase7-local left open: a chunked body has no declared
+    length, so a Content-Length check alone lets it through. The bytes actually
+    received are counted as well."""
+    chunk = b"A" * 16384
+    n = config.MAX_API_BODY_BYTES // len(chunk) + 4
+
+    def body():
+        yield b'{"envelope": "'
+        for _ in range(n):
+            yield chunk
+        yield b'"}'
+
+    r = client.post("/api/mailbox/nobody", params={"t": "x"}, content=body(),
+                    headers={"content-type": "application/json"})
+    assert r.status_code == 413, (r.status_code, r.text[:200])
+    # A body under the cap, chunked, still reaches the handler.
+    r = client.post("/api/mailbox/nobody", params={"t": "x"},
+                    content=iter([b'{"envelope": "', b"A" * 300, b'"}']),
+                    headers={"content-type": "application/json"})
+    assert r.status_code == 404, r.text
+
+
+def _vendor_closure(root: Path) -> tuple[set, set]:
+    """(vendored module files, files reachable from the client's imports)."""
+    import re
+    imp = re.compile(r"""^\s*(?:import|export)\b[^;]*?\bfrom\s*["']([^"']+)["']|^\s*import\s*["']([^"']+)["']""", re.M)
+    dyn = re.compile(r"""import\(\s*["']([^"']+)["']\s*\)""")
+    html = (root / "index.html").read_text()
+    import json as _json
+    imap = _json.loads(re.search(r'<script type="importmap">(.*?)</script>', html, re.S).group(1))["imports"]
+
+    def resolve(spec, frm):
+        for k, v in imap.items():
+            if spec == k:
+                return (root / v).resolve()
+            if k.endswith("/") and spec.startswith(k):
+                return (root / (v + spec[len(k):])).resolve()
+        if spec.startswith("."):
+            return (frm.parent / spec).resolve()
+        return None
+
+    seen, todo = set(), [p.resolve() for p in root.glob("*.js")]
+    while todo:
+        f = todo.pop()
+        if f in seen or not f.exists():
+            continue
+        seen.add(f)
+        src = re.sub(r"/\*.*?\*/", "", f.read_text(), flags=re.S)
+        src = re.sub(r"(?m)^\s*//.*$", "", src)
+        for m in list(imp.finditer(src)) + list(dyn.finditer(src)):
+            r = resolve(next(g for g in m.groups() if g), f)
+            if r:
+                todo.append(r)
+    vendored = {p.resolve() for p in (root / "vendor").rglob("*") if p.suffix in (".js", ".mjs")}
+    return vendored, {p for p in seen if "vendor" in p.parts}
+
+
+def test_only_the_import_closure_is_vendored():
+    """F-WEB-002: @noble/hashes/{sha2,hmac,_md}.js and curves/abstract/modular.js
+    were served although nothing imports them (JSDoc @example lines only).
+    The vendored tree must equal what the client can actually import."""
+    root = Path(__file__).resolve().parents[2] / "client"
+    vendored, reached = _vendor_closure(root)
+    assert reached, "the closure walk found nothing — the test itself is broken"
+    unused = sorted(str(p.relative_to(root)) for p in vendored - reached)
+    assert not unused, f"vendored but never imported (served for nothing): {unused}"
+    missing = sorted(str(p.relative_to(root)) for p in reached - vendored)
+    assert not missing, f"imported but not vendored: {missing}"

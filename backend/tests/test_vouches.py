@@ -241,6 +241,25 @@ def test_vouch_buckets_are_not_spent_without_a_session(monkeypatch):
     assert codes == [200, 200, 429], codes  # the host ceiling exists, for real vouchers
 
 
+def test_vouch_error_strings_do_not_reveal_the_target():
+    """Phase-7 pentest 2026-09-16 F-P7-11: a valid Ed25519 vouch with junk
+    ML-DSA used to answer "post-quantum vouch signature invalid" for a REAL
+    target and "vouch signature invalid" for a missing one — the M-7 oracle
+    without the lookup token. One string, whatever the target."""
+    alice = _register("wot-str-alice")
+    bob = _register("wot-str-bob")
+    tok = _login(alice)
+    real = _vouch_body(alice, bob)
+    raw = bytearray(base64.b64decode(real["mldsa_sig"]))
+    raw[0] ^= 0x01
+    real["mldsa_sig"] = base64.b64encode(bytes(raw)).decode("ascii")  # ed valid, pq well-formed but wrong
+    ghost = dict(real, target="wot-str-ghost")
+    r_real = client.post("/api/vouch", json=real, headers=_auth(tok))
+    r_ghost = client.post("/api/vouch", json=ghost, headers=_auth(tok))
+    assert (r_real.status_code, r_real.json()) == (r_ghost.status_code, r_ghost.json()) == (
+        400, {"detail": "vouch signature invalid"})
+
+
 def _register_v2(username):
     """Register a bundle-v2 identity (with encryption keys), like a real client."""
     ident = _new_identity()

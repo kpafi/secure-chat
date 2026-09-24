@@ -27,8 +27,10 @@ import os
 import posixpath
 import sqlite3
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 import mimetypes
 
@@ -47,6 +49,19 @@ from relay import Conn, ConnectionLimiter, JoinResult, RoomRegistry, TokenBucket
 from validation import Envelope, MsgType, is_ascii_printable
 
 
+class _ClientProtocolNoiseFilter(logging.Filter):
+    """Drop uvicorn's per-request client protocol errors (F-P7-15)."""
+
+    NOISE = ("Invalid HTTP request received", "Unsupported upgrade request")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:  # noqa: BLE001 - a broken record is not worth a traceback
+            return True
+        return not any(n in msg for n in self.NOISE)
+
+
 def _minimize_log_metadata() -> None:
     """Silence request/connection metadata at rest (I2).
 
@@ -62,7 +77,16 @@ def _minimize_log_metadata() -> None:
     access = logging.getLogger("uvicorn.access")
     access.handlers.clear()
     access.disabled = True
-    logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+    error = logging.getLogger("uvicorn.error")
+    error.setLevel(logging.WARNING)
+    # Phase-7 pentest 2026-09-16 F-P7-15 (ported from phase7-local 4b9d2c6): a
+    # malformed request line, header or Content-Length, or a TLS ClientHello on
+    # the plain port, is rejected by h11 BELOW the app and logged at WARNING
+    # once per request — unauthenticated, unthrottled, and over the .onion any
+    # visitor. Same class as the 2026-07-27 M-3 WebSocket fix. The line carries
+    # no client data; it is dropped. Genuine warnings still pass.
+    if not any(isinstance(f, _ClientProtocolNoiseFilter) for f in error.filters):
+        error.addFilter(_ClientProtocolNoiseFilter())
 
 
 _minimize_log_metadata()
@@ -84,12 +108,63 @@ app = FastAPI(
     openapi_url=None,
 )
 
+
+class _ApiBodyLimit:
+    """Phase-7 pentest 2026-09-16 F-P7-12: cap /api request bodies.
+
+    No request body on /api is legitimately larger than one envelope plus JSON
+    overhead, but nothing bounded it: a 40 MB body was read, parsed and then
+    ECHOED back inside the 422. phase7-local (4b9d2c6) refused on the DECLARED
+    Content-Length only, which a chunked body skips; this also counts the bytes
+    actually received and refuses once they pass the cap, before the handler
+    ever sees the body. Pure ASGI, added INNERMOST (before CORS and the security
+    headers), so the 413 still carries CORS and the security headers.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not scope["path"].startswith("/api/"):
+            return await self.app(scope, receive, send)
+        limit = config.MAX_API_BODY_BYTES
+        declared = 0
+        for k, v in scope.get("headers", ()):
+            if k == b"content-length":
+                try:
+                    declared = int(v)
+                except ValueError:
+                    declared = 0
+        if declared > limit:
+            await Response("request body too large", status_code=413, media_type="text/plain")(scope, receive, send)
+            return
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    # An HTTPException is re-raised as-is by FastAPI's body
+                    # reader (anything else becomes a generic 400).
+                    raise HTTPException(status_code=413, detail="request body too large")
+            return message
+
+        await self.app(scope, limited_receive, send)
+
+
+app.add_middleware(_ApiBodyLimit)
+
+
 # CORS is shut for the web client (served same-origin via the .onion) and opened
 # to exactly one extra origin: the Android app's bundled-client origin, whose
 # /api directory fetches are cross-origin. Only GET/POST + the two headers the
 # client actually sends are allowed; no credentials mode (auth is an explicit
 # Bearer token, never a cookie). The WS handshake is guarded separately by the
 # origin allow-list in ws_endpoint.
+# Added AFTER _ApiBodyLimit, so it sits outside it (Starlette: last added is
+# outermost) and a 413 still carries the CORS headers the apps need to read it.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.ALLOWED_HTTP_ORIGINS,
@@ -158,15 +233,35 @@ async def _sqlite_busy(request: Request, exc: sqlite3.OperationalError) -> Respo
     return Response(status_code=503, content="busy", media_type="text/plain")
 
 
+@app.exception_handler(RequestValidationError)
+async def _validation_without_echo(request: Request, exc: RequestValidationError) -> Response:
+    # Phase-7 pentest 2026-09-16 F-P7-12 (ported from 4b9d2c6): FastAPI's
+    # default 422 echoes the offending INPUT back — for an oversize body that
+    # was the whole body, for a mistyped envelope the ciphertext reflected.
+    # Keep loc/msg/type (the client's formatDetail renders exactly those),
+    # drop `input` and `ctx`.
+    detail = [{k: v for k, v in e.items() if k in ("loc", "msg", "type")} for e in exc.errors()]
+    return JSONResponse(status_code=422, content={"detail": detail})
+
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     # Audit 2026-07-18 M-01: decide on the raw ASGI path, NOT request.url.path.
     # Affected Starlette versions reconstruct `url` using the client-controlled
     # Host header, which can desync it from the routed path and bypass this
     # gate (GHSA-86qp-5c8j-p5mr). scope["path"] is what routing actually uses.
-    if _is_blocked_static(request.scope["path"]):
-        return Response(status_code=404)
-    resp: Response = await call_next(request)
+    path = request.scope["path"]
+    api = path.startswith("/api/")
+    # Phase-7 pentest 2026-09-16 F-P7-16: the gate is for the static mount only.
+    # Run on every path, it made legal usernames (a leading ".", a ".test.mjs"
+    # suffix) register fine and then 404 on every /api/users lookup,
+    # indistinguishably from "no such user".
+    if not api and _is_blocked_static(path):
+        # F-P7-25: this 404 used to return before the headers below were set,
+        # so it went out with none of them. Same headers as every response.
+        resp: Response = Response(status_code=404)
+    else:
+        resp = await call_next(request)
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
     # HSTS only when actually reached over HTTPS (L-01). Caddy terminates TLS
@@ -201,6 +296,19 @@ async def security_headers(request: Request, call_next):
     )
     resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    # Pentest 2026-07-26 Info: process isolation. COOP severs any cross-origin
+    # opener, so a page that opens (or is opened by) the client cannot keep a
+    # window handle into it. CORP same-origin forbids other sites from
+    # embedding the relay's static files as no-cors subresources. Not COEP (the
+    # client needs no cross-origin isolation, and it would constrain the apps).
+    # CORP is left off /api: the Android (https://secure-chat.internal) and iOS
+    # (secure-chat://app) shells reach /api cross-origin under CORS, and never
+    # load relay static files (their CSP allows img/script/style from their own
+    # origin only), so CORP on the static mount cannot affect them while the
+    # spec's CORS-mode exemption is not something /api needs to lean on.
+    resp.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    if not api:
+        resp.headers["Cross-Origin-Resource-Policy"] = "same-origin"
     # no-cache = always revalidate (cheap 304 via the ETag StaticFiles sends).
     # Without it browsers cache heuristically and keep serving a stale client
     # after a deploy — for a security-critical client, staleness is a bug.
@@ -322,9 +430,18 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 await _safe_send(ws, '{"type":"error","reason":"binary frames not accepted"}')
                 break
             except asyncio.TimeoutError:
-                if joined_room:
+                # Phase-7 pentest 2026-09-16 F-P7-10 (ported from 4b9d2c6): the
+                # reason and the armed timeout were the PRE-await snapshot, so a
+                # guest admitted by the owner while blocked here, that then
+                # stayed silent, was closed at the pending deadline with
+                # "approval timeout" instead of getting the idle window a member
+                # is owed. Re-read the state: admitted mid-wait means re-arm
+                # with the idle window, not close.
+                if conn.admitted and conn.room and not joined_room:
+                    continue
+                if conn.admitted and conn.room:
                     reason = "idle timeout"
-                elif waiting_room:
+                elif conn.waiting_room:
                     reason = "approval timeout"
                 else:
                     reason = "join timeout"

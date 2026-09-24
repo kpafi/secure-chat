@@ -254,3 +254,30 @@ def test_unix_socket_deployment_is_one_bucket_and_silent():
     assert accounts.client_key(_UdsReq()) == "unknown"
     assert accounts.client_key(_UdsReq("1.2.3.4")) == "unknown"
     assert not accounts._proxy_warning_emitted, "a UDS deployment must stay silent"
+
+
+@pytest.mark.parametrize("proxies", ["127.0.0.1", "10.0.0.1, 127.0.0.1", "::1", "localhost", "127.0.0.2"])
+def test_loopback_trusted_proxy_is_refused_at_startup(proxies):
+    """Phase-7 pentest 2026-09-16 F-P7-13: SECURE_CHAT_TRUSTED_PROXIES=127.0.0.1
+    silently defeated every limiter (F-RELAY-001's fix was documentation only).
+    On the shipped topology a loopback proxy cannot be told from Tor's raw
+    forward, so config refuses it unless the operator states they separated
+    the two."""
+    import subprocess
+    backend = str(Path(__file__).resolve().parents[1])
+    env = dict(os.environ, SECURE_CHAT_TRUSTED_PROXIES=proxies)
+    env.pop("SECURE_CHAT_TRUSTED_PROXIES_ALLOW_LOOPBACK", None)
+    r = subprocess.run([sys.executable, "-c", "import config"], cwd=backend, env=env, capture_output=True, text=True)
+    assert r.returncode != 0 and "loopback" in r.stderr, r.stderr[-400:]
+    env["SECURE_CHAT_TRUSTED_PROXIES_ALLOW_LOOPBACK"] = "1"
+    r = subprocess.run([sys.executable, "-c", "import config"], cwd=backend, env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-400:]
+
+
+def test_non_loopback_trusted_proxy_still_starts():
+    import subprocess
+    backend = str(Path(__file__).resolve().parents[1])
+    env = dict(os.environ, SECURE_CHAT_TRUSTED_PROXIES="10.0.0.5")
+    env.pop("SECURE_CHAT_TRUSTED_PROXIES_ALLOW_LOOPBACK", None)
+    r = subprocess.run([sys.executable, "-c", "import config"], cwd=backend, env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-400:]
