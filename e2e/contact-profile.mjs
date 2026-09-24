@@ -786,6 +786,45 @@ const geo = await alice.page.evaluate(() => {
 });
 check("on a phone the sheet docks above the tab bar, every button ≥44px",
   geo.sheetBottom <= geo.tabTop && geo.top > 0 && geo.minTarget >= 44, JSON.stringify(geo));
+// Remove is alone under the decision row: centred in the sheet, never hanging
+// off the right edge (owner, on the phone, 0.3.0), and always BELOW the
+// decision row's hit area (p4 I-2, hot r4 n5) — measured in both phone arms:
+// the static key-changed row here, the sticky Message/Unverify bar below.
+// `width < 200` guards the other way to be centred: stretched to the sheet.
+const removeGeo = () => alice.page.evaluate(() => {
+  const s = document.querySelector("#contactSheet").getBoundingClientRect();
+  const r = document.querySelector("#contactRemove").getBoundingClientRect();
+  const btns = [...document.querySelectorAll(".contact-actions > button:not([hidden])")].map((b) => b.getBoundingClientRect());
+  const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+  return { sheetMid: Math.round((s.left + s.right) / 2), removeMid: Math.round((r.left + r.right) / 2), width: Math.round(r.width),
+    clearance: Math.round(r.top - Math.max(...btns.map((b) => b.bottom))), hit: hit?.id, pos: getComputedStyle(document.querySelector(".contact-actions")).position };
+});
+const okRemove = (g) => Math.abs(g.sheetMid - g.removeMid) <= 1 && g.width < 200 && g.clearance >= 0 && g.hit === "contactRemove";
+const geoStatic = await removeGeo();
+check("key changed: Remove is centred under the static row, below its hit area, not right-aligned",
+  okRemove(geoStatic) && geoStatic.pos === "static", JSON.stringify(geoStatic));
+await alice.page.mouse.click(195, 20);
+await waitSheet(alice.page, false);
+// The sticky arm: a verified contact, Message primary, Unverify beside it.
+await store(alice.page, async (u) => { await (await import("./contacts.js")).setVerified(u, true); }, bob.username);
+await alice.page.click(`${rowOf(bob.username)} > .u-open`);
+await waitSheet(alice.page);
+await sleep(400);
+const geoSticky = await removeGeo();
+check("verified: Remove is centred under the sticky Message/Unverify bar and below its hit area",
+  okRemove(geoSticky) && geoSticky.pos === "sticky", JSON.stringify(geoSticky));
+// Opened from a conversation there is no Message: the lone Unverify is
+// centred on the same axis as Remove (hot r7 MINOR-2). Hidden the way
+// app.js hides it, then restored.
+const geoLone = await alice.page.evaluate(() => {
+  const m = document.querySelector("#contactMessage"); m.hidden = true;
+  const s = document.querySelector("#contactSheet").getBoundingClientRect();
+  const v = document.querySelector("#contactVerify").getBoundingClientRect();
+  m.hidden = false;
+  return { sheetMid: Math.round((s.left + s.right) / 2), verifyMid: Math.round((v.left + v.right) / 2) };
+});
+check("without Message the lone Unverify is centred on Remove's axis", Math.abs(geoLone.sheetMid - geoLone.verifyMid) <= 1, JSON.stringify(geoLone));
+await store(alice.page, async (u) => { await (await import("./contacts.js")).setVerified(u, false); }, bob.username);
 await alice.page.mouse.click(195, 20);
 await waitSheet(alice.page, false);
 check("a tap on the scrim closes it on a phone", !(await sheet(alice.page)).open);
