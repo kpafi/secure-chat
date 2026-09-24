@@ -390,11 +390,20 @@ MAX_MAILBOX_PER_RECIPIENT = 200       # queued envelopes per inbox
 #     envelope is well over 1.5 KiB and 256 B refuses nothing real;
 #   * each inbox has a hard BYTE share beside its row cap (429, the owner can
 #     fetch);
-#   * the server-wide budget is BYTES, the row cap only bounds table size (and
-#     the cost of the budget query), and when either is full the OLDEST queued
-#     mail is EVICTED instead of refusing new mail. Under a sustained flood
-#     retention degrades (mail must be fetched sooner) but delivery never
-#     stops; with free registration that is the honest limit (mailbox.py).
+#   * the server-wide budget is BYTES, the row cap only bounds table size, and
+#     when either is full queued mail is EVICTED instead of refusing new mail —
+#     from the HEAVIEST inbox first, its oldest envelope, only as much as the
+#     new envelope needs (fix review F1: evicting the globally oldest rows let
+#     80 throwaway accounts flooding their own inboxes silently delete every
+#     victim's queued mail). A flood therefore mostly evicts the flooders' own
+#     full inboxes. RESIDUAL, stated honestly: an inbox is reached once it is
+#     the heaviest one left, so an attacker who spreads the whole budget over
+#     inboxes no bigger than the victim's — about
+#     MAX_MAILBOX_TOTAL_BYTES / (victim's queued bytes) accounts, e.g. ~30 000
+#     for 9 KiB of queued mail — can still evict it; and an HONEST inbox that is
+#     simply the heaviest (someone offline receiving a lot) loses its oldest
+#     mail first under pressure. Totals are maintained counters (mailbox.py
+#     mailbox_totals / mailbox_inbox), never a table scan on the request path.
 MIN_ENVELOPE_BYTES = 256
 MAX_MAILBOX_TOTAL = 100_000                        # rows server-wide (evict-oldest)
 MAX_MAILBOX_TOTAL_BYTES = 256 * 1024 * 1024        # queued bytes server-wide (evict-oldest)

@@ -235,15 +235,18 @@ def test_envelopes_have_a_minimum_size():
 
 
 def _clear_mailbox():
+    # Raw edits bypass the maintained counters (F2), so resync them.
     with accounts._db() as conn:
         conn.execute("DELETE FROM mailbox")
+        mailbox._rebuild_counters(conn)
 
 
-def test_mailbox_budget_is_bytes_and_evicts_oldest(monkeypatch):
+def test_mailbox_budget_is_bytes_and_evicts_from_the_heaviest_inbox(monkeypatch):
     """F-RELAY-008 / F-P7-1: the server-wide budget is BYTES, and when it is
-    full the OLDEST queued mail is evicted instead of a relay-wide 503 "storage
-    full" (which ~500 throwaway accounts could hold for the whole 14-day TTL).
-    The per-inbox share stays a hard 429 — the recipient can fetch."""
+    full queued mail is evicted — from the HEAVIEST inbox, oldest first (fix
+    review F1) — instead of a relay-wide 503 "storage full" (which ~500
+    throwaway accounts could hold for the whole 14-day TTL). The per-inbox
+    share stays a hard 429 — the recipient can fetch."""
     _clear_mailbox()
     n = config.MIN_ENVELOPE_BYTES
     monkeypatch.setattr(config, "MAX_MAILBOX_TOTAL_BYTES", 3 * n)
@@ -260,7 +263,7 @@ def test_mailbox_budget_is_bytes_and_evicts_oldest(monkeypatch):
     r = post(bob, "3")
     assert r.status_code == 429 and "inbox full" in r.text, r.text  # bob's share (2n) is hard
     assert post(alice, "a").status_code == 200                      # 3n total: full
-    assert post(alice, "b").status_code == 200                      # evicts bob's oldest ("1"), never refuses
+    assert post(alice, "b").status_code == 200                      # bob is heaviest: his oldest ("1") goes
     with accounts._db() as conn:
         rows = [(r["recipient"], r["envelope"][0])
                 for r in conn.execute("SELECT recipient, envelope FROM mailbox ORDER BY id").fetchall()]
@@ -324,8 +327,9 @@ def test_nothing_is_written_before_the_token_gate(monkeypatch):
     _clear_mailbox()
     bob = _register("l2-bob")
     with accounts._db() as conn:
-        conn.execute("INSERT INTO mailbox (recipient, envelope, created_at) VALUES (?,?,?)",
-                      ("l2-expired", _env(), int(time.time()) - config.MAILBOX_TTL_SEC - 5))
+        conn.execute("INSERT INTO mailbox (recipient, envelope, created_at, size) VALUES (?,?,?,?)",
+                      ("l2-expired", _env(), int(time.time()) - config.MAILBOX_TTL_SEC - 5, len(_env())))
+        mailbox._rebuild_counters(conn)
 
     def fast_db():
         conn = accounts._db()
@@ -352,13 +356,140 @@ def test_nothing_is_written_before_the_token_gate(monkeypatch):
     _clear_mailbox()
 
 
-def test_prune_is_indexed_on_created_at():
-    """§9 L-2: the prune's `WHERE created_at < ?` scanned the whole table under
-    the write lock; it uses an index now."""
+def _traced(monkeypatch):
+    """Record every SQL statement mailbox.py runs (parameters expanded)."""
+    seen = []
+
+    def traced_db():
+        conn = accounts._db()
+        conn.set_trace_callback(seen.append)
+        return conn
+
+    monkeypatch.setattr(mailbox, "_db", traced_db)
+    return seen
+
+
+def _full_scans(statements):
+    """Statements whose query plan reads the whole mailbox table."""
+    import re
+    bad = []
     with accounts._db() as conn:
-        plan = " ".join(str(tuple(r)) for r in conn.execute(
-            "EXPLAIN QUERY PLAN DELETE FROM mailbox WHERE created_at < ?", (0,)).fetchall())
-    assert "idx_mailbox_created" in plan, plan
+        for sql in statements:
+            head = sql.lstrip().split(None, 1)[0].upper() if sql.strip() else ""
+            if head not in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+                continue
+            plan = [r[3] for r in conn.execute("EXPLAIN QUERY PLAN " + sql).fetchall()]
+            if any(re.search(r"SCAN mailbox(\s|$)", line) for line in plan):
+                bad.append((sql[:120], plan))
+    return bad
+
+
+def test_request_path_never_scans_the_mailbox_table(monkeypatch):
+    """§9 L-2 and fix review F2: the first budget fix ran
+    SUM(LENGTH(CAST(envelope AS BLOB))) over the WHOLE table on every accepted
+    POST, inside the write transaction (~60 ms at 256 MiB: POST throughput
+    capped at ~16/s relay-wide, polls stalled for seconds). Every statement a
+    POST (including prune and eviction) and a fetch run must now be an index
+    or counter lookup — no `SCAN mailbox` in any query plan."""
+    _clear_mailbox()
+    n = config.MIN_ENVELOPE_BYTES
+    monkeypatch.setattr(config, "MAX_MAILBOX_TOTAL_BYTES", 3 * n)
+    bob = _register("f2-scan-bob")
+    alice = _register("f2-scan-alice")
+    with accounts._db() as conn:  # one expired row, so the prune really deletes
+        conn.execute("INSERT INTO mailbox (recipient, envelope, created_at, size) VALUES (?,?,?,?)",
+                     ("f2-expired", _env(), int(time.time()) - config.MAILBOX_TTL_SEC - 5, n))
+        mailbox._rebuild_counters(conn)
+    tok = _login(bob)
+    seen = _traced(monkeypatch)
+    for who, fill in ((bob, "1"), (bob, "2"), (alice, "a"), (alice, "b")):  # the last one evicts
+        r = client.post(f"/api/mailbox/{who['username']}", params={"t": who["token"]},
+                        json={"envelope": _env(n, fill)})
+        assert r.status_code == 200, r.text
+    assert client.get("/api/mailbox", headers=_auth(tok)).status_code == 200
+    joined = " | ".join(seen)
+    assert "DELETE FROM mailbox WHERE id" in joined, "precondition: prune/eviction/fetch deletes were traced"
+    assert "INSERT INTO mailbox " in joined
+    bad = _full_scans(seen)
+    assert not bad, f"full mailbox scans on the request path: {bad}"
+    _clear_mailbox()
+
+
+def _counters_match():
+    with accounts._db() as conn:
+        real = conn.execute("SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(envelope AS BLOB))), 0) FROM mailbox").fetchone()
+        kept = conn.execute("SELECT rows, bytes FROM mailbox_totals WHERE id = 1").fetchone()
+        real_inbox = {r[0]: (r[1], r[2]) for r in conn.execute(
+            "SELECT recipient, COUNT(*), SUM(LENGTH(CAST(envelope AS BLOB))) FROM mailbox GROUP BY recipient")}
+        kept_inbox = {r[0]: (r[1], r[2]) for r in conn.execute("SELECT recipient, rows, bytes FROM mailbox_inbox")}
+    assert tuple(kept) == tuple(real), f"totals drifted: kept {tuple(kept)} vs real {tuple(real)}"
+    assert kept_inbox == real_inbox, f"per-inbox counters drifted: {kept_inbox} vs {real_inbox}"
+
+
+def test_counters_equal_the_real_sums_after_mixed_traffic(monkeypatch):
+    """F2: the counters are only safe if every INSERT and DELETE maintains
+    them — post, fetch, TTL prune and eviction, in any mix."""
+    _clear_mailbox()
+    n = config.MIN_ENVELOPE_BYTES
+    monkeypatch.setattr(config, "MAX_MAILBOX_TOTAL_BYTES", 10 * n)
+    monkeypatch.setattr(mailbox._post_limiter, "_refill", 0.0)
+    users = [_register(f"f2-mix{i}") for i in range(3)]
+    toks = [_login(u) for u in users]
+
+    def post(u, size, fill):
+        return client.post(f"/api/mailbox/{u['username']}", params={"t": u["token"]},
+                           json={"envelope": _env(size, fill)}).status_code
+
+    for i in range(9):  # fills and then evicts (sizes vary)
+        assert post(users[i % 3], n + 37 * i, str(i)) == 200
+    _counters_match()
+    assert client.get("/api/mailbox", headers=_auth(toks[1])).status_code == 200  # fetch-delete
+    _counters_match()
+    with accounts._db() as conn:  # age one inbox past the TTL, then any access prunes it
+        conn.execute("UPDATE mailbox SET created_at = ? WHERE recipient = ?",
+                     (int(time.time()) - config.MAILBOX_TTL_SEC - 5, users[2]["username"]))
+    assert post(users[0], 2 * n, "p") == 200  # prune + possibly evict + insert
+    _counters_match()
+    with accounts._db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM mailbox_inbox WHERE recipient = ?",
+                            (users[2]["username"],)).fetchone()[0] == 0, "an emptied inbox leaves no counter row"
+    for t in toks:
+        client.get("/api/mailbox", headers=_auth(t))
+    _counters_match()
+    _clear_mailbox()
+
+
+def test_flood_of_full_throwaway_inboxes_cannot_evict_a_small_victim(monkeypatch):
+    """Fix review F1: evicting the globally OLDEST rows let throwaway accounts
+    flooding their OWN inboxes silently delete everyone else's queued mail
+    (PoC: 80 accounts, the victim's 3 envelopes: 0 delivered, every flood POST
+    200). Eviction now takes from the HEAVIEST inbox, so attackers sitting at
+    their per-inbox cap evict each other, and a victim holding one small
+    envelope survives however long the flood runs."""
+    _clear_mailbox()
+    n = config.MIN_ENVELOPE_BYTES
+    monkeypatch.setattr(config, "MAX_MAILBOX_PER_RECIPIENT_BYTES", 4 * n)
+    monkeypatch.setattr(config, "MAX_MAILBOX_TOTAL_BYTES", 13 * n)
+    monkeypatch.setattr(mailbox._post_limiter, "_refill", 0.0)
+    victim = _register("f1-victim")
+    attackers = [_register(f"f1-att{i}") for i in range(5)]
+
+    def post(u, fill):
+        return client.post(f"/api/mailbox/{u['username']}", params={"t": u["token"]},
+                           json={"envelope": _env(n, fill)}).status_code
+
+    assert post(victim, "V") == 200                      # queued BEFORE the flood: the oldest row
+    for a in attackers[:3]:                              # fill the budget, attackers at their cap
+        for _ in range(4):
+            assert post(a, "Z") == 200
+    codes = []
+    for i in range(60):                                  # keep flooding past a full budget
+        mailbox._post_limiter._buckets.clear()
+        codes.append(post(attackers[i % 5], "Z"))
+    assert 200 in codes, f"precondition: the flood kept being accepted (evicting): {codes}"
+    got = client.get("/api/mailbox", headers=_auth(_login(victim))).json()["messages"]
+    assert [m["envelope"][0] for m in got] == ["V"], "the victim's queued envelope was evicted by the flood"
+    _clear_mailbox()
 
 
 def test_sqlite_waits_for_the_lock_and_maps_failure_to_a_bare_503(monkeypatch, caplog):
