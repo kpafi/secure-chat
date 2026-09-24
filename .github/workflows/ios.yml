@@ -107,10 +107,17 @@ jobs:
 
       - name: Pick a simulator
         id: sim
+        timeout-minutes: 6
         run: |
           SDK=$(xcrun --sdk iphonesimulator --show-sdk-version)
           UDID=$(xcrun simctl list devices available -j | python3 ios/scripts/pick-simulator.py "$SDK")
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          # Boot it here: a simulator xcodebuild boots itself is shut down again
+          # after the tests, and simctl calls against the re-booted device hung
+          # in the cold-relaunch step (CI runs 13, 14). One it did not boot, it
+          # leaves running.
+          perl -e 'alarm shift; exec @ARGV' 60 xcrun simctl boot "$UDID" || true
+          perl -e 'alarm shift; exec @ARGV' 240 xcrun simctl bootstatus "$UDID" -b
 
       - name: Build and test on the simulator
         timeout-minutes: 20
@@ -143,7 +150,15 @@ jobs:
           lim 180 xcrun simctl bootstatus "$UDID" -b
           sleep 10
           lim 30 xcrun simctl terminate "$UDID" org.securechat.app || true
-          DATA=$(lim 30 xcrun simctl get_app_container "$UDID" org.securechat.app data)
+          lim 15 xcrun simctl list devices | grep "$UDID" || true
+          DATA=$(lim 30 xcrun simctl get_app_container "$UDID" org.securechat.app data) || DATA=
+          if [ -z "$DATA" ]; then
+            # Same directory, read from disk: the container's metadata plist names the bundle id.
+            META=$(grep -l org.securechat.app "$HOME/Library/Developer/CoreSimulator/Devices/$UDID/data/Containers/Data/Application"/*/.com.apple.mobile_container_manager.metadata.plist 2>/dev/null | head -1 || true)
+            [ -n "$META" ] && DATA=$(dirname "$META")
+          fi
+          echo "data container: $DATA"
+          [ -d "$DATA/Documents" ] || { echo "no data container"; exit 1; }
           rm -f "$DATA/Documents/persist-probe.txt"
           launched=
           for attempt in 1 2 3; do
