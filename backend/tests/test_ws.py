@@ -18,7 +18,10 @@ from pathlib import Path
 os.environ.setdefault("SECURE_CHAT_DB", os.path.join(tempfile.mkdtemp(), "test_ws.db"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import threading  # noqa: E402
+
 import pytest  # noqa: E402
+import starlette.testclient  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
@@ -26,7 +29,70 @@ import config  # noqa: E402
 import main  # noqa: E402
 from main import app  # noqa: E402
 
+# ONE event loop for every socket in this module. A bare `TestClient(app)`
+# gives each websocket_connect() its own blocking portal — its own event loop
+# in its own thread. The relay then writes into a peer's socket from the
+# OTHER socket's loop (the owner's coroutine admits the guest and forwards
+# frames to it), i.e. it sets an anyio/asyncio wake-up from a foreign thread.
+# That is not thread-safe: the peer's loop, asleep in select(), is never
+# woken, and the test's receive_text() waits until that loop wakes for its own
+# reasons — the guest's read timeout: 120 s pending (PENDING_TIMEOUT_SEC) or
+# 900 s idle (IDLE_TIMEOUT_SEC). That was the intermittent "hang" in this file
+# (stack dump: main thread in receive_text, the session's loop idle in
+# select). uvicorn runs every socket on one loop, so production never had
+# this; entering the client makes the tests match it.
+class _GracefulSession(starlette.testclient.WebSocketTestSession):
+    """A test socket that leaves the way a real client does.
+
+    Starlette's session __exit__ sends websocket.disconnect and then at once
+    CANCELS the server task. If the cancel wins, the relay's `finally`
+    (registry.leave: the "withdrawn" notice, closing orphaned waiters) runs
+    under cancellation, its awaits abort, and the peer waits forever for a
+    notice that was never sent — the second intermittent hang in this file
+    (owner blocked in receive_text in test_owner_is_told_when_a_waiter_departs,
+    one idle loop). uvicorn delivers a disconnect as a message and lets the
+    handler finish; so do we: disconnect, wait for the handler to return (up
+    to 5 s), then let Starlette cancel what is left.
+    """
+
+    def __init__(self, app, scope, portal_factory):
+        self._handler_done = threading.Event()
+
+        async def app_then_signal(scope, receive, send):
+            try:
+                await app(scope, receive, send)
+            finally:
+                self._handler_done.set()
+
+        super().__init__(app_then_signal, scope, portal_factory)
+
+    def __exit__(self, *exc):
+        try:
+            self.close(1000)
+        except Exception:
+            pass
+        self._handler_done.wait(5)
+        return super().__exit__(*exc)
+
+
+# TestClient builds sessions through this module global.
+starlette.testclient.WebSocketTestSession = _GracefulSession
+
 client = TestClient(app)
+client.__enter__()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _close_shared_event_loop():
+    yield
+    client.__exit__(None, None, None)
+
+
+def test_all_sockets_share_one_event_loop():
+    # Guard for the comment above: without the shared portal every session
+    # gets its own loop again and cross-socket delivery can stall for minutes.
+    assert client.portal is not None
+
 
 _room_seq = 0
 
