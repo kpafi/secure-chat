@@ -10,6 +10,7 @@ on:
   push:
     paths:
       - "ios/**"
+      - "!ios/**/*.md"
       - ".github/workflows/ios.yml"
   workflow_dispatch:
 
@@ -85,10 +86,12 @@ jobs:
       - name: Pick a simulator
         id: sim
         run: |
-          UDID=$(xcrun simctl list devices available -j | python3 ios/scripts/pick-simulator.py)
+          SDK=$(xcrun --sdk iphonesimulator --show-sdk-version)
+          UDID=$(xcrun simctl list devices available -j | python3 ios/scripts/pick-simulator.py "$SDK")
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
 
       - name: Build and test on the simulator
+        timeout-minutes: 20
         env:
           TEST_RUNNER_SC_TEST_RELAY: http://127.0.0.1:8000
           TEST_RUNNER_SC_SHOT_DIR: ${{ github.workspace }}/shots
@@ -100,13 +103,17 @@ jobs:
             -destination "id=${{ steps.sim.outputs.udid }}" \
             -resultBundlePath /tmp/SecureChat.xcresult \
             -parallel-testing-enabled NO \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 180 \
+            -maximum-test-execution-time-allowance 300 \
             CODE_SIGN_IDENTITY=- \
             | tee /tmp/xcodebuild-test.log | grep -E "^(Test Case|Test Suite|.*error:|.*warning: .*Swift|\*\*)" || true
           grep -q "\*\* TEST SUCCEEDED \*\*" /tmp/xcodebuild-test.log
 
       - name: Cold relaunch keeps the client's storage
+        timeout-minutes: 5
         run: |
           UDID=${{ steps.sim.outputs.udid }}
+          xcrun simctl bootstatus "$UDID" -b
           xcrun simctl terminate "$UDID" org.securechat.app || true
           DATA=$(xcrun simctl get_app_container "$UDID" org.securechat.app data)
           rm -f "$DATA/Documents/persist-probe.txt"
@@ -121,6 +128,7 @@ jobs:
           test "$(cat "$DATA/Documents/persist-probe.txt")" = "persist-ok"
 
       - name: Build the unsigned device IPA (Release)
+        timeout-minutes: 10
         run: |
           set -o pipefail
           xcodebuild build \
@@ -130,11 +138,13 @@ jobs:
             | tail -n 5
           APP=/tmp/sc-release/Release-iphoneos/SecureChat.app
           # The Release binary must not carry the debug-only test hooks.
-          if strings "$APP/SecureChat" | grep -q "SC_PERSIST_PROBE\|SC_TEST_RELAY"; then
+          if strings "$APP/SecureChat" | grep -q "SC_PERSIST_PROBE\|SC_TEST_RELAY\|DebugHooks\|persist-probe"; then
             echo "debug hooks leaked into Release"; exit 1
           fi
           test -f "$APP/web/index.html"
-          ! ls "$APP/web" | grep -q "\.test\.mjs$"
+          if find "$APP/web" -name "*.test.mjs" -o -name "package*.json" | grep -q .; then
+            echo "test files or manifests bundled"; exit 1
+          fi
           mkdir -p /tmp/ipa/Payload && cp -R "$APP" /tmp/ipa/Payload/
           (cd /tmp/ipa && zip -qry "$GITHUB_WORKSPACE/SecureChat-unsigned.ipa" Payload)
           shasum -a 256 SecureChat-unsigned.ipa | tee SecureChat-unsigned.ipa.sha256

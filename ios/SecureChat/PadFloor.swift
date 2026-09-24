@@ -72,8 +72,13 @@ final class PadFloor {
         // permanently TAMPERED without anything having been tampered with;
         // refuse instead (still TAMPERED, fail closed, but no new key is
         // written, so restoring the Keychain restores the floors).
+        // The key is cached once found: one Keychain query per launch, not
+        // one per floor call on the main thread.
+        var cached: SymmetricKey?
         return PadFloor(fileURL: file, keyProvider: {
-            PadFloor.keychainKey(create: !FileManager.default.fileExists(atPath: file.path))
+            if let k = cached { return k }
+            cached = PadFloor.keychainKey(create: !FileManager.default.fileExists(atPath: file.path))
+            return cached
         })
     }()
 

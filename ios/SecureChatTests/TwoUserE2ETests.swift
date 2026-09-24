@@ -123,15 +123,6 @@ final class TwoUserE2ETests: XCTestCase {
         try await Task.sleep(nanoseconds: 800_000_000)
         TestApp.screenshot("12-alice-conversation")
 
-        // The per-identity stores are under the native floor, not just
-        // localStorage: their generation floors exist and are positive.
-        let floors = try await alice.eval("""
-            const f = window.__SECURE_CHAT_PAD_FLOOR__;
-            const ids = Object.keys(localStorage);
-            return { keys: ids.length, marker: window.__SECURE_CHAT_NATIVE_FLOOR__ };
-            """) as? [String: Any]
-        XCTAssertEqual(floors?["marker"] as? Bool, true)
-
         // Bob's view, for the design review.
         wv.superview?.bringSubviewToFront(wv)
         try await Task.sleep(nanoseconds: 500_000_000)

@@ -62,4 +62,11 @@ final class RelayUrlsTests: XCTestCase {
         XCTAssertTrue(csp.hasPrefix("default-src 'none';"))
         XCTAssertFalse(csp.contains("unsafe"))
     }
+
+    @MainActor
+    func testPageZoomFollowsDynamicType() {
+        XCTAssertEqual(MainViewController.pageZoom(for: .large), 1.0)
+        XCTAssertGreaterThan(MainViewController.pageZoom(for: .accessibilityExtraExtraExtraLarge), 1.5)
+        XCTAssertLessThan(MainViewController.pageZoom(for: .extraSmall), 1.0)
+    }
 }

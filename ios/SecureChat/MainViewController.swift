@@ -20,6 +20,32 @@ final class MainViewController: UIViewController {
     /// Latched once the "cannot start securely" screen is up (Android refuseToRun).
     private(set) var refusedToRun = false
     private var startedLoading = false
+    private var crashTimes: [Date] = []
+
+    /// Dynamic Type for the page (cold review r1 M5). WKWebView ignores the
+    /// system text size, unlike Android's WebView, so the page is zoomed with
+    /// it: the whole layout scales, as with browser zoom.
+    static func pageZoom(for category: UIContentSizeCategory) -> CGFloat {
+        switch category {
+        case .extraSmall: return 0.85
+        case .small: return 0.9
+        case .medium: return 0.95
+        case .large: return 1.0
+        case .extraLarge: return 1.1
+        case .extraExtraLarge: return 1.2
+        case .extraExtraExtraLarge: return 1.3
+        case .accessibilityMedium: return 1.45
+        case .accessibilityLarge: return 1.6
+        case .accessibilityExtraLarge: return 1.75
+        case .accessibilityExtraExtraLarge: return 1.9
+        case .accessibilityExtraExtraExtraLarge: return 2.0
+        default: return 1.0
+        }
+    }
+
+    private func applyTextSize() {
+        webView?.pageZoom = Self.pageZoom(for: traitCollection.preferredContentSizeCategory)
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -42,13 +68,20 @@ final class MainViewController: UIViewController {
         view.addSubview(wv)
         // Inside the safe area: the page does not use viewport-fit=cover, so
         // the notch and home-indicator strips are native bg, not page.
+        // Bottom follows the keyboard (keyboardLayoutGuide sits on the safe
+        // area while it is hidden), so the page's fixed tab bar and composer
+        // stay above it — Android's adjustResize, not an overlaid keyboard.
         NSLayoutConstraint.activate([
             wv.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            wv.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+            wv.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor),
             wv.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
             wv.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
         ])
         webView = wv
+        applyTextSize()
+        registerForTraitChanges([UITraitPreferredContentSizeCategory.self]) { (self: Self, _) in
+            self.applyTextSize()
+        }
 
         navDelegate.onClientLoaded = { [weak self] _, ok in
             guard let self = self else { return }
@@ -56,8 +89,13 @@ final class MainViewController: UIViewController {
         }
         navDelegate.onProcessTerminated = { [weak self] _ in
             // The unlocked identity and live sessions were in that process and
-            // are gone either way; reload to the locked start screen.
+            // are gone either way; reload to the locked start screen — but not
+            // forever: a page that kills its process on every load gets three
+            // tries a minute, then the refusal screen.
             guard let self = self, !self.refusedToRun, let relay = Prefs.relay() else { return }
+            let now = Date()
+            self.crashTimes = self.crashTimes.filter { now.timeIntervalSince($0) < 60 } + [now]
+            if self.crashTimes.count > 3 { self.refuseToRun(); return }
             self.load(relay)
         }
     }
@@ -113,12 +151,27 @@ final class MainViewController: UIViewController {
         stack.axis = .vertical
         stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(stack)
+        // Scrollable, so the largest accessibility text sizes still fit.
+        let scroll = UIScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.alwaysBounceVertical = false
+        view.addSubview(scroll)
+        scroll.addSubview(stack)
+        let centre = stack.centerYAnchor.constraint(equalTo: scroll.frameLayoutGuide.centerYAnchor)
+        centre.priority = .defaultLow
         NSLayoutConstraint.activate([
+            scroll.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+            scroll.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             stack.leadingAnchor.constraint(equalTo: view.readableContentGuide.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: view.readableContentGuide.trailingAnchor),
-            stack.centerYAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerYAnchor),
+            stack.topAnchor.constraint(greaterThanOrEqualTo: scroll.contentLayoutGuide.topAnchor, constant: 24),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: scroll.contentLayoutGuide.bottomAnchor, constant: -24),
+            scroll.contentLayoutGuide.heightAnchor.constraint(greaterThanOrEqualTo: scroll.frameLayoutGuide.heightAnchor),
+            centre,
         ])
+        UIAccessibility.post(notification: .screenChanged, argument: title)
     }
 
     private func makeMenu() -> UIMenu {

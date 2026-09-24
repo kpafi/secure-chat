@@ -52,7 +52,7 @@ final class Page {
             try await Task.sleep(nanoseconds: 250_000_000)
         }
         XCTFail("[\(label)] timed out waiting for: \(expr)", file: file, line: line)
-        throw XCTSkip("aborting after timeout")
+        throw CancellationError()
     }
 
     func type(_ selector: String, _ text: String) async throws {
@@ -115,7 +115,9 @@ enum TestApp {
             }
             try await Task.sleep(nanoseconds: 250_000_000)
         }
-        throw XCTSkip("the app's client never loaded — is SC_TEST_RELAY set?")
+        // A failure, not a skip: a skipped suite would read as green.
+        XCTFail("the app's client never loaded — is SC_TEST_RELAY set?")
+        throw CancellationError()
     }
 
     /// Save a PNG of the key window to $SC_SHOT_DIR (the CI uploads the folder).

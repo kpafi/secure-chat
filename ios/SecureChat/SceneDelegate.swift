@@ -58,7 +58,13 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     }
 
     private func showShield() {
-        guard let window = window, shield == nil else { return }
+        guard let window = window else { return }
+        if let shield = shield {
+            // Already up: keep the label current (recording may have started).
+            (shield.subviews.first(where: { $0 is UILabel }) as? UILabel)?.isHidden = !isCaptured
+            shield.accessibilityLabel = shieldLabel
+            return
+        }
         let v = UIView(frame: window.bounds)
         v.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         v.backgroundColor = Theme.bg
@@ -74,16 +80,39 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
             lock.widthAnchor.constraint(equalToConstant: 44),
             lock.heightAnchor.constraint(equalToConstant: 44),
         ])
+        // While recording/mirroring the user is looking at this: say why.
+        let note = UILabel()
+        note.text = "Hidden while the screen is being recorded or shared"
+        note.textColor = Theme.muted
+        note.font = .preferredFont(forTextStyle: .callout)
+        note.adjustsFontForContentSizeCategory = true
+        note.numberOfLines = 0
+        note.textAlignment = .center
+        note.isHidden = !isCaptured
+        note.translatesAutoresizingMaskIntoConstraints = false
+        v.addSubview(note)
+        NSLayoutConstraint.activate([
+            note.topAnchor.constraint(equalTo: lock.bottomAnchor, constant: 16),
+            note.leadingAnchor.constraint(equalTo: v.readableContentGuide.leadingAnchor),
+            note.trailingAnchor.constraint(equalTo: v.readableContentGuide.trailingAnchor),
+        ])
         // Hide what is underneath from VoiceOver too while covered.
         v.accessibilityViewIsModal = true
         v.isAccessibilityElement = true
-        v.accessibilityLabel = isCaptured ? "Hidden while the screen is being recorded or shared" : "secure-chat"
+        v.accessibilityLabel = shieldLabel
         window.addSubview(v)
         shield = v
+        UIAccessibility.post(notification: .screenChanged, argument: v)
+    }
+
+    private var shieldLabel: String {
+        isCaptured ? "secure-chat is hidden while the screen is being recorded or shared" : "secure-chat"
     }
 
     private func hideShield() {
-        shield?.removeFromSuperview()
-        shield = nil
+        guard let shield = shield else { return }
+        shield.removeFromSuperview()
+        self.shield = nil
+        UIAccessibility.post(notification: .screenChanged, argument: nil)
     }
 }

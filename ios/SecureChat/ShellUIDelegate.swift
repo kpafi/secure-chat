@@ -35,6 +35,17 @@ final class ShellUIDelegate: NSObject, WKUIDelegate {
         return top
     }
 
+    /// Present `alert`; if UIKit refuses (another presentation raced us), the
+    /// alert never shows and `fallback` answers the page instead. `Once`
+    /// guarantees WebKit's handler runs exactly once either way — a dropped
+    /// handler raises NSInternalInconsistencyException (cold review r1 M1).
+    private func show(_ alert: UIAlertController, on top: UIViewController, fallback: @escaping () -> Void) {
+        top.present(alert, animated: true)
+        DispatchQueue.main.async {
+            if alert.presentingViewController == nil && !alert.isBeingPresented { fallback() }
+        }
+    }
+
     // No pop-ups, ever: window.open / target=_blank get nothing.
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
@@ -43,19 +54,21 @@ final class ShellUIDelegate: NSObject, WKUIDelegate {
 
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
-        guard WebShell.isAppMainFrame(frame), let top = top() else { completionHandler(); return }
+        let done = Once<Void> { _ in completionHandler() }
+        guard WebShell.isAppMainFrame(frame), let top = top() else { done.run(()); return }
         let a = UIAlertController(title: nil, message: message, preferredStyle: .alert)
-        a.addAction(UIAlertAction(title: "OK", style: .default) { _ in completionHandler() })
-        top.present(a, animated: true)
+        a.addAction(UIAlertAction(title: "OK", style: .default) { _ in done.run(()) })
+        show(a, on: top) { done.run(()) }
     }
 
     func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String,
                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
-        guard WebShell.isAppMainFrame(frame), let top = top() else { completionHandler(false); return }
+        let done = Once<Bool>(completionHandler)
+        guard WebShell.isAppMainFrame(frame), let top = top() else { done.run(false); return }
         let a = UIAlertController(title: nil, message: message, preferredStyle: .alert)
-        a.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in completionHandler(false) })
-        a.addAction(UIAlertAction(title: "OK", style: .default) { _ in completionHandler(true) })
-        top.present(a, animated: true)
+        a.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in done.run(false) })
+        a.addAction(UIAlertAction(title: "OK", style: .default) { _ in done.run(true) })
+        show(a, on: top) { done.run(false) }
     }
 
     func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String,
@@ -70,7 +83,8 @@ final class ShellUIDelegate: NSObject, WKUIDelegate {
             completionHandler(FloorBridge.answer(prompt, floor: floor))
             return
         }
-        guard WebShell.isAppMainFrame(frame), let top = top() else { completionHandler(nil); return }
+        let done = Once<String?>(completionHandler)
+        guard WebShell.isAppMainFrame(frame), let top = top() else { done.run(nil); return }
 
         // Audit 2026-07-18 L-02 / pentest 2026-07-25 F-08: mask secrets. The
         // explicit mark decides; the word "passphrase" is a fail-SECURE
@@ -90,10 +104,21 @@ final class ShellUIDelegate: NSObject, WKUIDelegate {
             field.smartQuotesType = .no
             field.accessibilityLabel = secret ? "Secret" : "Answer"
         }
-        a.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in completionHandler(nil) })
+        a.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in done.run(nil) })
         a.addAction(UIAlertAction(title: "OK", style: .default) { [weak a] _ in
-            completionHandler(a?.textFields?.first?.text ?? "")
+            done.run(a?.textFields?.first?.text ?? "")
         })
-        top.present(a, animated: true)
+        show(a, on: top) { done.run(nil) }
+    }
+}
+
+/// Calls the wrapped completion handler at most once.
+final class Once<T> {
+    private var handler: ((T) -> Void)?
+    init(_ handler: @escaping (T) -> Void) { self.handler = handler }
+    func run(_ value: T) {
+        let h = handler
+        handler = nil
+        h?(value)
     }
 }
