@@ -33,9 +33,16 @@ backups) is fixed. Two of my own fixes regressed and were caught by the next pas
 that silently cancelled a confirm; a crash counter reset that disabled the crash-loop limit) —
 both now have tests. Unverified without a device: backup exclusion in a real backup/Quick Start,
 whether the app-switcher snapshot contains the keyboard, keychain behaviour under re-signing.
-Known design debt and CI notes: end of `ios/README.md`. Pre-existing, NOT fixed here:
-`backend/tests/test_ws.py::test_msg_relayed_verbatim_between_peers` intermittently hangs
-(reproduced on master), so the iOS gate runs only the iOS-relevant relay tests.
+Known design debt and CI notes: end of `ios/README.md`.
+
+**Relay test hangs fixed (same branch).** `backend/tests/test_ws.py` hung intermittently (120 s
+to 15+ min, also on master). Two test-harness bugs, both shown by faulthandler stack dumps, neither
+in the relay: every test socket had its own event loop (cross-loop wake-ups were lost until a read
+timeout fired), and Starlette cancelled the server task on disconnect before the relay's `finally`
+could send its notices. Fixed in the harness (shared loop; sessions wait for the handler before
+the cancel). 40 consecutive runs of test_ws.py clean (~12 s each). Also a boot-time flake in
+`test_accounts.py` (0.0 prune sentinel vs monotonic time). New `.github/workflows/backend.yml`
+runs the full relay + client suites on Linux for `backend/` and `client/` changes.
 
 **CI state at hand-off.** Run 9 (0ac36bb): gate green, 41/41 simulator tests, cold relaunch keeps
 storage, unsigned Release IPA built (debug hooks absent), screenshots published. 9 runs used about
