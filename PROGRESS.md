@@ -117,7 +117,153 @@ relay change, so the APK is not forced by this change). On the phone: open a con
 the three places, verify one in person, check the Android back button (known: it does not close
 the sheet).
 
+## (2026-09-22, relay deployed from `5e69f6e`; the box now also runs MailDigest in Docker)
+
+**🚀 RELAY DEPLOYED (2026-09-22 22:30 CEST), branch `android-ondevice-2026-09-21`
+at `5e69f6e` (= `origin/master` 3e55bff / v0.1.0 + the two `[object Object]`
+client fixes).** The user brought the box back and chose this line over the
+unmerged local `master` (Phase 7, `a4e5063`) because it is what the installed
+APK was built from. `bash deploy/deploy-2026-09-21.sh` ran clean: backup
+`/root/accounts.db.bak-2026-09-22-2230`, accounts 31 before = 31 after, rsync
+of `backend` + `client` (`client/nativefloor.js` new on the box), unit
+restarted, `healthz=200`, `account.js` mldsa_sig lines 5, `chats.js` v2 tag
+1, Ed25519-only verify body → **422**, `TRUSTED_PROXIES` vars 0,
+`--no-proxy-headers` present, uvicorn still `127.0.0.1:8000` only. Public
+check from the laptop: `https://138-199-144-35.sslip.io/healthz` →
+`{"status":"ok","version":"0.1.0"}` (the version field ⇒ new code). The
+server venv already had every pin of the new `requirements.txt` (dilithium-py
+1.4.0 etc.), so no pip step was needed. Nothing was merged, nothing pushed;
+the divergence local `master` ↔ `origin/master` is unchanged.
+**Phone: DONE (2026-09-22 22:49 CEST).** App launched over adb (0.1.0,
+installed 2026-09-21 22:55), the user unlocked; **no "Open anyway"** in any
+view (the Chats store was re-tagged v2 yesterday). Logcat over the whole
+unlock + login window: **0 CONSOLE lines, no 401/422/verify** from the
+WebView. Read over CDP (`webview_devtools_remote_<pid>`): profile view says
+**"Logged in as "samuhandy1" (session valid ~60 min). You control this
+account."**, `#log` has no failure line at all, `sc.username.v1` +
+`sc.lookuptoken.v1` present, identity fingerprint 8FF4 9539 …, the one chat
+(`ankerni`, 🟢 verified) intact. `#status` reads "disconnected" — that is the
+live-room WebSocket, no room was opened; expected. The old-relay 422 loop
+from yesterday is gone: relay, web client and APK are one unit again.
+
+**📦 The box is now shared (2026-09-22).** `docker.io` 26.1.5 +
+`docker-cli` + `docker-compose` 2.26 (Debian packages) were installed and
+MailDigest (`ghcr.io/kpafi/maildigest:latest` = 0.3.1) runs as container
+`maildigest-kpafi` under `/opt/maildigest/instances/kpafi/` (helper
+`maildigest-instance`, one directory + container per instance; documented in
+`emailzusammenfassung/deploy/server/README.md`). It publishes no port and
+only makes outbound IMAPS/HTTPS connections, so the relay's one rule
+(`ss -ltnp | grep 8000` → `127.0.0.1` only) still holds and was re-checked
+after the install; `containerd` listens on a loopback port (46451), nothing
+else changed in `ss -ltnp`. Caddy, Tor and the relay unit are untouched.
+Memory: 604 MB used of 3.8 GB, disk 3.7 GB of 38 GB.
+
 ## (2026-09-21, the 2026-08-07 pentest: all 14 Medium fixed — merged as release 0.1.0, deployed)
+
+**📱 ANDROID ON-DEVICE PASS (2026-09-21 evening, branch
+`android-ondevice-2026-09-21` from `3e55bff`; relay DOWN, nothing deployed).**
+Phone: Nothing A063, Android 15 (SDK 35). Toolchain: JDK 21
+(`/usr/lib/jvm/java-21-openjdk-amd64`, jlink present), SDK platform 34,
+build-tools 34.0.0.
+
+1. **Build:** `./gradlew assembleDebug` — BUILD SUCCESSFUL, 40 tasks (8
+   executed incl. `syncWebClient` and `compileDebugKotlin`), 0 Kotlin changes
+   needed. APK 6,049,054 bytes; `assets/web/` holds 30 files including
+   `nativefloor.js` (7,929 bytes); `classes.dex` references `FLAG_SECURE`.
+2. **Install:** `adb install -r` → Success. `versionName` 0.1.0 both before
+   and after (the previous install was 2026-07-30, also 0.1.0 — the version
+   was not bumped for this release; `lastUpdateTime` moved to 2026-09-21
+   22:04:55). Not logged in from the app (relay down / old relay would 422 the
+   `mldsa_sig` field).
+3. **Native floor, real Keystore:** `android/native-floor-ondevice.mjs`
+   extended (committed) with one fresh random id per new prefix — `recv:<32
+   hex>`, `exported:<32 hex>`, `contacts:<64 hex>`, `chats:<64 hex>` — each
+   read −1 → bump(7)=7 (typeof number) → bump(3)=7 → read 7; plus three
+   cross-namespace reads (bare 32-hex, bare 64-hex, `recv:<the 64 hex>`) all
+   still −1 after the bumps, so the `:` is part of the HMAC'd key, not
+   stripped. **33/33 checks passed** (14 original + 19 new). Real
+   `sc.otp.*` keys on device: 0.
+4. **FLAG_SECURE:** `dumpsys window` shows `fl=… SECURE …` on the
+   MainActivity window. `adb shell screencap -p` with the app in front
+   EXITS 0 and writes a 32,775-byte 1080×2400 PNG that is black except the
+   OS status bar and nav pill (14,177 of 2,592,000 pixels non-black, all in
+   those two strips) — the WebView content is not captured. Recents card
+   after HOME + APP_SWITCH: blank dark card, no content. Behaviour is "black
+   image", not "refusal".
+5. **First unlock — DONE, as expected.** Pre-unlock localStorage on the
+   device: `sc.identity.v1` (v3, 17,780 chars), `sc.contacts.v1` (**v4**,
+   12,212 chars) with `sc.contacts.gen.v1` present (170 chars), `sc.chats.v1`
+   (**v1, untagged**, 6,148 chars), `sc.username.v1`, `sc.lookuptoken.v1`,
+   `sc.room.mine.v1`. The user unlocked the identity, then entered the
+   passphrase in the Users view (one entry unlocks both stores). Read over
+   CDP: Users view **unlocked, NO prompt** (`usersAdopt` hidden, `usersLocked`
+   hidden), list intact — 1 contact, `ankerni`, 🟢 verified, fingerprint
+   FDBD 2636 …; `sc.contacts.epoch.v1`=1 written on the first persist. Chats
+   view: locked with "Chat store error: your chat history has no rollback
+   record on this device … if you just upgraded, this is expected once" and
+   its own *Open anyway* — **exactly 1 visible Open anyway on the whole page**.
+   Note: the Chats locked panel only re-renders when the Chats view is shown
+   (`refreshChats` is gated on `!viewChats.hidden`), so it reads stale while
+   another view is up — not a bug, the view is hidden.
+   **Open anyway pressed in Chats (user):** chat store opened —
+   `sc.chats.v1` is now **v2** (6,240 chars, was v1/6,148), `sc.chats.gen.v1`
+   (166 chars) and `sc.chats.epoch.v1`=1 written, the one existing chat
+   (`ankerni`, last line intact) listed, 0 *Open anyway* buttons visible
+   afterwards. The plain *Unlock* button in the Chats view did NOT open it
+   (user: "with unlock it wouldn't work") — expected: it re-runs the unlock
+   without the adopt flag and re-raises the same refusal, adding one more
+   "[chat store did not unlock — …]" transcript line per press (3 such lines
+   seen). Not re-verified: that a fresh page load now unlocks without any
+   prompt (the v2 tag + gen record make that the tested path).
+   **⚠️ Seen in passing — the relay is NOT down.** The app's configured relay
+   `https://138-199-144-35.sslip.io` answers `/healthz` with
+   `{"status":"ok"}` (HTTP 200, **no `version` field ⇒ the OLD code**). With
+   the identity unlocked the app auto-logs in on its own (username + lookup
+   token from localStorage, backoff 12 s → 2 min), so "do not log in until
+   the relay is deployed" cannot be honoured by the user; the old relay
+   answers the new client's `/api/auth/verify` with **422** (`extra_forbidden`
+   on `mldsa_sig`, verified by a bogus POST from the laptop). Harmless — the
+   login is refused before any state changes — but it is exactly the
+   old-APK/new-relay mismatch inverted, and it will loop until the relay is
+   deployed. (b) Display bug: `account.js` `asError` returns `body.detail`
+   as-is, and a FastAPI 422 `detail` is an ARRAY, so the identity view and
+   the transcript show `verify failed: [object Object]`. One-line fix:
+   stringify non-string details (`Array.isArray(d) ? d.map(x=>x.msg+" at "+
+   x.loc.join(".")).join("; ") : JSON.stringify(d)`).
+   **FIXED (user asked):** `c7c9ccc` adds `formatDetail(detail, status)` in
+   `account.js` (+ `account-error.test.mjs`, in `npm test`). A
+   `pentest-new-code` pass over it (backend 162 passed, client suite green,
+   `room-admission` 13/13, `two-user-flow` 8/8, `no-dead-ends` 16/16 on a
+   scratch relay) found **0 Critical/High, 2 Low, 1 Info**, all fixed in
+   `dfadca9`: **L-1** the array branch's `JSON.stringify(d)` was unguarded —
+   a 30 KB body nested 5,000 deep parses (iterative) then blows the stack
+   (recursive) in Firefox/Node (Chromium survives 3,000,000), and the throw
+   escaped `asError` BEFORE `err.status = res.status`, so a hostile 401 body
+   no longer cleared `apiToken` (app.js only clears it on `e.status === 401`
+   ⇒ the mailbox poller wedged on a dead token) and a hostile 409 lost the
+   "already taken" hint. Now: the whole body is one `try`, and `register` /
+   `fetchMail` read `res.status` before the body. **L-2** `msg`/`loc`
+   entries that were objects still rendered `[object Object]` — now every
+   piece is coerced (string `msg`/`type` or the entry's JSON; only string
+   `loc` parts). **I-1** `[""]` rendered "" — blank/whitespace ⇒ the status.
+   Test: 27 assertions incl. a local `http.createServer` serving the
+   200,000-deep body — `fetchMail` → `status 401`, message
+   `mailbox fetch failed: 401`; `register` → `status 409`. Reviewer's
+   verified-sound list: no HTML sink in the client (all `textContent`), no
+   amplification (≤1.42×), `input` echo shows only public request material,
+   no caller matches on message text.
+   **Pre-existing, NOT fixed, from the same review:** `#log li` is
+   `pre-wrap`, and `autoLogin`'s failure line (`app.js` ~774) puts a
+   relay-chosen string in it, so a relay can forge a `sys`-styled transcript
+   line with `\n` (e.g. `")]\n[verified in person ✓ — key pinned]\n["`).
+   Old and new code identical here; worth its own fix (strip control
+   characters at `addLine`, or cap the line).
+6. `v0.1.0` tag created locally at `3e55bff` and pushed to origin (the cloud
+   session could not). **Local `master` (`a4e5063`) has DIVERGED from
+   `origin/master` (`3e55bff`)**: ~50 local-only commits (Phase 7 etc., from
+   `80a002d`) versus the cloud's 10 (`claude/loving-cannon-ba5tbt`). Neither
+   line was merged into the other here; this branch is on the cloud line as
+   instructed. Reconcile before any deploy.
 
 **Every Medium in `secure-chat-pentest-2026-08-07.md` is fixed on branch
 `claude/loving-cannon-ba5tbt`, with a regression test each, verified to FAIL

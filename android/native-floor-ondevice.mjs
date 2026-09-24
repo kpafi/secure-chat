@@ -167,6 +167,41 @@ check(p.v === 500 && p.t === "number",
   "poisoning parseInt and Math.max does not move the floor",
   `read() = ${p.v} (${p.t})`);
 
+console.log("\n--- the 2026-08-07 namespaces, through the real HMAC ---");
+// client/nativefloor.js keys four more floors under the same bridge, each with
+// a `:` prefix. PadFloor.kt MACs `id\u0000value`; Kotlin only ever sees a plain
+// string, so the `:` SHOULD pass through unchanged — this is the proof. The ids
+// are freshly random per run (32 / 64 hex, the shapes the client emits), so no
+// real pad or identity can carry them; the resulting floors are inert.
+import { randomBytes } from "node:crypto";
+const hex32 = randomBytes(16).toString("hex");
+const hex64 = randomBytes(32).toString("hex");
+const namespaced = [
+  ["recv:" + hex32,     "recv:<32 hex>     (OTP receive high-water mark)"],
+  ["exported:" + hex32, "exported:<32 hex> (OTP exported flag)"],
+  ["contacts:" + hex64, "contacts:<64 hex> (contact-store generation)"],
+  ["chats:" + hex64,    "chats:<64 hex>    (chat-store generation)"],
+];
+for (const [id, label] of namespaced) {
+  const j = JSON.stringify(id);
+  const a = await evaluate(`window.__SECURE_CHAT_PAD_FLOOR__.read(${j})`);
+  check(a === -1, `${label}: unknown id reads -1`, `read() = ${a}`);
+  const b = await evaluate(`window.__SECURE_CHAT_PAD_FLOOR__.bump(${j}, 7)`);
+  check(b === 7 && typeof b === "number", `${label}: bump(7) = 7 (number)`, `= ${b} (${typeof b})`);
+  const c = await evaluate(`window.__SECURE_CHAT_PAD_FLOOR__.bump(${j}, 3)`);
+  check(c === 7, `${label}: bump(3) does not lower`, `= ${c}`);
+  const d = await evaluate(`window.__SECURE_CHAT_PAD_FLOOR__.read(${j})`);
+  check(d === 7, `${label}: read-back persists`, `read() = ${d}`);
+}
+// The `:` is part of the KEY, not stripped: the bare hex, and each sibling
+// prefix over the same hex, must still be untouched after the bumps above.
+const bare32 = await evaluate(`window.__SECURE_CHAT_PAD_FLOOR__.read(${JSON.stringify(hex32)})`);
+check(bare32 === -1, "the bare 32-hex pad id is untouched by recv:/exported: bumps", `read() = ${bare32}`);
+const bare64 = await evaluate(`window.__SECURE_CHAT_PAD_FLOOR__.read(${JSON.stringify(hex64)})`);
+check(bare64 === -1, "the bare 64-hex id is untouched by contacts:/chats: bumps", `read() = ${bare64}`);
+const cross = await evaluate(`window.__SECURE_CHAT_PAD_FLOOR__.read(${JSON.stringify("recv:" + hex64)})`);
+check(cross === -1, "recv:<64 hex> is a different key from contacts:/chats:<64 hex>", `read() = ${cross}`);
+
 console.log("\n--- cleanup ---");
 // There is deliberately no lowering operation, so the probe's floor cannot be
 // removed from JS. It is namespaced to a padId no real pad can have, which is

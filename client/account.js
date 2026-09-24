@@ -50,15 +50,49 @@ function registerMessageBytes(username, bundle) {
   return enc.encode([REGISTER_DOMAIN, username, bundle.ed, bundle.mldsa].join("\n"));
 }
 
+// Turn an error response into one line of text. The relay's own errors put a
+// string in `detail`; a FastAPI validation error (422) puts an ARRAY of
+// `{type, loc, msg}` objects there, and before 2026-09-21 that reached the
+// screen as "verify failed: [object Object]" (seen on the phone when the new
+// dual-signature client met the old relay). Never let a non-string through.
+export function formatDetail(detail, status) {
+  // Total: whatever shape the relay chooses, this returns a string and never
+  // throws (fix review 2026-09-21 L-1: an unguarded JSON.stringify on a deeply
+  // nested entry blew the stack, and the throw escaped asError BEFORE
+  // `err.status` was set — so a hostile 401 body stopped clearing apiToken).
+  // Every piece is coerced (L-2: `msg` or `loc` entries that are objects
+  // rendered "[object Object]" — the very bug this function exists to kill).
+  let text = "";
+  try {
+    if (typeof detail === "string") {
+      text = detail;
+    } else if (Array.isArray(detail)) {
+      text = detail.map((d) => {
+        if (!d || typeof d !== "object") return String(d);
+        const loc = Array.isArray(d.loc)
+          ? d.loc.filter((x) => typeof x === "string" && x !== "body").join(".")
+          : "";
+        const msg = ["msg", "type"].map((k) => d[k]).find((v) => typeof v === "string" && v);
+        return (msg || JSON.stringify(d)) + (loc ? " (" + loc + ")" : "");
+      }).filter((x) => x).join("; ");
+    } else if (detail && typeof detail === "object") {
+      text = JSON.stringify(detail);
+    }
+  } catch {
+    text = "";
+  }
+  return typeof text === "string" && text.trim() ? text : status + "";
+}
+
 async function asError(res) {
-  let detail = res.status + "";
+  let detail = null;
   try {
     const body = await res.json();
     if (body && body.detail) detail = body.detail;
   } catch {
     /* non-JSON error body */
   }
-  return detail;
+  return formatDetail(detail, res.status);
 }
 
 // Claim a username and bind it to this identity's public bundle. The DUAL
@@ -78,8 +112,9 @@ export async function register(base, identity, username) {
     body: JSON.stringify(body),
   });
   if (!res.ok) {
+    const status = res.status; // taken BEFORE the body is read — nothing in asError may lose it
     const err = new Error(await asError(res));
-    err.status = res.status;
+    err.status = status;
     throw err;
   }
   return res.json();
@@ -284,10 +319,11 @@ export async function fetchMail(base, sessionToken) {
     headers: { authorization: "Bearer " + sessionToken },
   });
   if (!res.ok) {
+    const status = res.status; // taken BEFORE the body is read — nothing in asError may lose it
     const err = new Error("mailbox fetch failed: " + (await asError(res)));
     // Session tokens expire (TOKEN_TTL_SEC). Surface the status so the caller
     // can re-login instead of silently never receiving mail again.
-    err.status = res.status;
+    err.status = status;
     throw err;
   }
   return (await res.json()).messages;
