@@ -236,13 +236,14 @@ h1, h2, p, ul, dl, dd { margin: 0; }
 .chatmode::before,
 .facts li::before,
 .hint.err::before,
-.hint.ok:not(#myHandleText)::before,
+.hint.ok:not(#myHandleText, #contactHandle)::before,
 .u-claim::before,
 .disclosure > summary::after,
 .composer button::before,
 #chatBack::before,
 #copyRoom::before,
 #copyHandle::before,
+#contactCopyHandle::before,
 #disconnect::before,
 .locked > .lead::before,
 .wordmark::after,
@@ -603,7 +604,7 @@ select option { background: var(--panel); color: var(--fg); }
 }
 /* Errors carry an icon so they do not rely on colour. */
 .hint.err:not(:empty),
-.hint.ok:not(:empty):not(#myHandleText) { display: flex; gap: var(--sp-2); }
+.hint.ok:not(:empty):not(#myHandleText, #contactHandle) { display: flex; gap: var(--sp-2); }
 .hint:empty::before { content: none; }
 .hint.err::before {
   --icon: var(--i-alert);
@@ -611,7 +612,7 @@ select option { background: var(--panel); color: var(--fg); }
   height: 16px;
   margin-top: 2px;
 }
-.hint.ok:not(#myHandleText)::before {
+.hint.ok:not(#myHandleText, #contactHandle)::before {
   --icon: var(--i-check);
   width: 14px;
   height: 14px;
@@ -804,43 +805,87 @@ select option { background: var(--panel); color: var(--fg); }
   border-radius: var(--r-m);
   box-shadow: var(--shadow-1);
 }
-/* A row: a 40px avatar disc (the initial app.js puts in `data-initial`),
-   then name + trust mark, the claim / warning / fingerprint lines, and the
-   actions on a line of their own under it all, right-aligned. Named areas
-   keep every part in its place whichever optional lines a row has; an
-   absent line is an empty 0px track (row-gap 0, the parts space themselves
-   with margins). The fingerprint track is the flexible one, so a spanning
-   avatar that is taller than the text adds its space under the text, never
-   between its lines. */
-.userlist > li {
-  display: grid;
-  grid-template-columns: var(--avatar) minmax(0, 1fr);
-  grid-template-rows: auto auto auto 1fr auto;
-  grid-template-areas:
-    "av head"
-    "av claim"
-    "av warn"
-    "av fp"
-    "act act";
-  align-items: start;
-  column-gap: var(--sp-3);
+/* A row. Users: its head is ONE button — a 40px avatar disc (the initial
+   app.js puts in `data-initial`), name + trust mark, a chevron — that opens
+   the contact's profile; the claim / warning lines, when a row has them,
+   sit under the name, outside the button (a security signal is never
+   behind a tap). Chats: the avatar is a button of its own (the profile) and
+   the rest of the row is the button that opens the conversation. Either
+   way the buttons span the row edge to edge, so the whole row is target. */
+.userlist > li { position: relative; }
+.userlist > li > :is(.u-open, .chatrow-open, .u-avatar) {
   min-height: var(--row-h);
+  height: auto;
   padding: var(--sp-3) var(--sp-4);
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  white-space: normal;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
 }
-.userlist > li > * + * { margin-top: var(--sp-2); }
-.userlist > li > .u-head { grid-area: head; }
-.userlist > li > .u-claim { grid-area: claim; }
-.userlist > li > .hint { grid-area: warn; }
-.userlist > li > .u-fp { grid-area: fp; }
-.userlist > li > .u-actions { grid-area: act; margin-top: var(--sp-3); }
-.userlist > li::before {
+.userlist > li > .u-open {
+  display: grid;
+  grid-template-columns: var(--avatar) minmax(0, 1fr) 16px;
+  align-items: center;
+  justify-content: stretch;
+  column-gap: var(--sp-3);
+  width: 100%;
+}
+.userlist > li > .u-open::after {
+  --icon: var(--i-chevron);
+  content: "";
+  width: 16px;
+  height: 16px;
+  color: var(--muted);
+  background: currentColor;
+  -webkit-mask: var(--icon) center / contain no-repeat;
+  mask: var(--icon) center / contain no-repeat;
+}
+/* A Users row hovers as one: a click anywhere on it opens the profile
+   (app.js forwards the claim / warning lines to the button). */
+.userlist > li:has(> .u-open) { cursor: pointer; }
+.userlist > li:has(> .u-open):hover,
+.chatrow:has(> .chatrow-open:hover) { background: var(--panel-2); }
+/* The Chats avatar answers on the disc itself (hot M7): hover, press, and
+   the focus ring round the disc, not a box round the column. */
+.chatrow > button.u-avatar:is(:hover, :active)::before { background: var(--panel-2); border-color: var(--muted); }
+.chatrow > button.u-avatar:focus-visible { outline: none; }
+.chatrow > button.u-avatar:focus-visible::before { outline: 2px solid var(--accent); outline-offset: 2px; }
+.userlist > li > .chatrow-open:focus-visible { outline-offset: -2px; background: var(--panel-2); }
+/* A Users row focuses as it hovers — as one, warning lines included (hot r2 m-b). */
+.userlist > li > .u-open:focus-visible { outline: none; }
+.userlist > li:has(> .u-open:focus-visible) { outline: 2px solid var(--accent); outline-offset: -2px; background: var(--panel-2); }
+/* The lines under a Users row's head: aligned with the name, not the disc. */
+.userlist > li > .u-open ~ * {
+  margin: calc(-1 * var(--sp-1)) var(--sp-4) var(--sp-3) calc(var(--sp-4) + var(--avatar) + var(--sp-3));
+}
+.userlist > li > .u-open ~ * + * { margin-top: 0; }
+.chatrow { display: flex; align-items: stretch; }
+.userlist > li > .u-avatar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding-right: 0;
+}
+.userlist > li > .chatrow-open {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
+  gap: var(--sp-1);
+}
+.userlist > li > .u-open::before,
+.userlist > li > .u-avatar::before {
   content: attr(data-initial) / "";   /* decorative: the name says it */
-  grid-area: av;
   width: var(--avatar);
   height: var(--avatar);
   font-size: var(--fs-4);
 }
-.userlist > li:not([data-initial])::before { content: none; }
+span.u-avatar { cursor: default; }
 .userlist > li + li { border-top: 1px solid var(--border-soft); }
 /* On a phone the mark goes under the name, in every row alike — side by
    side, a 40px avatar leaves a handle too little room and it would break.
@@ -879,11 +924,6 @@ select option { background: var(--panel); color: var(--fg); }
   overflow-wrap: anywhere;
 }
 .u-claim::before { width: 16px; height: 16px; margin-top: 2px; }
-.u-actions { justify-content: flex-end; flex-wrap: wrap; }
-/* Remove is confirm-gated and rare: a quiet ghost that turns red on hover,
-   so red on this screen means one thing — a key that changed. */
-.u-actions > .danger { color: var(--muted); background: transparent; border-color: transparent; }
-.u-actions > .danger:hover { color: var(--err-fg); background: var(--panel-2); border-color: transparent; }
 /* A contact whose key changed since it was saved wears the alert mark
    (app.js sets `.changed`; the dots still show the trust level). The mark
    says a sentence, so it is a box, not a pill; the row's err line then
@@ -909,7 +949,8 @@ select option { background: var(--panel); color: var(--fg); }
   font-size: var(--fs-1);
   font-weight: 400;
 }
-li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
+li:has(> .u-open .u-mark.changed) > .hint.err::before,
+.contact-sheet:has(.contact-head .u-mark.changed) .contact-warn > .hint.err::before { display: none; }
 
 /* Empty state: one title, one sentence, centred in the list's frame. */
 .userlist > li.empty {
@@ -1165,6 +1206,180 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
   border-radius: var(--r-s);
 }
 #admitWarn.err::before { margin-top: 3px; }
+/* 5.8b Contact profile: the same sheet, but the user opened it and may close
+   it — × (top right), Escape or a tap on the scrim (app.js). A real scrim
+   element, so the tap has something to land on; it covers the tab bar too. */
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: var(--scrim);
+}
+.contact-sheet:focus { outline: none; }   /* focusable only to keep focus in (index.html) */
+/* ...but when the keyboard lands there (the focused Verify got disabled),
+   the ring says where focus is (cold r2 m3). */
+.contact-sheet:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* Head: the 56px disc of the Profile view, the name, the trust pill under
+   it, the close button level with the top. */
+.contact-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--sp-4);
+}
+.contact-head-text {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--sp-1);
+}
+#contactName { font-size: var(--fs-5); line-height: 1.25; }
+#contactClose {
+  align-self: start;
+  width: var(--control-h);
+  margin: calc(-1 * var(--sp-2)) calc(-1 * var(--sp-2)) 0 0;
+  padding: 0;
+  font-size: var(--fs-6);
+  font-weight: 400;
+}
+/* The claim and the key-changed sentence: under the head, before anything
+   the user might act on. The key-changed one is the alert box the admission
+   sheet uses. */
+.contact-warn { display: flex; flex-direction: column; gap: var(--sp-2); }
+.contact-warn:empty { display: none; }
+.contact-warn > .hint.err {
+  padding: var(--sp-3);
+  color: var(--err-fg);
+  background: color-mix(in srgb, var(--err) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--err) 40%, transparent);
+  border-radius: var(--r-s);
+}
+/* The handle and its Copy on ONE line (hot M4): 13px mono wraps a long
+   handle into two even lines beside the button. When the claim line above
+   already quotes it, the value is not printed twice (hot M8, app.js). */
+.contact-sheet .handle-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+.contact-handle { min-width: 0; font-size: var(--fs-2); overflow-wrap: anywhere; }
+/* A handle breaks at its "#" first; only the token, when it is wider than
+   the column, breaks inside itself (hot r3 n1 — the token is what people
+   read out, so it is not cut to balance two lines). */
+.contact-handle.ok { font-family: var(--font-mono); color: var(--fg); overflow-wrap: anywhere; }
+.contact-handle.ok > .tok { display: inline-block; max-width: 100%; word-break: break-all; text-wrap: balance; }
+#contactHandleLabel { margin-bottom: var(--sp-2); }
+#contactCopyHandle { --icon: var(--i-copy); flex: none; }
+#contactCopyHandle::before { width: 16px; height: 16px; }
+#contactCopyHandle.copied { color: var(--ok); }
+#contactCopyHandle.copy-failed { --icon: var(--i-alert); color: var(--err); }
+#contactFingerprint { margin: 0; }
+/* Facts: one quiet caption line — only what the pill does not say (hot M3). */
+.facts-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 var(--sp-2);
+  margin: calc(var(--sp-1) - var(--gap)) 0 0;
+  font-size: var(--fs-1);
+  color: var(--muted);
+}
+.facts-line:empty { display: none; }
+.facts-line > div { display: inline-flex; gap: var(--sp-1); margin-right: var(--sp-2); }
+.facts-line dt::after { content: ":"; }
+.facts-line dd { margin: 0; color: var(--fg); }
+/* Actions: the two decisions, natural widths, the one primary grows (app.js
+   puts it first in the DOM). Unverify keeps a hairline, so it never reads
+   like Remove. Remove: last, on its own line, right-aligned, a muted word
+   until hover or focus — red on this sheet means the changed key (hot M5). */
+/* One line at normal text size (the pair needs 270 of 288px at 320); at
+   200% text the pair wraps, and a button is never narrower than its longest
+   word — a label never spills out of its button (cold r3 MAJOR-B). */
+.contact-actions { flex-wrap: wrap; gap: var(--sp-2); }
+.contact-actions > button {
+  flex: 0 1 auto;
+  min-width: min-content;
+  height: auto;
+  white-space: normal;
+}
+.contact-actions > .primary { flex: 1 1 auto; }
+/* Below 360px the pair would wrap into two rows at normal text (line
+   breaking uses each button's full width): there the secondary counts only
+   its longest word and never grows past its text, and a primary "Verified
+   in person ✓" also counts only its longest word — the label wraps inside
+   its button, the pair keeps one row (hot r4, cold r4 MINOR-4). Scoped to
+   that width: wider, and at 200% text, the natural wrap is the better one
+   (cold r5 MINOR-A). */
+@media (max-width: 359px) {
+  .contact-actions > button:not(.primary) { flex: 1000 1 min-content; max-width: max-content; }
+  .contact-actions > #contactVerify.primary { flex: 10 1 min-content; }
+}
+.contact-actions > #contactVerify.ghost { border-color: var(--border); }
+.contact-remove-row { display: flex; justify-content: flex-end; margin-top: calc(var(--sp-1) - var(--gap)); }
+#contactRemove {
+  margin-right: calc(-1 * var(--sp-3));
+  padding: 0 var(--sp-3);
+  color: var(--muted);
+  background: transparent;
+  border-color: transparent;
+}
+#contactRemove:is(:hover, :focus-visible) {
+  color: var(--err-fg);
+  background: color-mix(in srgb, var(--err) 8%, transparent);
+  border-color: transparent;
+}
+/* On a phone the two decisions stay on screen while the sheet scrolls, so
+   one is visible the moment it opens, however short the screen (hot M4):
+   ONE row, so the bar never grows over the fingerprint it sits under (hot
+   r2 M-A). Remove scrolls in under it. A focused control is scrolled clear
+   of the bar, never under it (cold r2, WCAG 2.4.11); rem, so it grows with
+   the text. */
+@media (max-width: 600px) {
+  .contact-sheet { scroll-padding-bottom: 10rem; }
+  .contact-actions {
+    position: sticky;
+    bottom: calc(-1 * var(--sp-5));
+    z-index: 1;
+    margin: 0 calc(-1 * var(--gutter));
+    padding: var(--sp-3) var(--gutter);
+    background: var(--panel);
+    border-top: 1px solid var(--border-soft);
+  }
+  .contact-remove-row { margin-top: calc(-1 * var(--gap)); }
+  /* A changed key: Verify is the primary, and the fingerprint it asks you to
+     compare must never sit under it (pentest p3 L-4, 320px). The row stays
+     in the flow, after the fingerprint: reaching Verify means reading past
+     the number first. */
+  .contact-actions:has(> #contactVerify.primary) {
+    position: static;
+    padding-bottom: 0;
+    border-top: 0;
+  }
+  /* ...and Remove keeps the sheet's own gap under it (no overlap with the
+     row's hit area, pentest p4 I-2; hot r4 n5). */
+  .contact-actions:has(> #contactVerify.primary) + .contact-remove-row { margin-top: 0; }
+  #contactName { font-size: var(--fs-4); }
+}
+/* The conversation's name opens the profile: it looks like the name, and
+   says it is a control only on hover and focus. A sender who is not a saved
+   user has no profile: the name is then plain text. */
+#chatPeer.peer-open {
+  flex: 0 1 auto;               /* as wide as the name, not the whole track (hot m3; the id beats #chatPeer's own rule) */
+  max-width: 100%;
+  justify-content: flex-start;
+  padding: 0 var(--sp-2);
+  margin-left: calc(-1 * var(--sp-2));
+  font-family: var(--font-mono);
+  font-weight: 600;
+  text-align: left;
+  white-space: normal;
+  border-color: transparent;
+}
+button.peer-open:hover { border-color: transparent; }
+button.peer-open:disabled,
+button.peer-open:disabled:hover { opacity: 1; cursor: default; background: transparent; border-color: transparent; }
+
 /* Let in / Deny carry equal weight: same size, side by side. */
 .pair { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2); }
 
@@ -1496,7 +1711,8 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
    disc is the same one the lists draw at 40px (5.6). */
 .idhead { display: flex; align-items: center; gap: var(--sp-4); }
 .avatar,
-.userlist > li::before {
+.userlist > li > .u-open::before,
+.userlist > li > .u-avatar::before {
   flex: none;
   display: grid;
   place-items: center;
@@ -1820,12 +2036,9 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
 .inline:has(> #addHandle:placeholder-shown) > #addContact { opacity: 0.45; box-shadow: none; }
 .list > #userList { margin-top: var(--sp-1); }
 
-/* Chats: rows open a conversation. */
-.chatrow { cursor: pointer; }
-.chatrow:hover { background: var(--panel-2); }
-/* A row is a keyboard stop (app.js B4): the ring sits inside it, where the
-   list's edges cannot clip it, on the hover ground. */
-.chatrow:focus-visible { outline-offset: -2px; background: var(--panel-2); }
+/* Chats: a row's opener opens the conversation; its avatar, the profile
+   (5.6). Each is a keyboard stop (app.js B4) whose ring sits inside it,
+   where the list's edges cannot clip it, on the hover ground. */
 .chatrow .u-fp {
   font-family: var(--font-ui);
   font-size: var(--fs-2);
@@ -2208,7 +2421,7 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
   .chatmode::before,
   .facts li::before,
   .hint.err::before,
-  .hint.ok:not(#myHandleText)::before,
+  .hint.ok:not(#myHandleText, #contactHandle)::before,
   .u-claim::before,
   .disclosure > summary::after,
   .locked > .lead::before,
@@ -2222,6 +2435,8 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
   #chatBack::before,
   #copyRoom::before,
   #copyHandle::before,
+  #contactCopyHandle::before,
+  .userlist > li > .u-open::after,
   #disconnect::before {
     forced-color-adjust: none;
     background: ButtonText;
@@ -2267,7 +2482,8 @@ li:has(> .u-head .u-mark.changed) > .hint.err::before { display: none; }
   .view:not(#viewLive):not([hidden]),
   .screen:not(.window):not([hidden]) { animation: rise var(--t-move) var(--ease); }
   .sheet:not([hidden]) { animation: sheet-in var(--t-move) var(--ease); }
-  #scrChat:has(> .sheet:not([hidden]))::before { animation: fade-in 160ms ease-out; }
+  #scrChat:has(> .sheet:not([hidden]))::before,
+  .scrim:not([hidden]) { animation: fade-in 160ms ease-out; }
 }
 @keyframes rise { from { opacity: 0; transform: translateY(6px); } }
 @keyframes sheet-in {

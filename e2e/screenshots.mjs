@@ -103,6 +103,9 @@ const PLAN = [
   ["19", "live-chat-connected", "Live room: connected, messages in #log"],
   ["20", "live-disconnected", "Live room: after Disconnect"],
   ["21", "users-unlock-wrong-passphrase", "Error: wrong passphrase on the Users unlock row (#usersUnlockStatus)"],
+  ["22", "contact-profile", "Contact profile (#contactSheet) over Users: bob, verified in person", "viewport"],
+  ["23", "contact-profile-stranger", "Contact profile over Users: the stranger, handle labelled a claim", "viewport"],
+  ["24", "contact-profile-convo", "Contact profile opened from the conversation's name (no Message button)", "viewport"],
 ].map(([n, id, what, mode]) => ({ n, id, what, fullPage: mode !== "viewport", state: "pending", note: "", files: [] }));
 const byId = Object.fromEntries(PLAN.map((p) => [p.id, p]));
 
@@ -496,16 +499,29 @@ async function addContact(page, handle, username) {
 }
 
 async function markVerified(page, username) {
-  const clicked = await page.evaluate((u) => {
+  // The Verify action lives in the contact's profile: open the row, wait for
+  // the fingerprint (Verify is disabled until it is on screen), click, close.
+  const opened = await page.evaluate((u) => {
     const list = document.querySelector("#userList");
     const row = list && [...list.children].find((li) => li.textContent.includes(u));
-    const btn = row && [...row.querySelectorAll("button")]
-      .find((b) => /verif/i.test(b.textContent) && !/unverif/i.test(b.textContent));
-    if (!btn) return false;
-    btn.click(); // confirm() dialogs are accepted by the tab's dialog handler
+    const open = row && row.querySelector(".u-open");
+    if (!open) return false;
+    open.click();
     return true;
   }, username);
-  if (!clicked) throw new Error(`no "Verified in person" control in ${username}'s row`);
+  if (!opened) throw new Error(`no row for ${username} in #userList`);
+  await page.waitForFunction(() => {
+    const b = document.querySelector("#contactVerify");
+    return b && !b.disabled && !document.querySelector("#contactSheet").hidden;
+  }, { timeout: 10000 }).catch(() => {});
+  await sleep(600); // the sheet ignores activations in its first 500 ms
+  const clicked = await page.evaluate(() => {
+    const btn = document.querySelector("#contactVerify");
+    if (!btn || btn.disabled || !/verif/i.test(btn.textContent) || /unverif/i.test(btn.textContent)) return false;
+    btn.click(); // confirm() dialogs are accepted by the tab's dialog handler
+    return true;
+  });
+  if (!clicked) throw new Error(`no "Verified in person" control in ${username}'s profile`);
   await pollUntil(() => page.evaluate(async (u) => {
     try {
       const c = await import("./contacts.js");
@@ -516,6 +532,7 @@ async function markVerified(page, username) {
       return !!row && /unverify|verified by you/i.test(row.textContent);
     }
   }, username), 20000, `${username} never showed as verified`);
+  await page.evaluate(() => { if (!document.querySelector("#contactSheet").hidden) document.querySelector("#contactClose").click(); });
 }
 
 // Click the row of `container` that names `needle` (a real row, whatever its tag).
@@ -524,7 +541,7 @@ async function clickRow(page, container, needle) {
     const list = document.querySelector(c);
     const row = list && [...list.children].find((el) => el.textContent.includes(n));
     if (!row) return false;
-    row.click();
+    (row.querySelector(".chatrow-open") || row).click(); // a chat row's opener, not its avatar
     return true;
   }, container, needle);
 }
@@ -909,6 +926,43 @@ await step("users-unlocked", async () => {
   await capture(p, "users-unlocked", claimShown ? "" : "the stranger's claimed name did not appear in #userList");
 });
 
+// ---- 22-23: contact profile over Users ---------------------------------------------
+
+async function openProfile(p, listSel, needle, sel) {
+  const ok = await p.evaluate((l, n, s) => {
+    const row = [...document.querySelector(l).children].find((el) => el.textContent.includes(n));
+    const b = row && row.querySelector(s);
+    if (!b) return false;
+    b.click();
+    return true;
+  }, listSel, needle, sel);
+  if (!ok) throw new Error(`no ${sel} for ${needle} in ${listSel}`);
+  await waitShown(p, "#contactSheet", 5000);
+  await p.waitForFunction(() => !/^…$/.test(document.querySelector("#contactFingerprint").textContent),
+    { timeout: 10000 }).catch(() => {});
+}
+const closeProfile = (p) => p.evaluate(() => {
+  if (!document.querySelector("#contactSheet").hidden) document.querySelector("#contactClose").click();
+});
+
+await step("contact-profile", async () => {
+  req("contacts");
+  const p = alice.page;
+  await view(p, "users");
+  await openProfile(p, "#userList", others.bob.username, ".u-open");
+  await capture(p, "contact-profile");
+  await closeProfile(p);
+});
+
+await step("contact-profile-stranger", async () => {
+  req("contacts");
+  const p = alice.page;
+  await openProfile(p, "#userList", others.carol.username, ".u-open");
+  const label = await text(p, "#contactHandleLabel");
+  await capture(p, "contact-profile-stranger", label === "Handle they claim" ? "" : `handle label reads ${JSON.stringify(label)}`);
+  await closeProfile(p);
+});
+
 // ---- 09-12: chats ---------------------------------------------------------------
 
 await step("chats-list", async () => {
@@ -940,6 +994,19 @@ await step("chat-conversation", async () => {
   await waitIncludes(p, "#chatLog", MSG.bob[0], 15000);
   for (const m of MSG.alice) await sendChat(p, m);
   await capture(p, "chat-conversation");
+});
+
+await step("contact-profile-convo", async () => {
+  req("contacts");
+  const p = alice.page;
+  if (!(await shown(p, "#chatConvo"))) throw new Error("no open conversation");
+  await click(p, "#chatPeer");
+  await waitShown(p, "#contactSheet", 5000);
+  await p.waitForFunction(() => !/^…$/.test(document.querySelector("#contactFingerprint").textContent),
+    { timeout: 10000 }).catch(() => {});
+  const msg = await shown(p, "#contactMessage");
+  await capture(p, "contact-profile-convo", msg ? "#contactMessage is shown" : "");
+  await closeProfile(p);
 });
 
 let proposalSent = false;

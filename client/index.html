@@ -472,7 +472,7 @@
       <section>
         <div id="usersLocked" class="panel locked">
           <div class="qline lead">
-            <p class="hint">Locked. Enter your passphrase.</p>
+            <p class="hint" id="usersLockedMsg">Locked. Enter your passphrase.</p>
             <details class="why">
               <summary><span class="vh">Why is it locked?</span></summary>
               <div>Your users are stored on this device, encrypted under your identity
@@ -481,7 +481,7 @@
           </div>
           <div class="row inline unlock-row">
             <input id="usersUnlockPass" type="password" autocomplete="off"
-                   aria-label="Identity passphrase" placeholder="identity passphrase" />
+                   aria-label="Identity passphrase" aria-describedby="usersLockedMsg" placeholder="identity passphrase" />
             <button id="usersUnlock" type="button" class="primary">Unlock</button>
           </div>
           <p class="hint" id="usersUnlockStatus"></p>
@@ -550,7 +550,7 @@
       <section id="chatsPanel">
         <div id="chatsLocked" class="panel locked">
           <div class="qline lead">
-            <p class="hint">Locked. Enter your passphrase.</p>
+            <p class="hint" id="chatsLockedMsg">Locked. Enter your passphrase.</p>
             <details class="why">
               <summary><span class="vh">Why is it locked?</span></summary>
               <div>Your chats are stored on this device, encrypted under your identity
@@ -559,7 +559,7 @@
           </div>
           <div class="row inline unlock-row">
             <input id="chatsUnlockPass" type="password" autocomplete="off"
-                   aria-label="Identity passphrase" placeholder="identity passphrase" />
+                   aria-label="Identity passphrase" aria-describedby="chatsLockedMsg" placeholder="identity passphrase" />
             <button id="chatsUnlock" type="button" class="primary">Unlock</button>
           </div>
           <p class="hint" id="chatsUnlockStatus"></p>
@@ -595,7 +595,9 @@
           <div id="chatConvo" class="window" hidden>
             <div class="topbar convo-head">
               <button id="chatBack" type="button" class="ghost" aria-label="Back to chats">‹</button>
-              <span class="u-name" id="chatPeer"></span>
+              <!-- The name opens the contact's profile (app.js disables it
+                   for a sender who is not a saved user: no profile then). -->
+              <button type="button" class="u-name peer-open" id="chatPeer" aria-haspopup="dialog"></button>
               <span class="u-mark" id="chatPeerMark"></span>
               <span class="chatmode" id="chatMode"></span>
               <select id="chatModeSel" aria-label="Encryption mode for this chat"
@@ -622,6 +624,60 @@
       </section>
     </div><!-- /viewChats -->
   </main>
+
+  <!-- A saved user's short profile: opened by the user's own tap on a row in
+       Users, the avatar of a row in Chats, or the name in a conversation.
+       The same sheet as the admission prompt (a bottom sheet on a phone, a
+       centred dialog wider up), but dismissible: ×, Escape or the scrim.
+       app.js fills it from the contact store; everything is textContent. -->
+  <div id="contactScrim" class="scrim" hidden></div>
+  <!-- tabindex="-1": a click on the sheet's text keeps focus IN the sheet
+       (else it drops to <body>, where Escape would not reach its handler). -->
+  <section class="sheet contact-sheet" id="contactSheet" role="dialog" aria-modal="true"
+           aria-labelledby="contactName" tabindex="-1" hidden>
+    <div class="contact-head">
+      <span class="avatar" id="contactAvatar" aria-hidden="true"></span>
+      <div class="contact-head-text">
+        <h2 class="u-name" id="contactName"></h2>
+        <span class="u-mark" id="contactMark"></span>
+      </div>
+      <button id="contactClose" type="button" class="ghost" aria-label="Close">×</button>
+    </div>
+    <!-- The claim and the key-changed / reset sentences, when a contact has
+         them (app.js; the same words the Users row carries). -->
+    <div class="contact-warn" id="contactWarn"></div>
+    <div class="row">
+      <p class="overline" id="contactHandleLabel">Handle</p>
+      <div class="handle-line">
+        <p class="hint contact-handle" id="contactHandle"></p>
+        <button id="contactCopyHandle" type="button" aria-describedby="contactHandleLabel">Copy</button>
+      </div>
+    </div>
+    <dl class="facts-line" id="contactFacts"></dl>
+    <!-- The fingerprint sits directly above the action that says you
+         compared it. -->
+    <div class="row why-row">
+      <label class="overline">Fingerprint</label>
+      <p class="safety" id="contactFingerprint"></p>
+      <details class="why">
+        <summary><span class="vh">What do I compare?</span></summary>
+        <div>Compare it with them in person, or on a call where you recognise
+          their voice. It covers all four of their keys, including the ones
+          that seal messages to them.</div>
+      </details>
+    </div>
+    <p class="hint" id="contactStatus" aria-live="polite"></p>
+    <!-- The two decisions (app.js puts the primary first). On a phone this
+         row stays on screen while the sheet scrolls; Remove, rare and
+         confirm-gated, is under it, last. -->
+    <div class="row inline contact-actions">
+      <button id="contactMessage" type="button" class="primary">Message</button>
+      <button id="contactVerify" type="button">Verified in person&nbsp;✓</button>
+    </div>
+    <div class="contact-remove-row">
+      <button id="contactRemove" type="button" class="danger">Remove</button>
+    </div>
+  </section>
 
   <script type="importmap">{"imports":{"@noble/post-quantum/":"./vendor/@noble/post-quantum/","@noble/hashes/":"./vendor/@noble/hashes/","@noble/curves/":"./vendor/@noble/curves/","lean-qr":"./vendor/lean-qr/index.mjs"}}</script>
   <script type="module" src="app.js"></script>

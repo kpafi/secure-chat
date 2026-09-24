@@ -66,7 +66,7 @@ design, e2e coverage and a pentest pass):
   invite link opens a new, locked tab) and Chats as the home view (identity creation lives in the
   live room's step 1);
 - Start | Join segmented control for the chat code; the encryption picker as a bottom sheet;
-- a contact detail screen; a "re-verify or send anyway" sheet when a contact's key changed;
+- ~~a contact detail screen~~ — shipped as the contact profile (below); a "re-verify or send anyway" sheet when a contact's key changed;
 - typed confirmation for Forget identity; QR scanning; moving the username to Profile;
 - a backup-reminder banner after creating an identity; "Encrypted to <name>" as the composer
   placeholder; a desktop two-pane chat.
@@ -91,3 +91,12 @@ independent reviews (their reports are summarised in `design/research/reviews.md
   fixed with a test that its own mutant fails; no open findings at commit 2bbc64d.
 - A harsh design review and a dispassionate correctness/a11y review, each in three rounds; the
   last round found no blocker or major.
+
+## Contact profile (2026-09-23)
+
+A saved user's short profile as a sheet: tap a Users row, a Chats row's avatar or the
+conversation's name. Decisions in `design/research/reviews/profile-brief.md`; the canvas has a
+"Contact profile" row (ContactProfile, ContactProfileChanged, ContactProfileDesktop, UsersSlim),
+updated to the design after the review rounds. Reviewed like the rework — hot and cold critics and
+the pentest agent, three rounds each; triage in `reviews/profile-fix-round-1.md` and
+`reviews/profile-fix-round-2.md`, summary in `research/reviews.md`. e2e: `e2e/contact-profile.mjs`.

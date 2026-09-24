@@ -165,27 +165,35 @@ const pickerNote = await alice.page.evaluate(() => document.querySelector("#chat
 check("A4: the picker says every saved user already has a chat",
   pickerNote === "— every saved user already has a chat —", JSON.stringify(pickerNote));
 // Phase 2a, B4 (a11y review): a chat row is a keyboard stop — Tab from the
-// Open button reaches it — and Enter opens the conversation.
+// Open button reaches it — and Enter opens the conversation. Contact profile:
+// the row is two real buttons now, the avatar (profile) and the opener, so
+// Tab reaches the avatar first, then the opener.
 await alice.page.focus("#chatStart");
+await alice.page.keyboard.press("Tab");
+const avFocus = await alice.page.evaluate(() => {
+  const a = document.activeElement;
+  return { avatar: a.matches("#chatList > li.chatrow > button.u-avatar"), label: a.getAttribute("aria-label") };
+});
 await alice.page.keyboard.press("Tab");
 const rowFocus = await alice.page.evaluate(() => {
   const a = document.activeElement;
-  return { row: a.matches("#chatList > li.chatrow"), role: a.getAttribute("role") };
+  return { row: a.matches("#chatList > li.chatrow > button.chatrow-open"), role: a.tagName === "BUTTON" ? "button" : a.getAttribute("role") };
 });
 await alice.page.keyboard.press("Enter");
 await alice.page.waitForFunction(() => !document.querySelector("#chatConvo").hidden, { timeout: 5000 }).catch(() => {});
 const rowOpened = await alice.page.evaluate(() => ({
   convo: !document.querySelector("#chatConvo").hidden, peer: document.querySelector("#chatPeer").textContent,
 }));
-check("B4: Tab reaches the first chat row and Enter opens the conversation",
+check("B4: Tab reaches the first chat row (its profile button, then its opener) and Enter opens the conversation",
+  avFocus.avatar && avFocus.label === "Profile of " + bob.username &&
   rowFocus.row && rowFocus.role === "button" && rowOpened.convo && rowOpened.peer === bob.username,
-  JSON.stringify({ rowFocus, rowOpened }));
+  JSON.stringify({ avFocus, rowFocus, rowOpened }));
 // Fix round, C2 (a11y review): opening the row hides it — focus continues in the
 // conversation; Back returns focus to the row that was open, not to <body>.
 const focusIn = (page) => page.evaluate(() => {
   const a = document.activeElement;
   return { id: a.id || a.tagName, convo: document.querySelector("#chatConvo").contains(a),
-    list: document.querySelector("#chatListWrap").contains(a), user: a.dataset ? a.dataset.user || null : null };
+    list: document.querySelector("#chatListWrap").contains(a), user: a.closest("li")?.dataset.user || null };
 });
 const afterOpen = await focusIn(alice.page);
 await alice.page.keyboard.press("Enter"); // on "Back to chats", where focus now is
@@ -225,7 +233,7 @@ await bob.page.waitForFunction(
   () => document.querySelectorAll("#userList li:not(.empty)").length > 0, { timeout: 30000 });
 await view(bob.page, "chats");
 await bob.page.evaluate(async () => {
-  const row = document.querySelector("#chatList li:not(.empty)");
+  const row = document.querySelector("#chatList li:not(.empty) > .chatrow-open");
   if (row) row.click();
   await new Promise((r) => setTimeout(r, 700));
 });
@@ -248,11 +256,20 @@ console.log("\n5. web of trust");
 alice.page.on("dialog", (d) => d.accept());
 await view(alice.page, "users");
 await sleep(500);
-await alice.page.evaluate(() => {
-  const b = [...document.querySelectorAll("#userList button")].find((x) => /Verified in person/i.test(x.textContent));
-  if (b) b.click();
-});
+// Contact profile: Verify lives in the contact's profile now, beside the
+// fingerprint it confirms — open bob's row, wait for the fingerprint, click.
+await alice.page.evaluate((u) => {
+  const li = [...document.querySelectorAll("#userList > li")].find((x) => x.dataset.user === u);
+  li?.querySelector(".u-open")?.click();
+}, bob.username);
+await alice.page.waitForFunction(() => {
+  const b = document.querySelector("#contactVerify");
+  return !document.querySelector("#contactSheet").hidden && b && !b.disabled && /Verified in person/i.test(b.textContent);
+}, { timeout: 10000 }).catch(() => {});
+await sleep(600); // the sheet ignores activations in its first 500 ms (a double tap's second half)
+await alice.page.evaluate(() => document.querySelector("#contactVerify").click());
 await sleep(2500);
+await alice.page.evaluate(() => document.querySelector("#contactClose").click());
 const aliceMarks = await alice.page.evaluate(() =>
   [...document.querySelectorAll("#userList .u-mark")].map((e) => e.textContent));
 check("alice can mark bob verified (green)",

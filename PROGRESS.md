@@ -3,6 +3,36 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
+## ⮕ RESUME HERE (2026-09-24, contact profile — branch `claude/user-profile-view-e7qr9y`, NOT merged, NOT deployed)
+
+**What it is.** The owner's ask after testing 0.2.0: tap a saved user's row in Users, the avatar
+of a row in Chats, or the name in a conversation → a short profile as a sheet (handle, full
+fingerprint, trust mark and warnings, when saved/verified, Message / Verified in person /
+Remove). Users rows got lighter (one button; the claim and key-changed lines stay in the list);
+Verify and Remove moved into the profile, next to the fingerprint they refer to. Client only —
+no relay or protocol change (one exception in scope: `account.vouch` takes an optional abort
+signal; `contacts.js` tags its stale-tab refusal `err.code = "STALE"`).
+
+**How it was built.** Brief → Claude Design canvas ("Contact profile" row, updated after the
+reviews) → implementation → hot critic, cold critic and pentest in rounds until clean; decisions
+and triage in `design/research/reviews/profile-brief.md` and `profile-fix-round-1..6.md`, summary
+in `design/research/reviews.md`. e2e `contact-profile.mjs` (61 checks) beside the five existing
+runs; all green at the last commit, plus `npm test` and pytest 162.
+
+**Honest notes for the reviewer.** The trust core (Verify marks only the keys on screen) held from
+the first pentest pass. Most later findings were in the vouch-retraction bookkeeping the fix rounds
+added themselves; one of them (pass 4) was a Medium — a stranger's claimed handle could make us
+delete our real vouch — fixed by removing that code, with a mutation-proven regression check;
+round 6 then removed the rest of the retraction bookkeeping (vouch only for contacts added by
+handle; retract only on the user's own Unverify/Remove). Known limits: end of
+`profile-fix-round-6.md`; the clean fix for the vouch ones is a relay-side DELETE that names the
+exact vouch.
+
+**Delivery.** Nothing deployed. Review the branch, merge, then relay + client + APK as usual (no
+relay change, so the APK is not forced by this change). On the phone: open a contact from each of
+the three places, verify one in person, check the Android back button (known: it does not close
+the sheet).
+
 ## ⮕ RESUME HERE (2026-09-21, the 2026-08-07 pentest: all 14 Medium fixed, NOT deployed)
 
 **Every Medium in `secure-chat-pentest-2026-08-07.md` is fixed on branch
