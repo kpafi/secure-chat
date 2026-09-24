@@ -182,3 +182,39 @@ of the web client".
 public clearnet site on the same host, so anyone who knows both can correlate
 them, and the clearnet site remains an attack surface into the same box. A
 location-anonymous deployment needs a host with no clearnet service on it.
+
+## iOS app downloads (SideStore / AltStore)
+
+> **Not yet on the box.** The `/ios/` block in `Caddyfile` was added with the
+> iOS distribution and has not been deployed; until it is, the file in this
+> directory is ahead of the live one.
+
+The relay's clearnet host also serves the iOS download bundle, as static files,
+under `https://<host>/ios/`. The repository is private, so GitHub release
+assets are not a public download — this server is the distribution point.
+
+1. Bump `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` in `ios/project.yml`,
+   merge, then tag: `git tag ios-v0.3.0 && git push origin ios-v0.3.0`.
+2. The iOS workflow builds the unsigned IPA and a release `ios-v0.3.0` with four
+   files: `SecureChat-0.3.0.ipa`, `SecureChat-0.3.0.ipa.sha256`, `apps.json`,
+   `icon.png`. `apps.json` points at `https://138-199-144-35.sslip.io/ios`
+   unless the repository variable `IOS_DIST_BASE_URL` says otherwise.
+3. Copy them to the box:
+   ```bash
+   sudo mkdir -p /srv/secure-chat-ios
+   sha256sum -c SecureChat-0.3.0.ipa.sha256        # before copying
+   sudo cp SecureChat-0.3.0.ipa SecureChat-0.3.0.ipa.sha256 apps.json icon.png /srv/secure-chat-ios/
+   sudo chown -R root:root /srv/secure-chat-ios && sudo chmod 644 /srv/secure-chat-ios/*
+   sudo systemctl reload caddy
+   ```
+4. Users add `https://<host>/ios/apps.json` as a source in SideStore
+   (`ios/README.md`, "Getting it onto an iPhone").
+
+Keep old IPAs out of the directory once a new one is published — `apps.json`
+lists one version, and a stale file is just attack surface. The Onion does not
+serve `/ios/` (Tor forwards straight to the relay); SideStore has no Tor.
+
+**Publish the SHA-256 somewhere other than this server** (e.g. in the chat
+where you hand out the source URL). Whoever controls `/srv/secure-chat-ios/`
+can replace the IPA *and* `apps.json` together; a checksum users compare
+against a second channel is what catches that.

@@ -8,6 +8,10 @@ name: iOS
 
 on:
   push:
+    # A tag ios-vX.Y.Z also builds the SideStore/AltStore download bundle and a
+    # GitHub release (path filters are not applied to tag pushes).
+    tags:
+      - "ios-v*"
     paths:
       - "ios/**"
       - "!ios/**/*.md"
@@ -137,6 +141,16 @@ jobs:
           echo "probe: $(cat "$DATA/Documents/persist-probe.txt" 2>/dev/null)"
           test "$(cat "$DATA/Documents/persist-probe.txt")" = "persist-ok"
 
+      # The web version in real Mobile Safari, for the design review (the
+      # standalone Home Screen mode cannot be scripted). Non-blocking.
+      - name: Mobile Safari screenshot of the web version
+        timeout-minutes: 3
+        run: |
+          UDID=${{ steps.sim.outputs.udid }}
+          xcrun simctl openurl "$UDID" http://127.0.0.1:8000/ || true
+          sleep 12
+          xcrun simctl io "$UDID" screenshot shots/31-mobile-safari.png || true
+
       - name: Build the unsigned device IPA (Release)
         timeout-minutes: 10
         run: |
@@ -158,6 +172,33 @@ jobs:
           mkdir -p /tmp/ipa/Payload && cp -R "$APP" /tmp/ipa/Payload/
           (cd /tmp/ipa && zip -qry "$GITHUB_WORKSPACE/SecureChat-unsigned.ipa" Payload)
           shasum -a 256 SecureChat-unsigned.ipa | tee SecureChat-unsigned.ipa.sha256
+
+      # Release only: the bundle the relay's web server serves under /ios/
+      # (deploy/README.md). The tag must match MARKETING_VERSION in project.yml.
+      - name: SideStore/AltStore bundle (tags only)
+        if: startsWith(github.ref, 'refs/tags/ios-v')
+        env:
+          TAG: ${{ github.ref_name }}
+          BASE_URL: ${{ vars.IOS_DIST_BASE_URL || 'https://138-199-144-35.sslip.io/ios' }}
+        run: |
+          set -eu
+          VERSION="${TAG#ios-v}"
+          MV=$(sed -n 's/^ *MARKETING_VERSION: *"\(.*\)"$/\1/p' ios/project.yml)
+          BUILD=$(sed -n 's/^ *CURRENT_PROJECT_VERSION: *"\(.*\)"$/\1/p' ios/project.yml)
+          if [ "$VERSION" != "$MV" ]; then
+            echo "tag $TAG does not match MARKETING_VERSION $MV in ios/project.yml"; exit 1
+          fi
+          python3 ios/scripts/make-dist.py --ipa SecureChat-unsigned.ipa \
+            --version "$VERSION" --build "$BUILD" --base-url "$BASE_URL" \
+            --icon ios/SecureChat/Assets.xcassets/AppIcon.appiconset/icon-1024.png \
+            --out ios-dist
+
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/ios-v')
+        with:
+          name: ios-dist
+          path: ios-dist/
+          retention-days: 90
 
       - uses: actions/upload-artifact@v4
         with:
@@ -239,3 +280,40 @@ jobs:
           $G add -A
           $G commit -qm "iOS CI ${{ github.run_id }} (${{ github.sha }})"
           $G push -qf "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git" HEAD:refs/heads/ci/ios-shots
+
+  # Tags only: a GitHub release carrying the bundle, for the operator to fetch
+  # and copy to the relay server (the repository is private, so its release
+  # assets are NOT a public download link — the relay's /ios/ is). Like
+  # publish-shots, the artifact comes from the macOS job and is treated as
+  # hostile: allow-listed names only, no checkout, no git.
+  release:
+    needs: ios
+    if: startsWith(github.ref, 'refs/tags/ios-v') && needs.ios.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-dist
+          path: dist
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          V="${TAG#ios-v}"
+          files=""
+          for n in "SecureChat-$V.ipa" "SecureChat-$V.ipa.sha256" apps.json icon.png; do
+            f="dist/$n"
+            [ -f "$f" ] && [ ! -L "$f" ] || { echo "missing $n"; exit 1; }
+            files="$files $f"
+          done
+          SUM=$(cut -d' ' -f1 "dist/SecureChat-$V.ipa.sha256")
+          case "$SUM" in *[!0-9a-f]*|"") echo "bad checksum"; exit 1 ;; esac
+          gh release create "$TAG" $files --repo "$REPO" --title "iOS $V (unsigned)" \
+            --notes "Unsigned iOS build for SideStore/AltStore. SHA-256 of SecureChat-$V.ipa: $SUM. Copy all four files to the relay's /ios/ directory (deploy/README.md)."
+

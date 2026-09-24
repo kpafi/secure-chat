@@ -6,6 +6,16 @@
   <meta name="referrer" content="no-referrer" />
   <meta name="color-scheme" content="dark" />
   <title>secure-chat</title>
+  <!-- Home Screen web app (Safari: Share → Add to Home Screen). Standalone
+       display, own icon. It is still the WEB client: its code comes from the
+       relay on every load — see ios/README.md, "Getting it onto an iPhone". -->
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="icons/icon-180.png" />
+  <meta name="theme-color" content="#0d1117" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="secure-chat" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>

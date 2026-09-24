@@ -86,16 +86,88 @@ Cost: the repository is private, so macOS minutes are billed 10×; one run is
 about 100–150 billed minutes. The workflow therefore runs only when `ios/**` or
 the workflow changes (or by hand).
 
-## Installing on an iPhone
-The CI build is **unsigned**; iOS will not install it as is. Options:
-- **Sideload** (AltStore / Sideloadly with a free Apple ID): re-signs the IPA
-  for 7 days at a time.
-- **Apple Developer Program** (99 USD/year): add a signing certificate and
-  provisioning profile as repository secrets and the workflow can produce a
-  signed ad-hoc or TestFlight build. Not wired up yet — needs the owner's
-  account.
+## Getting it onto an iPhone
 
-Compare the IPA's SHA-256 (next to it in the artifact) before sideloading.
+There is no "download the APK and install it" on iOS: the system installs and
+starts only apps signed with a certificate Apple trusts. Without a paid Apple
+Developer account (99 USD/year, not used here) there are two ways, and they
+make **different security promises**. Pick per person, and tell them which one
+they have.
+
+| | **iOS app via SideStore** | **Home Screen web app** |
+| --- | --- | --- |
+| Where the client code comes from | inside the app, fixed at install | the relay, **on every start** |
+| A compromised relay can… | only offer a malicious *update* (you must accept it) | ship different code the next time you open it |
+| One-time-pad rollback protection | native floor (Keychain + HMAC) | browser residual (see the main README) |
+| Setup | ~20 min, a computer once, a free Apple ID | ~30 s, nothing to install |
+| Upkeep | re-sign every 7 days (automatic in SideStore) | none |
+| Fits | people who want the app's guarantee and can handle sideloading | everyone else, who trusts the relay operator |
+
+### Option A — the iOS app via SideStore
+
+What the user does (the tools change; **docs.sidestore.io** is authoritative):
+
+1. **Once, on a computer:** install SideStore on the iPhone with the installer
+   the SideStore guide recommends; it signs SideStore with the user's own
+   Apple ID and creates a *pairing file*.
+2. **iPhone:** Settings → General → VPN & Device Management → trust the Apple
+   ID; Settings → Privacy & Security → **Developer Mode** on (restart).
+3. Install the small helper "VPN" the guide names (it only lets SideStore
+   talk to the phone itself, for signing without a computer).
+4. Open SideStore, sign in, import the pairing file.
+5. SideStore → Sources → **+** → `https://<your relay host>/ios/apps.json`
+   → install **secure-chat**. (Or install the `.ipa` file directly.)
+6. **Compare the SHA-256** SideStore/the source shows with the one the relay
+   operator sent you through a different channel.
+7. Open secure-chat, enter the relay address (`https://…`).
+
+Problems, stated plainly:
+- **Every 7 days** SideStore must refresh the signature (helper VPN on,
+  "Refresh All"; an iOS Shortcut can automate it). Missed it → the app will
+  not start until refreshed. Chats and keys stay.
+- A free Apple ID signs at most **3 apps** at a time; SideStore is one of them.
+- SideStore logs in to Apple with that Apple ID through a helper service —
+  use a **separate Apple ID**, not the main one.
+- Developer Mode, a trusted developer profile and a helper VPN are real
+  hurdles; non-technical users give up here.
+- The download server (the relay host, `deploy/README.md`) can replace the
+  IPA *and* `apps.json` together. The app's guarantee starts after install;
+  **the checksum from a second channel** is what protects the install itself.
+- Apple re-signing is not involved, but neither is any review: the user runs
+  what the operator built. That is the point — and the responsibility.
+
+### Option B — the Home Screen web app
+
+What the user does: open `https://<your relay host>/` in **Safari** →
+Share → **Add to Home Screen**. It gets the secure-chat icon, opens full
+screen, no Safari bars.
+
+Problems, stated plainly:
+- **It is the web client with an icon.** Its code is fetched from the relay on
+  every start, so the web client's trust boundary applies unchanged (main
+  README, "Trust boundary of the web client"): whoever controls the relay
+  controls the code. For a self-hosted relay run by someone you trust, that
+  may be fine; it is not the app's guarantee.
+- **No native rollback floor** for one-time pads and the at-rest stores; the
+  browser residual documented in the main README applies.
+- **Separate storage.** The Home Screen web app does not share storage with
+  Safari: an identity created in Safari is not there. Move it with the
+  identity backup (Copy backup → restore) or create it in the web app.
+- **iOS may drop website data** under storage pressure; Home Screen web apps
+  are exempt from Safari's 7-day deletion of unused sites, but a device-wide
+  cleanup or deleting the icon wipes the identity. Keep the backup.
+- Needs **https** (a clearnet relay with TLS); the `.onion` does not work in
+  Safari.
+- No offline mode: without the relay there is no client (no service worker, on
+  purpose — it would not close the trust gap and adds an update channel).
+
+### With an Apple Developer account (not set up)
+
+TestFlight (a public link, builds expire after 90 days) or ad-hoc installs
+from the relay (≤ 100 registered devices) would remove the 7-day refresh and
+the sideloading steps. Needs the account's signing certificate, profile or
+App Store Connect API key as repository secrets; the CI can then upload or
+build signed installs.
 
 ## Known limits
 - Invite links (`#add=` in `location`) point at `secure-chat://app/...`; the
