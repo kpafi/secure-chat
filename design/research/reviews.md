@@ -105,3 +105,43 @@ username and Expecting toggles hide nothing a user needs.
   well; a contact detail screen; "re-verify or send anyway" on key change; typed confirmation for
   Forget identity; QR scanning; username on Profile; backup reminder; "Encrypted to <name>"
   placeholder; desktop two-pane chat.
+
+## Contact profile (2026-09-23/24) — a saved user's short profile as a sheet
+
+Scope: the owner's ask after testing 0.2.0 — tap a saved user's avatar or name in Users or Chats and
+see a short profile (handle, fingerprint, and the rest). Decisions in `reviews/profile-brief.md`;
+design on the Claude Design canvas ("Contact profile" row); triage per round in
+`reviews/profile-fix-round-1.md` … `profile-fix-round-5.md`. Same three reviewers as the rework.
+
+Design critic ("hot"): round 1 no — Message was the blue primary even when the key had changed
+(B1), the fingerprint sat far from Verify, facts repeated the pill, no action on screen on short
+phones, three reds. Round 2: B1 fixed, three new majors from the fixes (the sticky bar over the
+fingerprint on short phones, a claimed-handle row with a lone Copy, Tab order ≠ screen order).
+Round 3: "meets the owner's bar". Round 4 (regression check): one major at 320px (the pair wrapping
+into two rows), fixed in round 4/5.
+
+Correctness/a11y critic ("cold"): round 1 three majors (stale Chats trust marks after Verify from
+the sheet, focus lost after Remove, a mail re-render dropping focus); round 2 one regression (the
+sticky bar covering focus, 2.4.11) and a large mutant gap; round 3 two regressions (moving the
+focused button dropped focus; "Message" spilling out of its button at 200% text); rounds 4–5
+minors only (stale-tab refusal told the user to Forget their identity; reason not announced; CSS
+side effects at 200%), all fixed.
+
+Pentest (`.claude/agents/pentest-new-code.md`): never Critical or High. The trust core held from
+pass 1 — Verify can only mark the keys whose fingerprint is on screen (refused when they move under
+an open sheet), and a slow fingerprint never lands on another contact's sheet, each pinned by a
+mutant. What the passes found was in the edges, and most of it in code the fix rounds themselves
+added: a double click that verified then silently unverified (pass 1), a vouch the relay never
+answers blocking every later Verify (pass 2), an aborted vouch that could still be published while
+the UI said it was not (pass 3), and — the one Medium, pass 4 — round 3's "backstop" that retracted
+any vouch of ours the relay listed for an unverified contact, which let a stranger's mail claiming a
+friend's handle delete our real vouch for that friend. It was removed, not patched, and pass 5's
+diagnosis (the retraction bookkeeping was keyed on our local label, the relay keys a vouch on the
+directory name) drove round 5. contact-profile.mjs grew from 27 to 60 checks, each added check
+proven against a mutant of the fix it guards.
+
+Known and accepted (see the round files): a double click on a Users row opens the profile; the
+Android back button does not close the sheet; Remove of a verified contact whose vouch was declined
+still sends one DELETE (no persisted "vouched" bit); another tab re-vouching inside this tab's 20 s
+delayed retraction; a 502 after the relay committed reads as "could not publish". A complete fix
+for the last three needs a relay change (a DELETE naming the exact vouch).
