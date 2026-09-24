@@ -3,16 +3,21 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ CURRENT STATE (2026-09-24)
+## ⮕ CURRENT STATE (2026-09-24 evening)
 
-- **`master`** = release 0.3.0 plus the iOS app (PRs #2, #3). Tags `v0.1.0`–`v0.3.0`.
-- **Relay deployed** from `a54315f` (tag `v0.3.0`). Not yet on the box: the
-  relay's iOS origin (PR #2) and the `/ios/` download block in `deploy/Caddyfile`
-  (PR #3, see `deploy/README.md`).
-- **Not merged:** `android-ondevice-2026-09-21` (on-device notes and the
-  `formatDetail` fix `c7c9ccc` / `dfadca9`) and `fix/contact-remove-row`.
-- The sections below are the history, newest first; their headings say where
-  each piece of work ended up.
+- **`master` = `v0.3.1`** (`55c11b4`): 0.3.0 + the iOS app (PRs #2, #3) + the
+  docs refresh + `fix/contact-remove-row` + `android-ondevice-2026-09-21`
+  (formatDetail). Release notes: `deploy/release-2026-09-24-v0.3.1.md`.
+- **Relay DEPLOYED 0.3.1** at 19:13 with `deploy/deploy-2026-09-24-v0.3.1.sh`
+  from a detached `v0.3.1`: backup `/root/accounts.db.bak-2026-09-24-1913`,
+  accounts 31 = 31, every check green (public `/healthz` 0.3.1, formatDetail
+  and the centred Remove served, iOS-origin preflight 200 / foreign 400,
+  `worker-src 'none'`, TRUSTED_PROXIES unset, loopback only).
+- **Not on the box:** the Caddyfile's `/ios/` block (needs a published IPA).
+- **Phone:** still the debug APK from `e811219` (0.3.0, versionCode 3); a
+  0.3.1 rebuild is optional (the old APK works against this relay).
+- **Local `master` (`a4e5063`, Phase 7) is still diverged** from `origin/master`
+  — never `git pull` it; deploy from a detached tag checkout.
 
 ## (2026-09-24, 0.3.0 deployed + the Remove-row fix — merged and released in 0.3.1)
 
