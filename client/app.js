@@ -763,6 +763,9 @@ async function forgetIdentity() {
   localStorage.removeItem(LS_IDENTITY);
   closeContact(false); // it shows a record that is about to be gone
   retractPending.clear(); // they belonged to this identity's account
+  retractInflight.clear();
+  vouchedAs.clear();
+  retractNotice = null;
   contactsStale = false; // nothing of this identity is left to reload (cold r5 MINOR-B)
   contactsError = null;
   contacts.wipe(); // bound to the identity passphrase; unusable without it
@@ -1009,6 +1012,7 @@ function refreshUsers() {
   applyPendingInvite();
   renderUserList();
   if (storeNotice) usersStatus(storeNotice, true);
+  if (retractNotice) { usersStatus(retractNotice, true); retractNotice = null; }
 }
 
 // My shareable handle (username#token) — only exists after registering, since
@@ -1288,31 +1292,47 @@ const VOUCH_TIMEOUT_MS = 15000; // a relay that never answers must not hold cont
 //   the user is told when it waits and when it gives up. A reload forgets it,
 //   and the status line says so.
 const RETRACT_TRIES = 3;
+const RETRY_GAP_MS = 20000; // tries spread wider than a network blip (pentest p7 I-1)
 const canVouchFor = (c) => !c.auto && !c.claimedName;
-const retractPending = new Map(); // dirName -> tries left
-const retractInflight = new Set();
+// The directory name a vouch was POSTed under, this page: a record that later
+// adopts a claim is still retracted under the name it was vouched as
+// (pentest p7 L-3). In memory, like the rest.
+const vouchedAs = new Map();       // local username -> dirName
+const retractPending = new Map();  // dirName -> { left, nextAt }
+const retractInflight = new Map(); // dirName -> the token it was sent with
+let retractNotice = null;          // a give-up line not yet seen (shown on the next Users/Chats render)
 function vouchNotice(text) {
   if (!els.viewUsers.hidden) usersStatus(text, true);
   else if (!els.viewChats.hidden) chatsStatus(text, true);
+  else retractNotice = text;
 }
 function sendRetract(name) {
-  if (!apiToken || retractInflight.has(name)) return;
-  retractInflight.add(name);
-  account.unvouch(API_BASE, apiToken, name).then(() => {
-    retractPending.delete(name);
+  const entry = retractPending.get(name);
+  if (!apiToken || !entry || retractInflight.has(name) || Date.now() < entry.nextAt) return;
+  const token = apiToken;
+  retractInflight.set(name, token);
+  account.unvouch(API_BASE, token, name, AbortSignal.timeout(VOUCH_TIMEOUT_MS)).then(() => {
+    if (retractPending.get(name) === entry) retractPending.delete(name);
   }).catch(() => {
-    const left = (retractPending.get(name) ?? RETRACT_TRIES) - 1;
-    if (left > 0) { retractPending.set(name, left); return; }
+    // Cancelled meanwhile (a re-vouch, a Forget) or a different account now:
+    // nothing to count — never re-create it (pentest p7 L-1).
+    if (retractPending.get(name) !== entry || apiToken !== token) return;
+    entry.left -= 1;
+    entry.nextAt = Date.now() + RETRY_GAP_MS;
+    if (entry.left > 0) return;
     retractPending.delete(name);
     vouchNotice(`Could not retract your vouch for "${name}" — it may still be published.`);
-  }).finally(() => retractInflight.delete(name));
+  }).finally(() => { if (retractInflight.get(name) === token) retractInflight.delete(name); });
 }
 // "none" (no vouch of ours can exist), "sent", or "pending" (logged out).
 function retractVouch(c) {
-  if (!canVouchFor(c)) return "none";
-  const name = dirName(c);
-  retractPending.set(name, RETRACT_TRIES);
+  const name = vouchedAs.get(c.username) ?? (canVouchFor(c) ? dirName(c) : null);
+  vouchedAs.delete(c.username);
+  if (!name) return "none";
+  retractPending.set(name, { left: RETRACT_TRIES, nextAt: 0 });
   if (!apiToken) return "pending";
+  // One already in flight (a re-verify and unverify in quick succession):
+  // this entry is sent on the next tick once that one settles (p7 L-2).
   sendRetract(name);
   return "sent";
 }
@@ -1581,9 +1601,10 @@ els.contactVerify.addEventListener("click", async (e) => {
     contactStatus("This user's keys changed while their profile was open — compare the new fingerprint.", true);
     return;
   }
-  // Busy from the store write to the end of the vouch round trip, so a vouch
-  // and an unvouch for the same contact can never race each other at the
-  // relay; the round trip is bounded, so busy always ends.
+  // Busy from the store write to the end of the vouch round trip (bounded, so
+  // busy always ends): a second click cannot start another vouch meanwhile.
+  // A retraction DELETE is not awaited, so a slow one can still land after a
+  // quick re-vouch — an accepted limit (profile-fix-round-6.md).
   contactBusy = true;
   let statusMsg = null, statusErr = false, lostErr = null;
   try {
@@ -1612,6 +1633,7 @@ els.contactVerify.addEventListener("click", async (e) => {
       )) {
         contactStatus("Publishing the vouch…");
         retractPending.delete(dirName(c)); // this vouch is the wanted state now
+        vouchedAs.set(c.username, dirName(c));
         try {
           // Vouch over the FULL in-person-verified bundle incl. encryption
           // keys (H-01) so the vouched mark attests the keys used to seal async
@@ -1644,7 +1666,10 @@ els.contactVerify.addEventListener("click", async (e) => {
     // locked itself (the refusal above) has nothing to show: the sheet closes
     // and the view underneath shows its locked state, with the reason.
     if (!contacts.isUnlocked()) {
-      contactStoreLost(lostErr);
+      // Our own write refused: the user just clicked — focus the field. A lock
+      // someone else raised while the vouch was in flight: they may be typing
+      // elsewhere by now (pentest p7 L-4).
+      contactStoreLost(lostErr, { background: !lostErr || contactShown !== user });
     } else {
       contactsChanged();
       // The result belongs to this contact: another one's sheet opened
@@ -1874,6 +1899,7 @@ function refreshChats() {
   } else {
     chatsStatus("");
   }
+  if (retractNotice) { chatsStatus(retractNotice, true); retractNotice = null; }
   // "Start a chat" picker: saved users not already in the chat list.
   const picked = els.chatNew.value; // a rebuild keeps the user's pick (cold r2 m5)
   els.chatNew.textContent = "";

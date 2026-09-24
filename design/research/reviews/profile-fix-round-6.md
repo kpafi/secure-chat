@@ -56,3 +56,24 @@ lost on reload (said in the line); Remove/Unverify of a verified contact whose v
 still sends one DELETE; another tab re-vouching while this tab's retraction waits; a 502 after the
 relay committed reads "could not publish"; a stale tab drops the rest of a mailbox batch
 (pre-existing, delete-on-read); a double click on a Users row opens the profile; Android back.
+
+## Pass 7 on the simplified code (HEAD 48b0780) — and the follow-up fixes
+
+Pentest pass 7: every pass-6 PoC fixed or an accepted limit; nothing Critical/High/Medium; four
+Lows and an info, each a small correction to the new code, all taken:
+- p7 L-1: a DELETE failing AFTER its retraction was cancelled (a re-vouch, a Forget) re-created it
+  — the client then deleted the vouch it had just reported "published", or sent a DELETE with the
+  NEXT identity's token. A failure now counts only for the entry it was sent for, and only while
+  the token is unchanged; Forget clears what is in flight.
+- p7 L-2: `account.unvouch` had no bound, so a black-holed DELETE silenced that name for good —
+  it now has the same 15 s bound as the vouch.
+- p7 L-3: a record vouched under its typed name that later adopted a claim (honest mail filling in
+  a missing token) could no longer be retracted — the name a vouch was POSTed under is remembered
+  for the page and retracted as such.
+- p7 L-4: the Verify handler's own late `finally` could still move focus into the passphrase field
+  when someone else's write locked the store — it counts as a background lock unless our write was
+  the one refused.
+- p7 I-1: the give-up line was lost if the user was not on Users/Chats, and the three tries fell
+  inside ten seconds — the line waits for the next Users/Chats render, and tries are 20 s apart.
+- Stated honestly in the code: a retraction DELETE is not awaited before a quick re-vouch, so a slow
+  one can still land after it (added to the accepted list).

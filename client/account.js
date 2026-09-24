@@ -236,10 +236,11 @@ export async function vouch(base, identity, sessionToken, targetUsername, target
   return res.json();
 }
 
-export async function unvouch(base, sessionToken, targetUsername) {
+export async function unvouch(base, sessionToken, targetUsername, signal = undefined) {
   const res = await fetch(base + "/api/vouch/" + encodeURIComponent(targetUsername), {
     method: "DELETE",
     headers: { authorization: "Bearer " + sessionToken },
+    signal,
   });
   if (!res.ok) throw new Error("unvouch failed: " + (await asError(res)));
   return res.json();
