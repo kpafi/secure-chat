@@ -12,9 +12,10 @@ import UIKit
 ///    (`UIScreen.isCaptured`), the cover stays up;
 ///  * the cover is a separate window at alert level + 1, so alerts are
 ///    behind it. The system keyboard is NOT: it lives in its own window above
-///    every app window (pentest iOS-2 L-C). So editing ends when the cover
-///    goes up, and any keyboard that tries to appear while it is up is
-///    dismissed again;
+///    every app window (pentest iOS-2 L-C). So while the screen is being
+///    captured, editing ends and any keyboard that tries to appear is
+///    dismissed again (not for the app switcher, whose snapshot has no
+///    keyboard);
 ///  * a SCREENSHOT cannot be prevented or even announced beforehand — the OS
 ///    only reports it after the fact. Not covered.
 final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
@@ -54,7 +55,7 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
             forName: UIResponder.keyboardWillShowNotification, object: nil, queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self = self, self.shieldWindow != nil else { return }
+                guard let self = self, self.shieldWindow != nil, self.isCaptured else { return }
                 self.window?.endEditing(true)
             }
         }
@@ -80,10 +81,14 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
             // Already up: keep the note and label current (recording may
             // have started or stopped since).
             (shield.rootViewController?.view.subviews.first(where: { $0 is UILabel }) as? UILabel)?.isHidden = !isCaptured
+            if isCaptured { window?.endEditing(true) }
             shield.rootViewController?.view.accessibilityLabel = shieldLabel
             return
         }
-        window?.endEditing(true)
+        // The keyboard is not in the app-switcher snapshot, so only end
+        // editing when a recording could see it; otherwise pulling down
+        // Control Center would cost the composer its focus (hot review r2 m2).
+        if isCaptured { window?.endEditing(true) }
 
         let vc = UIViewController()
         let v = vc.view!

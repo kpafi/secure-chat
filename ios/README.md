@@ -102,3 +102,23 @@ Compare the IPA's SHA-256 (next to it in the artifact) before sideloading.
   app registers no URL scheme on purpose (no deep-link attack surface), so
   such a link cannot open the app. Paste the handle instead.
 - Lock-on-background is not done, as on Android (it would end live sessions).
+- Design debt, deliberately deferred (hot review, rounds 1–2): the native
+  bar stays visible with the keyboard up (hiding it risks the web review's
+  lost-first-tap bug; needs its own test); in a conversation the bar is
+  `--bg` over the `--panel` conversation head, and a 34 pt strip sits under
+  the composer — the one remaining "page in a frame" seam; the page reflows
+  behind native alerts while the keyboard guide moves.
+- The pad floor holds at most 4096 records (about 1365 pads); past that a new
+  pad's floor reads TAMPERED (fail closed). Raise the cap if anyone gets near.
+- Pinch zoom is off; text size follows Dynamic Type, capped so the page stays
+  at least 320 CSS px wide. System Zoom (Accessibility) still works.
+- Screenshots of the app are possible (iOS offers no FLAG_SECURE).
+
+## CI notes
+- The iOS gate runs only the relay tests the app depends on:
+  `tests/test_ws.py` has a pre-existing intermittent hang (seen on `master`
+  too), which must not burn this pipeline's timeout. The full relay suite
+  runs in `deploy/deploy-*.sh`.
+- Screenshots and a test summary go to the `ci/ios-shots` branch from a
+  separate job; the macOS job itself holds a read-only token.
+

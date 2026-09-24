@@ -117,9 +117,13 @@ final class ShellUIDelegate: NSObject, WKUIDelegate {
             field.accessibilityLabel = secret ? "Passphrase" : "Answer"
         }
         a.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in done.run(nil) })
-        a.addAction(UIAlertAction(title: "OK", style: .default) { [weak a] _ in
+        let ok = UIAlertAction(title: "OK", style: .default) { [weak a] _ in
             done.run(a?.textFields?.first?.text ?? "")
-        })
+        }
+        a.addAction(ok)
+        // Typing then Return means OK; confirm() keeps Cancel as the default
+        // (hot review r2 m4).
+        a.preferredAction = ok
         show(a) { done.run(nil) }
     }
 }

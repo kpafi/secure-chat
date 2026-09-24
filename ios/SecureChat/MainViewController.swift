@@ -46,6 +46,8 @@ final class MainViewController: UIViewController {
         config.secondaryTextProperties.color = Theme.muted
         var button = UIButton.Configuration.filled()
         button.title = "Try again"
+        button.baseBackgroundColor = Theme.accentFill   // hot review r2 M1: 4.6:1
+        button.baseForegroundColor = .white
         config.button = button
         config.buttonProperties.primaryAction = UIAction { [weak self] _ in self?.retryAfterCrashLoop() }
         let v = UIContentUnavailableView(configuration: config)
@@ -62,11 +64,7 @@ final class MainViewController: UIViewController {
     }
 
     private func retryAfterCrashLoop() {
-        crashView?.removeFromSuperview()
-        crashView = nil
-        crashTimes = []
-        webView?.isHidden = false
-        if let relay = Prefs.relay() { load(relay) }
+        if let relay = Prefs.relay() { load(relay) } else { promptForRelay(initial: true) }
     }
 
     /// Dynamic Type for the page (cold review r1 M5). WKWebView ignores the
@@ -131,9 +129,6 @@ final class MainViewController: UIViewController {
         // An app, not a page: no pinch or double-tap zoom (text size follows
         // Dynamic Type instead), and no white overscroll behind the page.
         wv.underPageBackgroundColor = Theme.bg
-        wv.scrollView.pinchGestureRecognizer?.isEnabled = false
-        wv.scrollView.minimumZoomScale = 1
-        wv.scrollView.maximumZoomScale = 1
         view.addSubview(wv)
         // Inside the safe area: the page does not use viewport-fit=cover, so
         // the notch and home-indicator strips are native bg, not page.
@@ -152,8 +147,13 @@ final class MainViewController: UIViewController {
             self.applyTextSize()
         }
 
-        navDelegate.onClientLoaded = { [weak self] _, ok in
+        navDelegate.onClientLoaded = { [weak self] wv, ok in
             guard let self = self else { return }
+            // No pinch or double-tap zoom. After load: the recogniser does not
+            // exist earlier, and WebKit resets zoom limits per load (r2 m3).
+            wv.scrollView.pinchGestureRecognizer?.isEnabled = false
+            wv.scrollView.minimumZoomScale = 1
+            wv.scrollView.maximumZoomScale = 1
             if ok { self.clientLoaded() } else { self.refuseToRun() }
         }
         navDelegate.onProcessTerminated = { [weak self] _ in
@@ -189,6 +189,12 @@ final class MainViewController: UIViewController {
     /// Point the client at `relay`, (re)install the document-start script, load.
     func load(_ relay: RelayUrls) {
         guard !refusedToRun, let wv = webView else { return }
+        // Any load (Reload, a new relay, Try again) leaves the crash-loop
+        // screen behind (hot review r2 M2).
+        crashView?.removeFromSuperview()
+        crashView = nil
+        crashTimes = []
+        wv.isHidden = false
         WebShell.install(relay: relay, into: wv.configuration.userContentController)
         wv.load(URLRequest(url: AppOrigin.indexURL, cachePolicy: .reloadIgnoringLocalCacheData))
     }
