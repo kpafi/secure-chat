@@ -12,7 +12,7 @@ uvicorn[standard]==0.51.0
 pydantic==2.13.4
 cryptography==49.0.0   # server-side Ed25519 verification (login + ownership proof)
 dilithium-py==1.4.0    # server-side ML-DSA-65 verification (PQ ownership proof at registration)
-websockets==16.1.1     # used only by the local smoke-test client
+websockets==16.1.1     # uvicorn's WebSocket implementation (pulled in by uvicorn[standard])
 pytest==9.1.1
 pytest-asyncio==1.4.0
 httpx==0.28.1          # ASGI test client for endpoint tests
