@@ -473,10 +473,12 @@ async function persist() {
   const witness = await readWitness();
   if (witness && !witness.corrupt && witness.gen > generation) {
     lock();
-    throw new Error(
+    const err = new Error(
       "your contacts were changed in another tab (or another window) — this page is out of date. " +
       "Reload before making further changes, so the other tab's changes are not lost.",
     );
+    err.code = "STALE"; // app.js tells this benign case apart from a real store error
+    throw err;
   }
   generation += 1; // L-1: every write moves the store forward, monotonically
   const iv = crypto.getRandomValues(new Uint8Array(12));

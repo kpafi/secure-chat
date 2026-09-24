@@ -246,6 +246,39 @@ check("Verify (clicked twice) marks bob verified once: the sheet and the row say
   s.open && s.mark === "verified by you" && rowMark === "verified by you" && s.verify.text === "Unverify" &&
   !!s.facts.Verified, JSON.stringify({ mark: s.mark, rowMark, verify: s.verify, facts: s.facts }));
 
+// Pentest p4 M-1 guard: a stranger's mail makes an automatic contact that
+// CLAIMS bob's handle. The vouch refresh then fetches the real bob's vouches —
+// ours among them — and must never delete it (an earlier fix did).
+{
+  const vouchesAboutBob = () => alice.page.evaluate(async (h) =>
+    (await (await import("./account.js")).fetchVouches("", h)).map((v) => v.voucher), bob.handle);
+  const before = await vouchesAboutBob();
+  const deletes = [];
+  const onDel = (r) => { if (r.method() === "DELETE" && r.url().includes("/api/vouch")) deletes.push(r.url()); };
+  alice.page.on("request", onDel);
+  await alice.page.evaluate(async (b) => {
+    const { Identity } = await import("./identity.js");
+    const contacts = await import("./contacts.js");
+    const k = (await Identity.generate()).publicBundle(); // the stranger's own keys
+    const [name, token] = b.split("#");
+    await contacts.upsert({ username: "unknown-claimsbob01", addrUsername: name, token, claimedName: b, auto: true,
+      ed: k.ed, mldsa: k.mldsa, ecdh: k.ecdh, mlkem: k.mlkem });
+  }, bob.handle);
+  await alice.page.keyboard.press("Escape");
+  await waitSheet(alice.page, false);
+  await view(alice.page, "chats");
+  await view(alice.page, "users"); // renders the list, which runs the vouch refresh
+  await sleep(2500);
+  alice.page.off("request", onDel);
+  const after = await vouchesAboutBob();
+  check("a stranger claiming bob's handle cannot make us delete our real vouch for bob",
+    before.includes(alice.username) && after.includes(alice.username) && deletes.length === 0,
+    JSON.stringify({ before, after, deletes }));
+  await alice.page.evaluate(async () => { await (await import("./contacts.js")).remove("unknown-claimsbob01"); });
+  await alice.page.click(`${rowOf(bob.username)} > .u-open`);
+  await waitSheet(alice.page);
+}
+
 // --- 3. Message → Chats; the conversation's name opens the profile -----------
 console.log("\n3. from Chats");
 await alice.page.click("#contactMessage");

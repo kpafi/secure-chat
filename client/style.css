@@ -1304,15 +1304,16 @@ li:has(> .u-open .u-mark.changed) > .hint.err::before,
   white-space: normal;
 }
 .contact-actions > .primary { flex: 1 1 auto; }
-/* The secondary counts only its longest word toward the line break, so at
-   320px its label wraps inside the button before the pair wraps into two
-   rows; it never grows past its own text (hot r4, cold r4 MINOR-4). */
-.contact-actions > button:not(.primary) { flex: 1000 1 min-content; max-width: max-content; }
-/* Below 360px "Verified in person ✓" — primary or not — also counts only
-   its longest word, so its label wraps inside the button and the pair keeps
-   one row (hot r4: at 320 the primary Verify's full width broke the row). */
+/* Below 360px the pair would wrap into two rows at normal text (line
+   breaking uses each button's full width): there the secondary counts only
+   its longest word and never grows past its text, and a primary "Verified
+   in person ✓" also counts only its longest word — the label wraps inside
+   its button, the pair keeps one row (hot r4, cold r4 MINOR-4). Scoped to
+   that width: wider, and at 200% text, the natural wrap is the better one
+   (cold r5 MINOR-A). */
 @media (max-width: 359px) {
-  .contact-actions > #contactVerify { flex: 10 1 min-content; }
+  .contact-actions > button:not(.primary) { flex: 1000 1 min-content; max-width: max-content; }
+  .contact-actions > #contactVerify.primary { flex: 10 1 min-content; }
 }
 .contact-actions > #contactVerify.ghost { border-color: var(--border); }
 .contact-remove-row { display: flex; justify-content: flex-end; margin-top: calc(var(--sp-1) - var(--gap)); }
