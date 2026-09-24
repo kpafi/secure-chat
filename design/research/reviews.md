@@ -111,7 +111,10 @@ username and Expecting toggles hide nothing a user needs.
 Scope: the owner's ask after testing 0.2.0 — tap a saved user's avatar or name in Users or Chats and
 see a short profile (handle, fingerprint, and the rest). Decisions in `reviews/profile-brief.md`;
 design on the Claude Design canvas ("Contact profile" row); triage per round in
-`reviews/profile-fix-round-1.md` … `profile-fix-round-5.md`. Same three reviewers as the rework.
+`reviews/profile-fix-round-1.md` … `profile-fix-round-7.md`. Same three reviewers as the rework.
+Round 7 (after 0.3.0 shipped): the owner found the lone Remove, right-aligned under the decision
+row, off centre on the phone; it is centred now, and so is the lone Unverify when there is no
+Message; the e2e measures Remove's centre and its clearance under the bar in both phone arms.
 
 Design critic ("hot"): round 1 no — Message was the blue primary even when the key had changed
 (B1), the fingerprint sat far from Verify, facts repeated the pill, no action on screen on short

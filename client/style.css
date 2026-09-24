@@ -1291,8 +1291,8 @@ li:has(> .u-open .u-mark.changed) > .hint.err::before,
 .facts-line dd { margin: 0; color: var(--fg); }
 /* Actions: the two decisions, natural widths, the one primary grows (app.js
    puts it first in the DOM). Unverify keeps a hairline, so it never reads
-   like Remove. Remove: last, on its own line, right-aligned, a muted word
-   until hover or focus — red on this sheet means the changed key (hot M5). */
+   like Remove. Remove: last, on its own line, centred, a muted word until
+   hover or focus — red on this sheet means the changed key (hot M5). */
 /* One line at normal text size (the pair needs 270 of 288px at 320); at
    200% text the pair wraps, and a button is never narrower than its longest
    word — a label never spills out of its button (cold r3 MAJOR-B). */
@@ -1316,9 +1316,16 @@ li:has(> .u-open .u-mark.changed) > .hint.err::before,
   .contact-actions > #contactVerify.primary { flex: 10 1 min-content; }
 }
 .contact-actions > #contactVerify.ghost { border-color: var(--border); }
-.contact-remove-row { display: flex; justify-content: flex-end; margin-top: calc(var(--sp-1) - var(--gap)); }
+/* Opened from a conversation there is no Message: the one decision left is
+   centred too, on the same axis as Remove under it, instead of one button
+   flush left and one centred (hot r7 MINOR-2). */
+.contact-actions:has(> #contactMessage[hidden]) { justify-content: center; }
+/* Remove sits alone under the decision row: centred, like a sheet's quiet
+   last action, not hanging off the right edge as a second column would
+   (owner, on the phone, 0.3.0). Its own padding is its hit area; no negative
+   margin to a content edge it no longer aligns with. */
+.contact-remove-row { display: flex; justify-content: center; margin-top: calc(var(--sp-1) - var(--gap)); }
 #contactRemove {
-  margin-right: calc(-1 * var(--sp-3));
   padding: 0 var(--sp-3);
   color: var(--muted);
   background: transparent;
