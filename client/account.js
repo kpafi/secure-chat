@@ -81,7 +81,33 @@ export function formatDetail(detail, status) {
   } catch {
     text = "";
   }
-  return typeof text === "string" && text.trim() ? text : status + "";
+  // Package 2, item 1 (transcript-line forgery): this text is the RELAY's,
+  // and it is shown in the app's own voice (a hint, the Users status, a line
+  // in the room transcript, which is `white-space: pre-wrap`). A relay-chosen
+  // "\n" started a line of its own there; a bidi override reordered one. So:
+  // printable ASCII only (every other run becomes one space) and at most
+  // FORMAT_DETAIL_MAX characters. Still total — nothing below can throw.
+  if (typeof text !== "string") text = "";
+  text = text.replace(/[^\x20-\x7e]+/g, " ").trim();
+  if (text.length > FORMAT_DETAIL_MAX) text = text.slice(0, FORMAT_DETAIL_MAX - 3) + "...";
+  return text ? text : String(status).replace(/[^\x20-\x7e]+/g, " ").slice(0, 16);
+}
+const FORMAT_DETAIL_MAX = 200;
+
+// Second fix round (re-review of 9a38d97, L-1): a success body is relay bytes
+// too, and a SyntaxError echoes ~20 of them (U+202E, U+2028 included) into
+// whatever sentence the caller builds. Every success-path parse goes through
+// here and fails with a fixed sentence.
+async function okJson(res, what) {
+  try {
+    return await res.json();
+  } catch (e) {
+    // Fix round 3 (L-1): a body that never finished arriving (abort, timeout,
+    // network) is NOT a malformed answer — the request may have been carried
+    // out. Callers tell those apart by the error's type, so it passes through.
+    if (e && (e.name === "AbortError" || e.name === "TimeoutError" || e instanceof TypeError)) throw e;
+    throw new Error((what ? what + ": " : "") + "the directory returned a malformed answer");
+  }
 }
 
 async function asError(res) {
@@ -117,7 +143,7 @@ export async function register(base, identity, username) {
     err.status = status;
     throw err;
   }
-  return res.json();
+  return okJson(res, null); // the caller says "Registration failed: "
 }
 
 // Fetch a peer's public identity bundle from a `username#token` handle. Returns
@@ -131,7 +157,14 @@ export async function fetchBundle(base, handle) {
   );
   if (res.status === 404) return null;
   if (!res.ok) throw new Error("lookup failed: " + (await asError(res)));
-  const d = await res.json();
+  // Fix round (review of e0e8f30): a parse error echoes the relay's bytes.
+  let d;
+  try {
+    d = await res.json();
+  } catch {
+    throw new Error("the directory returned a malformed answer");
+  }
+  if (!d || typeof d !== "object") throw new Error("the directory returned a malformed answer");
   // Pentest 2026-07-29 M-6: canonicalise here, at the boundary where a
   // server-controlled string first enters the client.
   //
@@ -212,7 +245,12 @@ export async function login(base, identity, username) {
     body: JSON.stringify({ username }),
   });
   if (!cRes.ok) throw new Error("challenge failed: " + (await asError(cRes)));
-  const { challenge } = await cRes.json();
+  let challenge;
+  try {
+    ({ challenge } = await cRes.json());
+  } catch {
+    throw new Error("challenge failed: the directory returned a malformed answer");
+  }
 
   // Sign under the login domain prefix (matches accounts._login_message) so the
   // signature is bound to the login protocol and can't be cross-used elsewhere.
@@ -229,7 +267,11 @@ export async function login(base, identity, username) {
     body: JSON.stringify({ username, challenge, sig, mldsa_sig: mldsaSig }),
   });
   if (!vRes.ok) throw new Error("verify failed: " + (await asError(vRes)));
-  return vRes.json(); // { token, ttl }
+  try {
+    return await vRes.json(); // { token, ttl }
+  } catch {
+    throw new Error("verify failed: the directory returned a malformed answer");
+  }
 }
 
 // ---- web-of-trust vouches -------------------------------------------------
@@ -268,7 +310,7 @@ export async function vouch(base, identity, sessionToken, targetUsername, target
     signal,
   });
   if (!res.ok) throw new Error("vouch failed: " + (await asError(res)));
-  return res.json();
+  return okJson(res, "vouch failed");
 }
 
 export async function unvouch(base, sessionToken, targetUsername, signal = undefined) {
@@ -278,7 +320,7 @@ export async function unvouch(base, sessionToken, targetUsername, signal = undef
     signal,
   });
   if (!res.ok) throw new Error("unvouch failed: " + (await asError(res)));
-  return res.json();
+  return okJson(res, "unvouch failed");
 }
 
 // Vouches ABOUT a contact (requires their username#token handle, same gate as
@@ -292,7 +334,8 @@ export async function fetchVouches(base, handle) {
   );
   if (res.status === 404) return null;
   if (!res.ok) throw new Error("vouch lookup failed: " + (await asError(res)));
-  return (await res.json()).vouches;
+  const v = (await okJson(res, "vouch lookup failed")).vouches;
+  return Array.isArray(v) ? v : [];
 }
 
 // ---- mailbox (store-and-forward for sealed envelopes) ---------------------
@@ -309,8 +352,31 @@ export async function sendMail(base, handle, envelope) {
   if (res.status === 404) throw new Error("recipient unknown (check the handle)");
   if (res.status === 429) throw new Error("recipient inbox full or rate limited — try again later");
   if (!res.ok) throw new Error("send failed: " + (await asError(res)));
-  return res.json();
+  // Fix round 3: a 200 means the relay queued it. Nobody reads the answer, and
+  // failing a delivered message over its body made the sender skip recording
+  // it in the chat history.
+  return true;
 }
+
+// Package 2, item 9 (F-WEB-003): the relay's own bounds (backend/config.py):
+// at most MAX_MAILBOX_PER_RECIPIENT = 200 queued envelopes per inbox, each at
+// most MAX_ENVELOPE_BYTES = 64 KiB. A hostile relay could otherwise hand us an
+// arbitrarily large body to JSON.parse and an arbitrarily long batch to open
+// (an ML-KEM decapsulation and two signature verifies each).
+//
+// Fix round (review of e0e8f30, Medium): the GET is DELETE-ON-READ, so
+// refusing a whole body throws away every envelope in it — the relay has
+// already dropped them. The first bound, 200 x (64 KiB + 1 KiB), was below
+// what an HONEST relay can send: an envelope may be 65 536 printable-ASCII
+// characters, and `"` and `\` JSON-escape to two characters each. A sender
+// holding our handle could post 104 envelopes of `"` and every real message
+// queued beside them was lost for good. So the body bound is the worst-case
+// ESCAPED size (2 x 64 KiB per envelope + framing), and everything below it is
+// parsed and judged PER ENTRY: one oversize or malformed entry never costs the
+// others.
+export const MAX_MAILBOX_BATCH = 200;
+export const MAX_ENVELOPE_CHARS = 64 * 1024;
+const MAX_MAILBOX_BODY_CHARS = MAX_MAILBOX_BATCH * (2 * MAX_ENVELOPE_CHARS + 1024);
 
 // Fetch AND consume my queued envelopes (requires login; the server deletes
 // what it returns). Returns [{envelope, created_at}].
@@ -326,7 +392,23 @@ export async function fetchMail(base, sessionToken) {
     err.status = status;
     throw err;
   }
-  return (await res.json()).messages;
+  const body = await res.text();
+  if (body.length > MAX_MAILBOX_BODY_CHARS) {
+    throw new Error("mailbox fetch failed: the relay returned more than any mailbox can hold");
+  }
+  let msgs;
+  try {
+    msgs = JSON.parse(body).messages;
+  } catch {
+    throw new Error("mailbox fetch failed: malformed answer");
+  }
+  if (!Array.isArray(msgs)) throw new Error("mailbox fetch failed: malformed answer");
+  // Per entry: an oversized or malformed one is not an envelope the relay
+  // could have accepted and is skipped ALONE; the batch is bounded to what one
+  // inbox can hold.
+  return msgs
+    .filter((m) => m && typeof m.envelope === "string" && m.envelope.length <= MAX_ENVELOPE_CHARS)
+    .slice(0, MAX_MAILBOX_BATCH);
 }
 
 // Resolve a bearer token back to a username (sanity check / "who am I").
@@ -335,5 +417,5 @@ export async function me(base, token) {
     headers: { authorization: "Bearer " + token },
   });
   if (!res.ok) throw new Error("me failed: " + (await asError(res)));
-  return (await res.json()).username;
+  return (await okJson(res, "me failed")).username;
 }

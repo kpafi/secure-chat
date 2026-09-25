@@ -472,8 +472,17 @@ console.log("OK  L-3: a concurrent second-tab write is refused, not silently los
     await contacts.setVouches("carol", ["bob"], { ed: "E2==", mldsa: "M2==", ecdh: "C3==", mlkem: "K3==" }),
     true);
   assert.deepStrictEqual(contacts.get("carol").vouchedBy, ["bob"]);
+  // Package 2, item 11 (F-PROTO-005, the rest): `forKeys` used to default to
+  // null, and null SKIPPED the check — the unbound write, one forgotten
+  // argument away. Without the keys the vouches were verified against, the
+  // write is refused outright, and nothing is written.
+  for (const missing of [undefined, null, {}, { ed: "E2==" }]) {
+    await assert.rejects(contacts.setVouches("carol", ["mallory"], missing), /verified against/,
+      `item 11: setVouches without the verified keys (${JSON.stringify(missing)}) must throw`);
+  }
+  assert.deepStrictEqual(contacts.get("carol").vouchedBy, ["bob"], "item 11: ...and write nothing");
 }
-console.log("OK  F-PROTO-005: a vouch result for superseded keys is discarded");
+console.log("OK  F-PROTO-005: a vouch result for superseded keys is discarded; the keys are required");
 
 // ---- Pentest 2026-08-07 F-ATREST-007: Unverify / Remove revoke the pin ------
 {
@@ -605,5 +614,22 @@ console.log("OK  F-ATREST-007: Unverify and Remove revoke the pin (kept for chan
     "browser: both deleted opens as a fresh store (documented residual; app.js warns on `created`)");
 }
 console.log("OK  F-ATREST-003/004: on device the contact store fails closed; browser residual pinned");
+
+// ---- second fix round (re-review of 9a38d97, I-1): a planted, unparseable ----
+// store is refused with a fixed sentence — never the SyntaxError, which
+// echoes ~20 characters of the planted value (a newline, U+202E) into the
+// locked panel and the transcript.
+{
+  const lsKey = "sc.contacts.v1";
+  const saved = localStorage.getItem(lsKey);
+  if (contacts.isUnlocked()) contacts.lock();
+  localStorage.setItem(lsKey, "x\n[verified by you]\u202e\u2028");
+  const err = await contacts.unlock(PASS).catch((e) => e);
+  assert.ok(err instanceof Error, "a planted unparseable store is refused");
+  assert.match(err.message, /on this device is not readable \(damaged or replaced\)$/, "...with a fixed sentence");
+  assert.ok(!/[\n\u202e\u2028]|verified by you/.test(err.message), "...that carries none of the planted text");
+  if (saved === null) localStorage.removeItem(lsKey); else localStorage.setItem(lsKey, saved);
+  console.log("OK  I-1: an unparseable store is refused with a fixed sentence (no planted text echoed)");
+}
 
 console.log("\nAll contact-store checks passed.");

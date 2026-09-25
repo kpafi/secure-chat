@@ -194,7 +194,15 @@ export async function unlock(passphrase, opts = {}) {
     return { created: true };
   }
   expectedStore = true;
-  const blob = JSON.parse(raw);
+  // Second fix round (re-review of 9a38d97, I-1): a SyntaxError echoes ~20
+  // characters of what is in localStorage — a planted value with a newline or
+  // U+202E — into the locked panel and the transcript. A fixed sentence.
+  let blob;
+  try {
+    blob = JSON.parse(raw);
+  } catch {
+    throw new Error("the contact store on this device is not readable (damaged or replaced)");
+  }
   salt = unb64(blob.salt);
   dataKey = await deriveKey(passphrase, salt, blob.iters || KDF_ITERS);
   let plain;
@@ -674,11 +682,19 @@ function revokePin(username) {
 // result is discarded (returns false) and the next refresh redoes it against
 // the current keys. The check and the mutation are synchronous, so there is
 // no second window between them.
-export async function setVouches(username, names, forKeys = null) {
+//
+// Package 2, item 11 (F-PROTO-005, the rest): `forKeys` used to default to
+// null, and null skipped the check — the unbound write F-PROTO-005 is about,
+// one forgotten argument away. It is required now: a call without the keys the
+// vouches were verified against is a programming error and throws.
+export async function setVouches(username, names, forKeys) {
   if (!contacts) throw new Error("contact store is locked");
+  if (!forKeys || typeof forKeys !== "object" || !forKeys.ed || !forKeys.mldsa) {
+    throw new Error("setVouches needs the keys the vouches were verified against");
+  }
   const cur = contacts.find((c) => c.username === username);
   if (!cur) return false;
-  if (forKeys && (
+  if ((
     cur.ed !== forKeys.ed || cur.mldsa !== forKeys.mldsa ||
     (cur.ecdh ?? null) !== (forKeys.ecdh ?? null) ||
     (cur.mlkem ?? null) !== (forKeys.mlkem ?? null)

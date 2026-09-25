@@ -8,8 +8,8 @@
 //
 // Run: node identity.test.mjs   (server not required)
 import assert from "node:assert";
-import { Identity, b64 } from "./identity.js";
-import { signHandshake, verifyHandshake, freshNonce } from "./auth.js";
+import { Identity, b64, concat } from "./identity.js";
+import { signHandshake, verifyHandshake, freshNonce, signKnock, verifyKnock } from "./auth.js";
 import { makeCipher, bufToB64 } from "./crypto.js";
 
 const ROOM = "a".repeat(64);
@@ -230,7 +230,107 @@ async function testCrossSessionReplayDefeated() {
   console.log("OK  cross-session handshake replay (reused room id) DEFEATED by session nonces");
 }
 
+// Phase-7 pentest 2026-09-16, F-P7-A1 #1. identity.js's headline claim — "Both
+// signatures must verify for any check to pass" — had no test: the only
+// dual-signature check above uses a signature from a DIFFERENT identity, which
+// fails the classical half too. Deleting the whole ML-DSA half of
+// Identity.verify left every test file green. This pins each half alone.
+async function testDualSignatureIsMandatory() {
+  const id = await Identity.generate();
+  const other = await Identity.generate();
+  const bundle = id.publicBundle();
+  const msg = new TextEncoder().encode("both halves, or nothing");
+  const good = await id.sign(msg);
+  const alien = await other.sign(msg);
+  assert.strictEqual(await Identity.verify(bundle, msg, good), true, "control: the genuine dual signature verifies");
+  assert.strictEqual(await Identity.verify(bundle, msg, { ed: good.ed, mldsa: alien.mldsa }), false,
+    "a valid Ed25519 signature with a wrong ML-DSA signature must be REFUSED — the post-quantum half is not decorative");
+  assert.strictEqual(await Identity.verify(bundle, msg, { ed: alien.ed, mldsa: good.mldsa }), false,
+    "a valid ML-DSA signature with a wrong Ed25519 signature must be REFUSED — the classical half is not decorative");
+  assert.strictEqual(await Identity.verify(bundle, msg, { ed: good.ed }), false,
+    "an ABSENT ML-DSA signature must be refused, not skipped");
+  assert.strictEqual(await Identity.verify(bundle, msg, { ed: good.ed, mldsa: "AAAA" }), false,
+    "a malformed ML-DSA signature must be refused, not skipped");
+  console.log("OK  F-P7-A1: each signature half is independently load-bearing in Identity.verify");
+}
+
+// Phase-7 pentest 2026-09-16, F-P7-A1 #2. The 2026-07-26 P-03 fix binds the
+// signer's whole bundle (through its 32-byte digest) into the handshake
+// transcript, so a relay that swaps or strips the long-term ENCRYPTION keys in
+// a `key` frame fails signature verification instead of relying on the user to
+// spot a changed safety number. Dropping that digest from auth.js left every
+// test green. The same signature must verify against the bundle as presented
+// and fail against a swapped or stripped copy.
+async function testTranscriptBindsTheSignersBundle() {
+  const id = await Identity.generate();
+  const other = await Identity.generate();
+  const nonces = [freshNonce(), freshNonce()];
+  const pub = await ephemeralPub(makeCipher("DHKE", ROOM));
+  const sig = await signHandshake(id, ROOM, nonces, pub);
+  const b = id.publicBundle();
+  assert.strictEqual(await verifyHandshake(b, ROOM, nonces, pub, sig), true, "control: genuine bundle verifies");
+  const swappedEcdh = { ...b, ecdh: other.publicBundle().ecdh };
+  assert.strictEqual(await verifyHandshake(swappedEcdh, ROOM, nonces, pub, sig), false,
+    "P-03: a relay-swapped idb.ecdh must fail the handshake signature");
+  const swappedKem = { ...b, mlkem: other.publicBundle().mlkem };
+  assert.strictEqual(await verifyHandshake(swappedKem, ROOM, nonces, pub, sig), false,
+    "P-03: a relay-swapped idb.mlkem must fail the handshake signature");
+  const stripped = { ed: b.ed, mldsa: b.mldsa };
+  assert.strictEqual(await verifyHandshake(stripped, ROOM, nonces, pub, sig), false,
+    "P-03: stripping the encryption keys from the presented bundle must fail the handshake signature");
+  console.log("OK  F-P7-A1: the handshake transcript binds the signer's full bundle (P-03)");
+}
+
+// Phase-7 pentest 2026-09-16, F-P7-A1 (also green on its own): the knock
+// signature lives in its own domain, so a knock can never be read as a
+// handshake signature or the reverse. Making KNOCK_DOMAIN equal the handshake
+// domain was green. Pinned by behaviour: a knock-shaped transcript signed under
+// the HANDSHAKE domain is refused by verifyKnock, and the same shape under
+// "secure-chat/knock/v1" is accepted (the positive control proves the shape is
+// the real one, so the refusal is about the domain and nothing else).
+async function testKnockDomainIsItsOwn() {
+  const id = await Identity.generate();
+  const b = id.publicBundle();
+  const knockShaped = async (domain) => id.sign(concat(
+    new TextEncoder().encode(domain), new TextEncoder().encode(ROOM), await Identity.bundleDigest(b),
+  ));
+  assert.strictEqual(await verifyKnock(b, ROOM, await knockShaped("secure-chat/knock/v1")), true,
+    "control: the knock transcript is DOMAIN || room || bundleDigest");
+  assert.strictEqual(await verifyKnock(b, ROOM, await knockShaped("secure-chat/handshake/v3")), false,
+    "a knock signed under the HANDSHAKE domain must not verify as a knock — the two transcripts live in disjoint spaces");
+  assert.strictEqual(await verifyKnock(b, ROOM, await signKnock(id, ROOM)), true, "control: signKnock/verifyKnock agree");
+  console.log("OK  F-P7-A1: the knock signature has its own domain");
+}
+
+// Phase-7 pentest 2026-09-16, F-P7-A1 (P-17, green on its own): import proves
+// the stored PUBLIC keys belong to the stored PRIVATE keys. Deleting the
+// `_assertKeypairsConsistent()` call from import() was green. A backup that
+// pairs this identity's private keys with ANOTHER identity's public ML-DSA /
+// ECDH / ML-KEM key must be refused at import, not loaded to show contacts a
+// safety number for keys it cannot use.
+async function testImportRefusesMismatchedKeypairs() {
+  const a = await Identity.generate();
+  const other = await Identity.generate();
+  const fields = {
+    edPriv: a._edPriv, edPubRaw: a.edPubRaw, mldsaSecret: a._mldsaSecret, mldsaPub: a.mldsaPub,
+    ecdhPriv: a._ecdhPriv, ecdhPubRaw: a.ecdhPubRaw, mlkemSecret: a._mlkemSecret, mlkemPub: a.mlkemPub,
+  };
+  const pass = "franken";
+  const ok = await Identity.import(await new Identity(fields).export(pass), pass);
+  assert.strictEqual(ok.publicBundle().ed, a.publicBundle().ed, "control: an untampered backup imports");
+  for (const [k, v] of [["mldsaPub", other.mldsaPub], ["ecdhPubRaw", other.ecdhPubRaw], ["mlkemPub", other.mlkemPub]]) {
+    const blob = await new Identity({ ...fields, [k]: v }).export(pass);
+    await assert.rejects(() => Identity.import(blob, pass), /inconsistent|malformed|do not match|does not match/,
+      `P-17: a backup whose ${k} belongs to another identity must be refused at import`);
+  }
+  console.log("OK  F-P7-A1: import refuses a backup whose public keys do not match its private keys (P-17)");
+}
+
 await testIdentityBasics();
+await testDualSignatureIsMandatory();
+await testTranscriptBindsTheSignersBundle();
+await testKnockDomainIsItsOwn();
+await testImportRefusesMismatchedKeypairs();
 await testFingerprints();
 await testExportImport();
 await testLegacyBlobImport();

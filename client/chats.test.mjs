@@ -260,4 +260,21 @@ console.log("OK  F-ATREST-005: chat store is tagged, versioned and witnessed; de
 }
 console.log("OK  F-ATREST-005 on device: the chat store has a native floor");
 
+// ---- second fix round (re-review of 9a38d97, I-1): a planted, unparseable ----
+// store is refused with a fixed sentence — never the SyntaxError, which
+// echoes ~20 characters of the planted value (a newline, U+202E) into the
+// locked panel and the transcript.
+{
+  const lsKey = "sc.chats.v1";
+  const saved = localStorage.getItem(lsKey);
+  if (chats.isUnlocked()) chats.lock();
+  localStorage.setItem(lsKey, "x\n[verified by you]\u202e\u2028");
+  const err = await chats.unlock(PASS).catch((e) => e);
+  assert.ok(err instanceof Error, "a planted unparseable store is refused");
+  assert.match(err.message, /on this device is not readable \(damaged or replaced\)$/, "...with a fixed sentence");
+  assert.ok(!/[\n\u202e\u2028]|verified by you/.test(err.message), "...that carries none of the planted text");
+  if (saved === null) localStorage.removeItem(lsKey); else localStorage.setItem(lsKey, saved);
+  console.log("OK  I-1: an unparseable store is refused with a fixed sentence (no planted text echoed)");
+}
+
 console.log("\nAll chat-mode allow-list checks passed.");

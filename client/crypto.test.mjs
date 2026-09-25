@@ -513,6 +513,126 @@ async function pqkemLateOfferChangesTheChains() {
   console.log("OK  PQKEM a late offer DOES rebuild the chains (M-5's mechanism, pinned)");
 }
 
+// ---- Phase-7 pentest 2026-09-16, F-P7-A1: the crypto controls, pinned --------
+// The Phase-7 pentest removed seven client crypto controls AT ONCE and the
+// whole estate stayed green. These pin them by behaviour — none of them reads
+// a constant out of crypto.js, so moving a constant moves nothing here.
+
+// #4. RATCHET_MAX_SKIP bounds how far ahead a frame's sequence may be before
+// the receiver refuses to derive (and discard) skipped keys — the M-6 DoS fix.
+// Raising it to 100000 left every test green. Pinned at exactly 64: 65 steps
+// ahead is refused BEFORE any AEAD work; 64 is derived and then fails
+// authentication (the bound is the only thing that differs between the two).
+async function ratchetSkipBoundChecks() {
+  const mk = () => makeCipher("AES256", ROOM, { passphrase: "correct horse battery staple" });
+  const a = mk(); const b = mk();
+  await a.init(); await b.init();
+  await exchangeNonces(a, b);
+  const frame = JSON.parse(Buffer.from(await a.encrypt(MSG), "base64").toString());
+  const repack = (n) => Buffer.from(JSON.stringify({ ...frame, n })).toString("base64");
+  await assert.rejects(() => b.decrypt(repack(frame.n + 64)), /too far ahead/,
+    "a frame 65 steps ahead of the receiver must be refused by the skip bound");
+  await assert.rejects(() => b.decrypt(repack(frame.n + 63)), (e) => !/too far ahead/.test(e.message),
+    "a frame exactly 64 steps ahead passes the bound (and then fails authentication) — the bound is 64, not lower");
+  assert.strictEqual(await b.decrypt(await a.encrypt("still fine")), "still fine", "the channel survives both refusals");
+  console.log("OK  F-P7-A1: RATCHET_MAX_SKIP is 64 and enforced before any key derivation");
+}
+
+// #5. AES256 refuses a session whose two nonces are equal. Both chains are
+// HKDF(base, sender nonce), so equal nonces make send chain == recv chain: a
+// relay reflecting our own hello would then have every frame we send decrypt
+// as the peer's. app.js refuses a reflected hello too; this is the cipher's
+// own half, and deleting it was green.
+async function aesEqualNonceChecks() {
+  const a = makeCipher("AES256", ROOM, { passphrase: "correct horse battery staple" });
+  await a.init();
+  const n = nonce();
+  await assert.rejects(() => a.setNonces(n, n), /bad session nonces/,
+    "AES256: equal session nonces would make the send and receive chains identical — refused");
+  assert.ok(!a.ready, "...and nothing was derived");
+  console.log("OK  F-P7-A1: AES256 refuses equal session nonces (reflection at the cipher)");
+}
+
+// #3 + the AEAD parameters. Every ratchet frame is AES-GCM with a fresh 96-bit
+// IV, the default 128-bit tag, and additional data = the MODE's own domain,
+// the room and the frame number — so a frame can never be replayed across
+// modes, rooms or positions. Dropping the domain from the AD was green. The AD
+// and the IV are observed on the way into WebCrypto, not read from source.
+async function aeadParameterChecks() {
+  const seen = [];
+  const subtle = crypto.subtle;
+  const orig = subtle.encrypt;
+  subtle.encrypt = function (alg, key, data) {
+    if (alg && alg.name === "AES-GCM" && alg.additionalData) seen.push(alg);
+    return orig.call(this, alg, key, data);
+  };
+  try {
+    const want = {
+      AES256: "secure-chat/aes-msg/v2", DHKE: "secure-chat/dhke-msg/v2",
+      RSA: "secure-chat/rsa-msg/v2", PQKEM: "secure-chat/pqkem-msg/v2",
+    };
+    for (const [alg, domain] of Object.entries(want)) {
+      let a, b;
+      if (alg === "AES256") {
+        a = makeCipher(alg, ROOM, { passphrase: "p" }); b = makeCipher(alg, ROOM, { passphrase: "p" });
+        await a.init(); await b.init(); await exchangeNonces(a, b);
+      } else {
+        a = makeCipher(alg, ROOM); b = makeCipher(alg, ROOM);
+        await a.init(); await b.init();
+        const [ao, bo] = [await a.handshakePayload(), await b.handshakePayload()];
+        await a.onPeerKey(bo); await b.onPeerKey(ao);
+        const [aa, ba] = [await a.handshakePayload(), await b.handshakePayload()];
+        await a.onPeerKey(ba); await b.onPeerKey(aa);
+      }
+      seen.length = 0;
+      const w1 = await a.encrypt(MSG);
+      await a.encrypt(MSG);
+      assert.strictEqual(seen.length, 2, `${alg}: each frame is one AES-GCM encryption with additional data`);
+      const [f1, f2] = seen;
+      assert.strictEqual(new TextDecoder().decode(f1.additionalData), `${domain}|${ROOM}|1`,
+        `${alg}: the AD binds the mode's domain, the room and the frame number (F-P7-A1 #3)`);
+      assert.strictEqual(new TextDecoder().decode(f2.additionalData), `${domain}|${ROOM}|2`);
+      for (const f of seen) {
+        assert.strictEqual(f.iv.byteLength, 12, `${alg}: the GCM IV is 96 bits`);
+        assert.ok(f.tagLength === undefined || f.tagLength === 128, `${alg}: the GCM tag is the full 128 bits`);
+      }
+      assert.notDeepStrictEqual([...f1.iv], [...f2.iv], `${alg}: every frame gets a fresh IV`);
+      const wire = JSON.parse(Buffer.from(w1, "base64").toString());
+      assert.strictEqual(Buffer.from(wire.iv, "base64").length, 12, `${alg}: the IV on the wire is the one used`);
+      assert.strictEqual(await b.decrypt(w1), MSG, `${alg}: control — the observed frame still decrypts`);
+    }
+  } finally {
+    subtle.encrypt = orig;
+  }
+  console.log("OK  F-P7-A1: ratchet AEAD = AES-GCM, fresh 96-bit IV, 128-bit tag, AD = mode domain | room | n");
+}
+
+// #7. The P-01 / L-5 spent-keystream guards: consumed pad bytes are zeroed in
+// place, so an all-zero span means we are about to XOR with spent keystream
+// (send: ct = pt, the plaintext falls out on the wire; receive: decrypting
+// against a region already consumed). Both guards could be deleted with every
+// OTP test green.
+async function otpSpentKeystreamGuardChecks() {
+  {
+    const [a, b] = otpPeers();
+    const base = a.role * a.regionSize;
+    a.pad.fill(0, base, base + 256); // our own send region, already spent
+    await assert.rejects(() => a.encrypt(MSG), /already spent/,
+      "P-01: sending from a zeroed (spent) region must be refused — ct = pt XOR 0 would hand the relay the plaintext");
+    assert.strictEqual(await a.decrypt(await b.encrypt("peer still fine")), "peer still fine",
+      "the refusal is scoped to the spent region: the other direction still works");
+  }
+  {
+    const [a, b] = otpPeers();
+    const wire = await a.encrypt(MSG);
+    const peerBase = a.role * a.regionSize; // A's send region, as seen from B
+    b.pad.fill(0, peerBase, peerBase + 256); // B has already consumed it (or it was tampered)
+    await assert.rejects(() => b.decrypt(wire), /already consumed|zeroed/,
+      "L-5: decrypting against a zeroed (consumed) peer region must be refused before the MAC is even checked");
+  }
+  console.log("OK  F-P7-A1: both OTP spent-keystream guards are load-bearing");
+}
+
 // ---- OTP (pre-shared one-time pad) -----------------------------------------
 // Build two peer views of the SAME pad (as export/import would produce on two
 // devices): identical bytes, opposite roles, independent Uint8Arrays so zeroing
@@ -644,4 +764,8 @@ await concurrencyChecks("RSA");
 await concurrencyChecks("PQKEM");
 otpChecksOffsetValidation();
 await otpChecks();
+await ratchetSkipBoundChecks();
+await aesEqualNonceChecks();
+await aeadParameterChecks();
+await otpSpentKeystreamGuardChecks();
 console.log("\nAll crypto checks passed.");

@@ -19,7 +19,7 @@
 //   root (it shares the relay's origin), so the in-person check still governs.
 
 import { makeCipher, isAscii, bufToB64, b64ToBuf } from "./crypto.js";
-import { Identity } from "./identity.js";
+import { Identity, canonicalPublicBundle } from "./identity.js";
 import {
   signHandshake, verifyHandshake, freshNonce, isValidNonce, signKnock, verifyKnock,
   unb64,
@@ -90,6 +90,8 @@ const els = {
   profileQrRow: $("profileQrRow"), profileQr: $("profileQr"),
   profileFingerprint: $("profileFingerprint"), profileKeys: $("profileKeys"),
   profileStatus: $("profileStatus"),
+  // package 2, item 10 (F-P7-9): each non-Live view's own hint line
+  profileHint: $("profileHint"), usersHint: $("usersHint"), chatsHint: $("chatsHint"),
   profileExport: $("profileExport"), profileForget: $("profileForget"),
   profileLogout: $("profileLogout"), profileSessionHint: $("profileSessionHint"),
   // users view
@@ -186,6 +188,10 @@ let roomRole = null;       // "owner" | "guest" for this connection
 let admittedBundle = null; // the identity WE let in (owner side), or null
 let admittedAnon = false;  // we let in someone with no identity at all
 let wasPending = false;    // we sat in the approval queue (M-2, guest side)
+// Package 2, item 2 (phase7-local M-1 rounds): the two relay-driven arms whose
+// honest relay sends them once per connection are SAID once per connection.
+let saidTurnedAway = false;
+let saidDenied = false;
 // Pentest 2026-08-07 F-PROTO-001: the one fact about room ownership the relay
 // does NOT get to supply. `roomRole` above is whatever the relay answers to
 // `join`, and a hostile relay can answer the room's CREATOR with `pending` —
@@ -233,8 +239,39 @@ let closeHint = null;
 // refusal. `refusal`, when given, is what onclose shows (it wins over anything
 // the relay said). `sock` is the socket the refusal belongs to (a frame's own).
 let clientClosing = false;
+// Package 2, item 3 (F-PROTO-002): RETIRED sockets — the ones this app decided
+// to close (a refusal, the user's Disconnect) and, from the first line of a new
+// connectInner(), the previous session's socket whatever closed it (fix round,
+// review of e0e8f30: connectInner builds the new cipher and awaits its init()
+// before `ws` is reassigned, and backlog frames of a relay-closed old socket
+// used to pass the gate in that window and drive the NEW session's cipher).
+// handleMessage handles no further frame from a retired socket (see there).
+const retiredSockets = new WeakSet();
+// Second fix round (re-review of 9a38d97, L-2): the retire check above ran only
+// at DISPATCH. A frame suspended inside an await (a signature verify) across a
+// relay close and a reconnect resumed into the NEW session's shared state —
+// cipher, peerBundle, nonces — and a genuine new peer was then refused as "a
+// SECOND identity". Every session has a generation, bumped where a new one
+// starts to be built; handleMessage captures it with the socket and re-checks
+// both after every await (sessionLive), and sends on the captured socket.
+let sessionGen = 0;
+// Fix round 3 (review of d0c4074, M-1). sessionGen deliberately does NOT move
+// on a relay close — frames the relay sent just before hanging up are still
+// handled (e2e/hostile-relay.mjs sections 6 and 8). But the verification GATE
+// must never be drawn, or acted on, for a connection that is gone: in Firefox
+// the safety-number digest resolves on a later task, so a gate for Bob could be
+// drawn after the close, survive into the next session, and "It matches" then
+// pinned whatever peer that session held (a relay-routed Mallory). gateGen
+// moves on EVERY close and every new session; gateFor is the one bundle (and
+// generation) the gate on screen was drawn for, and onVerifyOk pins only that.
+let gateGen = 0;
+let gateFor = null; // { bundle, gen } of the gate on screen, or null
+function sessionLive(sock, gen) {
+  return sock === ws && gen === sessionGen && !retiredSockets.has(sock);
+}
 function closeWs(refusal = null, sock = ws) {
   if (!sock) return;
+  retiredSockets.add(sock);
   // Round 3 (pentest L2): a frame handled after its socket's onclose ran (the
   // room screen is up) — show the refusal now instead of dropping it.
   if (sock.readyState === WebSocket.CLOSED) { if (refusal !== null && sock === ws) hint(refusal, true); return; }
@@ -290,7 +327,14 @@ function packKey(obj) {
   return bufToB64(enc.encode(JSON.stringify(obj)));
 }
 function unpackKey(b64) {
-  return JSON.parse(dec.decode(b64ToBuf(b64)));
+  // Fix round (review of e0e8f30): a SyntaxError echoes up to ~20 characters of
+  // its source — relay bytes, U+202E included — and this error reaches
+  // hint("Key exchange failed: " + e.message). A fixed sentence instead.
+  try {
+    return JSON.parse(dec.decode(b64ToBuf(b64)));
+  } catch {
+    throw new Error("malformed key frame");
+  }
 }
 
 // ---- pin store (TOFU + change detection) ----------------------------------
@@ -361,20 +405,20 @@ function sameSigning(a, b) {
 // that is not already canonical. Anything PERSISTED (a pin, a contact record) or
 // re-signed (sealed.js signs the stored string) must go through this, so the
 // stored form is the one spelling of the bytes the user actually verified.
+//
+// Package 2, item 8 (F-CRYPTO-010): canonical spelling alone let a
+// correctly-spelled key of the WRONG SIZE through, and a lone `ecdh` (no
+// `mlkem`) rode outside the handshake's signed bundle digest. The shape rules
+// (both-or-neither encryption keys, exact sizes, an uncompressed ECDH point)
+// now live in identity.js canonicalPublicBundle, shared with sealed.open.
 function canonicalBundle(b) {
-  if (!b || typeof b !== "object") throw new Error("malformed identity bundle");
-  const out = {};
-  for (const f of ["ed", "mldsa", "ecdh", "mlkem"]) {
-    if (b[f] == null) continue;
-    out[f] = bufToB64(unb64(b[f])); // unb64 throws on a non-canonical spelling
-  }
-  if (!out.ed || !out.mldsa) throw new Error("malformed identity bundle");
-  return out;
+  return canonicalPublicBundle(b);
 }
 
 // ---- UI helpers -----------------------------------------------------------
 
 function setStatus(text, cls = "") {
+  text = hintSafe(text); // second fix round: every status line is a sink for e.message
   els.status.textContent = text;
   els.status.className = "status" + (cls ? " " + cls : "");
   // Mirror onto the chat top bar (only one of the two is visible at a time).
@@ -440,14 +484,37 @@ function showView(name) {
 // nothing, with no explanation. Routing by visible screen fixes all of those at
 // once, instead of leaving ten call sites to each remember the right target.
 function activeHintEl() {
+  // Package 2, item 10 (Phase-7 F-P7-9 + §9 L-5). The three targets below all
+  // live inside #viewLive, and this used to test only the SCREENS' `hidden` —
+  // so with Profile, Users or Chats on screen (where someone waiting for mail
+  // sits) a hint such as "sealed messages will not arrive" was written into a
+  // node nobody could see. Pick the visible VIEW first. Each view has a hint
+  // line of its OWN: the views' status elements are written and cleared by
+  // their renderers, so a warning written there would be destroyed on the
+  // next render (and Profile's "status" is a chip container).
+  if (els.viewLive.hidden) {
+    if (!els.viewUsers.hidden) return els.usersHint;
+    if (!els.viewChats.hidden) return els.chatsHint;
+    if (!els.viewProfile.hidden) return els.profileHint;
+  }
   if (!els.scrRoom.hidden) return els.roomHint;
   if (!els.scrIdentity.hidden) return els.idHint;
   return els.hint;
 }
 
+// Fix round (review of e0e8f30): hints carry e.message from anywhere — a
+// cipher's parse error of relay bytes, a directory answer — so the sink itself
+// applies the transcript's rule (printable ASCII plus the app's own
+// typography; see logSafe) and a length cap, whatever the caller built.
+const HINT_MAX_CHARS = 600;
+function hintSafe(text) {
+  let s = String(text).replace(LOG_UNSAFE_RE, " ");
+  if (s.length > HINT_MAX_CHARS) s = s.slice(0, HINT_MAX_CHARS - 1) + "\u2026";
+  return s;
+}
 function hint(text, isErr = false) {
   const el = activeHintEl();
-  el.textContent = text;
+  el.textContent = hintSafe(text);
   el.className = "hint" + (isErr ? " err" : "");
   // Errors are announced immediately; ordinary progress waits for a pause.
   el.setAttribute("aria-live", isErr ? "assertive" : "polite");
@@ -456,7 +523,7 @@ function hint(text, isErr = false) {
 // Clear stale feedback when moving between screens, so an old error can never
 // look like it belongs to the screen you just arrived at.
 function clearHints() {
-  for (const el of [els.idHint, els.roomHint, els.hint]) {
+  for (const el of [els.idHint, els.roomHint, els.hint, els.profileHint, els.usersHint, els.chatsHint]) {
     if (el) { el.textContent = ""; el.className = "hint"; }
   }
 }
@@ -511,7 +578,7 @@ function relayErrorHint(reason) {
 }
 
 function accountStatus(text, cls = "") {
-  els.accountStatus.textContent = text;
+  els.accountStatus.textContent = hintSafe(text);
   els.accountStatus.className = "hint" + (cls ? " " + cls : "");
 }
 
@@ -524,9 +591,85 @@ function showUsernameRow(show) {
   els.username.closest(".row").hidden = !show;
 }
 
-function addLine(kind, who, text) {
+// ---- the transcript (#log) ---------------------------------------------------
+//
+// Transcript-line forgery (package 2, item 1). #log is `.bubbles`, which is
+// `white-space: pre-wrap`, so a `\n` inside a line's text renders as a line
+// break INSIDE the bubble — and several system lines carry text the relay
+// chose (a directory error detail, a store error). A relay could therefore end
+// our sentence and start one of its own on the next visual line, styled as the
+// app's. Every line is normalised here, the one writer of #log: anything that
+// is not printable ASCII (C0/C1 controls, CR/LF, U+2028/2029, bidi overrides,
+// zero-width characters…) collapses to one space. The app's own sentences use
+// a handful of typographic characters, so those — and only those — are kept;
+// none of them can break or reorder a line. System lines are also capped in
+// length (peer and own lines are already bounded by the cipher and the
+// composer).
+const LOG_TYPOGRAPHY = "\u2014\u2013\u2026\u00d7\u2713\u201c\u201d\u2018\u2019\u2192\u00b7";
+const LOG_UNSAFE_RE = new RegExp(`[^\\x20-\\x7e${LOG_TYPOGRAPHY}]+`, "g");
+const LOG_SYS_MAX_CHARS = 400;
+function logSafe(kind, text) {
+  let s = String(text).replace(LOG_UNSAFE_RE, " ");
+  if (kind === "sys" && s.length > LOG_SYS_MAX_CHARS) s = s.slice(0, LOG_SYS_MAX_CHARS - 1) + "…";
+  return s;
+}
+
+// Package 2, item 2 (Phase-7 F-P7-7's analog, and the three M-1 review rounds
+// of phase7-local, §9.2-§9.4). The transcript was unbounded, and every relay
+// frame that makes us narrate costs a node plus a synchronous layout (the
+// scrollTop below): an attacker-controlled O(n^2). Worse, a bounded transcript
+// that evicts oldest-first lets a junk flood push the SESSION'S RECORD — "you
+// let someone in", "joined room", the refusals, the verification verdict —
+// out of it, and the F-PROTO-002 note says those must not survive only as a
+// scrolled-past line. So, the final design from phase7-local (3dd23c4):
+//
+//  * A NARRATION (a system line that is not part of the record — "message
+//    arrived before you verified", "undecryptable message", "not signed in")
+//    folds by MEMBERSHIP: if the transcript already holds that exact line it
+//    is counted onto ("… (×n)") and moved to the end, never appended again.
+//    The number of narration lines is therefore bounded by the number of
+//    distinct narration strings in this file, whatever a relay interleaves.
+//    (Folding only CONSECUTIVE repeats was defeated by any two alternating
+//    narrations — the second review round.)
+//  * RECORD lines (`keep`) are marked where they are written. Each is at most
+//    once per connection by construction (a write-once role, a latched arm, a
+//    closed socket, a decided approval) or is the user's own action; they fold
+//    only when consecutive, so the order of sessions stays readable.
+//  * Past LOG_MAX_LINES the eviction goes in three tiers: the oldest
+//    non-system line (conversation is the cheapest thing to lose), then the
+//    oldest unkept system line, then the oldest record line — the last tier
+//    reachable only through the user's own reconnects. Nothing ever freezes
+//    (the first phase7-local fix evicted the NEWEST line and destroyed every
+//    later one on arrival, a genuine refusal included).
+const LOG_MAX_LINES = 500;
+function addLine(kind, who, text, keep = false) {
+  text = logSafe(kind, text);
+  const narration = kind === "sys" && !who && !keep;
+  const fold = (c) => {
+    const n = (Number(c.dataset.repeat) || 1) + 1;
+    c.dataset.repeat = String(n);
+    c.textContent = `${text} (×${n})`;
+    els.log.appendChild(c); // a no-op for the last line; MOVES any other one
+    els.log.scrollTop = els.log.scrollHeight;
+  };
+  const last = els.log.lastElementChild;
+  if (kind === "sys" && !who && last && last.className === "sys" &&
+      last.dataset.text === text && !!last.dataset.keep === keep) {
+    fold(last);
+    return;
+  }
+  if (narration) {
+    for (const c of els.log.children) {
+      if (c.className === "sys" && !c.dataset.keep && c.dataset.text === text) {
+        fold(c);
+        return;
+      }
+    }
+  }
   const li = document.createElement("li");
   li.className = kind;
+  if (kind === "sys" && !who) li.dataset.text = text;
+  if (keep) li.dataset.keep = "1";
   if (who) {
     const w = document.createElement("span");
     w.className = "who";
@@ -535,6 +678,13 @@ function addLine(kind, who, text) {
   }
   li.appendChild(document.createTextNode(text)); // textContent path: no markup
   els.log.appendChild(li);
+  while (els.log.childElementCount > LOG_MAX_LINES) {
+    let victim = null;
+    for (const c of els.log.children) { if (c.className !== "sys") { victim = c; break; } }
+    if (!victim) for (const c of els.log.children) { if (!c.dataset.keep) { victim = c; break; } }
+    if (!victim) victim = els.log.firstElementChild;
+    els.log.removeChild(victim);
+  }
   els.log.scrollTop = els.log.scrollHeight;
 }
 
@@ -563,7 +713,7 @@ function algValue() {
 // ---- identity management --------------------------------------------------
 
 function setIdentityStatus(text, cls = "") {
-  els.idStatus.textContent = text;
+  els.idStatus.textContent = hintSafe(text);
   els.idStatus.className = "hint" + (cls ? " " + cls : "");
 }
 
@@ -859,9 +1009,13 @@ async function autoLogin(username) {
     // the same "only redrawn if you happen to look" complaint that made M-C
     // silent in the first place.
     if (autoLoginFailures === 1 || autoLoginFailures === 4) {
+      // Package 2, item 1: `why` carries a detail the RELAY chose (account.js
+      // formatDetail, now clamped and stripped there too). It is shown in the
+      // hint only; the transcript line is a constant narration, so a relay that
+      // varies the detail cannot vary the line (and it folds, item 2).
       const why = e && e.message ? e.message : "login failed";
       hint(`Not signed in to the directory — sealed messages will not arrive (${why}). Retrying.`, true);
-      addLine("sys", "", `[not signed in to the directory — sealed messages will not arrive (${why})]`);
+      addLine("sys", "", "[not signed in to the directory — sealed messages will not arrive]");
     }
     return false;
   } finally {
@@ -965,27 +1119,27 @@ async function unlockContacts(pass, opts = {}) {
       storeNotice = "No saved contacts were found for this identity. If you have used this device before, " +
         "they were deleted and key-change warnings for earlier contacts are gone — treat every contact as unverified.";
     }
-    if (storeNotice) addLine("sys", "", "[" + storeNotice + "]");
+    if (storeNotice) addLine("sys", "", "[" + storeNotice + "]", true);
   } catch (e) {
     contactsError = e.message;
     if (ADOPTABLE.has(e.code)) { contactsAdoptable = true; adoptCodes.add(e.code); }
-    addLine("sys", "", "[contact store did not unlock — key-change warnings are OFF until it does]");
+    addLine("sys", "", "[contact store did not unlock — key-change warnings are OFF until it does]", true);
   }
   if (chats.isUnlocked()) chats.lock();
   try {
     const r = await chats.unlock(pass, chatOpts); // chat history shares the at-rest posture
     if (r && r.created && opts.expectStore && !contactsError) {
-      addLine("sys", "", "[no chat history was found for this identity on this device]");
+      addLine("sys", "", "[no chat history was found for this identity on this device]", true);
     }
   } catch (e) {
     contactsError = contactsError || e.message;
     if (ADOPTABLE.has(e.code)) { contactsAdoptable = true; adoptCodes.add(e.code); }
-    addLine("sys", "", "[chat store did not unlock — " + e.message + "]");
+    addLine("sys", "", "[chat store did not unlock — " + e.message + "]", true);
   }
 }
 
 function usersStatus(text, isErr = false) {
-  els.usersStatus.textContent = text;
+  els.usersStatus.textContent = hintSafe(text);
   els.usersStatus.className = "hint" + (isErr ? " err" : "");
 }
 
@@ -998,11 +1152,11 @@ function refreshUsers() {
   els.usersLocked.hidden = unlocked;
   els.usersUnlocked.hidden = !unlocked;
   if (!unlocked) {
-    els.usersLocked.querySelector("p").textContent = contactsStale && identity ? STALE_LINE : contactsError
+    els.usersLocked.querySelector("p").textContent = hintSafe(contactsStale && identity ? STALE_LINE : contactsError
       ? "Contact store error: " + contactsError +
         (contactsAdoptable ? "" :
           " (Forget + recreate the identity resets it — contacts are bound to the identity passphrase.)")
-      : "Locked. Enter your passphrase.";
+      : "Locked. Enter your passphrase.");
     // F-ATREST-003/004/005: the override is offered, never taken for the user.
     els.usersAdopt.hidden = !contactsAdoptable;
     els.usersAdoptHint.hidden = !contactsAdoptable;
@@ -1240,12 +1394,18 @@ function contactWarnings(c, inSheet = false) {
   // cannot make themselves LOOK like a name you recognise. In the profile,
   // when the claim IS the handle printed under it, the sentence points there
   // instead of quoting the attacker's string a second time (hot M8, M-B).
-  if (c.claimedName) {
+  // Fix round (review of e0e8f30): processEnvelope keeps only a handle now,
+  // but a record written by an older client can hold any string the sender
+  // chose (U+202E, line breaks). Only a claim that parses as username#token is
+  // rendered, and in its parsed form.
+  const parsedClaim = typeof c.claimedName === "string" ? account.parseHandle(c.claimedName) : null;
+  const claimed = parsedClaim ? parsedClaim.username + "#" + parsedClaim.token : null;
+  if (claimed) {
     const claim = document.createElement("div");
     claim.className = "u-claim";
-    claim.textContent = inSheet && c.token && c.claimedName === mailHandle(c)
+    claim.textContent = inSheet && c.token && claimed === mailHandle(c)
       ? "claims the handle below — unverified, they chose this name themselves"
-      : `claims to be "${c.claimedName}" — unverified, they chose this name themselves`;
+      : `claims to be "${claimed}" — unverified, they chose this name themselves`;
     out.push(claim);
   }
   if (c.keyChangedAt && !c.verified) {
@@ -1525,7 +1685,7 @@ function renderContactActions(c) {
 const BUSY_LINE = "Still saving the last change — one moment.";
 function busyNotice() { contactStatus(BUSY_LINE); }
 function contactStatus(text, isErr = false) {
-  els.contactStatus.textContent = text;
+  els.contactStatus.textContent = hintSafe(text);
   els.contactStatus.className = "hint" + (isErr ? " err" : "");
 }
 
@@ -1853,12 +2013,12 @@ let activeChat = null;    // username of the open conversation, or null
 let mailboxTimer = null;  // polling interval handle
 
 function chatsStatus(text, isErr = false) {
-  els.chatsStatus.textContent = text;
+  els.chatsStatus.textContent = hintSafe(text);
   els.chatsStatus.className = "hint" + (isErr ? " err" : "");
 }
 
 function chatHint(text, isErr = false) {
-  els.chatHint.textContent = text;
+  els.chatHint.textContent = hintSafe(text);
   els.chatHint.className = "hint" + (isErr ? " err" : "");
 }
 
@@ -1897,9 +2057,9 @@ function refreshChats() {
     // Fix review 2026-09-21: a chat store that refused while contacts opened
     // had no visible error and no override anywhere — a dead end whose only
     // exit was Forget identity. The Chats view now carries both.
-    els.chatsLocked.querySelector("p").textContent = contactsStale && identity ? STALE_LINE : contactsError && identity
+    els.chatsLocked.querySelector("p").textContent = hintSafe(contactsStale && identity ? STALE_LINE : contactsError && identity
       ? "Chat store error: " + contactsError
-      : "Locked. Enter your passphrase.";
+      : "Locked. Enter your passphrase.");
     els.chatsAdopt.hidden = !contactsAdoptable;
     els.chatsAdoptHint.hidden = !contactsAdoptable;
     return;
@@ -2227,6 +2387,8 @@ async function pollMailbox() {
     return;
   }
   let changed = false;
+  // `batch` is bounded by account.fetchMail (package 2, item 9): at most 200
+  // envelopes of at most 64 KiB each — the relay's own per-inbox limits.
   for (const m of batch) {
     // Pentest 2026-07-25 F-06: GET /api/mailbox is delete-on-read, so the server
     // has ALREADY discarded everything in `batch`. Anything that throws while
@@ -2235,9 +2397,12 @@ async function pollMailbox() {
     // full isolation, and the loop continues past a failure.
     try {
       changed = (await processEnvelope(m)) || changed;
-    } catch (err) {
+    } catch {
       // Keep going: the other envelopes in this batch are still deliverable.
-      console.error("[mailbox] dropping one envelope:", err && err.message);
+      // Package 2, item 14 (Phase-7 F-P7-23): a fixed string, never the error's
+      // message — on Android the console reaches logcat, and a message can
+      // carry content of the envelope or of the contact store.
+      console.warn("[mailbox] dropped one envelope that could not be filed");
     }
   }
   // Filing a mail writes the store; a write refused because another tab wrote
@@ -2281,13 +2446,28 @@ async function processEnvelope(m) {
   } catch {
     return false; // undecryptable/forged envelope: drop silently
   }
-  const senderBundle = opened.from;
+  // Package 2, item 7 (Phase-7 F-P7-22, phase7-local 4b9d2c6): everything
+  // that reaches the contact store goes through canonicalBundle. sealed.open
+  // now applies the same rule at its own boundary (item 8), so this is the
+  // second line, kept because this is where the bundle is PERSISTED.
+  let senderBundle;
+  try {
+    senderBundle = canonicalBundle(opened.from);
+  } catch {
+    return false; // a malformed sender bundle is a malformed envelope
+  }
   // Match the sender to a saved user by their SIGNING keys — never by any
   // string they supplied.
   let sender = contacts.list().find((c) => c.ed === senderBundle.ed && c.mldsa === senderBundle.mldsa) || null;
   // The handle sealed inside is SELF-CLAIMED. It is signed, which proves the
   // sender wrote it — not that it is theirs.
-  const claimed = opened.name ? account.parseHandle(opened.name) : null;
+  // Package 2, item 6 (F-WEB-001): only a claim that IS a handle
+  // (username#token — printable ASCII by construction) is kept, stored and
+  // shown. Anything else used to be stored raw as `claimedName` and rendered
+  // in the Users list and the contact profile; it is ignored now, like a
+  // missing claim.
+  const claimed = typeof opened.name === "string" ? account.parseHandle(opened.name) : null;
+  const claimedName = claimed ? claimed.username + "#" + claimed.token : null;
 
   if (!sender) {
     // Pentest 2026-07-25 F-01: this used to take the local username straight
@@ -2306,7 +2486,7 @@ async function processEnvelope(m) {
     sender = await contacts.upsert({
       username: neutralName(senderBundle.ed),
       addrUsername: claimed ? claimed.username : null,
-      claimedName: opened.name || null,
+      claimedName,
       auto: true,
       token: claimed ? claimed.token : null,
       ed: senderBundle.ed, mldsa: senderBundle.mldsa,
@@ -2319,7 +2499,7 @@ async function processEnvelope(m) {
     sender = await contacts.upsert({
       username: sender.username,
       addrUsername: sender.addrUsername || claimed.username,
-      claimedName: sender.claimedName || opened.name || null,
+      claimedName: sender.claimedName || claimedName,
       token: claimed.token,
       ed: sender.ed, mldsa: sender.mldsa, ecdh: sender.ecdh, mlkem: sender.mlkem,
     });
@@ -2341,12 +2521,22 @@ async function processEnvelope(m) {
 
   // Regular message. Decrypt the inner AES256 layer if this chat is in that
   // mode; a mode mismatch (peer still on the old mode) shows a system note.
-  let text = opened.msg;
+  // Package 2, item 6 (F-WEB-001): the live path refuses anything that is not
+  // printable ASCII (crypto.js, both decrypt paths); the sealed path appended
+  // whatever the envelope carried into #chatLog, which is `white-space:
+  // pre-wrap` — a `\n` there forges a second bubble line, a bidi override
+  // reorders it. Same rule here, and never silently: the message is replaced
+  // by a line that says why.
+  const NOT_ASCII = "[a message arrived that contained characters this app does not display " +
+    "(only printable ASCII is allowed) — it was not shown]";
+  let text = typeof opened.msg === "string" ? opened.msg : "";
+  if (!isAscii(text)) text = NOT_ASCII;
   const chat = chats.get(sender.username);
   if (opened.enc !== undefined) {
     if (chat && chat.mode === "AES256" && chat.secret && chat.salt) {
       try {
         text = await chats.innerDecrypt(chat.secret, chat.salt, opened.enc);
+        if (typeof text !== "string" || !isAscii(text)) text = NOT_ASCII;
       } catch {
         text = "[AES256 message that did not decrypt — shared passphrase mismatch]";
       }
@@ -2434,6 +2624,7 @@ function stopMailboxPolling() {
 // had just taken, and both opened sockets into a room capped at two members,
 // locking the real peer out. Claimed synchronously, before the first await.
 let connecting = false;
+const MAX_WS_FRAME_CHARS = 64 * 1024; // = the relay's MAX_FRAME_BYTES; frames are ASCII
 
 async function connect() {
   if (connecting) return;
@@ -2453,6 +2644,17 @@ async function connect() {
 }
 
 async function connectInner() {
+  // Fix round (review of e0e8f30, lead): synchronously, before ANY await — the
+  // old session's socket is finished the moment a new session starts to be
+  // built (the button is only live once it is closed), so nothing it still has
+  // queued may reach the cipher and nonces this call is about to replace.
+  if (ws) retiredSockets.add(ws);
+  sessionGen += 1; // L-2: anything still suspended in the old session is stale from here on
+  // M-1: no gate of an earlier connection survives into this one.
+  gateGen += 1;
+  gateFor = null;
+  currentPinKey = null;
+  els.verify.hidden = true;
   const room = roomCode();
   const alg = algValue();
   if (!ROOM_RE.test(room)) {
@@ -2543,6 +2745,8 @@ async function connectInner() {
   admittedBundle = null;
   admittedAnon = false;
   wasPending = false;
+  saidTurnedAway = false;
+  saidDenied = false;
   keyConfirm.reset();
   knockQueue = [];
   hideAdmitPrompt();
@@ -2585,12 +2789,19 @@ async function connectInner() {
   msgChain = Promise.resolve();
   const sock = ws; // L2: every frame is handled against the socket it came on
   ws.onmessage = (ev) => {
+    // Package 2, item 9 (F-WEB-003): the relay accepts no frame above
+    // MAX_FRAME_BYTES (64 KiB, backend/config.py) and forwards nothing larger,
+    // so a bigger one is not from an honest relay. Refused before it is
+    // queued or parsed — JSON.parse of an attacker-sized string is the cost.
+    if (typeof ev.data !== "string" || ev.data.length > MAX_WS_FRAME_CHARS) return;
     msgChain = msgChain.then(() => handleMessage(room, ev.data, sock)).catch(() => {});
   };
 
   ws.onclose = () => {
+    gateGen += 1; // M-1: a gate still being computed for this connection is never drawn
+    gateFor = null;
     setStatus("disconnected", "err");
-    if (joined) addLine("sys", "", "disconnected");
+    if (joined) addLine("sys", "", "disconnected", true);
     joined = false;
     verified = false;
     els.chatVerified.hidden = true; // B2
@@ -2598,6 +2809,8 @@ async function connectInner() {
     admittedBundle = null;
     admittedAnon = false;
     wasPending = false;
+    saidTurnedAway = false;
+    saidDenied = false;
     keyConfirm.reset();
     knockQueue = [];
     hideAdmitPrompt(); // also lifts the B3 modal: nothing stays inert after a drop
@@ -2628,7 +2841,7 @@ async function knockIntro(room) {
 // Owner side: file an inbound knock for a human decision. Everything here is
 // UNTRUSTED input from the relay — validate it, never render it as markup, and
 // never let it decide anything by itself.
-async function queueKnock(m) {
+async function queueKnock(m, live = () => true) {
   if (roomRole !== "owner") return; // only the owner is asked; ignore the rest
   if (typeof m.jid !== "string" || !/^[0-9a-f]{16}$/.test(m.jid)) return;
   if (knockQueue.some((k) => k.jid === m.jid)) return;
@@ -2674,6 +2887,7 @@ async function queueKnock(m) {
       idb = null;
     }
     const ok = idb ? await verifyKnock(idb, sessionRoom, p.sig).catch(() => false) : false;
+    if (!live()) return; // L-2: the knock was for a session that has been replaced
     entry = { jid: m.jid, bundle: ok ? idb : null, anon: false, unproven: !ok };
   }
   knockQueue.push(entry);
@@ -2774,8 +2988,11 @@ async function showNextKnock() {
     els.admitFingerprint.hidden = false;
     // Who is this, in OUR terms? Matched on the keys themselves — never on a
     // name the other side chose (F-01).
+    // Package 2, item 12 (A4 item 11 residual): compared as KEYS (decoded
+    // bytes, sameSigning), like every other identity comparison in this file —
+    // not as the strings a store or a relay happened to spell them with.
     const known = contacts.isUnlocked()
-      ? contacts.list().find((c) => c.ed === k.bundle.ed && c.mldsa === k.bundle.mldsa)
+      ? contacts.list().find((c) => sameSigning(c, k.bundle))
       : null;
     if (known) {
       // B1 (design review): our name for them, then the same trust pill the
@@ -2871,12 +3088,12 @@ async function decideKnock(allow) {
     admittedAnon = !k.bundle;
     addLine("sys", "", k.bundle
       ? "you let someone in — their key is now pinned for this session"
-      : "you let someone in — they have no identity to pin");
+      : "you let someone in — they have no identity to pin", true);
   }
   ws.send(JSON.stringify({
     type: allow ? "admit" : "deny", room: sessionRoom, jid: k.jid,
   }));
-  if (!allow) addLine("sys", "", "you denied someone who asked to join");
+  if (!allow) addLine("sys", "", "you denied someone who asked to join", true);
   return showNextKnock();   // awaited by callers; unawaited it races the message path
 }
 
@@ -2899,9 +3116,10 @@ async function signedHandshake(room) {
   return { pub, sig };
 }
 
-function sendSignedKey(room, reply) {
+function sendSignedKey(room, reply, sock = ws, live = () => true) {
   return signedHandshake(room).then(({ pub, sig }) => {
-    ws.send(JSON.stringify({
+    if (!live()) return; // L-2: signed for a session that has since been replaced
+    sock.send(JSON.stringify({
       type: "key", room, alg: sessionAlg,
       payload: packKey({ pub, reply, idb: myBundle, sig }),
     }));
@@ -2966,17 +3184,25 @@ const keyConfirm = makeKeyConfirmation({
   })),
   hint: (msg) => hint(msg),
   fail: (why) => {
-    addLine("sys", "", `[${why} — refusing to continue]`);
+    addLine("sys", "", `[${why} — refusing to continue]`, true);
     // Phase 2a fix round (pentest P1): shown after the close, like the A2 refusals.
+    // F-P7-19 (Phase-7 §9 L-1): worded as what this end could not establish,
+    // not as a fault of the contact — the usual cause of a failed confirmation
+    // is a relay injecting, withholding or replaying key frames.
     closeWs(
-      "Key confirmation failed: you and your contact do not hold the same session key. " +
-      "Messages would silently fail to arrive. Disconnecting.",
+      "Key confirmation failed: this connection could not confirm that you and your contact hold the " +
+      "same session key — the relay may be interfering. Messages could silently fail to arrive. Disconnecting.",
     );
   },
   finish: () => finishSession(currentRoom),
 });
 
 async function onChannelReady(room) {
+  // Fix round 3: a handler still in flight when the relay hung up must not
+  // start key confirmation for the dead connection — onclose has just reset
+  // keyConfirm, and onChains would re-arm its 15 s deadline, whose failure
+  // later overwrote the room screen's close reason.
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
   currentRoom = room;
   await keyConfirm.onChains(cipher.confirmation);
 }
@@ -2989,8 +3215,14 @@ async function finishSession(room) {
     // read-only stop, never "It matches") unless the user is somewhere else.
     if (!els.verify.hidden && (document.activeElement === document.body ||
         els.scrChat.contains(document.activeElement))) els.safetyNumber.focus();
-    return;
+    return; // (enterVerification checks for an open connection itself)
   }
+  // Final round (review of 85208fb, R4-1): AES256 / OTP unlock right here. A
+  // peer's confirm tag still queued when the relay hung up used to reach this
+  // after onclose — keyConfirm is reset there, but the tag matched the
+  // unchanged cipher.confirmation again — and "Ready. Messages are end-to-end
+  // encrypted." replaced the room screen's close reason, with Send enabled.
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
   verified = true;
   enableSend(true);
   if (cipher.usesNonces) {
@@ -3002,6 +3234,25 @@ async function finishSession(room) {
 }
 
 async function handleMessage(room, raw, sock) {
+  // Package 2, item 3 (F-PROTO-002). Every refusal in this function ends in
+  // closeWs(), which only CLOSES: frames the relay batched behind the refused
+  // one were already queued on msgChain and kept driving this state machine
+  // after the decision to refuse (phase7-local demonstrated a derived channel,
+  // an opened receive gate and relayed text rendered as the peer's, after
+  // "[a SECOND identity tried to complete the key exchange — refusing]").
+  // closeWs() marks the socket before closing it, so testing the mark HERE — at
+  // dispatch, not at queue time — drops every frame queued behind a refusal,
+  // whichever refusal fired; and a frame from a socket that is no longer the
+  // current one never touches the new session's state.
+  // Deliberately NOT `readyState !== OPEN`: when the RELAY hangs up, the frames
+  // it sent before the close are still its last words and are handled — an
+  // `error` naming why ("approval timeout", parked for the room screen), or a
+  // forged handshake whose refusal must still reach the room screen (round 3
+  // L2, e2e/hostile-relay.mjs sections 6 and 8). A frame already being handled
+  // when the socket closes finishes either way.
+  if (!ws || sock !== ws || retiredSockets.has(sock)) return;
+  const gen = sessionGen;
+  const live = () => sessionLive(sock, gen); // re-asked after every await below
   let m;
   try {
     m = JSON.parse(raw);
@@ -3027,7 +3278,7 @@ async function handleMessage(room, raw, sock) {
         // hostile relay demoting the creator, or an invitee who connected
         // first. Both end the same way: refuse, and let the creator start over
         // in the order the design promises (creator connects, then approves).
-        addLine("sys", "", "[we created this chat code but the relay says someone else owns the room — refusing]");
+        addLine("sys", "", "[we created this chat code but the relay says someone else owns the room — refusing]", true);
         closeWs("You created this code, so you should be the one approving people. " +
           "Connect first, then send the code — or press New code and connect before sharing it.", sock);
         return;
@@ -3037,11 +3288,11 @@ async function handleMessage(room, raw, sock) {
       els.roomShort.textContent = room.slice(0, 8) + "…" + room.slice(-8);
       showScreen("chat");
       setStatus("waiting for approval");
-      addLine("sys", "", "waiting — the person who created this chat has to let you in");
+      addLine("sys", "", "waiting — the person who created this chat has to let you in", true);
       hint("Waiting for the other person to approve you. They see the fingerprint of your key and decide.");
-      ws.send(JSON.stringify({
-        type: "knock", room, payload: packKey(await knockIntro(room)),
-      }));
+      const intro = await knockIntro(room);
+      if (!live()) return;
+      sock.send(JSON.stringify({ type: "knock", room, payload: packKey(intro) }));
       break;
     }
 
@@ -3051,10 +3302,15 @@ async function handleMessage(room, raw, sock) {
     // for, and a queue held by knocked squatters cannot be cleared from here —
     // agreeing a fresh chat code out of band is the way out.
     case "turned-away": {
-      const n = Number.isInteger(m.count) && m.count > 1 ? m.count : 1;
-      addLine("sys", "", n > 1
-        ? `[${n} people were turned away — the waiting queue is full]`
-        : "[someone was turned away — the waiting queue is full]");
+      // Package 2, item 2 (phase7-local M-1): the line used to interpolate the
+      // relay's `count`, so consecutive frames differed, nothing folded, and a
+      // flood of 30-byte frames was an unbounded transcript and one hint per
+      // frame. Only the owner is told (a guest nudged to "agree a NEW chat
+      // code" is a lever to abandon a working one), the sentence is constant,
+      // and it is said once per connection.
+      if (roomRole !== "owner" || saidTurnedAway) break;
+      saidTurnedAway = true;
+      addLine("sys", "", "[someone was turned away — the waiting queue is full]", true);
       hint(
         "Someone could not even reach the approval queue because it is full. If the person you invited " +
         "is stuck on \"room full\", agree a NEW chat code with them out of band.",
@@ -3065,7 +3321,14 @@ async function handleMessage(room, raw, sock) {
 
     // The owner declined us (or the relay says so). Either way we are not in.
     case "denied": {
-      addLine("sys", "", "[the other person did not let you in]");
+      // Package 2, item 2 (phase7-local §9.4): no role guard, no latch, no
+      // state requirement — the honest relay sends it once and closes, a
+      // hostile one could send it forever (and, alternated with a junk `msg`,
+      // it defeated the consecutive fold). Only a guest waiting in the queue
+      // can be declined, and it is said once per connection.
+      if (roomRole !== "guest" || !wasPending || joined || saidDenied) break;
+      saidDenied = true;
+      addLine("sys", "", "[the other person did not let you in]", true);
       hint("They declined. If you expected to be let in, check with them out of band that you are both using the same chat code.", true);
       break;
     }
@@ -3073,7 +3336,7 @@ async function handleMessage(room, raw, sock) {
     // Owner side: someone is asking to be let in. NEVER auto-admit — the whole
     // point is that a human looks at the key.
     case "knock": {
-      await queueKnock(m);
+      await queueKnock(m, live);
       break;
     }
 
@@ -3092,18 +3355,23 @@ async function handleMessage(room, raw, sock) {
       const before = knockQueue.length;
       knockQueue = knockQueue.filter((k) => k.jid !== m.jid);
       // Re-render only if the prompt could be showing the entry we just removed.
-      if (knockQueue.length !== before) await showNextKnock();
+      if (knockQueue.length !== before) await showNextKnock(); // re-reads the queue head after its own await
       break;
     }
 
     case "joined": {
+      // Package 2, item 2 (phase7-local §9.3): a repeated `joined` for the
+      // seat we already hold re-narrated the session start and re-sent our
+      // hello — two lines per 32-byte frame, which reached any cap with no peer
+      // and no user. It is dropped; a CHANGED role still reaches the refusal.
+      if (joined && m.role === roomRole) break;
       joined = true;
       // An older relay answers `join` with a bare {"joined"} — no role, no
       // admission control. Refusing beats silently running the protocol this
       // fix removed: the room would again be first-come-first-served and the
       // approval prompt would never appear, with nothing on screen to say so.
       if (m.role !== "owner" && m.role !== "guest") {
-        addLine("sys", "", "[this relay does not support join approval — refusing]");
+        addLine("sys", "", "[this relay does not support join approval — refusing]", true);
         // Phase 2a, pentest pre-existing (this and the five refusals in `key`):
         // a hint() here was erased by onclose's return to the room screen.
         closeWs("This relay is running an older protocol without the join-approval step. Update the relay (or your app) before using it.", sock);
@@ -3117,7 +3385,7 @@ async function handleMessage(room, raw, sock) {
       if (roomRole === null) {
         roomRole = m.role;
       } else if (roomRole !== m.role) {
-        addLine("sys", "", "[the relay changed our role mid-session — refusing]");
+        addLine("sys", "", "[the relay changed our role mid-session — refusing]", true);
         closeWs("The relay tried to change your role in this room. Disconnected.", sock);
         return;
       }
@@ -3131,28 +3399,28 @@ async function handleMessage(room, raw, sock) {
         // F-PROTO-001, belt and braces: a relay that skips `pending` and seats
         // the creator straight in as a guest (already refused below via
         // `wasPending`, kept explicit so the invariant survives a refactor).
-        addLine("sys", "", "[we created this chat code but the relay seated us as a guest — refusing]");
+        addLine("sys", "", "[we created this chat code but the relay seated us as a guest — refusing]", true);
         closeWs("You created this code, so you should be the one approving people. " +
           "The relay tried to seat you as a guest. Connect first, then send the code.", sock);
         return;
       }
       if (roomRole === "guest" && !wasPending) {
-        addLine("sys", "", "[we were seated in this room without ever asking to be let in — refusing]");
+        addLine("sys", "", "[we were seated in this room without ever asking to be let in — refusing]", true);
         closeWs("This relay put you in the room without the owner approving you. Disconnected.", sock);
         return;
       }
       els.roomShort.textContent = room.slice(0, 8) + "…" + room.slice(-8);
       showScreen("chat");
       setStatus("connected", "ok");
-      addLine("sys", "", `joined room — encryption: ${sessionAlg}`);
+      addLine("sys", "", `joined room — encryption: ${sessionAlg}`, true);
       if (roomRole === "owner") {
-        addLine("sys", "", "you created this chat — you decide who is let in");
+        addLine("sys", "", "you created this chat — you decide who is let in", true);
       }
       // Phase 1: announce our fresh session nonce. For handshake modes the
       // signed handshake follows once we also know the peer's nonce; for
       // AES256 (usesNonces, no key material on the wire) the nonces alone fix
       // the session's ratchet chains, closing cross-session frame replay.
-      ws.send(JSON.stringify({
+      sock.send(JSON.stringify({
         type: "key", room, alg: sessionAlg,
         payload: packKey({ hello: true, n: myNonce, reply: false }),
       }));
@@ -3181,17 +3449,19 @@ async function handleMessage(room, raw, sock) {
           if (peerNonce === null) peerNonce = p.n;
           if (!p.reply && !helloAnswered) {
             helloAnswered = true;
-            ws.send(JSON.stringify({
+            sock.send(JSON.stringify({
               type: "key", room, alg: sessionAlg,
               payload: packKey({ hello: true, n: myNonce, reply: true }),
             }));
-            if (cipher.needsHandshake) await sendSignedKey(room, false);
+            if (cipher.needsHandshake) await sendSignedKey(room, false, sock, live);
+            if (!live()) return;
           }
           // AES256: both nonces known — derive the session's ratchet chains
           // and unlock. No identity gate here: the shared passphrase IS the
           // out-of-band verification, so receiving unlocks with sending.
           if (cipher.usesNonces && !cipher.ready) {
             await cipher.setNonces(myNonce, peerNonce);
+            if (!live()) return;
             await onChannelReady(room);
           } else if (!cipher.needsHandshake && !cipher.usesNonces && !verified) {
             // OTP: no key material and no nonces — the pre-shared pad IS the
@@ -3213,6 +3483,10 @@ async function handleMessage(room, raw, sock) {
           // relay can hammer — see MAX_PEER_CONFIRMS.
           currentRoom = room;
           await keyConfirm.onPeerTag(p.confirm, cipher.confirmation);
+          // (onclose resets keyConfirm, but a tag handled after the close can
+          // still match the unchanged cipher.confirmation and finish: the
+          // unlock paths — finishSession, enterVerification — each refuse a
+          // connection that is no longer open.)
           break;
         }
 
@@ -3242,9 +3516,26 @@ async function handleMessage(room, raw, sock) {
         // non-canonical bundle is malformed input and dies here, not three
         // checks later as a phantom "identity key CHANGED".
         const idbCanon = canonicalBundle(idb);
+        // Package 2, item 4 (F-PROTO-003): our OWN signed key frame, reflected
+        // by the relay, verifies here — the transcript folds both nonces
+        // order-independently, so our signature is valid from either end. It
+        // used to be pinned as the peer's identity (write-once) before the
+        // cipher refused the reflected key, so the REAL peer's handshake was
+        // then refused as "a SECOND identity" and the session torn down with a
+        // false MITM alarm. Our own identity is never the peer: refuse it before
+        // anything is pinned. (Two devices sharing one identity backup cannot
+        // chat with each other — a documented consequence, not a regression:
+        // their safety number would compare an identity with itself.)
+        if (myBundle && sameSigning(idbCanon, myBundle)) {
+          throw new Error("reflected handshake rejected (that is your own identity)");
+        }
         const ok = await verifyHandshake(idbCanon, room, [myNonce, peerNonce], pub, sig);
+        // L-2: the verify is the long await. A reconnect meanwhile replaced
+        // everything below (peerBundle, admission, cipher): this frame belongs
+        // to a session that no longer exists.
+        if (!live()) return;
         if (!ok) {
-          addLine("sys", "", "[handshake signature INVALID — refusing to connect; a relay may be tampering with the key exchange]");
+          addLine("sys", "", "[handshake signature INVALID — refusing to connect; a relay may be tampering with the key exchange]", true);
           closeWs("Authentication failed — disconnecting. This is what a MITM attempt looks like.", sock);
           return;
         }
@@ -3270,19 +3561,19 @@ async function handleMessage(room, raw, sock) {
         // (relay.py `admit` is the sole seat-granting path), so a handshake
         // with nobody admitted means the relay seated someone behind our back.
         if (roomRole === "owner" && !admittedSomeone()) {
-          addLine("sys", "", "[a peer completed the key exchange without ever being approved — refusing]");
+          addLine("sys", "", "[a peer completed the key exchange without ever being approved — refusing]", true);
           closeWs("Someone was connected to this room without your approval. The relay is not behaving. Disconnecting.", sock);
           return;
         }
         if (admittedBundle && !sameBundle(admittedBundle, idbCanon)) {
-          addLine("sys", "", "[the peer that connected is NOT the one you let in — refusing]");
+          addLine("sys", "", "[the peer that connected is NOT the one you let in — refusing]", true);
           closeWs("The identity that completed the key exchange differs from the one you approved. Disconnecting.", sock);
           return;
         }
         // Admitting someone who showed no identity, then receiving a signed
         // handshake, means the socket changed its story between the two steps.
         if (admittedAnon) {
-          addLine("sys", "", "[the peer you let in had no identity but now sends one — refusing]");
+          addLine("sys", "", "[the peer you let in had no identity but now sends one — refusing]", true);
           closeWs("This peer introduced itself without an identity and then produced one. Disconnecting.", sock);
           return;
         }
@@ -3295,10 +3586,15 @@ async function handleMessage(room, raw, sock) {
         // in — decoupling the verified identity from the live channel key. So:
         // pin the identity on first accept; hard-refuse any later frame whose
         // identity differs, and close the connection (that is a MITM attempt).
+        // (F-PROTO-003: the pin stays BEFORE cipher.onPeerKey on purpose. RSA's
+        // onPeerKey locks the peer key first-write-wins and can still throw
+        // afterwards — pinning only on success would leave the cipher keyed to
+        // identity X with nothing pinned, and let identity Y's next frame pin Y.
+        // The reflection is refused above instead, before anything is pinned.)
         if (peerBundle === null) {
           peerBundle = idbCanon; // write-once for this connection, canonical (H-1)
         } else if (!sameBundle(peerBundle, idbCanon)) {
-          addLine("sys", "", "[a SECOND identity tried to complete the key exchange — refusing; this is a relay MITM attempt]");
+          addLine("sys", "", "[a SECOND identity tried to complete the key exchange — refusing; this is a relay MITM attempt]", true);
           closeWs("Two different identities attempted this handshake — disconnecting to protect you.", sock);
           return;
         }
@@ -3317,16 +3613,19 @@ async function handleMessage(room, raw, sock) {
         // keeps its first key; repeat/answer frames from this identity are
         // folded idempotently.
         await cipher.onPeerKey(pub);
+        if (!live()) return;
 
         // Answer the initiator exactly once with our own signed key.
         if (!reply) {
-          await sendSignedKey(room, true);
+          await sendSignedKey(room, true, sock, live);
+          if (!live()) return;
         }
 
         if (cipher.ready) {
           await onChannelReady(room);
         }
       } catch (e) {
+        if (!live()) return; // a stale session's failure is not this session's news
         hint("Key exchange failed: " + e.message, true);
       }
       break;
@@ -3343,6 +3642,7 @@ async function handleMessage(room, raw, sock) {
       }
       try {
         const text = await cipher.decrypt(m.payload);
+        if (!live()) return;
         addLine("peer", "peer", text);
         // P-04: recvHighWater must reach disk too — an unpersisted receive
         // watermark lets an already-delivered frame be replayed after a reload.
@@ -3374,8 +3674,14 @@ async function enterVerification(room, verifiedBundle) {
   // Use the bundle passed from the pinned first handshake — never re-read a
   // mutable global that a later frame might have changed (C-01).
   const bundle = verifiedBundle || peerBundle;
+  // M-1: only for a connection that is still open, and only if it is still the
+  // same one after every await (gateGen moves on every close and new session).
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const gen = gateGen;
   const sn = await Identity.safetyNumber(myBundle, bundle);
   const peerFp = await Identity.fingerprintOf(bundle);
+  if (gen !== gateGen) return;
+  gateFor = { bundle, gen }; // what "It matches" may pin — this and nothing else
   els.safetyNumber.textContent = sn;
   els.peerFingerprint.textContent = "Contact fingerprint: " + peerFp;
   currentPinKey = expectedPeerName ? contacts.pinKeyFor(expectedPeerName) : "room:" + room;
@@ -3390,7 +3696,7 @@ async function enterVerification(room, verifiedBundle) {
     els.verifyHint.textContent =
       `The key presented in this room is different from the one the directory publishes for "${expectedPeerName}". ` +
       "Do NOT proceed unless you confirm this safety number with them in person.";
-    addLine("sys", "", `[directory mismatch for "${expectedPeerName}" — verification required]`);
+    addLine("sys", "", `[directory mismatch for "${expectedPeerName}" — verification required]`, true);
     hint("Directory mismatch — confirm the safety number in person before proceeding.", true);
     return;
   }
@@ -3409,17 +3715,18 @@ async function enterVerification(room, verifiedBundle) {
       ", so this app cannot check whether this contact's key changed since last time. " +
       "Treat this as an UNVERIFIED first contact: confirm the safety number below in person " +
       "before you continue. Unlock your contacts on the Profile screen to restore key-change warnings.";
-    addLine("sys", "", "[contact store unreadable — pinned-key change detection is OFF]");
+    addLine("sys", "", "[contact store unreadable — pinned-key change detection is OFF]", true);
     hint("Key-change detection is off — your saved contacts could not be opened.", true);
     return;
   }
 
   const pin = await getPin(currentPinKey);
+  if (gen !== gateGen) return; // M-1 (Low variant): no unlockMessaging() after the close
   if (sameBundle(pin, bundle) && !pin.revoked) {
     // Seen and verified before — accept without re-prompting.
     addLine("sys", "", expectedPeerName
       ? `contact "${expectedPeerName}" matches your saved pin`
-      : "contact identity matches your saved pin");
+      : "contact identity matches your saved pin", true);
     unlockMessaging();
     return;
   }
@@ -3435,7 +3742,7 @@ async function enterVerification(room, verifiedBundle) {
       "This key matches what you verified before, but you later removed or unverified this contact. " +
       "Compare the safety number with them in person (or over a call where you recognise their voice) " +
       "before proceeding.";
-    addLine("sys", "", "[pin matches, but your verification of this contact was withdrawn — re-verify]");
+    addLine("sys", "", "[pin matches, but your verification of this contact was withdrawn — re-verify]", true);
     hint("You unverified this contact earlier — confirm the safety number again.", true);
     return;
   }
@@ -3453,7 +3760,7 @@ async function enterVerification(room, verifiedBundle) {
       "Your earlier verification did not cover the keys now used to encrypt messages to this contact. " +
       "Compare the safety number with them in person (or over a call where you recognise their voice) " +
       "before proceeding.";
-    addLine("sys", "", "[pin predates encryption-key coverage — re-verification required]");
+    addLine("sys", "", "[pin predates encryption-key coverage — re-verification required]", true);
   } else if (pin) {
     // A pin exists but the key changed: loud warning, require re-verification.
     els.verify.classList.add("changed");
@@ -3462,7 +3769,7 @@ async function enterVerification(room, verifiedBundle) {
       "The identity key you pinned before is different now. This happens if your contact reset their " +
       "device — but it is also what an interceptor looks like. Do NOT proceed until you have confirmed " +
       "this safety number with them over a trusted channel.";
-    addLine("sys", "", "[pinned identity CHANGED — verification required]");
+    addLine("sys", "", "[pinned identity CHANGED — verification required]", true);
   } else {
     els.verify.classList.remove("changed");
     els.verifyTitle.textContent = "Verify your contact — in person";
@@ -3470,7 +3777,7 @@ async function enterVerification(room, verifiedBundle) {
     // hint; a clean first contact must not inherit it (same words as index.html).
     els.verifyHint.textContent = "Read it aloud to your contact. It must match exactly.";
     if (expectedPeerBundle) {
-      addLine("sys", "", `key matches the directory entry for "${expectedPeerName}" — still verify in person`);
+      addLine("sys", "", `key matches the directory entry for "${expectedPeerName}" — still verify in person`, true);
     }
   }
   hint("Confirm the safety number with your contact before messaging unlocks.");
@@ -3485,21 +3792,47 @@ function unlockMessaging() {
   // connect() and onclose.
   els.chatVerified.hidden = false;
   enableSend(true);
-  addLine("sys", "", "secure channel established");
+  addLine("sys", "", "secure channel established", true);
   hint("Verified. Messages are end-to-end encrypted.", false);
   els.hint.className = "hint ok";
 }
 
 async function onVerifyOk() {
-  if (!peerBundle || !currentPinKey) return;
+  // M-1: pin exactly the bundle the gate on screen was drawn for, in the same
+  // live connection, and only while it is still this connection's peer.
+  // Anything else is refused out loud — never pinned.
+  // Final round (Info): single-shot. A second click while the first is still
+  // writing the pin does nothing (not a second pin, not a refusal line), and
+  // the gate is consumed before the first await.
+  if (verifyOkBusy) return;
+  const g = gateFor;
+  if (!g || g.gen !== gateGen || !ws || ws.readyState !== WebSocket.OPEN || !currentPinKey ||
+      !peerBundle || !sameBundle(g.bundle, peerBundle)) {
+    gateFor = null;
+    els.verify.hidden = true;
+    addLine("sys", "", "[the safety number on screen did not belong to this connection — nothing was pinned]", true);
+    hint("That safety number belonged to an earlier connection. Nothing was pinned — reconnect and compare again.", true);
+    return;
+  }
+  const verifiedPeer = g.bundle;
+  gateFor = null;
+  verifyOkBusy = true;
+  try {
+    await pinVerifiedPeer(g, verifiedPeer);
+  } finally {
+    verifyOkBusy = false;
+  }
+}
+let verifyOkBusy = false;
+async function pinVerifiedPeer(g, verifiedPeer) {
   // P-02: savePin now rejects when the store is locked. The user's in-person
   // check still holds for THIS session, so messaging is allowed — but say
   // plainly that it was not remembered, or they would expect a change warning
   // next time that can never come.
   try {
-    await savePin(currentPinKey, peerBundle);
+    await savePin(currentPinKey, verifiedPeer);
   } catch (e) {
-    addLine("sys", "", "[verified for this session only — the pin could NOT be saved: " + e.message + "]");
+    addLine("sys", "", "[verified for this session only — the pin could NOT be saved: " + e.message + "]", true);
   }
   // An in-person safety-number confirmation is the strongest trust signal we
   // have — mirror it into the Users list (verified) when the peer is known by name.
@@ -3509,17 +3842,18 @@ async function onVerifyOk() {
     const parsed = account.parseHandle(els.contact.value.trim());
     await contacts.upsert({
       username: expectedPeerName, token: parsed ? parsed.token : null,
-      ed: peerBundle.ed, mldsa: peerBundle.mldsa,
-      ecdh: peerBundle.ecdh || null, mlkem: peerBundle.mlkem || null,
+      ed: verifiedPeer.ed, mldsa: verifiedPeer.mldsa,
+      ecdh: verifiedPeer.ecdh || null, mlkem: verifiedPeer.mlkem || null,
       verified: true,
     }).catch(() => { /* contact mirroring must never block messaging */ });
   }
-  addLine("sys", "", "contact verified and pinned");
+  if (g.gen !== gateGen) return; // closed while the pin was being written: no unlock for a dead connection
+  addLine("sys", "", "contact verified and pinned", true);
   unlockMessaging();
 }
 
 function onVerifyNo() {
-  addLine("sys", "", "disconnected — contact not verified");
+  addLine("sys", "", "disconnected — contact not verified", true);
   // Fix round (pentest P2/P4): the room screen says why the user is back there,
   // in the app's words — never a reason the relay parked before the click.
   closeWs("You disconnected because the safety numbers did not match — someone may be intercepting " +
@@ -3584,7 +3918,7 @@ async function sendText(e) {
 // ---- one-time pad UI ------------------------------------------------------
 
 function otpStatusMsg(text, isErr = false) {
-  els.otpStatus.textContent = text;
+  els.otpStatus.textContent = hintSafe(text);
   els.otpStatus.className = "hint" + (isErr ? " err" : "");
 }
 
@@ -3626,7 +3960,7 @@ function otpPersistFailed(err) {
   // additionally makes the `case "msg"` receive path refuse further frames.
   verified = false;
   enableSend(false);
-  addLine("sys", "", "[could not save one-time-pad progress — stopping to prevent key reuse]");
+  addLine("sys", "", "[could not save one-time-pad progress — stopping to prevent key reuse]", true);
   // Phase 2a fix round (pentest P1): shown after the close, like the A2 refusals.
   closeWs(
     "Could not save pad progress: " + err.message +
@@ -3927,7 +4261,7 @@ els.login.addEventListener("click", loginAccount);
 // always started locked with no way to unlock without navigating to the Live
 // room. Each locked view now unlocks in place.
 const setUnlockStatus = (el) => (text, isErr = false) => {
-  el.textContent = text;
+  el.textContent = hintSafe(text);
   el.className = "hint" + (isErr ? " err" : "");
 };
 wireViewUnlock(els.profileUnlockPass, els.profileUnlock,
@@ -4085,7 +4419,7 @@ els.profileLogout.addEventListener("click", async () => {
   // the identity screen, and "sign in again" on its own sends people looking.
   accountStatus("Signed out of the directory. Sealed messages will not arrive until you log in again on the identity screen.", "ok");
   showUsernameRow(true); // D3: Log in is on that screen again
-  addLine("sys", "", "[signed out of the directory — sealed messages will not arrive until you log in again]");
+  addLine("sys", "", "[signed out of the directory — sealed messages will not arrive until you log in again]", true);
 });
 els.profileForget.addEventListener("click", async () => {
   await forgetIdentity();
