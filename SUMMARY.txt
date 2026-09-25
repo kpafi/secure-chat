@@ -1,0 +1,54 @@
+run 36156141813 sha 0786d470bc3e7a371f45d15bd6794971345cf853 ref master
+Test Case '-[SecureChatTests.FloorBridgeTests testDocumentStartScriptEscapesConfigAndCapturesPrompt]' passed (0.002 seconds).
+Test Case '-[SecureChatTests.FloorBridgeTests testMalformedAnswersTamperedNeverAbsent]' passed (0.001 seconds).
+Test Case '-[SecureChatTests.FloorBridgeTests testParsesReadAndBump]' passed (0.002 seconds).
+Test Case '-[SecureChatTests.FloorBridgeTests testRejectsMalformed]' passed (0.417 seconds).
+	 Executed 4 tests, with 0 failures (0 unexpected) in 0.422 (0.428) seconds
+Test Case '-[SecureChatTests.InPageTests test01SecureContextAndWebCrypto]' passed (0.822 seconds).
+Test Case '-[SecureChatTests.InPageTests test02NativeFloorBridge]' passed (0.139 seconds).
+Test Case '-[SecureChatTests.InPageTests test03ContentSecurityPolicyIsEnforced]' passed (0.420 seconds).
+Test Case '-[SecureChatTests.InPageTests test04RelayReachable]' passed (0.741 seconds).
+Test Case '-[SecureChatTests.InPageTests test05SecretPromptIsMasked]' passed (2.846 seconds).
+Test Case '-[SecureChatTests.InPageTests test065MalformedFloorPromptIsNeverShown]' passed (1.110 seconds).
+Test Case '-[SecureChatTests.InPageTests test06PlainPromptAndConfirm]' passed (3.647 seconds).
+Test Case '-[SecureChatTests.InPageTests test07StorageMarkerForRelaunchProbe]' passed (0.010 seconds).
+Test Case '-[SecureChatTests.InPageTests test08NativeScreens]' passed (2.029 seconds).
+Test Case '-[SecureChatTests.InPageTests test99NavigationStaysOnOrigin]' passed (1.600 seconds).
+	 Executed 10 tests, with 0 failures (0 unexpected) in 13.364 (13.380) seconds
+Test Case '-[SecureChatTests.PadFloorTests testAbsentThenMonotone]' passed (0.007 seconds).
+Test Case '-[SecureChatTests.PadFloorTests testCorruptFileFailsClosedForEveryId]' passed (0.006 seconds).
+Test Case '-[SecureChatTests.PadFloorTests testDeletedFileReadsAbsent]' passed (0.004 seconds).
+Test Case '-[SecureChatTests.PadFloorTests testDifferentKeyIsTampered]' passed (0.003 seconds).
+Test Case '-[SecureChatTests.PadFloorTests testEditedValueIsTamperedAndNotHealed]' passed (0.005 seconds).
+Test Case '-[SecureChatTests.PadFloorTests testFileIsExcludedFromBackup]' passed (0.003 seconds).
+Test Case '-[SecureChatTests.PadFloorTests testKeychainKeyIsStable]' passed (0.032 seconds).
+Test Case '-[SecureChatTests.PadFloorTests testMalformedRecordShapes]' passed (0.007 seconds).
+Test Case '-[SecureChatTests.PadFloorTests testRecordCannotMoveIds]' passed (0.006 seconds).
+Test Case '-[SecureChatTests.PadFloorTests testRecordCountIsBounded]' passed (0.015 seconds).
+Test Case '-[SecureChatTests.PadFloorTests testWebKitDataIsExcludedFromBackup]' passed (0.004 seconds).
+	 Executed 11 tests, with 0 failures (0 unexpected) in 0.092 (0.097) seconds
+Test Case '-[SecureChatTests.RelayUrlsTests testAppliedZoomKeepsA320PxViewport]' passed (0.001 seconds).
+Test Case '-[SecureChatTests.RelayUrlsTests testCspPinsExactlyTheRelay]' passed (0.001 seconds).
+Test Case '-[SecureChatTests.RelayUrlsTests testHttpOnlyForLoopback]' passed (0.001 seconds).
+Test Case '-[SecureChatTests.RelayUrlsTests testPageZoomFollowsDynamicType]' passed (0.000 seconds).
+Test Case '-[SecureChatTests.RelayUrlsTests testParsesHttpsHost]' passed (0.000 seconds).
+Test Case '-[SecureChatTests.RelayUrlsTests testParsesLoopbackWithPort]' passed (0.000 seconds).
+Test Case '-[SecureChatTests.RelayUrlsTests testRejectsInjectionPayloads]' passed (0.001 seconds).
+Test Case '-[SecureChatTests.RelayUrlsTests testRejectsOtherShapes]' passed (0.005 seconds).
+Test Case '-[SecureChatTests.RelayUrlsTests testTrimsTrailingSlashAndWhitespace]' passed (0.000 seconds).
+	 Executed 9 tests, with 0 failures (0 unexpected) in 0.009 (0.011) seconds
+Test Case '-[SecureChatTests.SchemeHandlerTests testBundledClientIsPresent]' passed (0.001 seconds).
+Test Case '-[SecureChatTests.SchemeHandlerTests testExportFilenamesAreSanitised]' passed (0.002 seconds).
+Test Case '-[SecureChatTests.SchemeHandlerTests testMimeTypes]' passed (0.001 seconds).
+Test Case '-[SecureChatTests.SchemeHandlerTests testTestsAndManifestsAreNotBundled]' passed (0.002 seconds).
+Test Case '-[SecureChatTests.SchemeHandlerTests testTraversalAndOddShapesAreRefused]' passed (0.001 seconds).
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.007 (0.020) seconds
+Test Case '-[SecureChatTests.TwoUserE2ETests testTwoUsersChatBothWays]' passed (25.551 seconds).
+	 Executed 1 test, with 0 failures (0 unexpected) in 25.551 (25.553) seconds
+Test Case '-[SecureChatTests.WebVersionTests testRelayServedWebClientRunsOnIOSWebKit]' passed (4.150 seconds).
+	 Executed 1 test, with 0 failures (0 unexpected) in 4.150 (4.152) seconds
+Test Case '-[SecureChatTests.ZCrashLoopTests testFourForegroundDeathsInAMinuteShowTheCrashScreenAndTryAgainClearsIt]' passed (0.385 seconds).
+	 Executed 1 test, with 0 failures (0 unexpected) in 0.385 (0.386) seconds
+	 Executed 42 tests, with 0 failures (0 unexpected) in 43.981 (44.052) seconds
+	 Executed 42 tests, with 0 failures (0 unexpected) in 43.981 (44.053) seconds
+** TEST SUCCEEDED **
