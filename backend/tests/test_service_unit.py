@@ -138,3 +138,86 @@ def test_ws_max_size_matches_the_frame_cap_everywhere(unit):
     assert flag in (root / "backend" / "run.sh").read_text(), f"run.sh lost {flag!r}"
     assert flag in (root / ".github" / "workflows" / "ios.yml").read_text(), f"iOS CI relay lost {flag!r}"
     assert "ws_max_size=config.MAX_FRAME_BYTES + 1024" in (root / "backend" / "main.py").read_text()
+
+
+# ---- Caddy (the clearnet front end) ------------------------------------------
+
+_CADDYFILE = Path(__file__).resolve().parents[2] / "deploy" / "Caddyfile"
+
+
+def _caddy_blocks(text: str) -> list[tuple[str, list]]:
+    """Parse a Caddyfile into [(header, children)] by brace matching.
+
+    Enough of the grammar for these assertions: comments are dropped, a line
+    ending in `{` opens a block named by the rest of the line, `}` closes it,
+    anything else is a leaf directive (stored as its text)."""
+    root: list = []
+    stack = [root]
+    for raw in text.splitlines():
+        # A `#` starts a comment only at the start of a token.
+        line = re.sub(r"(^|\s)#.*$", "", raw).strip()
+        if not line:
+            continue
+        if line == "}":
+            stack.pop()
+            assert stack, "unbalanced '}' in the Caddyfile"
+        elif line.endswith("{"):
+            children: list = []
+            stack[-1].append((line[:-1].strip(), children))
+            stack.append(children)
+        else:
+            stack[-1].append(line)
+    assert len(stack) == 1, "unclosed '{' in the Caddyfile"
+    return root
+
+
+def _log_blocks(node) -> list[tuple[str, list]]:
+    out = []
+    for child in node:
+        if isinstance(child, tuple):
+            header, children = child
+            if header == "log" or header.startswith("log "):
+                out.append(child)
+            out.extend(_log_blocks(children))
+    return out
+
+
+def test_caddy_default_logger_is_discarded_too():
+    """Pentest F-RELAY-009: the site's `log { output discard }` only governs
+    the ACCESS log (http.log.access.*). Every other logger — `http.log.error`
+    with the client IP and URI of every failed request, `http.stdlib` with the
+    peer address of every failed TLS handshake — goes to Caddy's DEFAULT
+    logger, which writes to stderr and so to journald. A global options block
+    must send the default logger to discard as well."""
+    blocks = _caddy_blocks(_CADDYFILE.read_text())
+    first = blocks[0]
+    assert isinstance(first, tuple) and first[0] == "", (
+        "the Caddyfile must open with a global options block `{ ... }` "
+        f"(Caddy only accepts it first), got {first!r}")
+    default = [b for b in first[1] if isinstance(b, tuple) and b[0] == "log default"]
+    assert len(default) == 1, "the global options block must configure `log default`"
+    assert default[0][1] == ["output discard"], (
+        f"the default logger must be `output discard` and nothing else, got {default[0][1]!r}")
+
+
+def test_every_caddy_logger_discards_or_is_limited_to_certificate_upkeep():
+    """No logger may write request metadata anywhere. The one exception is a
+    logger that INCLUDEs only the certificate-management namespaces (ACME
+    obtain/renew), which log the site's own domain and the CA's answer but no
+    client data; it keeps a failing renewal visible in journald."""
+    blocks = _caddy_blocks(_CADDYFILE.read_text())
+    logs = _log_blocks(blocks)
+    assert logs, "no log blocks at all"
+    for header, children in logs:
+        outputs = [c for c in children if isinstance(c, str) and c.startswith("output ")]
+        includes = [c for c in children if isinstance(c, str) and c.startswith("include ")]
+        excludes = [c for c in children if isinstance(c, str) and c.startswith("exclude ")]
+        assert not any(isinstance(c, tuple) for c in children), (header, children)
+        if outputs == ["output discard"]:
+            continue
+        assert header != "log" and header != "log default", (
+            f"{header!r} writes somewhere: {outputs}")
+        assert len(includes) == 1 and not excludes, (header, children)
+        namespaces = includes[0].split()[1:]
+        assert namespaces and all(n in ("tls.obtain", "tls.renew") for n in namespaces), (
+            f"{header!r} includes loggers other than certificate upkeep: {namespaces}")
