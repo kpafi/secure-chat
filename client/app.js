@@ -4721,8 +4721,11 @@ function wireTakeover(btnEl, passEl, statusEl, render) {
     await unlockContacts(pass, { expectStore: true, takeover: true });
     passEl.value = "";
     status(contactsError ? contactsError : "", !!contactsError);
-    refreshUsers();
-    refreshChats();
+    // Each view drawn ONCE, this one last: refreshUsers() applies a pending
+    // invite and writes its line, and a second render would erase it (and the
+    // invite is consumed by then).
+    if (render !== refreshUsers) refreshUsers();
+    if (render !== refreshChats) refreshChats();
     render();
   });
 }

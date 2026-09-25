@@ -115,6 +115,12 @@ check("security options reflect the chosen mode",
 
 // 6. Copy button reports success or failure — never nothing.
 await page.evaluate(() => { document.querySelector("#room").value = ""; });
+// Package 4: with the RSA card gone the page is shorter, and after the clicks
+// above the room screen sits scrolled so that #copyCode is at the very top —
+// "in view" for puppeteer, but under the sticky header, which then took the
+// click (measured: the click landed on .wordmark). A person scrolls the button
+// into sight first; so does the test.
+await page.$eval("#copyCode", (b) => b.scrollIntoView({ block: "center" }));
 await page.click("#copyCode");
 await sleep(400);
 seen = await visibleText();
