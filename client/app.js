@@ -23,6 +23,7 @@ import {
   Identity, canonicalPublicBundle, checkIdentityGeneration, raiseIdentityFloor, identityFloorId,
 } from "./identity.js";
 import { captureNativeFloor } from "./nativefloor.js";
+import * as durable from "./durable.js";
 import {
   signHandshake, verifyHandshake, freshNonce, isValidNonce, signKnock, verifyKnock,
   unb64,
@@ -166,6 +167,18 @@ const LS_IDENTITY = "sc.identity.v1";
 // Package 4 (F-ATREST-008): the identity blob's native floor (Android; null in
 // a plain browser). See checkIdentityGeneration in identity.js.
 const identityFloor = captureNativeFloor();
+// Fix round (pentest of package 4, L-1): the identity blob's DURABLE copy.
+// localStorage.setItem returning is not "on disk" (durable.js: Chromium keeps
+// it off disk for up to a minute), while the native floor's commit() is on disk
+// at once — so "setItem, then raise the floor" could leave the floor AHEAD of
+// the only copy that survives a kill: a keyless gen-0 blob on disk, floor 1,
+// IDENTITY_ROLLBACK forever, no override. The blob is now also written to the
+// strict IndexedDB store, AWAITED, and the floor is raised only after that
+// write completed — for exactly the blob whose generation it records. At
+// unlock the durable copy is a second candidate: when the localStorage copy is
+// missing or older (a lost write), the durable one is used and put back.
+// localStorage stays the everyday copy (read synchronously by the UI, export).
+const IDB_IDENTITY = "sc.identity.v1";
 const LS_PINS = "sc.pins.v1";
 const LS_USERNAME = "sc.username.v1";
 const LS_LOOKUP_TOKEN = "sc.lookuptoken.v1"; // our directory lookup token
@@ -310,6 +323,10 @@ let currentRoom = null;    // the room this connection is in (keyconfirm effects
 // again. That is a permanent, silent denial of admission — a direct hit on the
 // P-08 property this was supposed to protect.
 const MAX_KNOCK_QUEUE = 16;
+// Fix round I-3: with the queue full, expected-peer claims are verified at most
+// once per this interval (see queueKnock).
+const EXPECTED_KNOCK_GAP_MS = 500;
+let expectedKnockNotBefore = 0;
 
 let identity = null;       // unlocked Identity, or null
 let myBundle = null;       // identity.publicBundle(), or null
@@ -810,7 +827,7 @@ async function createIdentity() {
     setIdentityStatus("Choose a passphrase first — it encrypts your private keys on this device.", "err");
     return;
   }
-  if (localStorage.getItem(LS_IDENTITY)) {
+  if (localStorage.getItem(LS_IDENTITY) || (await durableIdentityBlob())) {
     setIdentityStatus("An identity already exists here. Unlock it, or Forget it first.", "err");
     return;
   }
@@ -819,8 +836,9 @@ async function createIdentity() {
     identity = await Identity.generate();
     const blob = await identity.export(pass);
     localStorage.setItem(LS_IDENTITY, blob);
-    // F-ATREST-008: the floor follows the stored blob, never leads it.
-    await raiseIdentityFloorSaid(identity);
+    // F-ATREST-008 / fix round L-1: the floor follows the DURABLE blob, never
+    // leads it (raiseIdentityFloorSaid writes it to IndexedDB first).
+    await raiseIdentityFloorSaid(identity, blob);
     await unlockContacts(pass, { expectStore: false }); // contact store shares the identity passphrase
     els.idPass.value = "";
     await showIdentityUnlocked();
@@ -850,11 +868,29 @@ const NEW_KEYS_MISSING_Q =
   "and every contact will see your keys change.\n\n" +
   "Press Cancel and restore your newest backup unless you know exactly why this happened.";
 
-// Raise the identity floor to the STORED blob's generation. A failure leaves
-// the blob safe (it is already stored) and the next unlock catches up — said,
-// not swallowed.
-async function raiseIdentityFloorSaid(id) {
+// Make `blob` (the identity `id` was loaded from or just saved as) durable,
+// THEN raise the identity floor to its generation. The order is the point
+// (fix round L-1): the floor's commit() is on disk at once, so it may only
+// ever record a generation whose blob is already on disk too. A durable write
+// that fails leaves the floor where it was (said); a floor write that fails
+// leaves it behind the blob (said) — both are caught up at the next unlock,
+// and neither can lock the user out.
+async function raiseIdentityFloorSaid(id, blob) {
+  let durableOk = false;
+  if (durable.available()) {
+    try {
+      const have = await durable.get(IDB_IDENTITY);
+      if (have !== blob) await durable.put(IDB_IDENTITY, blob);
+      durableOk = true;
+    } catch {
+      durableOk = false;
+    }
+  }
   if (!identityFloor) return;
+  if (!durableOk) {
+    addLine("sys", "", "[your identity could not be saved to the device's durable storage — its rollback record was not advanced; retried at the next unlock]", true);
+    return;
+  }
   try {
     raiseIdentityFloor(identityFloor, await identityFloorId(id.edPubRaw), id.gen);
   } catch (e) {
@@ -862,14 +898,62 @@ async function raiseIdentityFloorSaid(id) {
   }
 }
 
+// The candidates for the stored identity: the everyday localStorage copy and
+// the durable IndexedDB copy (fix round L-1).
+async function durableIdentityBlob() {
+  if (!durable.available()) return null;
+  try {
+    const v = await durable.get(IDB_IDENTITY);
+    return typeof v === "string" ? v : null;
+  } catch {
+    return null;
+  }
+}
+const sameEdRaw = (a, b) => !!a && !!b && a.length === b.length && a.every((x, i) => x === b[i]);
+async function tryImport(blob, pass) {
+  try {
+    return { blob, id: await Identity.import(blob, pass) };
+  } catch (err) {
+    return { blob, err };
+  }
+}
+// Which copy to unlock. The localStorage copy wins unless the durable copy is
+// the SAME identity and newer — or the localStorage copy is gone — which is
+// exactly what a localStorage write lost to a kill looks like (create: nothing
+// there; upgrade: the keyless gen-0 copy still there). A durable copy of a
+// different identity, or one the passphrase does not open, never replaces it.
+async function pickIdentityBlob(pass) {
+  const ls = localStorage.getItem(LS_IDENTITY);
+  const idb = await durableIdentityBlob();
+  const a = ls ? await tryImport(ls, pass) : null;
+  const b = idb && idb !== ls ? await tryImport(idb, pass) : null;
+  if (b && b.id) {
+    const aEd = a ? (a.id ? a.id.edPubRaw : a.err && a.err.edPubRaw) : null;
+    const aGen = a ? (a.id ? a.id.storedGen : a.err && a.err.storedGen) : null;
+    const newer = !a || (sameEdRaw(aEd, b.id.edPubRaw) && typeof aGen === "number" &&
+      (b.id.storedGen > aGen || (a.err && a.err.code === "IDENTITY_NEEDS_NEW_KEYS")));
+    if (newer) {
+      localStorage.setItem(LS_IDENTITY, b.blob);
+      addLine("sys", "", "[your identity was taken from the device's durable copy — the last save had not reached the disk]", true);
+      return b;
+    }
+  }
+  return a;
+}
+
 async function unlockWithPassphrase(pass) {
-  const blob = localStorage.getItem(LS_IDENTITY);
-  if (!blob) return "Nothing to unlock — create an identity in the Live room first.";
+  if (!localStorage.getItem(LS_IDENTITY) && !(await durableIdentityBlob())) {
+    return "Nothing to unlock — create an identity in the Live room first.";
+  }
   if (!pass) return "Enter your identity passphrase to unlock.";
   try {
+    const picked = await pickIdentityBlob(pass);
+    if (!picked) return "Nothing to unlock — create an identity in the Live room first.";
+    const blob = picked.blob;
     let imported;
     try {
-      imported = await Identity.import(blob, pass);
+      if (picked.err) throw picked.err;
+      imported = picked.id;
     } catch (e) {
       if (e.code !== "IDENTITY_NEEDS_NEW_KEYS") throw e;
       // F-ATREST-008: never re-key silently. On Android a device that has used
@@ -887,14 +971,16 @@ async function unlockWithPassphrase(pass) {
     // this device has used (Android).
     await checkIdentityGeneration(imported.edPubRaw, imported.storedGen, !imported.upgraded, identityFloor);
     identity = imported;
+    let stored = blob;
     if (identity.upgraded) {
       // Encryption keys were just added, with the user's consent — persist
-      // them (generation +1) so it happens exactly once, then raise the floor
-      // and re-publish the bundle below.
-      localStorage.setItem(LS_IDENTITY, await identity.export(pass));
+      // them (generation +1) so it happens exactly once, then (durable copy
+      // first, fix round L-1) raise the floor and re-publish the bundle below.
+      stored = await identity.export(pass);
+      localStorage.setItem(LS_IDENTITY, stored);
       addLine("sys", "", "[new encryption keys were created for your identity — you confirmed it]", true);
     }
-    await raiseIdentityFloorSaid(identity);
+    await raiseIdentityFloorSaid(identity, stored);
     await unlockContacts(pass, { expectStore: true }); // contact store shares the identity passphrase
     await showIdentityUnlocked();
     return null;
@@ -912,7 +998,7 @@ async function unlockWithPassphrase(pass) {
 
 async function unlockIdentity() {
   const pass = els.idPass.value;
-  if (!localStorage.getItem(LS_IDENTITY)) {
+  if (!localStorage.getItem(LS_IDENTITY) && !(await durableIdentityBlob())) {
     setIdentityStatus("Nothing to unlock — create an identity first.", "err");
     return;
   }
@@ -984,6 +1070,15 @@ async function forgetIdentity() {
   apiToken = null;
   if (staleToken) await account.logout(API_BASE, staleToken);
 
+  // Fix round L-1: the durable copy goes FIRST (awaited) — the other order
+  // could leave a copy that the next unlock would put back.
+  if (durable.available()) {
+    try {
+      await durable.del(IDB_IDENTITY);
+    } catch {
+      addLine("sys", "", "[could not delete the durable copy of your identity from this device's database — reload and Forget again]", true);
+    }
+  }
   localStorage.removeItem(LS_IDENTITY);
   closeContact(false); // it shows a record that is about to be gone
   retractPending.clear(); // they belonged to this identity's account
@@ -1192,7 +1287,7 @@ async function holdStoreLock(floorId, takeover) {
   const name = "sc.stores.lock.v1." + floorId;
   if (storeLock && storeLock.name === name) return "held";
   releaseStoreLock(); // another identity's lock, if any
-  const mine = { name, release: null };
+  const mine = { name, release: null, lost: false };
   const got = await new Promise((resolveGot) => {
     locks.request(name, takeover ? { steal: true } : { ifAvailable: true }, (lock) => {
       if (!lock) { resolveGot(false); return undefined; }
@@ -1200,11 +1295,15 @@ async function holdStoreLock(floorId, takeover) {
       return new Promise((r) => { mine.release = r; }); // held until released
     }).catch(() => {
       // AbortError: another tab stole it (the only way this rejects while held).
+      // `lost` is set whatever state this tab is in (fix round L-2): a steal
+      // can land while unlockContacts is still opening the stores, before
+      // storesStolen() has anything to lock — the unlock re-checks it at the end.
+      mine.lost = true;
       if (storeLock === mine) storesStolen();
       resolveGot(false);
     });
   });
-  if (!got) return "elsewhere";
+  if (!got || mine.lost) return "elsewhere";
   storeLock = mine;
   return "held";
 }
@@ -1260,6 +1359,7 @@ async function unlockContacts(pass, opts = {}) {
   const chatOpts = flags("LEGACY_CHATS_ADOPTION", "DELETED_CHATS_ADOPTION");
   // Decision 3: one tab at a time, decided BEFORE either store is read.
   const held = floorId ? await holdStoreLock(floorId, !!opts.takeover) : "none";
+  const myLock = held === "held" ? storeLock : null; // fix round L-2, re-checked below
   if (held === "elsewhere") {
     storesElsewhere = true;
     storesTakenOver = false;
@@ -1328,6 +1428,24 @@ async function unlockContacts(pass, opts = {}) {
     contactsError = contactsError || e.message;
     if (ADOPTABLE.has(e.code)) { contactsAdoptable = true; adoptCodes.add(e.code); }
     addLine("sys", "", "[chat store did not unlock — " + e.message + "]", true);
+  }
+  // Fix round (pentest of package 4), L-2. Opening the stores is two 600k
+  // PBKDF2 derivations; another tab's "Use here" can take the lock in between.
+  // storesStolen() then ran with nothing open to lock, and without this check
+  // the stores opened here anyway — BOTH tabs held them, and this one's pins
+  // no longer saw the other's Unverify / Remove. The lock this call took must
+  // still be ours when the stores are open, or they are locked again at once.
+  if (myLock && (myLock.lost || storeLock !== myLock)) {
+    const saidAlready = storesTakenOver;
+    if (storeLock === myLock) storeLock = null;
+    storesTakenOver = true;
+    storesElsewhere = false;
+    closeContact(false);
+    if (contacts.isUnlocked()) contacts.lock();
+    if (chats.isUnlocked()) chats.lock();
+    if (!saidAlready) addLine("sys", "", "[your contacts and chats were opened in another tab — they are locked here]", true);
+    refreshUsers();
+    refreshChats();
   }
 }
 
@@ -3004,6 +3122,19 @@ async function connectInner() {
     // so a bigger one is not from an honest relay. Refused before it is
     // queued or parsed — JSON.parse of an attacker-sized string is the cost.
     if (typeof ev.data !== "string" || ev.data.length > MAX_WS_FRAME_CHARS) return;
+    // Fix round (pentest of package 4), I-1: while the guest's approval prompt
+    // is open the pump is parked on the user's decision, so every frame the
+    // relay sends meanwhile is kept alive in msgChain (up to 64 KiB each, no
+    // limit) — a hostile relay could fill the tab's memory. An honest owner
+    // sends nothing while it waits for our answer, so past a small cap the
+    // connection is dropped, once, with one line.
+    if (peerApproval && sock === ws && !retiredSockets.has(sock)) {
+      if (++framesWhilePrompt > MAX_FRAMES_WHILE_PROMPT) {
+        addLine("sys", "", "[the relay kept sending while you were deciding — disconnecting]", true);
+        closeWs("The relay flooded the connection while you were deciding whom to let in. Disconnected — nothing was exchanged.", sock);
+        return;
+      }
+    }
     msgChain = msgChain.then(() => handleMessage(room, ev.data, sock)).catch(() => {});
   };
 
@@ -3097,6 +3228,13 @@ async function queueKnock(m, live = () => true) {
     let claimed = null;
     try { claimed = p && p.idb ? canonicalBundle(p.idb) : null; } catch { claimed = null; }
     if (!expectedPeerBundle || !claimed || !sameBundle(expectedPeerBundle, claimed)) return;
+    // Fix round I-3: a claim of the expected key is PUBLIC (anyone can copy the
+    // bundle), so with a full queue it must not buy a dual-signature verify per
+    // frame. At most one such verify per EXPECTED_KNOCK_GAP_MS; a genuine peer
+    // that lands in the gap knocks again, as any dropped knocker does.
+    const now = performance.now();
+    if (now < expectedKnockNotBefore) return;
+    expectedKnockNotBefore = now + EXPECTED_KNOCK_GAP_MS;
   }
   let entry = { jid: m.jid, bundle: null, anon: true };
   if (p && p.idb && p.sig) {
@@ -3340,8 +3478,12 @@ function peerVerifiedInPerson(bundle) {
 // Registers the pending decision SYNCHRONOUSLY, then renders: the other order
 // would let a close arriving mid-render find nothing to settle, and the message
 // pump would stay parked on a promise nothing could ever resolve.
+// I-1: frames queued behind an open prompt, per prompt.
+const MAX_FRAMES_WHILE_PROMPT = 64;
+let framesWhilePrompt = 0;
 function requestPeerApproval(bundle) {
   settlePeerApproval(false);
+  framesWhilePrompt = 0;
   const decided = new Promise((resolve) => { peerApproval = { bundle, resolve }; });
   renderPeerApproval(peerApproval);
   return decided;
@@ -3778,7 +3920,11 @@ async function handleMessage(room, raw, sock) {
       // The tag is advisory and relay-writable — the worst a relay does with it
       // is close a session it could have dropped anyway — and it never selects
       // a cipher: the mode is this page's own choice, frozen in `sessionAlg`.
-      if (typeof m.alg === "string" && m.alg !== sessionAlg &&
+      // Fix round I-2: only BEFORE the handshake started (no peer nonce yet) —
+      // an old RSA client's very first frame is its hello, so that is where it
+      // shows. A relay injecting one RSA-tagged frame mid-session must not get
+      // to close the session blaming the peer; later it is an ordinary frame.
+      if (peerNonce === null && typeof m.alg === "string" && m.alg !== sessionAlg &&
           Object.prototype.hasOwnProperty.call(REMOVED_ALGS, m.alg)) {
         if (saidRemovedAlg) break;
         saidRemovedAlg = true;
@@ -3951,7 +4097,11 @@ async function handleMessage(room, raw, sock) {
             addLine("sys", "", `the other side is "${dirName(known)}", whom you verified in person — approved without asking`, true);
           } else {
             const allowed = await requestPeerApproval(idbCanon);
-            if (!live()) return; // closed (or replaced) while the prompt was up
+            // Closed (or replaced) while the prompt was up. Fix round M6: a
+            // RELAY close does not retire the socket, so live() alone still
+            // held and onclose's settle(false) was narrated as the user's
+            // "you refused" — the socket's own state decides too.
+            if (!live() || sock.readyState !== WebSocket.OPEN) return;
             if (!allowed) {
               addLine("sys", "", "[you refused the key the other side presented — nothing was exchanged]", true);
               closeWs("You refused the other side's key. Nothing was exchanged. " +
@@ -4931,6 +5081,17 @@ showScreen("identity");
 showView("live"); // establishes aria-current / active state on first paint
 syncAlgUI();
 refreshIdentityUI();
+// Fix round L-1: a create whose localStorage write was lost to a kill left the
+// identity only in the durable copy — put it back, so the page offers Unlock
+// (not Create, which would replace it).
+if (!localStorage.getItem(LS_IDENTITY)) {
+  durableIdentityBlob().then((b) => {
+    if (b && !localStorage.getItem(LS_IDENTITY) && !identity) {
+      localStorage.setItem(LS_IDENTITY, b);
+      refreshIdentityUI();
+    }
+  });
+}
 
 // Start with a chat code already in the box. Pressing Connect on an empty field
 // used to fail a validation check whose message was written to a hidden element,

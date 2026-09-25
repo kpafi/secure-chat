@@ -77,7 +77,17 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   two-user-flow 15/15, no-dead-ends 17/17, all-modes 28/28 (four modes),
   contact-profile 67/67 (new 5c: one tab), durable-crash — gradle
   assembleDebug + 12 unit tests.
-  **Owed:** a pentest-new-code round on the branch; the on-device checks in
+  **Pentest of 3b6243f..9adf87f (2026-09-26):** no Critical/High/Medium; fix
+  round in one commit: L-1 (identity floor could lead every surviving copy —
+  setItem is not on disk; now the blob is written to strict IndexedDB,
+  awaited, before the floor moves, and a lost localStorage write is recovered
+  from that copy at unlock), L-2 ("Use here" mid-unlock left both tabs open;
+  re-checked after the stores open), I-1 (frames behind an open prompt capped
+  at 64), I-2 (RSA wording only before the handshake starts), I-3 (≤1
+  expected-peer verify per 500 ms with a full queue), M6/M16 bound (M6 was a
+  real bug: a relay close was narrated as "you refused"). Re-checked: see the
+  fix-round commit.
+  **Owed:** a re-review of the fix round; the on-device checks in
   android/README.md ("Owed on the phone (package 4 …)"); the iOS XCTests run
   in CI only; merge on the owner's word. **Release notes:** a guest now confirms the owner's key once
   per live session (unless verified+pinned); RSA is gone; a second tab shows

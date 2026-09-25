@@ -537,9 +537,13 @@ export { b64, unb64, concat };
 // (PadFloor.kt, id `identity:<sha256(ed25519 public key) hex>`, the same hash
 // the contact/chat floors use). A blob OLDER than the floor is a rollback and
 // is refused; a newer one raises it. Ordering makes a crash harmless: callers
-// persist the blob FIRST and raise the floor after (raiseIdentityFloor), so a
-// crash in between leaves floor < blob, which the next unlock raises — never a
-// floor ahead of the only copy (that would brick the identity). In a plain
+// make the blob DURABLE first — app.js writes it to the strict IndexedDB store
+// (durable.js) and awaits completion, because localStorage.setItem is NOT on
+// disk when it returns (fix round L-1: setItem-then-raise left a floor ahead of
+// the copy a kill preserved = permanent IDENTITY_ROLLBACK) — and raise the
+// floor after (raiseIdentityFloor), so a crash in between leaves floor < blob,
+// which the next unlock raises; a lost localStorage write is recovered from
+// the durable copy. Never a floor ahead of every surviving copy. In a plain
 // browser there is no floor (`floor` null): the confirmation in import() is the
 // control there, and a like-for-like older copy of the SAME keys is not
 // detectable — stated in README.
