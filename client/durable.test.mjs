@@ -398,8 +398,14 @@ for (const fx of [V031_BROWSER, V031_ANDROID]) {
   const H = android ? await withFloor("chats.js", "h1") : await fresh("chats.js", "h1");
   await C.ready; await H.ready;
   for (const k of STORE_KEYS) {
-    assert.strictEqual(mem.get(k), undefined, `${fx.mode}: ${k} moved out of localStorage`);
-    assert.strictEqual(fake.getItem(k), fx.localStorage[k], `${fx.mode}: …into IndexedDB, byte for byte`);
+    assert.strictEqual(fake.getItem(k), fx.localStorage[k], `${fx.mode}: ${k} is in IndexedDB, byte for byte`);
+  }
+  // The blobs leave localStorage; the witnesses stay there as a MIRROR (review
+  // round 2, L-3: a downgraded client then refuses loudly instead of starting
+  // a fresh, pin-less store).
+  for (const k of ["sc.contacts.v1", "sc.chats.v1"]) assert.strictEqual(mem.get(k), undefined, `${fx.mode}: ${k} moved out of localStorage`);
+  if (!process.env.R2_ONLY) {
+    for (const k of ["sc.contacts.gen.v1", "sc.chats.gen.v1"]) assert.strictEqual(mem.get(k), fx.localStorage[k], `${fx.mode}: ${k} mirrored in localStorage`);
   }
   assert.ok(mem.has("sc.contacts.idb.v1") && mem.has("sc.chats.idb.v1"), `${fx.mode}: the moved-to-IndexedDB markers are set`);
   assert.ok(C.hasStore() && H.hasStore(), `${fx.mode}: hasStore() still says a store exists`);
@@ -413,7 +419,9 @@ for (const fx of [V031_BROWSER, V031_ANDROID]) {
   if (android) {
     assert.strictEqual(floors.get("contacts:" + fx.FLOOR_ID), 4, "android: the floor keeps counting from the migrated generation");
   }
-  assert.ok(STORE_KEYS.every((k) => !mem.has(k)), `${fx.mode}: later writes go to IndexedDB only (one source of truth)`);
+  assert.ok(!mem.has("sc.contacts.v1") && !mem.has("sc.chats.v1") &&
+    (process.env.R2_ONLY !== undefined || mem.get("sc.contacts.gen.v1") === fake.getItem("sc.contacts.gen.v1")),
+    `${fx.mode}: later writes go to IndexedDB (localStorage holds only the witness mirror, kept current)`);
   C.lock(); H.lock();
 }
 console.log("OK  3b: v0.3.1 contact + chat stores migrate to IndexedDB verbatim, open intact, and localStorage is cleared");
@@ -428,7 +436,7 @@ console.log("OK  3b: v0.3.1 contact + chat stores migrate to IndexedDB verbatim,
   fake.setItem("sc.contacts.gen.v1", fx.localStorage["sc.contacts.gen.v1"]);
   const C = await fresh("contacts.js", "h2");
   await C.ready;
-  assert.ok(!mem.has("sc.contacts.v1") && !mem.has("sc.contacts.gen.v1"), "an interrupted migration's leftover copy is removed");
+  assert.ok(!mem.has("sc.contacts.v1"), "an interrupted migration's leftover (identical) copy is removed");
   await C.unlock(fx.PASS, { floorId: fx.FLOOR_ID });
   assert.ok(C.get("alice"));
   C.lock();
@@ -592,6 +600,241 @@ console.log("OK  3b: v0.3.1 contact + chat stores migrate to IndexedDB verbatim,
   assert.deepStrictEqual(await H.unlock("id pass", { adoptDeleted: true }), { created: true }, "…with the explicit override");
   H.lock();
   console.log("OK  3b: wipe() clears IndexedDB; an emptied IndexedDB with the marker left refuses loudly");
+}
+
+// ============================================================================
+// R2. Review round 2 (coordinator's pentest of c0f6cd6)
+// ============================================================================
+const V031C = (tag) => import(`./v031-contacts.test.mjs?${tag}-${gen++}`);
+const V031H = (tag) => import(`./v031-chats.test.mjs?${tag}-${gen++}`);
+// R2_ONLY=<id> runs a single round-2 block (to show each one RED on its own).
+const r2 = (id) => !process.env.R2_ONLY || process.env.R2_ONLY === id;
+
+// L-1: two overlapping saves on Android. Save 2 used to ARM the floor to the
+// generation save 1 was still writing (its strict transaction in flight): a
+// kill then left floor N+1 over durable N — "OLDER than this device
+// recorded", no override. persist() is now serialized per store and the floor
+// is only ever armed/advanced at a generation whose durable write completed.
+for (const mod of r2("l1") ? ["chats.js", "contacts.js"] : []) {
+  mem.clear(); floors.clear(); freshIdb();
+  const ID = "e".repeat(64);
+  const H = await withFloor(mod, "r2-l1");
+  await H.unlock("id pass", { floorId: ID });
+  if (mod === "chats.js") await H.append("bob", { dir: "in", text: "a", ts: 1, id: "e0" });
+  else await H.upsert({ username: "bob", ed: "RURC", mldsa: "TUxC" });
+  const committed = new Map(fake.mem);
+  const key = (mod === "chats.js" ? "chats:" : "contacts:") + ID;
+  const onDisk = floors.get(key);
+  fake.hold();
+  const p1 = mod === "chats.js" ? H.append("bob", { dir: "in", text: "b", ts: 2, id: "e1" }) : H.upsert({ username: "carol", ed: "RURD", mldsa: "TUxD" });
+  const p2 = mod === "chats.js" ? H.markSeen("alice", "e2") : H.upsert({ username: "dave", ed: "RURE", mldsa: "TUxE" });
+  p1.catch(() => {}); p2.catch(() => {});
+  await settle(50);
+  assert.strictEqual(floors.get(key), onDisk,
+    `review r2 L-1 (${mod}): with a save's durable write in flight, a second save does not move the floor past the data`);
+  // Kill now: the held commits never land.
+  const snapFloors = new Map(floors);
+  freshIdb(); for (const [k, v] of committed) fake.mem.set(k, v);
+  floors.clear(); for (const [k, v] of snapFloors) floors.set(k, v);
+  const R = await withFloor(mod, "r2-l1-relaunch");
+  assert.deepStrictEqual(await R.unlock("id pass", { floorId: ID }), { created: false },
+    `review r2 L-1 (${mod}): killed with two saves in flight, the store reopens (no floor-ahead brick)`);
+  R.lock();
+}
+console.log("OK  review r2 L-1: overlapping saves never put the floor ahead of durable data (contacts + chats)");
+
+// L-1 (lead): out-of-order encryption. The older snapshot used to commit LAST
+// (and the witness was sealed from the live generation) — IndexedDB regressed
+// under an advanced floor, refused even without a crash.
+if (r2("reorder")) {
+  // Save 1's encryption is held until save 2 has been STARTED (and, unordered,
+  // has finished): save 1's snapshot is then the older one. It must not be the
+  // one that commits last.
+  for (const mod of ["chats.js", "contacts.js"]) {
+    mem.clear(); floors.clear(); freshIdb();
+    const ID = "f".repeat(64);
+    const H = await withFloor(mod, "r2-reorder");
+    await H.unlock("id pass", { floorId: ID });
+    const change = (i) => (mod === "chats.js"
+      ? H.append("bob", { dir: "in", text: "m" + i, ts: i, id: "e" + i })
+      : H.upsert({ username: "u" + i, ed: "RUQ" + i, mldsa: "TUw" + i }));
+    await change(0);
+    const orig = crypto.subtle.encrypt.bind(crypto.subtle);
+    let started, release;
+    const slowStarted = new Promise((r) => { started = r; });
+    const gate = new Promise((r) => { release = r; });
+    let first = true;
+    crypto.subtle.encrypt = async (...a) => {
+      const slow = first; first = false;
+      if (slow) { started(); await gate; }
+      return orig(...a);
+    };
+    const p1 = change(1);
+    await slowStarted;              // save 1 holds its (older) snapshot…
+    const p2 = change(2);            // …while save 2 starts with the newer one
+    await settle(40);
+    release();
+    await Promise.allSettled([p1, p2]);
+    crypto.subtle.encrypt = orig;
+    H.lock();
+    const R = await withFloor(mod, "r2-reorder-r");
+    await R.unlock("id pass", { floorId: ID });
+    if (mod === "chats.js") {
+      assert.deepStrictEqual(R.get("bob").messages.map((m) => m.text), ["m0", "m1", "m2"],
+        "review r2 L-1 (chats): overlapping saves commit in order — the newest state is the one on disk");
+    } else {
+      assert.ok(R.get("u1") && R.get("u2"),
+        "review r2 L-1 (contacts): overlapping saves commit in order — the newest state is the one on disk");
+    }
+    R.lock();
+  }
+  // A save that FAILED must not move the counter: the next save used to arm
+  // the floor at the generation that never reached disk (floor ahead of data).
+  for (const mod of ["chats.js", "contacts.js"]) {
+    mem.clear(); floors.clear(); freshIdb();
+    const ID = "8".repeat(64);
+    const key = (mod === "chats.js" ? "chats:" : "contacts:") + ID;
+    const H = await withFloor(mod, "r2-fail");
+    await H.unlock("id pass", { floorId: ID });
+    const change = (i) => (mod === "chats.js"
+      ? H.append("bob", { dir: "in", text: "m" + i, ts: i, id: "e" + i })
+      : H.upsert({ username: "u" + i, ed: "RUQ" + i, mldsa: "TUw" + i }));
+    const onDisk = floors.get(key);
+    fake.failWrites((k) => k.startsWith(mod === "chats.js" ? "sc.chats" : "sc.contacts"));
+    await assert.rejects(change(1));
+    fake.failWrites(null);
+    fake.hold();
+    const p = change(2); p.catch(() => {});
+    await settle(40);
+    assert.strictEqual(floors.get(key), onDisk,
+      `review r2 L-1 (${mod}): after a failed save the next one does not arm the floor at the generation that never reached disk`);
+    fake.release();
+    await p.catch(() => {});
+    H.lock();
+  }
+  console.log("OK  review r2 L-1: out-of-order encryption cannot commit an older snapshot last; a failed save moves no counter");
+}
+
+// L-2: a v0.3.1 tab left open across the upgrade. The new tab migrated the
+// store; the old tab (still unlocked) removed Bob — revoking his pin — in
+// localStorage; the next new-version load deleted that write as "the copy
+// goes" and Bob came back. Now the old tab's write is either refused (STALE,
+// when the new code wrote since) or adopted when it is the newer generation.
+if (r2("l2")) {
+  const PASSX = "identity passphrase r2";
+  const bob = { username: "bob", ed: "RUQx", mldsa: "TUwx", verified: true };
+  // (a) the old tab writes after the migration, nothing newer in IndexedDB.
+  mem.clear(); freshIdb();
+  const oldTab = await V031C("r2-l2a");
+  await oldTab.unlock(PASSX);
+  await oldTab.upsert(bob);
+  const newTab = await fresh("contacts.js", "r2-l2a-new");
+  await newTab.ready;
+  await oldTab.remove("bob");
+  const reload = await fresh("contacts.js", "r2-l2a-reload");
+  await reload.unlock(PASSX);
+  assert.strictEqual(reload.get("bob"), null,
+    "review r2 L-2: an old tab's newer write (Remove = pin revocation) is adopted, not silently deleted");
+  reload.lock();
+  // (b) the new code wrote since: the old tab's save is refused as STALE.
+  mem.clear(); freshIdb();
+  const oldB = await V031C("r2-l2b");
+  await oldB.unlock(PASSX);
+  await oldB.upsert(bob);
+  const newB = await fresh("contacts.js", "r2-l2b-new");
+  await newB.unlock(PASSX);
+  await newB.upsert({ username: "carol", ed: "RUQy", mldsa: "TUwy" });
+  await assert.rejects(oldB.remove("bob"), (e) => e.code === "STALE",
+    "review r2 L-2: once the new code has written, an old tab's save is refused loudly (STALE)");
+  // (c) an OLDER localStorage copy (a replayed snapshot, or an old tab that
+  // lost the race) never replaces the newer store — and the drop is reported.
+  mem.clear(); freshIdb();
+  const n3 = await fresh("contacts.js", "r2-l2c");
+  await n3.unlock(PASSX);
+  const oldBlob = fake.getItem("sc.contacts.v1");
+  const oldWit = fake.getItem("sc.contacts.gen.v1");
+  await n3.upsert(bob);
+  n3.lock();
+  mem.set("sc.contacts.v1", oldBlob); mem.set("sc.contacts.gen.v1", oldWit);
+  const n3r = await fresh("contacts.js", "r2-l2c-r");
+  assert.deepStrictEqual(await n3r.unlock(PASSX), { created: false, conflictDropped: true },
+    "review r2 L-2: an older localStorage copy is dropped, and the unlock says so");
+  assert.ok(n3r.get("bob") && !mem.has("sc.contacts.v1"), "…the newer IndexedDB store stands");
+  n3r.lock();
+  // (d) I-1: marker present, IndexedDB empty, a localStorage copy present —
+  // not migrated back in silently: the loud DELETED refusal.
+  fake.clear();
+  mem.set("sc.contacts.v1", oldBlob);
+  await assert.rejects((await fresh("contacts.js", "r2-l2d")).unlock(PASSX), (e) => e.code === "DELETED_CONTACTS_ADOPTION",
+    "review r2 I-1: marker + localStorage copy + empty IndexedDB is a loud refusal, not a silent re-migration");
+  console.log("OK  review r2 L-2: an old-version tab's writes after the migration are adopted or refused, never silently dropped");
+}
+
+// L-3: downgrade after the migration. The v0.3.1 client used to find no store
+// in localStorage and silently start a fresh, pin-less one (browser). It now
+// finds the generation witness the new code keeps mirrored there and takes its
+// own loud "store deleted" branch.
+if (r2("l3")) {
+  const PASSX = "identity passphrase r2 dg";
+  mem.clear(); freshIdb();
+  const n = await fresh("contacts.js", "r2-l3");
+  await n.unlock(PASSX);
+  await n.upsert({ username: "bob", ed: "RUQx", mldsa: "TUwx", verified: true });
+  const h = await fresh("chats.js", "r2-l3");
+  await h.unlock(PASSX);
+  await h.append("bob", { dir: "in", text: "x", ts: 1, id: "e0" });
+  const o = await V031C("r2-l3-old");
+  assert.strictEqual(o.hasStore(), true, "review r2 L-3: a downgraded client still sees that a contact store exists");
+  await assert.rejects(o.unlock(PASSX), /DELETED|refusing/,
+    "review r2 L-3: a downgraded client refuses loudly instead of starting a fresh, pin-less contact store");
+  const oh = await V031H("r2-l3-old");
+  await assert.rejects(oh.unlock(PASSX), /DELETED|refusing/, "…and the same for the chat store");
+  console.log("OK  review r2 L-3: a downgrade after the migration fails loudly (no silent pin-less store)");
+}
+
+// I-4: the "OLDER than recorded" messages name the real generation (they
+// used to lock() first, which reset it, and always said "generation 0").
+if (r2("i4")) {
+  mem.clear(); floors.clear(); freshIdb();
+  const ID = "9".repeat(64);
+  const C = await withFloor("contacts.js", "r2-i4");
+  await C.unlock("id pass", { floorId: ID });
+  await C.upsert({ username: "bob", ed: "RURC", mldsa: "TUxC" });
+  C.lock();
+  const g0 = floors.get("contacts:" + ID);
+  floors.set("contacts:" + ID, g0 + 5);
+  const R = await withFloor("contacts.js", "r2-i4-r");
+  await assert.rejects(R.unlock("id pass", { floorId: ID }), new RegExp(`generation ${g0}, device record ${g0 + 5}`),
+    "review r2 I-4: the refusal names the store's actual generation, not 0");
+  console.log("OK  review r2 I-4: rollback refusals name the real generation");
+}
+
+// I-6: a crash inside saveNewPad (re-import under a new passphrase) between the
+// new-key blob and the durable write stranded the OLD-key durable record → a
+// false "damaged or forged". A never-used record (`used: 0`) beside a pristine
+// blob is now simply replaced.
+if (r2("i6")) {
+  mem.clear(); freshIdb();
+  const A = await fresh("otp.js", "r2-i6");
+  const src = await A.generatePad({ label: "i6", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const file = await A.exportPad(src, "xfer");
+  mem.clear();
+  const imp1 = await A.importPad(file, "xfer");
+  await A.saveNewPad(imp1, "first pass");
+  mem.clear(); // the crash takes localStorage; the unused durable record survives
+  const B = await fresh("otp.js", "r2-i6-b");
+  const imp2 = await B.importPad(file, "xfer");
+  fake.failWrites((k) => k.startsWith("sc.otp.dur."));
+  await assert.rejects(B.saveNewPad(imp2, "second pass"));
+  fake.failWrites(null);
+  const C = await fresh("otp.js", "r2-i6-c");
+  const u = await C.unlockPad(src.padId, "second pass");
+  assert.strictEqual(u.record.sendOffset, 0, "review r2 I-6: the pristine pad opens (no false 'damaged or forged')");
+  // …but a USED record under another key is still refused.
+  fake.setItem(durKey(src.padId), JSON.stringify({ ...JSON.parse(fake.getItem(durKey(src.padId))), used: 1, ct: "AAAAAAAAAAAAAAAAAAAAAAA=" }));
+  await assert.rejects((await fresh("otp.js", "r2-i6-d")).unlockPad(src.padId, "second pass"), /damaged or forged/,
+    "review r2 I-6: an unreadable record that says USED is still refused");
+  console.log("OK  review r2 I-6: an unused durable record stranded under an old key is replaced, a used one refused");
 }
 
 console.log("\nAll durable-storage checks passed.");

@@ -1122,6 +1122,12 @@ async function unlockContacts(pass, opts = {}) {
     } else if (r && r.created && opts.expectStore) {
       storeNotice = "No saved contacts were found for this identity. If you have used this device before, " +
         "they were deleted and key-change warnings for earlier contacts are gone — treat every contact as unverified.";
+    } else if (r && r.conflictDropped) {
+      // Package 3b review round 2 (L-2): an older copy left in this browser's
+      // old storage (a tab of the previous version, or a restored snapshot)
+      // was not newer than the saved contacts and was discarded — say so.
+      storeNotice = "An older copy of your contacts from a previous app version (another open tab?) was found and discarded. " +
+        "If you changed contacts in an old tab after updating, check them again.";
     }
     if (storeNotice) addLine("sys", "", "[" + storeNotice + "]", true);
   } catch (e) {
@@ -1134,6 +1140,9 @@ async function unlockContacts(pass, opts = {}) {
     const r = await chats.unlock(pass, chatOpts); // chat history shares the at-rest posture
     if (r && r.created && opts.expectStore && !contactsError) {
       addLine("sys", "", "[no chat history was found for this identity on this device]", true);
+    }
+    if (r && r.conflictDropped) { // 3b review round 2 (L-2), as for contacts
+      addLine("sys", "", "[an older copy of your chat history from a previous app version was found and discarded]", true);
     }
   } catch (e) {
     contactsError = contactsError || e.message;

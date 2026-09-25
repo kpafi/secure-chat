@@ -211,8 +211,12 @@ passphrase; the key lives only in memory while the identity is unlocked).
 Both stores live in the browser's **IndexedDB**, written with strict
 durability (since 0.4.0; the first start moves them there from
 `localStorage` once). Going back to an older version after that is **not
-supported**: an older client does not look in IndexedDB and would behave as if
-there were no saved contacts or chats. Without IndexedDB the stores stay in
+supported**: an older client does not look in IndexedDB; it finds only the
+generation record kept in `localStorage` and refuses loudly ("your saved
+contacts … have been DELETED") rather than starting over. Reload every open tab
+after updating: a tab still running the old version that saves afterwards is
+either refused ("changed in another tab") or, if its copy is newer, adopted on
+the next unlock. Without IndexedDB the stores stay in
 `localStorage` and the apps' rollback floor is not advanced for them.
 
 **Users** — your contacts with their public keys and a **trust mark**:

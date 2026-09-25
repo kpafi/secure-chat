@@ -223,6 +223,17 @@ async function readDurable(id, key) {
   }
 }
 
+// True only when a durable record exists and its plaintext hint is exactly
+// `used: 0` (review round 2, I-6). Anything unreadable is NOT "unused".
+async function durableSaysUnused(id) {
+  try {
+    const raw = await durable.get(durKey(id));
+    return raw !== null && raw !== undefined && JSON.parse(raw).used === 0;
+  } catch {
+    return false;
+  }
+}
+
 // The plaintext `used` hint of the durable record (see above). Fail-closed:
 // an unreadable record counts as used.
 async function durablePadUsed(id) {
@@ -833,7 +844,23 @@ export async function unlockPad(padId, passphrase, opts = {}) {
   // watermark: damaged = refuse; absent = the rules below as before (a pad
   // saved before 3b, or a deleted record); present = a record, and the one a
   // crash cannot lose.
-  const dur = await readDurable(padId, key);
+  let dur = await readDurable(padId, key);
+  // Review round 2 (I-6): a re-import under a NEW pad passphrase (saveNewPad:
+  // new salt, new key) that crashed between writing its blob and its durable
+  // record leaves the previous record, sealed under the OLD key, beside a new
+  // blob — which then read as "damaged or forged" and burned a pad that never
+  // sent a byte. saveNewPad only runs when that old record says `used: 0`, so
+  // exactly that case is recognised and the record replaced (dur === null
+  // re-creates it below): the old record's own plaintext says never used AND
+  // the blob — authenticated under the new key — is pristine (both offsets,
+  // both in-AEAD mirrors, not exported) AND the watermark, if any, is at 0.
+  // Anything that says "used" is still refused. Replacing it is no weaker than
+  // the record being deleted, which falls back to the pre-3b rules anyway.
+  if (dur === "corrupt" && await durableSaysUnused(padId) &&
+      sendOffset === 0 && recvHighWater === 0 && (inner.hwSend | 0) === 0 && (inner.hwRecv | 0) === 0 &&
+      inner.exported !== true && (outerWm === null || (outerWm.send === 0 && outerWm.recv === 0))) {
+    dur = null;
+  }
   if (dur === "corrupt") {
     throw new Error(
       "the durable progress record for this pad is damaged or forged — refusing to use the pad; exchange a fresh one",

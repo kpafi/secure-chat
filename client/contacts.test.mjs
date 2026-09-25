@@ -767,8 +767,9 @@ console.log("OK  fix round 2: a re-verification under new keys revokes the old k
   // outlives an emptied IndexedDB, so the two deletions alone are now loud…
   await assert.rejects(cB.unlock(PASS, { floorId: ID }), (e) => e.code === "DELETED_CONTACTS_ADOPTION",
     "3b: store + witness gone from IndexedDB with the marker left is a loud DELETED refusal");
-  // …and the residual needs the marker deleted as well.
+  // …and the residual needs the marker and the witness mirror deleted as well.
   localStorage.removeItem("sc.contacts.idb.v1");
+  localStorage.removeItem("sc.contacts.gen.v1"); // …and (review round 2) the witness mirror kept there
   assert.deepStrictEqual(await cB.unlock(PASS, { floorId: ID }), { created: true },
     "browser: both deleted opens as a fresh store (documented residual; app.js warns on `created`)");
 }

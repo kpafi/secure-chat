@@ -206,13 +206,18 @@ export function del(key) {
 // Migration: the first read on a device whose IndexedDB holds neither record
 // but whose localStorage does copies both, verbatim (they are opaque sealed
 // strings; no passphrase is needed), reads them back, and only then removes the
-// localStorage copies — so one source of truth remains, and a crash at any
-// point leaves at least one complete copy. `marker` (a localStorage key) then
-// records "this store lives in IndexedDB": it makes hasStore() answer
-// synchronously across tabs, and if IndexedDB later goes missing it turns
-// "no store here" into a loud refusal instead of a silent fresh (pin-less)
-// store. An OLDER client does not know the marker and would see no store at
-// all — downgrading after the migration is not supported (release notes).
+// localStorage BLOB — so one source of truth remains, and a crash at any point
+// leaves at least one complete copy. The WITNESS stays in localStorage as a
+// mirror of IndexedDB's (review round 2): an older client (a downgrade, or a
+// tab left open across the upgrade) then sees "witness, no store" and refuses
+// loudly, and an old tab's compare-and-swap sees new generations. `marker` (a
+// localStorage key) records "this store lives in IndexedDB": it makes
+// hasStore() answer synchronously across tabs, and if IndexedDB later goes
+// missing it turns "no store here" into a loud refusal instead of a silent
+// fresh (pin-less) store. A blob an old tab writes to localStorage after the
+// migration is a CONFLICT, settled in unlock(): the higher authenticated
+// generation wins. Downgrading after the migration is still not supported —
+// it now fails loudly instead of silently (release notes).
 //
 // Without IndexedDB (and no marker) the slot keeps using localStorage exactly
 // as before; `durable()` is then false and the stores do NOT advance their
@@ -242,6 +247,16 @@ export function storeSlot({ blobKey, genKey, marker }) {
     mode = "idb";
     if (got[blobKey] === null && got[genKey] === null) {
       const legacy = { blob: lsGet(blobKey), witness: lsGet(genKey) };
+      // Review round 1 (Low) + round 2 (I-1): nothing in IndexedDB but the
+      // marker says the store WAS moved there — emptied storage (eviction, a
+      // deletion). Whatever localStorage holds then (the witness mirror, or a
+      // copy an old-version tab wrote) is not migrated: the store refuses
+      // loudly (DELETED adoption, with its explicit override) instead of
+      // starting a fresh, pin-less one or quietly resurrecting a stale copy.
+      if (lsGet(marker) !== null) {
+        cache = { blob: null, witness: null, lost: true };
+        return cache;
+      }
       if (legacy.blob !== null || legacy.witness !== null) {
         // Conditional: another tab may have migrated (and even saved) between
         // our read and this write. Then its copy stands and we re-read it.
@@ -252,24 +267,42 @@ export function storeSlot({ blobKey, genKey, marker }) {
         }
         ls().setItem(marker, "1");
         ls().removeItem(blobKey);
-        ls().removeItem(genKey);
+        mirror(back[genKey]);
         cache = { blob: back[blobKey], witness: back[genKey] };
         return cache;
       }
-      // Review round 1 (Low): nothing in IndexedDB, nothing to migrate, but
-      // the marker says a store WAS moved there — emptied storage (eviction,
-      // a deletion). Reported so the store refuses loudly (DELETED adoption)
-      // instead of starting a fresh, pin-less one.
-      cache = { ...legacy, lost: lsGet(marker) !== null };
+      cache = legacy;
       return cache;
     }
-    // IndexedDB holds the store. A localStorage copy can only be what an
-    // interrupted migration left behind: IndexedDB wins, the copy goes.
-    if (lsGet(blobKey) !== null) ls().removeItem(blobKey);
-    if (lsGet(genKey) !== null) ls().removeItem(genKey);
+    // IndexedDB holds the store. A localStorage BLOB beside it is either an
+    // interrupted migration's leftover (identical: dropped) or — review round
+    // 2 (L-2) — what a tab still running the previous version wrote after the
+    // migration. That used to be deleted here unseen ("IndexedDB wins"), which
+    // silently undid e.g. a Remove (a pin revocation) made in the old tab. It
+    // is now handed to the store as a CONFLICT, resolved in unlock() with the
+    // passphrase: the higher authenticated generation wins (resolve()).
     if (lsGet(marker) === null) ls().setItem(marker, "1");
+    const lsBlob = lsGet(blobKey);
+    if (lsBlob !== null && lsBlob !== got[blobKey]) {
+      cache = { blob: got[blobKey], witness: got[genKey], conflict: { blob: lsBlob, witness: lsGet(genKey) } };
+      return cache;
+    }
+    if (lsBlob !== null) ls().removeItem(blobKey);
+    mirror(got[genKey]);
     cache = { blob: got[blobKey], witness: got[genKey] };
     return cache;
+  }
+
+  // Review round 2 (L-3 / L-2): once the store lives in IndexedDB, localStorage
+  // keeps a MIRROR of its generation witness (never the blob). An older client
+  // — a downgrade, or a tab left open across the upgrade — reads localStorage
+  // only: with the witness there and the blob gone it takes its own loud
+  // "your saved contacts have been DELETED" branch instead of silently starting
+  // a fresh, pin-less store, and an old tab's compare-and-swap sees every
+  // generation the new code commits (STALE instead of a lost update).
+  function mirror(witness) {
+    if (witness === null || witness === undefined) return;
+    if (lsGet(genKey) !== witness) ls().setItem(genKey, witness);
   }
 
   // Preload at module load, so hasStore() can answer synchronously. Until it
@@ -300,6 +333,18 @@ export function storeSlot({ blobKey, genKey, marker }) {
     },
     // True when the last read went to IndexedDB (writes are durable there).
     durable: () => mode === "idb",
+    // Review round 2 (L-2): settle a conflict read() reported. `adopt` = the
+    // localStorage copy is the newer authenticated generation (the caller
+    // checked, with the passphrase): it becomes the IndexedDB store. Otherwise
+    // it is an older / equal copy and is dropped (the caller says so).
+    async resolve(conflict, adopt) {
+      if (adopt) {
+        await write({ [blobKey]: conflict.blob, [genKey]: conflict.witness });
+        cache = { blob: conflict.blob, witness: conflict.witness };
+      }
+      ls().removeItem(blobKey);
+      mirror(cache.witness);
+    },
     async write(blob, witness) {
       await ready;
       if (mode === null) throw new Error("the durable database could not be read — reload and try again");
@@ -309,6 +354,7 @@ export function storeSlot({ blobKey, genKey, marker }) {
       } else {
         await write({ [blobKey]: blob, [genKey]: witness });
         if (lsGet(marker) === null) ls().setItem(marker, "1");
+        mirror(witness);
       }
       cache = { blob, witness };
     },
