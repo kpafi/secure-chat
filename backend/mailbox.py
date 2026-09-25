@@ -133,7 +133,10 @@ def _row_charge(size: int) -> int:
     shipped numbers) makes the two budgets one: the byte budget always fills
     first, the row cap stays as a backstop only, and a minimum-size filler
     weighs what a row of the table really costs. A real sealed envelope is
-    ~1.5-3 KB, so honest mail is charged at or near its size."""
+    ~13.6 KB or more (it carries the sender's ML-DSA key and signature inside;
+    see config MIN_ENVELOPE_BYTES), so honest mail is always charged exactly
+    its size; with the 8 KiB minimum no accepted envelope is below the floor,
+    which stays as the invariant's guard if the constants change."""
     return max(size, _row_floor())
 
 
@@ -366,12 +369,15 @@ def _evict_to_fit(conn, recipient: str, incoming: int) -> None:  # incoming = th
         under sealed sender, so this is inherent to a bounded, shared store;
         the victim sees it (their inbox is full of undecryptable junk) once
         they come online and fetch;
-      * WITHOUT the handle, an inbox is reached only once it is the heaviest
-        left, i.e. after the attacker holds the whole budget in inboxes
-        charged no more than it: ~MAX_MAILBOX_TOTAL_BYTES / (its charged
-        bytes) accounts — ~4 300 for a 63 KB inbox, ~29 000 for 9 KiB, and
-        never fewer than MAX_MAILBOX_TOTAL / MAX_MAILBOX_PER_RECIPIENT = 500
-        (a full inbox of minimum-size filler is charged 200 x ~2.6 KiB);
+      * WITHOUT the handle, an inbox of L charged bytes is reached only once
+        it is the heaviest left, i.e. after the attacker holds the whole
+        budget in inboxes no heavier than it, each at most
+        min(L, MAX_MAILBOX_PER_RECIPIENT_BYTES) (large envelopes are charged
+        their size): ~MAX_MAILBOX_TOTAL_BYTES /
+        min(L, MAX_MAILBOX_PER_RECIPIENT_BYTES) + 1 accounts — ~4 300 for a
+        63 KB inbox, ~98 for a realistic full honest inbox (200 x ~13.7 KB),
+        ~65 for an inbox at the 4 MiB limit (round-4 L-1; "never fewer than
+        500" was wrong);
       * an honest inbox that is simply the heaviest (someone offline receiving
         a lot) loses its newest mail first, and while it is the heaviest new
         mail to it is refused (429) under a full budget.

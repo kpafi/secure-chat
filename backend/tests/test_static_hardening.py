@@ -213,7 +213,7 @@ def test_chunked_api_bodies_are_capped_too():
     assert r.status_code == 413, (r.status_code, r.text[:200])
     # A body under the cap, chunked, still reaches the handler.
     r = client.post("/api/mailbox/nobody", params={"t": "x"},
-                    content=iter([b'{"envelope": "', b"A" * 300, b'"}']),
+                    content=iter([b'{"envelope": "', b"A" * (config.MIN_ENVELOPE_BYTES + 100), b'"}']),
                     headers={"content-type": "application/json"})
     assert r.status_code == 404, r.text
 

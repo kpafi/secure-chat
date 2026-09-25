@@ -384,10 +384,15 @@ MAX_MAILBOX_PER_RECIPIENT = 200       # queued envelopes per inbox
 # 6604d9e): the server-wide cap counted ROWS and a full table was a relay-wide
 # 503 "storage full", so ~500 throwaway accounts x 200 one-byte envelopes shut
 # off sealed mail for everyone for the 14-day TTL. Now:
-#   * envelopes have a realistic MINIMUM size — the only sender, the client's
-#     sealed.seal, always carries an ML-KEM-768 ciphertext (1088 B -> 1452
-#     base64 chars) plus the ephemeral key, IV and AES-GCM body, so a genuine
-#     envelope is well over 1.5 KiB and 256 B refuses nothing real;
+#   * envelopes have a realistic MINIMUM size. The only sender, the client's
+#     sealed.seal, carries an ML-KEM-768 ciphertext and, INSIDE the AES-GCM
+#     body, the sender's full public bundle (incl. the 1952 B ML-DSA key) and
+#     dual signature (incl. the 3309 B ML-DSA signature). Measured (round-4
+#     review, re-checked with client/sealed.js): an empty text 13 649-13 657 B,
+#     "hi" 13 653-13 661 B, the shortest control message (mode-decline)
+#     13 645 B, 200 chars 13 925 B, 2 000 chars 16 325 B. MIN_ENVELOPE_BYTES =
+#     8 192 is ~40 % below the smallest real envelope, so no honest client is
+#     affected, and filler now costs real disk, not just budget (it was 256);
 #   * each inbox has a hard BYTE share beside its row cap (429, the owner can
 #     fetch);
 #   * the server-wide budget is BYTES, the row cap only bounds table size, and
@@ -402,9 +407,11 @@ MAX_MAILBOX_PER_RECIPIENT = 200       # queued envelopes per inbox
 #     Every row is CHARGED at least MAX_MAILBOX_TOTAL_BYTES / MAX_MAILBOX_TOTAL
 #     (~2.6 KiB) against the byte budget, the per-inbox share and the
 #     heaviest-inbox ranking (mailbox._row_charge; round-3 review M-1: the row
-#     cap used to fill first at 25.6 MB of minimum-size filler, making every
-#     inbox over 51 200 B "the heaviest" for 500 accounts). The byte budget now
-#     always fills first; the row cap is a backstop only.
+#     cap used to fill first at 25.6 MB of 256 B filler, making every inbox
+#     over 51 200 B "the heaviest" for 500 accounts). The byte budget now
+#     always fills first; the row cap is a backstop only. (With the 8 KiB
+#     minimum envelope the floor no longer binds for any accepted envelope; it
+#     stays so the invariant survives a change of these constants.)
 #     RESIDUAL, stated precisely — the relay cannot distinguish padding from
 #     mail under sealed sender, so only the eviction order can be chosen:
 #       - a HANDLE HOLDER can suppress a victim's new mail CONTINUOUSLY, for as
@@ -418,17 +425,23 @@ MAX_MAILBOX_PER_RECIPIENT = 200       # queued envelopes per inbox
 #         running cost. Mail queued BEFORE the padding survives until all newer
 #         mail in that inbox is gone. Padding to the cap instead makes new mail
 #         a loud 429;
-#       - WITHOUT the handle, an inbox is reached only when it is the heaviest
-#         left: ~MAX_MAILBOX_TOTAL_BYTES / (its CHARGED bytes) accounts — ~4 300
-#         for a 63 KB inbox, ~29 000 for 9 KiB — and never fewer than
-#         MAX_MAILBOX_TOTAL / MAX_MAILBOX_PER_RECIPIENT = 500;
+#       - WITHOUT the handle, an inbox of L charged bytes is reached only when
+#         it is the heaviest left, i.e. once the attacker holds the whole budget
+#         in inboxes no heavier than it — each at most
+#         min(L, MAX_MAILBOX_PER_RECIPIENT_BYTES), since large envelopes are
+#         charged their size: ~MAX_MAILBOX_TOTAL_BYTES /
+#         min(L, MAX_MAILBOX_PER_RECIPIENT_BYTES) + 1 accounts. That is ~4 300
+#         for a 63 KB inbox, ~98 for a realistic FULL honest inbox (200 x
+#         ~13.7 KB = ~2.7 MB), and as few as ~65 (256 MiB / 4 MiB + 1) for an
+#         inbox at the 4 MiB limit. (An earlier revision claimed "never fewer
+#         than 500"; that only held for minimum-size filler — round-4 L-1.)
 #       - an honest inbox that is simply the heaviest (someone offline receiving
 #         a lot) loses its newest mail first and, while the budget is full, has
 #         new mail refused with 429.
 #     Totals are maintained counters (mailbox_totals / mailbox_inbox), updated
 #     from what each DELETE ... RETURNING actually removed, under a write lock
 #     taken before any read (re-review R1) — never a table scan on requests.
-MIN_ENVELOPE_BYTES = 256
+MIN_ENVELOPE_BYTES = 8192
 MAX_MAILBOX_TOTAL = 100_000                        # rows server-wide (evict-oldest)
 MAX_MAILBOX_TOTAL_BYTES = 256 * 1024 * 1024        # queued bytes server-wide (evict-oldest)
 MAX_MAILBOX_PER_RECIPIENT_BYTES = 4 * 1024 * 1024  # queued bytes per inbox (hard, 429)

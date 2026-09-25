@@ -657,7 +657,7 @@ def test_R1_counters_match_after_a_mixed_concurrent_burst(monkeypatch):
         if i % 2:
             return client.get("/api/mailbox", headers=_auth(toks[i % 6])).status_code
         return client.post(f"/api/mailbox/{u['username']}", params={"t": u["token"]},
-                           json={"envelope": _env(700)}).status_code
+                           json={"envelope": _env(config.MIN_ENVELOPE_BYTES + 700)}).status_code
 
     with cf.ThreadPoolExecutor(max_workers=16) as ex:
         codes = list(ex.map(work, range(48)))
@@ -746,22 +746,45 @@ def test_R3_interrupted_size_migration_is_repaired_on_start():
 
 
 def test_R3_migration_from_a_pre_size_schema_and_after_a_crash(tmp_path):
-    """migr.py, as a test: an old-schema DB, and one where the ALTER ran but
-    the backfill did not, both come up with exact sizes and counters, twice."""
+    """migr.py / r4mig, as a test. Four starting points, each started twice:
+      * old_schema — v0.3.1 (deployed): no size, no charge;
+      * crash_after_alter — the size ALTER ran, its backfill did not;
+      * mid_schema — the 7010ea5 intermediate: size column, idx_mailbox_expiry,
+        counters that summed SIZE (round-4 review);
+      * crash_after_charge_alter — mid_schema plus the charge ALTER, whose
+        repair never ran (charge = 0 everywhere; round-4 review).
+    All must come up with exact sizes, charges and counters, and the old
+    indexes gone."""
     import sqlite3
     import subprocess
     import sys
     backend = str(Path(__file__).resolve().parents[1])
-    for case in ("old_schema", "crash_after_alter"):
+    for case in ("old_schema", "crash_after_alter", "mid_schema", "crash_after_charge_alter"):
         db = str(tmp_path / f"{case}.db")
         c = sqlite3.connect(db)
         c.execute("CREATE TABLE mailbox (id INTEGER PRIMARY KEY AUTOINCREMENT, recipient TEXT NOT NULL, "
                   "envelope TEXT NOT NULL, created_at INTEGER NOT NULL)")
-        for i in range(50):
+        c.execute("CREATE INDEX idx_mailbox_recipient ON mailbox(recipient)")
+        for i in range(50):  # sizes straddle the row floor (~2.6 KiB)
             c.execute("INSERT INTO mailbox (recipient, envelope, created_at) VALUES (?,?,?)",
-                      (f"u{i % 5}", "E" * (300 + i), int(time.time())))
-        if case == "crash_after_alter":
+                      (f"u{i % 5}", "E" * (300 + 97 * i), int(time.time())))
+        if case != "old_schema":
             c.execute("ALTER TABLE mailbox ADD COLUMN size INTEGER NOT NULL DEFAULT 0")
+        if case in ("mid_schema", "crash_after_charge_alter"):
+            # the 7010ea5 state: sizes filled, its indexes and size-summing counters
+            c.execute("UPDATE mailbox SET size = LENGTH(CAST(envelope AS BLOB))")
+            c.execute("DROP INDEX idx_mailbox_recipient")
+            c.execute("CREATE INDEX idx_mailbox_inbox ON mailbox(recipient, id, size)")
+            c.execute("CREATE INDEX idx_mailbox_expiry ON mailbox(created_at, recipient, size)")
+            c.execute("CREATE TABLE mailbox_totals (id INTEGER PRIMARY KEY CHECK (id = 1), "
+                      "rows INTEGER NOT NULL, bytes INTEGER NOT NULL)")
+            c.execute("CREATE TABLE mailbox_inbox (recipient TEXT PRIMARY KEY, rows INTEGER NOT NULL, "
+                      "bytes INTEGER NOT NULL)")
+            c.execute("CREATE INDEX idx_mailbox_inbox_bytes ON mailbox_inbox(bytes)")
+            c.execute("INSERT INTO mailbox_totals SELECT 1, COUNT(*), SUM(size) FROM mailbox")
+            c.execute("INSERT INTO mailbox_inbox SELECT recipient, COUNT(*), SUM(size) FROM mailbox GROUP BY recipient")
+        if case == "crash_after_charge_alter":
+            c.execute("ALTER TABLE mailbox ADD COLUMN charge INTEGER NOT NULL DEFAULT 0")
         c.commit()
         c.close()
         code = "import accounts, mailbox; accounts.init_db(); mailbox.init_db()"
@@ -775,6 +798,12 @@ def test_R3_migration_from_a_pre_size_schema_and_after_a_crash(tmp_path):
         assert c.execute("SELECT rows, bytes FROM mailbox_totals").fetchone() == real, case
         assert c.execute("SELECT COUNT(*) FROM mailbox WHERE size != LENGTH(CAST(envelope AS BLOB)) "
                          "OR charge != MAX(size, ?)", (floor,)).fetchone()[0] == 0, case
+        real_inbox = {r[0]: (r[1], r[2]) for r in c.execute(
+            "SELECT recipient, COUNT(*), SUM(charge) FROM mailbox GROUP BY recipient")}
+        assert {r[0]: (r[1], r[2]) for r in c.execute("SELECT * FROM mailbox_inbox")} == real_inbox, case
+        idx = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='mailbox'")}
+        assert not idx & {"idx_mailbox_recipient", "idx_mailbox_created", "idx_mailbox_expiry"}, (case, idx)
+        assert "idx_mailbox_age" in idx, (case, idx)
         c.close()
 
 
@@ -874,7 +903,7 @@ def _plant(conn, recipient, n, size, created=None):
                      [(recipient, "Z" * size, created, size)] * n)
 
 
-def test_ROWCAP_minimum_size_filler_cannot_make_a_63KB_inbox_the_heaviest(monkeypatch):
+def test_ROWCAP_minimum_size_filler_cannot_make_a_74KB_inbox_the_heaviest(monkeypatch):
     """Round-3 M-1, the reviewer's scenario with the SHIPPED constants. The row
     cap (100 000) used to be a second "budget full" trigger: 500 accounts x 200
     x 256 B filled it at 25.6 MB, every inbox over 51 200 B was then "the
@@ -891,8 +920,8 @@ def test_ROWCAP_minimum_size_filler_cannot_make_a_63KB_inbox_the_heaviest(monkey
         return client.post(f"/api/mailbox/{u['username']}", params={"t": u["token"]},
                            json={"envelope": _env(n, fill)}).status_code
 
-    assert post(victim, 3000, "O") == 200      # honest, old
-    assert post(victim, 60000, "N") == 200     # honest, a photo — victim now 63 000 B
+    assert post(victim, 14000, "O") == 200     # honest, old (a real envelope is >= ~13.6 KB)
+    assert post(victim, 60000, "N") == 200     # honest, a photo — victim now 74 000 B
     with accounts._db() as conn:               # == 100 000 POSTs of 256 B to 500 own inboxes
         for i in range(500):
             _plant(conn, f"rc-att{i:03d}", 200, 256)
@@ -902,8 +931,8 @@ def test_ROWCAP_minimum_size_filler_cannot_make_a_63KB_inbox_the_heaviest(monkey
         rows, charged = mailbox._totals(conn)
     assert rows == config.MAX_MAILBOX_TOTAL
     assert charged >= config.MAX_MAILBOX_TOTAL_BYTES, "the filler must weigh a full byte budget"
-    r_victim = post(victim, 2000, "V")         # honest mail to the victim
-    r_other = post(sender_to, 300, "x")        # anyone posts anywhere else
+    r_victim = post(victim, 14000, "V")        # honest mail to the victim
+    r_other = post(sender_to, 14000, "x")      # anyone posts anywhere else
     got = client.get("/api/mailbox", headers=_auth(_login(victim))).json()["messages"]
     kinds = [m["envelope"][0] for m in got]
     _counters_match()
@@ -1038,36 +1067,102 @@ def test_prune_of_more_rows_than_sqlite_can_bind_at_once(monkeypatch):
     _clear_mailbox()
 
 
-def test_ROWCAP_scaled_through_the_api(monkeypatch):
-    """Round-3 M-1 again, but every filler envelope goes through POST (so
-    through _insert's charge, not the startup repair): with a 20-row cap and
-    a 20-row-floor budget, 20 minimum-size filler posts (4 accounts at a
-    5-row inbox cap) used to fill the ROW cap at 5 KB and make a 6 KB inbox
-    the heaviest. Charged per row, the same filler weighs the whole byte
-    budget, and the victim's mail survives and keeps arriving."""
+def test_insert_charges_the_row_floor():
+    """Round-3 M-1 on the insert path: a row below the floor is charged the
+    floor — in the row, in the totals and in its inbox. (With the 8 KiB
+    minimum envelope an API post can no longer be below the floor at the
+    shipped numbers, so _insert is exercised directly.)"""
     _clear_mailbox()
-    monkeypatch.setattr(config, "MAX_MAILBOX_TOTAL", 20)
-    monkeypatch.setattr(config, "MAX_MAILBOX_TOTAL_BYTES", 20 * 2048)   # row floor 2048
-    monkeypatch.setattr(config, "MAX_MAILBOX_PER_RECIPIENT", 5)
-    monkeypatch.setattr(mailbox._post_limiter, "_refill", 0.0)
-    victim = _register("rcs-victim")
-    other = _register("rcs-x")
-    atts = [_register(f"rcs-att{i}") for i in range(4)]
-
-    def post(u, n, fill):
-        mailbox._post_limiter._buckets.clear()
-        return client.post(f"/api/mailbox/{u['username']}", params={"t": u["token"]},
-                           json={"envelope": _env(n, fill)}).status_code
-
-    assert post(victim, 3000, "O") == 200
-    assert post(victim, 3000, "N") == 200              # victim: 6 000 B queued
-    for i in range(20):                                   # minimum-size filler, inbox by inbox
-        assert post(atts[i // 5], 256, "Z") == 200
-    r_victim = post(victim, 2000, "V")
-    r_other = post(other, 256, "x")
-    got = client.get("/api/mailbox", headers=_auth(_login(victim))).json()["messages"]
-    kinds = [m["envelope"][0] for m in got]
+    floor = mailbox._row_floor()
+    with accounts._db() as conn:
+        mailbox._insert(conn, "fl-u", "A" * 256)
+        assert conn.execute("SELECT size, charge FROM mailbox WHERE recipient = 'fl-u'").fetchone()[:] == (256, floor)
+        assert mailbox._totals(conn) == (1, floor)
+        assert conn.execute("SELECT rows, bytes FROM mailbox_inbox WHERE recipient = 'fl-u'").fetchone()[:] == (1, floor)
     _counters_match()
     _clear_mailbox()
-    assert (r_victim, r_other) == (200, 200), (r_victim, r_other)
-    assert kinds == ["O", "N", "V"], kinds
+
+
+def _floor_config(monkeypatch, rows, floor):
+    monkeypatch.setattr(config, "MAX_MAILBOX_TOTAL", rows)
+    monkeypatch.setattr(config, "MAX_MAILBOX_TOTAL_BYTES", rows * floor)
+    monkeypatch.setattr(mailbox._post_limiter, "_refill", 0.0)
+    assert mailbox._row_floor() == floor
+
+
+def test_per_inbox_share_counts_the_charge_not_the_length(monkeypatch):
+    """Round-4 surviving mutant (a): the per-inbox byte share must count what
+    a row is CHARGED. With a floor above the envelope size and a share one
+    byte short of three charges, the third post is refused although its raw
+    bytes would still fit."""
+    _clear_mailbox()
+    n = config.MIN_ENVELOPE_BYTES
+    _floor_config(monkeypatch, 1000, 3 * n)           # floor 24 KiB > an 8 KiB envelope
+    monkeypatch.setattr(config, "MAX_MAILBOX_PER_RECIPIENT_BYTES", 3 * 3 * n - 1)
+    bob = _register("r4a-bob")
+    codes = []
+    for _ in range(3):
+        mailbox._post_limiter._buckets.clear()
+        codes.append(client.post("/api/mailbox/r4a-bob", params={"t": bob["token"]},
+                                 json={"envelope": _env(n)}).status_code)
+    _counters_match()
+    _clear_mailbox()
+    assert codes == [200, 200, 429], codes
+
+
+def test_budget_never_overshoots_on_a_sub_floor_insert(monkeypatch):
+    """Round-4 surviving mutant (b): _evict_to_fit must be given the CHARGE.
+    Given the raw size, a sub-floor envelope arriving into a budget with less
+    free room than its charge (but more than its size) was inserted without
+    eviction and overshot the budget by up to (floor - size)."""
+    _clear_mailbox()
+    n = config.MIN_ENVELOPE_BYTES
+    floor = 3 * n                                       # 24 KiB
+    _floor_config(monkeypatch, 10, floor)               # budget 240 KiB
+    budget = config.MAX_MAILBOX_TOTAL_BYTES
+    a = _register("r4b-a")
+    b = _register("r4b-b")
+
+    def post(u, size):
+        mailbox._post_limiter._buckets.clear()
+        return client.post(f"/api/mailbox/{u['username']}", params={"t": u["token"]},
+                           json={"envelope": _env(size)}).status_code
+
+    for _ in range(3):
+        assert post(a, 60000) == 200                    # 180 000
+    assert post(a, budget - 180000 - 10000) == 200      # budget - 10 000: less room than a charge
+    assert post(b, n) == 200                            # charged 24 KiB, 8 KiB of raw bytes
+    with accounts._db() as conn:
+        rows, total = mailbox._totals(conn)
+    _counters_match()
+    _clear_mailbox()
+    assert total <= budget, f"budget {budget} overshot: {total}"
+
+
+def test_startup_repairs_a_charge_between_zero_and_the_floor():
+    """Round-4 surviving mutant (c): the repair condition is
+    charge < MAX(size, floor), not charge = 0 — a row charged 1 (a manual
+    edit, an older floor) is raised to what it costs."""
+    _clear_mailbox()
+    floor = mailbox._row_floor()
+    with accounts._db() as conn:
+        conn.execute("INSERT INTO mailbox (recipient, envelope, created_at, size, charge) VALUES (?,?,?,?,1)",
+                     ("r4c-u", "A" * 256, int(time.time()), 256))
+    mailbox.init_db()
+    with accounts._db() as conn:
+        assert conn.execute("SELECT charge FROM mailbox WHERE recipient = 'r4c-u'").fetchone()[0] == floor
+    _counters_match()
+    _clear_mailbox()
+
+
+def test_minimum_envelope_is_8KiB_and_below_every_real_envelope():
+    """Round-4 I-1: MIN_ENVELOPE_BYTES was 256 while the smallest envelope
+    client/sealed.js can produce is ~13.6 KB (measured: shortest control
+    message 13 645 B, empty text 13 649 B). 8 KiB leaves ~40 % headroom below
+    that and makes filler cost real disk."""
+    assert config.MIN_ENVELOPE_BYTES >= 8192
+    assert config.MIN_ENVELOPE_BYTES <= 13_645 * 0.65
+    bob = _register("i1-min")
+    r = client.post("/api/mailbox/i1-min", params={"t": bob["token"]}, json={"envelope": _env(4096)})
+    assert r.status_code == 422, r.text
+
