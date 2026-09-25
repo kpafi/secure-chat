@@ -8,6 +8,7 @@
 // A chat could therefore display "🔒 AES256 + verified by secure-chat" while no
 // inner layer was applied and no passphrase had ever been requested.
 import assert from "node:assert";
+import { fakeIdb } from "./fake-idb.test.mjs"; // package 3b: IndexedDB for node
 
 const mem = new Map();
 globalThis.localStorage = {
@@ -17,6 +18,7 @@ globalThis.localStorage = {
 };
 
 const chats = await import("./chats.js");
+await chats.ready; // 3b: the IndexedDB preload
 const PASS = "correct horse battery staple";
 
 await chats.unlock(PASS);
@@ -82,7 +84,7 @@ const poisoned = {
 // Re-encrypt that object under the same passphrase/salt the store uses.
 {
   const enc = new TextEncoder();
-  const blob = JSON.parse(localStorage.getItem("sc.chats.v1"));
+  const blob = JSON.parse(fakeIdb.getItem("sc.chats.v1"));
   const unb64 = (s) => {
     const bin = atob(s);
     const u = new Uint8Array(bin.length);
@@ -103,13 +105,13 @@ const poisoned = {
   const ct = new Uint8Array(await crypto.subtle.encrypt(
     { name: "AES-GCM", iv }, key, enc.encode(JSON.stringify(poisoned)),
   ));
-  localStorage.setItem("sc.chats.v1", JSON.stringify({ ...blob, iv: b64(iv), ct: b64(ct) }));
+  fakeIdb.setItem("sc.chats.v1", JSON.stringify({ ...blob, iv: b64(iv), ct: b64(ct) }));
 }
 
 chats.lock();
 // (F-ATREST-005: the hand-made blob is the untagged pre-v2 shape with no
 // witness, on a device that has run this code — an explicit adoption now.)
-localStorage.removeItem("sc.chats.gen.v1");
+fakeIdb.removeItem("sc.chats.gen.v1");
 await assert.rejects(chats.unlock(PASS), (e) => e.code === "LEGACY_CHATS_ADOPTION");
 await chats.unlock(PASS, { adoptLegacy: true });
 const healed = chats.get("mallory");
@@ -122,7 +124,7 @@ console.log("OK  a store poisoned before the fix heals on unlock");
 // One removeItem used to empty the envelope-replay ring and every negotiated
 // mode; an older blob rewound the ring. Same mechanism as the contact store.
 {
-  mem.clear();
+  mem.clear(); fakeIdb.clear();
   await chats.unlock(PASS);
   await chats.ensure("bob");
   assert.strictEqual(await chats.markSeen("bob", "env-1"), true);
@@ -130,7 +132,7 @@ console.log("OK  a store poisoned before the fix heals on unlock");
   // The plaintext is tagged and versioned inside the AEAD.
   {
     const enc = new TextEncoder(), dec = new TextDecoder();
-    const blob = JSON.parse(localStorage.getItem("sc.chats.v1"));
+    const blob = JSON.parse(fakeIdb.getItem("sc.chats.v1"));
     const unb64 = (x) => Uint8Array.from(Buffer.from(x, "base64"));
     const base = await crypto.subtle.importKey("raw", enc.encode(PASS), "PBKDF2", false, ["deriveKey"]);
     const key = await crypto.subtle.deriveKey(
@@ -140,29 +142,29 @@ console.log("OK  a store poisoned before the fix heals on unlock");
     const inner = JSON.parse(dec.decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(blob.iv) }, key, unb64(blob.ct))));
     assert.strictEqual(inner.d, "secure-chat/chats-store/v2", "domain-tagged inside the AEAD");
     assert.ok(Number.isInteger(inner.gen) && inner.gen >= 1, "carries a generation");
-    assert.ok(localStorage.getItem("sc.chats.gen.v1"), "and a witness beside it");
+    assert.ok(fakeIdb.getItem("sc.chats.gen.v1"), "and a witness beside it");
   }
   chats.lock();
 
   // Deletion: the store is gone, the witness says one existed.
-  const storeSnap = localStorage.getItem("sc.chats.v1");
-  const witSnap = localStorage.getItem("sc.chats.gen.v1");
-  localStorage.removeItem("sc.chats.v1");
+  const storeSnap = fakeIdb.getItem("sc.chats.v1");
+  const witSnap = fakeIdb.getItem("sc.chats.gen.v1");
+  fakeIdb.removeItem("sc.chats.v1");
   await assert.rejects(chats.unlock(PASS), (e) => e.code === "DELETED_CHATS_ADOPTION" && /DELETED/.test(e.message),
     "F-ATREST-005: a deleted chat store is refused, not silently recreated");
   assert.ok(!chats.isUnlocked());
-  localStorage.setItem("sc.chats.v1", storeSnap);
+  fakeIdb.setItem("sc.chats.v1", storeSnap);
 
   // Witness gone, store present: tampering (a tagged store always has one).
-  localStorage.removeItem("sc.chats.gen.v1");
+  fakeIdb.removeItem("sc.chats.gen.v1");
   await assert.rejects(chats.unlock(PASS), /generation record .* is missing/);
-  localStorage.setItem("sc.chats.gen.v1", witSnap);
+  fakeIdb.setItem("sc.chats.gen.v1", witSnap);
 
   // Rollback: mark another envelope seen, then restore the older blob.
   await chats.unlock(PASS);
   assert.strictEqual(await chats.markSeen("bob", "env-2"), true);
   chats.lock();
-  localStorage.setItem("sc.chats.v1", storeSnap);
+  fakeIdb.setItem("sc.chats.v1", storeSnap);
   await assert.rejects(chats.unlock(PASS), /OLDER than this device recorded/,
     "an older chat store is refused — env-2 would otherwise be accepted again");
   // The whole point, stated as the consequence: post-fix, no unlock path exists
@@ -170,7 +172,7 @@ console.log("OK  a store poisoned before the fix heals on unlock");
 
   // Both restored (the coordinated snapshot): opens in a browser, documented
   // residual — the floor below is what removes it on device.
-  localStorage.setItem("sc.chats.gen.v1", witSnap);
+  fakeIdb.setItem("sc.chats.gen.v1", witSnap);
   await chats.unlock(PASS);
   assert.strictEqual(await chats.markSeen("bob", "env-2"), true, "browser residual: both-restored rewinds the ring");
   chats.lock();
@@ -196,7 +198,7 @@ console.log("OK  a store poisoned before the fix heals on unlock");
   // epoch marker — the state an attacker can produce with one removeItem, and
   // the state of a device that just upgraded. Both get the prompt: the fix
   // review showed that adopting silently here reopened the whole finding.
-  mem.clear();
+  mem.clear(); fakeIdb.clear();
   {
     const enc = new TextEncoder();
     const salt = crypto.getRandomValues(new Uint8Array(16));
@@ -209,7 +211,7 @@ console.log("OK  a store poisoned before the fix heals on unlock");
     const legacy = { erin: { username: "erin", mode: "SEALED", messages: [], seenIds: ["old-1"], updatedAt: 1 } };
     const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(JSON.stringify(legacy))));
     const b64 = (u) => Buffer.from(u).toString("base64");
-    localStorage.setItem("sc.chats.v1", JSON.stringify({ v: 1, iters: 600000, salt: b64(salt), iv: b64(iv), ct: b64(ct) }));
+    fakeIdb.setItem("sc.chats.v1", JSON.stringify({ v: 1, iters: 600000, salt: b64(salt), iv: b64(iv), ct: b64(ct) }));
   }
   await assert.rejects(chats.unlock(PASS),
     (e) => e.code === "LEGACY_CHATS_ADOPTION" && e.suspicious === false,
@@ -217,14 +219,14 @@ console.log("OK  a store poisoned before the fix heals on unlock");
   assert.deepStrictEqual(await chats.unlock(PASS, { adoptLegacy: true }), { created: false },
     "the upgrade adopts the pre-v2 blob on request");
   assert.strictEqual(await chats.markSeen("erin", "old-1"), false, "its ring survives");
-  assert.ok(localStorage.getItem("sc.chats.gen.v1"), "and it is witnessed from now on");
+  assert.ok(fakeIdb.getItem("sc.chats.gen.v1"), "and it is witnessed from now on");
   chats.lock();
 }
 console.log("OK  F-ATREST-005: chat store is tagged, versioned and witnessed; delete/rollback fail closed");
 
 // ---- F-ATREST-005 on device: the native floor ------------------------------
 {
-  mem.clear();
+  mem.clear(); fakeIdb.clear();
   const floors = new Map();
   globalThis.__SECURE_CHAT_PAD_FLOOR__ = {
     read: (id) => (floors.has(id) ? floors.get(id) : -1),
@@ -240,19 +242,19 @@ console.log("OK  F-ATREST-005: chat store is tagged, versioned and witnessed; de
   await cN.unlock(PASS, { floorId: ID });
   await cN.ensure("bob");
   await cN.markSeen("bob", "env-1");
-  const storeSnap = localStorage.getItem("sc.chats.v1");
-  const witSnap = localStorage.getItem("sc.chats.gen.v1");
+  const storeSnap = fakeIdb.getItem("sc.chats.v1");
+  const witSnap = fakeIdb.getItem("sc.chats.gen.v1");
   await cN.markSeen("bob", "env-2");
   assert.ok(floors.get("chats:" + ID) >= 3, "every persist bumps the identity's chat floor");
   cN.lock();
   // The coordinated snapshot: refused on device.
-  localStorage.setItem("sc.chats.v1", storeSnap);
-  localStorage.setItem("sc.chats.gen.v1", witSnap);
+  fakeIdb.setItem("sc.chats.v1", storeSnap);
+  fakeIdb.setItem("sc.chats.gen.v1", witSnap);
   await assert.rejects(cN.unlock(PASS, { floorId: ID }), /OLDER than this device recorded/,
     "F-ATREST-005 on device: both-restored is caught by the floor");
   // Both deleted: refused (explicit adoption), then continues the numbering.
-  localStorage.removeItem("sc.chats.v1");
-  localStorage.removeItem("sc.chats.gen.v1");
+  fakeIdb.removeItem("sc.chats.v1");
+  fakeIdb.removeItem("sc.chats.gen.v1");
   await assert.rejects(cN.unlock(PASS, { floorId: ID }), (e) => e.code === "DELETED_CHATS_ADOPTION");
   assert.deepStrictEqual(await cN.unlock(PASS, { floorId: ID, adoptDeleted: true }), { created: true });
   cN.lock();
@@ -264,7 +266,7 @@ console.log("OK  F-ATREST-005 on device: the chat store has a native floor");
 // Same PadFloor.kt model as contacts.test.mjs: memory before file, a failed
 // commit() answers -3 and latches, out-of-range is -4; `disk` survives restarts.
 {
-  mem.clear();
+  mem.clear(); fakeIdb.clear();
   const disk = new Map();
   let failCommit = null;
   const kotlinModel = () => {
@@ -292,7 +294,7 @@ console.log("OK  F-ATREST-005 on device: the chat store has a native floor");
   await assert.rejects(c1.unlock(PASS, { floorId: ID }), (e) => e.code === "FLOOR_WRITE_FAILED",
     "F-4: a chat-store floor write that did not commit fails the save");
   assert.ok(!c1.isUnlocked());
-  assert.strictEqual(localStorage.getItem("sc.chats.v1"), null,
+  assert.strictEqual(fakeIdb.getItem("sc.chats.v1"), null,
     "F-A1-R1: no blob claims a floor whose slot never landed");
   failCommit = null;
   globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinModel();
@@ -303,21 +305,22 @@ console.log("OK  F-ATREST-005 on device: the chat store has a native floor");
   {
     const IDQ = "9".repeat(64);
     const realSet = localStorage.setItem;
-    const saved = new Map(mem);
-    mem.clear();
-    localStorage.setItem = (k, v) => { if (k === "sc.chats.v1") throw new Error("QuotaExceededError"); return realSet(k, v); };
+    const saved = new Map(mem); const savedIdb = new Map(fakeIdb.mem);
+    mem.clear(); fakeIdb.clear();
+    fakeIdb.failWrites((k) => k === "sc.chats.v1"); // 3b: the store write is the IndexedDB transaction now
     const cq = await import("./chats.js?p3=quota");
     try {
       await assert.rejects(cq.unlock(PASS, { floorId: IDQ }), /QuotaExceededError/);
     } finally {
-      localStorage.setItem = realSet;
+      fakeIdb.failWrites(null);
     }
     assert.strictEqual(disk.get("chats:" + IDQ), 0, "precondition: armed at 0");
     assert.deepStrictEqual(await cq.unlock(PASS, { floorId: IDQ }), { created: true },
       "F-A1-R1: an armed-but-never-saved chat floor (0) is a first run, not a DELETED alarm");
     cq.lock();
-    mem.clear();
+    mem.clear(); fakeIdb.clear();
     for (const [k, v] of saved) mem.set(k, v);
+    for (const [k, v] of savedIdb) fakeIdb.mem.set(k, v);
   }
   await c2.ensure("bob");
   failCommit = () => true;
@@ -326,7 +329,7 @@ console.log("OK  F-ATREST-005 on device: the chat store has a native floor");
   assert.ok(!c2.isUnlocked(), "…and the chat store locks");
   failCommit = null;
   // 7b: the ceiling is a loud refusal before anything is written.
-  mem.clear();
+  mem.clear(); fakeIdb.clear();
   const ID2 = "f".repeat(64);
   disk.set("chats:" + ID2, 0x7fffffff);
   globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinModel();
@@ -334,9 +337,9 @@ console.log("OK  F-ATREST-005 on device: the chat store has a native floor");
   await assert.rejects(c3.unlock(PASS, { floorId: ID2, adoptDeleted: true }),
     (e) => e.code === "FLOOR_WRITE_FAILED" && /highest generation/.test(e.message),
     "7b: the chat store refuses to advance past the ceiling, loudly");
-  assert.strictEqual(localStorage.getItem("sc.chats.v1"), null);
+  assert.strictEqual(fakeIdb.getItem("sc.chats.v1"), null);
   delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
-  mem.clear();
+  mem.clear(); fakeIdb.clear();
 }
 console.log("OK  Package 3: chat-store floor writes are checked; first-save failure is not a brick; int32 ceiling is loud");
 
@@ -346,14 +349,14 @@ console.log("OK  Package 3: chat-store floor writes are checked; first-save fail
 // locked panel and the transcript.
 {
   const lsKey = "sc.chats.v1";
-  const saved = localStorage.getItem(lsKey);
+  const saved = fakeIdb.getItem(lsKey);
   if (chats.isUnlocked()) chats.lock();
-  localStorage.setItem(lsKey, "x\n[verified by you]\u202e\u2028");
+  fakeIdb.setItem(lsKey, "x\n[verified by you]\u202e\u2028");
   const err = await chats.unlock(PASS).catch((e) => e);
   assert.ok(err instanceof Error, "a planted unparseable store is refused");
   assert.match(err.message, /on this device is not readable \(damaged or replaced\)$/, "...with a fixed sentence");
   assert.ok(!/[\n\u202e\u2028]|verified by you/.test(err.message), "...that carries none of the planted text");
-  if (saved === null) localStorage.removeItem(lsKey); else localStorage.setItem(lsKey, saved);
+  if (saved === null) fakeIdb.removeItem(lsKey); else fakeIdb.setItem(lsKey, saved);
   console.log("OK  I-1: an unparseable store is refused with a fixed sentence (no planted text echoed)");
 }
 

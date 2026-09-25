@@ -16,7 +16,17 @@ node e2e/hostile-relay.mjs      #            — a relay cannot demote the room 
 node e2e/contact-profile.mjs    #            — a saved user's short profile (sheet)
 node e2e/all-modes.mjs          #            — all five encryption modes, both directions
 node e2e/screenshots.mjs <dir>  #            — every screen at phone + desktop size, for design review
+node e2e/durable-crash.mjs      #            — SIGKILL after an OTP send; the pad must not reopen at a spent offset (~2 min)
 ```
+
+`durable-crash.mjs` (package 3b) is the real-browser half of
+`client/durable.test.mjs`: it saves a pad, lets it settle on disk, spends two
+messages' worth of pad (each save awaited, as before a send), SIGKILLs the
+browser process as soon as the second save returned and unlocks the pad in a new browser on the same
+profile. It reports which save `localStorage` actually kept (three runs on
+Chromium: the offset-500 blob — the second save never reached disk). Against the
+pre-3b client it fails (`{"open":500}` — the pad reopened inside a spent
+message); with 3b the IndexedDB record reopens it at 1000.
 
 Needs Node 20+, system Chromium (`/usr/bin/chromium`, override with `$CHROMIUM`)
 and `puppeteer-core` resolvable from `e2e/` (`cd e2e && npm install --no-save

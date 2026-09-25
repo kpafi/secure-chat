@@ -917,8 +917,13 @@ async function forgetIdentity() {
   retractNotice = null;
   contactsStale = false; // nothing of this identity is left to reload (cold r5 MINOR-B)
   contactsError = null;
-  contacts.wipe(); // bound to the identity passphrase; unusable without it
-  chats.wipe();
+  // Bound to the identity passphrase; unusable without it. Package 3b: both
+  // stores live in IndexedDB now, so their deletion is awaited — and a failure
+  // is said, not swallowed (the records would outlive the identity).
+  const wiped = await Promise.allSettled([contacts.wipe(), chats.wipe()]);
+  if (wiped.some((r) => r.status === "rejected")) {
+    addLine("sys", "", "[could not delete the saved contacts / chat history from this device's database — reload and Forget again]", true);
+  }
   // Pentest 2026-07-27 L-4: the handle and the lookup token are PLAINTEXT and
   // used to survive this. "Forget identity" is the control a user reaches for
   // when handing the device on or when they think they are compromised, and it
@@ -1114,9 +1119,22 @@ async function unlockContacts(pass, opts = {}) {
     contactsError = null;
     if (contactOpts.adoptLegacy || contactOpts.adoptDeleted) {
       storeNotice = "Contacts opened WITHOUT a verifiable history — treat every contact as unverified until you re-check the safety number.";
+      // 3b review round 4 (L-1): a leftover copy in the old storage was discarded on the way.
+      if (r && r.conflictDropped) storeNotice += " An older copy left in this browser's old storage was discarded.";
     } else if (r && r.created && opts.expectStore) {
       storeNotice = "No saved contacts were found for this identity. If you have used this device before, " +
         "they were deleted and key-change warnings for earlier contacts are gone — treat every contact as unverified.";
+    } else if (r && r.conflictAdopted) {
+      // Review round 3 (F1): adoption is said too — changes made in THIS
+      // version after the other tab's last save may be gone.
+      storeNotice = "Your contacts were taken from a newer save made by an older version of the app (another open tab). " +
+        "Changes made here since then may be lost — check your contacts and verifications.";
+    } else if (r && r.conflictDropped) {
+      // Package 3b review round 2 (L-2): an older copy left in this browser's
+      // old storage (a tab of the previous version, or a restored snapshot)
+      // was not newer than the saved contacts and was discarded — say so.
+      storeNotice = "An older copy of your contacts from a previous app version (another open tab?) was found and discarded. " +
+        "If you changed contacts in an old tab after updating, check them again.";
     }
     if (storeNotice) addLine("sys", "", "[" + storeNotice + "]", true);
   } catch (e) {
@@ -1129,6 +1147,12 @@ async function unlockContacts(pass, opts = {}) {
     const r = await chats.unlock(pass, chatOpts); // chat history shares the at-rest posture
     if (r && r.created && opts.expectStore && !contactsError) {
       addLine("sys", "", "[no chat history was found for this identity on this device]", true);
+    }
+    if (r && r.conflictAdopted) { // 3b review round 3 (F1)
+      addLine("sys", "", "[your chat history was taken from a newer save made by an older version of the app (another tab) — messages from here since then may be missing]", true);
+    }
+    if (r && r.conflictDropped) { // 3b review round 2 (L-2), as for contacts
+      addLine("sys", "", "[an older copy of your chat history from a previous app version was found and discarded]", true);
     }
   } catch (e) {
     contactsError = contactsError || e.message;

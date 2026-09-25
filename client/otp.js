@@ -110,6 +110,146 @@ import {
   captureNativeFloor, NATIVE_ABSENT, NATIVE_TAMPERED, maxOf, floorUnavailableError, bumpFloor,
 } from "./nativefloor.js";
 const nativeFloor = captureNativeFloor();
+import * as durable from "./durable.js";
+
+// --- the durable progress record (package 3b) --------------------------------
+//
+// Everything above is localStorage, and localStorage is not durable: Chromium
+// commits it in rate-limited batches, so a pad saved seconds before a crash
+// reopened at the offset the last message had already used — a two-time pad
+// with no attacker at all (see durable.js). Owner decision 2026-09-25: HEAL
+// FORWARD. Every progress save now also writes, to IndexedDB with strict
+// durability, a record of how far the pad has been consumed:
+//
+//   sc.otp.dur.v1.<padId> = { used: 0|1, iv, ct }
+//     ct = AES-GCM under the pad's at-rest key of
+//          { d: DUR_DOMAIN, padId, send, recv, exported }
+//
+// Sealed like the watermark, with its own domain tag (so neither the watermark
+// nor the pad blob, which live under the same key, can stand in for it) and
+// the pad id inside, so a JS-context attacker can neither raise nor lower it
+// undetected. A pad blob found BEHIND its durable record (or behind its
+// authenticated watermark) is opened at the higher offsets: skipping pad bytes
+// is harmless, reusing them is the only danger. The native floor never heals:
+// it only ever refuses, and a floor ahead of every data source — the durable
+// record included — is still rollback evidence.
+//
+// `used` sits outside the AEAD on purpose: importPad holds only the TRANSFER
+// passphrase and after a crash may have no blob to derive the at-rest key
+// from, yet it must refuse to recreate a pad this device already consumed. It
+// is evidence-of-presence like `usedKey` (extra evidence only refuses), and it
+// survives the crash that took the localStorage markers with it.
+//
+// Write order on every save: native slots armed → blob + watermark to
+// localStorage → AWAIT the durable write → native floors advanced. So the
+// floor can never get ahead of durable data (the Android brick), and app.js's
+// "persist before transmit / display / download" now waits for the disk.
+// A deleted durable record falls back to the rules below (the next save
+// re-creates it). Without IndexedDB, OTP is refused, like without Web Locks.
+const durKey = (id) => `sc.otp.dur.v1.${id}`;
+const DUR_DOMAIN = "secure-chat/otp-durable/v1";
+// Per-pad high-water of what has been handed to the durable store, and a
+// per-pad queue: two saves in flight (a send and a receive overlapping) must
+// reach the disk in order, and the record written last must never be the
+// smaller one.
+const durHigh = new Map(); // padId -> {send, recv, exported}
+const durQueue = new Map(); // padId -> Promise
+function requireDurable() {
+  if (!durable.available()) throw durable.unavailableError("One-time pads");
+}
+
+async function sealDurable(id, key, v) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plain = encU.encode(JSON.stringify({
+    d: DUR_DOMAIN, padId: id, send: v.send, recv: v.recv, exported: !!v.exported,
+    // Review round 1: the pad's geometry, so a blob whose role / region size
+    // disagree (an archived v1 blob kept them outside its AEAD) is refused
+    // rather than healed onto the wrong half of the pad.
+    role: v.role, regionSize: v.regionSize,
+  }));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain));
+  return JSON.stringify({
+    used: v.send > 0 || v.recv > 0 || v.exported ? 1 : 0, iv: b64(iv), ct: b64(ct),
+  });
+}
+
+function writeDurable(id, key, v) {
+  const job = async () => {
+    const prev = durHigh.get(id) || { send: 0, recv: 0, exported: false };
+    const next = {
+      send: maxOf(prev.send, v.send), recv: maxOf(prev.recv, v.recv), exported: !!(prev.exported || v.exported),
+    };
+    await durable.put(durKey(id), await sealDurable(id, key, { ...next, role: v.role, regionSize: v.regionSize }));
+    durHigh.set(id, next);
+  };
+  const run = (durQueue.get(id) || Promise.resolve()).then(job, job);
+  durQueue.set(id, run.catch(() => {}));
+  return run.catch((e) => {
+    const err = new Error(
+      "could not write this pad's progress to durable storage (" + (e && e.message ? e.message : "unknown error") +
+      "), so it was NOT saved safely. Free some storage and try again.",
+    );
+    err.code = "DURABLE_WRITE_FAILED";
+    throw err;
+  });
+}
+
+// {send, recv, exported} | null (absent) | "corrupt".
+async function readDurable(id, key) {
+  let raw;
+  try {
+    raw = await durable.get(durKey(id));
+  } catch {
+    const err = new Error("could not read this pad's durable progress record — refusing to use the pad now; reload and try again");
+    err.code = "DURABLE_READ_FAILED";
+    throw err;
+  }
+  if (raw === null || raw === undefined) return null;
+  try {
+    const rec = JSON.parse(raw);
+    const plain = new Uint8Array(await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: unb64(rec.iv) }, key, unb64(rec.ct),
+    ));
+    const w = JSON.parse(decU.decode(plain));
+    plain.fill(0);
+    if (w.d !== DUR_DOMAIN || w.padId !== id || !isInt(w.send) || !isInt(w.recv) ||
+        w.send < 0 || w.recv < 0 || typeof w.exported !== "boolean" ||
+        (w.role !== 0 && w.role !== 1) || !isInt(w.regionSize) || w.regionSize <= 0) {
+      return "corrupt";
+    }
+    return { send: w.send, recv: w.recv, exported: w.exported, role: w.role, regionSize: w.regionSize };
+  } catch {
+    return "corrupt";
+  }
+}
+
+// True only when a durable record exists and its plaintext hint is exactly
+// `used: 0` (review round 2, I-6). Anything unreadable is NOT "unused".
+async function durableSaysUnused(id) {
+  try {
+    const raw = await durable.get(durKey(id));
+    return raw !== null && raw !== undefined && JSON.parse(raw).used === 0;
+  } catch {
+    return false;
+  }
+}
+
+// The plaintext `used` hint of the durable record (see above). Fail-closed:
+// an unreadable record counts as used.
+async function durablePadUsed(id) {
+  let raw;
+  try {
+    raw = await durable.get(durKey(id));
+  } catch {
+    return true;
+  }
+  if (raw === null || raw === undefined) return false;
+  try {
+    return JSON.parse(raw).used !== 0;
+  } catch {
+    return true;
+  }
+}
 
 // Floor ids for the per-pad state beside the send offset (which uses the bare
 // padId). F-ATREST-001: the receive high-water mark had no native floor, so a
@@ -383,7 +523,11 @@ export async function importPad(fileText, passphrase) {
   // keystream the peer has already seen. The watermark survives `forgetPad`
   // precisely so this check can fire.
   if (nativeFloor && nativeFloor.broken) throw floorUnavailableError();
-  if (padWasUsed(o.padId)) {
+  requireDurable();
+  // Package 3b: the durable record's `used` hint as well — after a crash it
+  // may be the only trace left that this pad ran here (the localStorage
+  // markers lost with the rest of an uncommitted batch).
+  if (padWasUsed(o.padId) || await durablePadUsed(o.padId)) {
     throw new Error(
       "this pad has already been used on this device — importing it again would reuse key material. Generate and exchange a fresh pad in person.",
     );
@@ -556,6 +700,12 @@ async function writePadBlob(record, key, salt, iters) {
   }));
   writeIndexEntry(record, { exported: !!record.exported });
   await writeWatermark(record.padId, key, wm);
+  // Package 3b: the durable record, and only once it is ON DISK the native
+  // floors. Every caller awaits this function before it transmits, displays or
+  // hands out a file, so those now wait for the disk too.
+  await writeDurable(record.padId, key, {
+    send: wm.send, recv: wm.recv, exported: !!record.exported, role: record.role, regionSize: record.regionSize,
+  });
   // AFTER the blob, never before: a floor ahead of the blob it protects reads
   // as a rollback on the next unlock (the A4 F-A1 brick). Behind is harmless —
   // the blob's own hwSend/hwRecv are the higher input to unlockPad's max().
@@ -603,7 +753,8 @@ export async function saveNewPad(record, passphrase) {
   // caller that reaches it with a used padId would rebuild the same hole, and
   // an argument about why the callers are safe is not a control.
   if (nativeFloor && nativeFloor.broken) throw floorUnavailableError();
-  if (padWasUsed(record.padId)) {
+  requireDurable();
+  if (padWasUsed(record.padId) || await durablePadUsed(record.padId)) {
     throw new Error(
       "this pad has already been used on this device — saving it as new would erase its usage record and reuse key material. Generate and exchange a fresh pad in person.",
     );
@@ -619,6 +770,7 @@ export async function saveNewPad(record, passphrase) {
     send: maxOf(readLegacyHW(record.padId), survivingNative > NATIVE_ABSENT ? survivingNative : 0),
     recv: maxOf(survivingRecv > NATIVE_ABSENT ? survivingRecv : 0),
   });
+  durHigh.delete(record.padId); // a new at-rest key: the old record is not ours to max against
   await writePadBlob(record, key, salt, KDF_ITERS);
   return { key, salt, iters: KDF_ITERS };
 }
@@ -635,6 +787,7 @@ export async function savePadProgress(record, atRest) {
 // true: silent adoption IS the vulnerability.
 export async function unlockPad(padId, passphrase, opts = {}) {
   if (typeof padId !== "string" || !PAD_ID_RE.test(padId)) throw new Error("no such pad on this device");
+  requireDurable();
   const raw = localStorage.getItem(padKey(padId));
   if (!raw) throw new Error("no such pad on this device");
   const o = JSON.parse(raw);
@@ -687,6 +840,33 @@ export async function unlockPad(padId, passphrase, opts = {}) {
       "the rollback record for this pad is damaged or forged — refusing to use the pad; exchange a fresh one",
     );
   }
+  // Package 3b: the durable progress record (IndexedDB). Same verdicts as the
+  // watermark: damaged = refuse; absent = the rules below as before (a pad
+  // saved before 3b, or a deleted record); present = a record, and the one a
+  // crash cannot lose.
+  let dur = await readDurable(padId, key);
+  // Review round 2 (I-6): a re-import under a NEW pad passphrase (saveNewPad:
+  // new salt, new key) that crashed between writing its blob and its durable
+  // record leaves the previous record, sealed under the OLD key, beside a new
+  // blob — which then read as "damaged or forged" and burned a pad that never
+  // sent a byte. saveNewPad only runs when that old record says `used: 0`, so
+  // exactly that case is recognised and the record replaced (dur === null
+  // re-creates it below): the old record's own plaintext says never used AND
+  // the blob — authenticated under the new key — is pristine (both offsets,
+  // both in-AEAD mirrors, not exported) AND the watermark, if any, is at 0.
+  // Anything that says "used" is still refused. Replacing it is no weaker than
+  // the record being deleted, which falls back to the pre-3b rules anyway.
+  if (dur === "corrupt" && await durableSaysUnused(padId) &&
+      sendOffset === 0 && recvHighWater === 0 && (inner.hwSend | 0) === 0 && (inner.hwRecv | 0) === 0 &&
+      inner.exported !== true && (outerWm === null || (outerWm.send === 0 && outerWm.recv === 0))) {
+    dur = null;
+  }
+  if (dur === "corrupt") {
+    throw new Error(
+      "the durable progress record for this pad is damaged or forged — refusing to use the pad; exchange a fresh one",
+    );
+  }
+  const hasRecord = outerWm !== null || dur !== null;
 
   // F-1: the native floor, where available, is the one input to this decision an
   // attacker holding the JS context cannot touch. Read it BEFORE the localStorage
@@ -709,7 +889,9 @@ export async function unlockPad(padId, passphrase, opts = {}) {
   // A floor recorded natively but no authenticated record beside it means the
   // record was deleted: the H-3 PoC, and the v2-shaped variant it used to escape
   // through. Unlike `usedKey`, this evidence is not deletable from JS.
-  if (native > NATIVE_ABSENT && outerWm === null) {
+  // (Package 3b: "no authenticated record" now means neither the watermark
+  // nor the durable record — after a crash the durable one may be all there is.)
+  if (native > NATIVE_ABSENT && !hasRecord) {
     throw missingRecordError();
   }
   // …and the converse (2026-07-29 H-1): a blob written WHILE a floor was in
@@ -755,28 +937,54 @@ export async function unlockPad(padId, passphrase, opts = {}) {
   // Package 3 (F-P7-A3 residual): `isInt`, not `Number.isInteger` — see isInt.
   const knownUsedHere = isInt(inner.hwSend) || isInt(inner.hwRecv) ||
     localStorage.getItem(usedKey(padId)) !== null;
-  if (outerWm === null && knownUsedHere) {
+  if (!hasRecord && knownUsedHere) {
     // H-3: this is the reported PoC — restore an old blob, delete the watermark.
     // A pad that has demonstrably run on this device but can no longer produce
     // its watermark FAILS CLOSED. (No record AND no evidence = a pad written
     // before this fix, adopted below.)
     throw missingRecordError();
   }
-  // max(outer, inner, legacy, native): each is a floor this device is known to
-  // have passed, so the highest of them is the truth.
-  const wm = {
-    send: maxOf(
-      outerWm ? outerWm.send : 0,
-      inner.hwSend | 0,
-      readLegacyHW(padId),
-      native > NATIVE_ABSENT ? native : 0,
-    ),
-    recv: maxOf(outerWm ? outerWm.recv : 0, inner.hwRecv | 0, nativeRecv > NATIVE_ABSENT ? nativeRecv : 0),
+  // Package 3b, owner decision 2026-09-25: HEAL FORWARD.
+  //
+  // This used to be max(outer, inner, legacy, native) with a REFUSAL whenever
+  // the blob's own offsets were below it. After a crash that is the ordinary
+  // state, not an attack: the blob's last localStorage write never reached
+  // disk while the durable record (or the watermark, written in a later task
+  // and so possibly in a later commit batch) did — and on Android the native
+  // floor with them. Refusing burned the pad; opening at the blob's offset
+  // (the pre-package-3 behaviour) reused key material. Now the pad opens at
+  // the highest offset any AUTHENTICATED record of it reached: the blob, its
+  // in-AEAD mirror, the watermark and the durable record — every one sealed
+  // under the pad's key, so none can be raised by a JS-context attacker, and
+  // the only effect of a higher one is that pad bytes are skipped.
+  //
+  // Two inputs never heal, they only refuse, as before:
+  //   * the legacy plaintext watermark (attacker-writable; written only by
+  //     pre-fix code, never by a crash);
+  //   * the native floor. A floor ahead of EVERY data record — the durable one
+  //     included — cannot come from a crash any more (the floor is advanced
+  //     only after the durable write completed), so it is what it always was:
+  //     evidence that the pad's state was rolled back (or its data lost), and
+  //     the pad is refused.
+  const data = {
+    send: maxOf(sendOffset, inner.hwSend | 0, outerWm ? outerWm.send : 0, dur ? dur.send : 0),
+    recv: maxOf(recvHighWater, inner.hwRecv | 0, outerWm ? outerWm.recv : 0, dur ? dur.recv : 0),
   };
-  if (sendOffset < wm.send) {
+  // Review round 1 (HIGH, pentest-new-code): never heal a v1 blob. Its
+  // `role` / `regionSize` sit OUTSIDE the AEAD and the upgrade re-seals under
+  // the same key, so an archived v1 copy decrypts beside the current records;
+  // healing it opened the pad with the attacker's outer role — sending from
+  // the peer's half, a two-time pad. Pre-3b this state was refused ("blob
+  // below its records"), and for v1 it still is. (The durable record's sealed
+  // geometry, checked below, binds every other blob shape.)
+  if (legacy && (sendOffset < data.send || recvHighWater < data.recv)) {
     throw new Error("pad state was rolled back (consumed key material) — refusing to use it; exchange a fresh pad");
   }
-  if (recvHighWater < wm.recv) {
+  if (data.send < maxOf(readLegacyHW(padId), native > NATIVE_ABSENT ? native : 0)) {
+    throw new Error("pad state was rolled back (consumed key material) — refusing to use it; exchange a fresh pad");
+  }
+  const wm = { send: data.send, recv: data.recv };
+  if (data.recv < (nativeRecv > NATIVE_ABSENT ? nativeRecv : 0)) {
     // M-7: no keystream is reused, but every OTP frame the peer already sent
     // would authenticate again as fresh — the anti-replay guarantee, gone.
     throw new Error("pad receive state was rolled back (already-delivered messages could replay) — refusing to use it; exchange a fresh pad");
@@ -814,7 +1022,7 @@ export async function unlockPad(padId, passphrase, opts = {}) {
   // blob written by v3 code carries `hwSend` inside the AEAD, and forging it
   // needs the pad passphrase.
   const preV3 = legacy || !isInt(inner.hwSend);
-  const needsAdoption = preV3 && outerWm === null;
+  const needsAdoption = preV3 && !hasRecord;
   if (needsAdoption && !opts.adoptLegacy) {
     const err = new Error(
       "this pad has no usage record on this device. If it has ever sent a message, that record has been deleted and the pad is NOT safe to use — exchange a fresh one.",
@@ -862,6 +1070,29 @@ export async function unlockPad(padId, passphrase, opts = {}) {
   if (bytes.length !== 2 * regionSize) {
     throw new Error("stored pad is internally inconsistent — refusing to use it");
   }
+  // Review round 1: the blob's geometry must be the one the durable record
+  // sealed. A mismatch is not a crash artefact (role and size never change),
+  // it is a substituted or tampered blob.
+  if (dur && (dur.role !== role || dur.regionSize !== regionSize)) {
+    throw new Error("stored pad does not match its durable progress record (role or size) — refusing to use it; exchange a fresh pad");
+  }
+  if (wm.send > regionSize || wm.recv > regionSize) {
+    throw new Error("this pad's progress records point past its end — refusing to use it; exchange a fresh pad");
+  }
+  // Package 3b: the heal. The bytes between the blob's offsets and the healed
+  // ones were consumed in the session whose last save did not reach disk, so
+  // they are zeroed here exactly as the cipher would have zeroed them (forward
+  // secrecy; the next save writes them out as zero).
+  const healed = wm.send > sendOffset || wm.recv > recvHighWater;
+  if (wm.send > sendOffset) bytes.fill(0, role * regionSize + sendOffset, role * regionSize + wm.send);
+  if (wm.recv > recvHighWater) bytes.fill(0, (1 - role) * regionSize + recvHighWater, (1 - role) * regionSize + wm.recv);
+  if (dur) {
+    const prev = durHigh.get(padId);
+    durHigh.set(padId, {
+      send: maxOf(dur.send, prev ? prev.send : 0), recv: maxOf(dur.recv, prev ? prev.recv : 0),
+      exported: !!(dur.exported || (prev && prev.exported)),
+    });
+  }
   const record = {
     padId,
     label: src.label,
@@ -869,8 +1100,8 @@ export async function unlockPad(padId, passphrase, opts = {}) {
     role,
     createdAt: src.createdAt,
     bytes,
-    sendOffset,
-    recvHighWater,
+    sendOffset: wm.send,
+    recvHighWater: wm.recv,
     // L-3: authenticated in v3; a v1/v2 blob falls back to the plaintext index
     // ONCE, on the unlock that upgrades it, after which the flag is covered.
     //
@@ -905,7 +1136,9 @@ export async function unlockPad(padId, passphrase, opts = {}) {
     // receive side this needs no prompt: assuming "exported" only costs a
     // confirm on re-export (exportPad refuses a used pad anyway), and the next
     // save latches it (writePadBlob advances `exported:` to 1).
-    exported: nativeExported >= 1 ||
+    // Package 3b: and the durable record's flag — an export latched just
+    // before a crash whose blob write was lost is still an export.
+    exported: nativeExported >= 1 || (dur !== null && dur.exported) ||
       (native > NATIVE_ABSENT && nativeExported === NATIVE_ABSENT) ||
       (inner.exported !== undefined ? !!inner.exported : true),
     // Fix round 2 (Info): true when that TRUE comes only from missing
@@ -913,7 +1146,7 @@ export async function unlockPad(padId, passphrase, opts = {}) {
     // recorded on this device. Only the wording of the re-export warning
     // depends on it; the confirm stays.
     exportedInferred: inner.exportedInferred === true ||
-      (nativeExported < 1 && inner.exported !== true &&
+      (nativeExported < 1 && inner.exported !== true && !(dur !== null && dur.exported) &&
         (inner.exported === undefined || (native > NATIVE_ABSENT && nativeExported === NATIVE_ABSENT))),
   };
   const atRest = { key, salt, iters };
@@ -934,7 +1167,12 @@ export async function unlockPad(padId, passphrase, opts = {}) {
   // (Package 3, F-P7-5: keyed on the inner shape for the same reason as the
   // adoption gate — an outer `v` of 3 on a v2 blob used to skip this upgrade
   // too, leaving the pad without its authenticated watermark mirror.)
-  if (preV3) await writePadBlob(record, key, salt, iters);
+  //
+  // Package 3b: also rewritten when it was HEALED (so localStorage catches up
+  // and the skipped bytes are zeroed on disk), and when it has no durable
+  // record yet — the one-time adoption of every pad saved before 3b: its
+  // record starts at the offsets just verified.
+  if (preV3 || healed || dur === null) await writePadBlob(record, key, salt, iters);
   return { record, atRest };
 }
 

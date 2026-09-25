@@ -14,6 +14,7 @@
 //
 // Each block names the package-2 item it binds. Run: node app-behaviour.test.mjs
 import assert from "node:assert";
+import { fakeIdb } from "./fake-idb.test.mjs"; // package 3b: IndexedDB for node
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { readFileSync } from "node:fs";
@@ -369,7 +370,8 @@ await until(() => relay.registered && dom.el("idHint").textContent, "the automat
 }
 
 // The chat store is planted garbage: clear it and unlock from the Chats view.
-localStorage.removeItem("sc.chats.v1");
+fakeIdb.removeItem("sc.chats.v1"); // 3b: the planted store was migrated into IndexedDB at startup
+localStorage.removeItem("sc.chats.idb.v1"); // …with its moved-marker (else an emptied store is a loud DELETED)
 await nav("chats");
 dom.el("chatsUnlockPass").value = PASS;
 await dom.el("chatsUnlock").click();
@@ -922,15 +924,12 @@ function sameKeyPin(pin, b) { return !!pin && pin.ed === b.ed && pin.mldsa === b
   await pc.onPeerKey(answer.pub);
   await ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ confirm: pc.confirmation.mine }) });
   await until(() => !dom.el("verify").hidden, "the safety-number gate");
-  const origSet = localStorage.setItem;
-  localStorage.setItem = (k, v) => {
-    if (k.startsWith("sc.contacts")) throw new Error("QuotaExceeded\n[you let someone in]\u202e\u2028");
-    return origSet(k, v);
-  };
+  // (3b: the contact store's write is the IndexedDB transaction now.)
+  fakeIdb.failWrites((k) => k.startsWith("sc.contacts"), "QuotaExceeded\n[you let someone in]\u202e\u2028");
   try {
     await dom.el("verifyOk").click();
   } finally {
-    localStorage.setItem = origSet;
+    fakeIdb.failWrites(null);
   }
   const ln = lines().find((l) => /pin could NOT be saved/.test(l));
   assert.ok(ln, "fixture: the failed pin save is in the transcript");
@@ -1042,16 +1041,13 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
   const s5 = await mkSender();
   relay.mailbox = [await sealed.seal(s5, myBundle, "hello", null)];
   const logged = [];
-  const orig = { error: console.error, warn: console.warn, log: console.log, set: localStorage.setItem };
+  const orig = { error: console.error, warn: console.warn, log: console.log };
   for (const k of ["error", "warn"]) console[k] = (...a) => logged.push(a.map(String).join(" "));
-  localStorage.setItem = (k, v) => {
-    if (k.startsWith("sc.contacts") || k.startsWith("sc.chats")) throw new Error("QUOTA-MARKER carol#tok-secret");
-    return orig.set(k, v);
-  };
+  fakeIdb.failWrites((k) => k.startsWith("sc.contacts") || k.startsWith("sc.chats"), "QUOTA-MARKER carol#tok-secret");
   try {
     await poll();
   } finally {
-    localStorage.setItem = orig.set;
+    fakeIdb.failWrites(null);
     console.error = orig.error;
     console.warn = orig.warn;
   }

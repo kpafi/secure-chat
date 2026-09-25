@@ -1,0 +1,410 @@
+// Durable on-device storage: one IndexedDB object store, written with
+// `durability: "strict"`. Package 3b (the package-3 pentest's durability HIGH).
+//
+// THE FINDING. `localStorage.setItem` returning is NOT "on disk". Chromium keeps
+// localStorage changes in the browser process and commits them to its LevelDB
+// in rate-limited batches; measured on Chromium 150, a write made ~12 s after
+// the previous one was still lost when the process was killed 45 s later. Every
+// "persist before X" rule in this client — persist a pad's consumption before
+// the ciphertext leaves, persist a receipt before the text is shown, latch
+// "exported" before the file is handed out — was therefore a rule about the
+// renderer's memory, not about the disk. End to end through the real otp.js: a
+// kill a few seconds after a send reopened the pad at the offset the message
+// had already used, and the next message reused those pad bytes (a two-time
+// pad). No attacker is needed: a crash, an OOM kill or a power cut does it.
+//
+// On Android the order was the other way round and just as bad: the native
+// floor (PadFloor.kt, SharedPreferences.commit(), synchronous) reached disk
+// while the WebView's localStorage batch did not, so after a kill the floor was
+// AHEAD of the data it protects — the pad refused as rolled back, the contact
+// or chat store refused as "an earlier copy restored", with no override.
+//
+// WHAT THIS MODULE GUARANTEES. `write()` resolves only on the transaction's
+// `complete` event, and every read-write transaction is opened with
+// `{durability: "strict"}`:
+//   * Chromium (Chrome, Android WebView): strict makes the backend flush to disk
+//     BEFORE `complete` fires (Chrome's own documentation, and the reason 121
+//     made "relaxed" the default). IndexedDB lives in the browser/storage
+//     process, not the renderer, and has no commit batching of its own.
+//   * WebKit (Safari, iOS WKWebView): strict runs a FULL WAL checkpoint of the
+//     SQLite database after the commit (WebKit changeset 280415, Safari 15+).
+//   * Firefox: strict (its "default") syncs the SQLite commit.
+// Where the hint is ignored (an old engine), `complete` still means the
+// transaction was committed by the storage backend and handed to the OS: that
+// survives the app's process being killed — the failure measured above — and
+// only a power cut before the OS writes back can lose it. The ordering rule the
+// callers rely on (native floor advanced only after `complete`) does not depend
+// on the hint at all.
+//
+// It is NOT a security boundary against the JS context: whoever runs script in
+// the page can delete or rewrite these records like any localStorage key. The
+// callers seal what they store and treat a missing record by their existing
+// rules. This module is about crashes, not attackers.
+//
+// TESTS: node has no IndexedDB. fake-idb.test.mjs installs a small in-memory
+// `globalThis.indexedDB` with just the API surface used here; every call below
+// reads `globalThis.indexedDB` afresh, so a test can swap or remove it.
+
+const DB_NAME = "secure-chat";
+const DB_VERSION = 1;
+const STORE = "kv";
+
+let cached = null; // { factory, promise<IDBDatabase> }
+
+function factory() {
+  const f = globalThis.indexedDB;
+  return f && typeof f.open === "function" ? f : null;
+}
+
+// True when this engine offers IndexedDB at all. OTP is refused without it
+// (otp.js); the contact and chat stores fall back to localStorage without a
+// native floor (see storeSlot below).
+export function available() {
+  return factory() !== null;
+}
+
+export function unavailableError(what) {
+  const err = new Error(
+    `${what} need the browser's durable database (IndexedDB), which is not available here — ` +
+    "private browsing, disabled site data or a very old browser. Use the app or a current browser with site data allowed.",
+  );
+  err.code = "NO_DURABLE_STORAGE";
+  return err;
+}
+
+function openDb() {
+  const f = factory();
+  if (!f) return Promise.reject(unavailableError("This feature"));
+  if (cached && cached.factory === f) return cached.promise;
+  const promise = new Promise((resolve, reject) => {
+    let req;
+    try {
+      req = f.open(DB_NAME, DB_VERSION);
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
+    };
+    req.onsuccess = () => {
+      const db = req.result;
+      // Another tab upgrading the schema (a future version) asks us to let go.
+      db.onversionchange = () => { try { db.close(); } catch { /* ignore */ } cached = null; };
+      resolve(db);
+    };
+    req.onerror = () => reject(req.error || new Error("could not open the durable database"));
+    req.onblocked = () => reject(new Error("the durable database is blocked by another tab — close other tabs of this app"));
+  });
+  cached = { factory: f, promise };
+  promise.catch(() => { if (cached && cached.promise === promise) cached = null; });
+  return promise;
+}
+
+// Read several keys in one read-only transaction: { key: value | null }.
+export async function getMany(keys) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const out = {};
+    let tx;
+    try {
+      tx = db.transaction(STORE, "readonly");
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    const os = tx.objectStore(STORE);
+    for (const k of keys) {
+      const r = os.get(k);
+      r.onsuccess = () => { out[k] = r.result === undefined ? null : r.result; };
+    }
+    tx.oncomplete = () => resolve(out);
+    tx.onerror = () => reject(tx.error || new Error("durable read failed"));
+    tx.onabort = () => reject(tx.error || new Error("durable read aborted"));
+  });
+}
+
+export async function get(key) {
+  return (await getMany([key]))[key];
+}
+
+// Write several keys ATOMICALLY in one strict read-write transaction. A value
+// of null deletes the key. Resolves only once the transaction has COMPLETED —
+// never on a request's `success`, which fires before the commit.
+export async function write(entries) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    let tx;
+    try {
+      tx = db.transaction(STORE, "readwrite", { durability: "strict" });
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    const os = tx.objectStore(STORE);
+    for (const k of Object.keys(entries)) {
+      const v = entries[k];
+      if (v === null || v === undefined) os.delete(k);
+      else os.put(v, k);
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error("durable write failed"));
+    tx.onabort = () => reject(tx.error || new Error("durable write aborted (storage full?)"));
+  });
+}
+
+// Write `entries` only if NONE of their keys exists yet — checked and written in
+// the same strict transaction, so two tabs migrating at once cannot let the
+// slower one overwrite what the faster one has already moved AND updated.
+// Resolves true when written, false when something was already there.
+export async function writeIfAbsent(entries) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    let tx;
+    try {
+      tx = db.transaction(STORE, "readwrite", { durability: "strict" });
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    const os = tx.objectStore(STORE);
+    const keys = Object.keys(entries);
+    let seen = 0;
+    let present = false;
+    for (const k of keys) {
+      const r = os.get(k);
+      r.onsuccess = () => {
+        if (r.result !== undefined) present = true;
+        if (++seen === keys.length && !present) {
+          for (const w of keys) if (entries[w] !== null && entries[w] !== undefined) os.put(entries[w], w);
+        }
+      };
+    }
+    tx.oncomplete = () => resolve(!present);
+    tx.onerror = () => reject(tx.error || new Error("durable write failed"));
+    tx.onabort = () => reject(tx.error || new Error("durable write aborted (storage full?)"));
+  });
+}
+
+export function put(key, value) {
+  return write({ [key]: value });
+}
+
+export function del(key) {
+  return write({ [key]: null });
+}
+
+// ---- the contact / chat store slot -----------------------------------------
+//
+// Owner decision 2026-09-25: the contact and chat stores MOVE to IndexedDB. A
+// store is two records — the sealed blob and its generation witness — and they
+// now travel together in ONE strict transaction (under localStorage they were
+// two setItem calls and a crash could split them). `blobKey` / `genKey` keep
+// their localStorage names, so a record is the same string in either place.
+//
+// Migration: the first read on a device whose IndexedDB holds neither record
+// but whose localStorage does copies both, verbatim (they are opaque sealed
+// strings; no passphrase is needed), reads them back, and only then removes the
+// localStorage BLOB — so one source of truth remains, and a crash at any point
+// leaves at least one complete copy. The WITNESS stays in localStorage as a
+// mirror of IndexedDB's (review round 2): an older client (a downgrade, or a
+// tab left open across the upgrade) then sees "witness, no store" and refuses
+// loudly, and an old tab's compare-and-swap sees new generations. `marker` (a
+// localStorage key) records "this store lives in IndexedDB": it makes
+// hasStore() answer synchronously across tabs, and if IndexedDB later goes
+// missing it turns "no store here" into a loud refusal instead of a silent
+// fresh (pin-less) store. A blob an old tab writes to localStorage after the
+// migration is a CONFLICT, settled in unlock(): the higher authenticated
+// generation wins. Downgrading after the migration is still not supported —
+// it now fails loudly instead of silently (release notes).
+//
+// Without IndexedDB (and no marker) the slot keeps using localStorage exactly
+// as before; `durable()` is then false and the stores do NOT advance their
+// native floor, so a floor can never get ahead of data that may not be on disk.
+export function storeSlot({ blobKey, genKey, marker }) {
+  let pending = true;
+  let mode = null;           // "idb" | "ls"
+  // Review round 3 (info): bumped by wipe(). A save that was in flight across
+  // a Forget must not put the marker / witness mirror back afterwards (that
+  // read as a false "DELETED" on the next unlock).
+  let epoch = 0;
+  let cache = { blob: null, witness: null };
+  const ls = () => globalThis.localStorage;
+  const lsGet = (k) => ls().getItem(k);
+
+  async function read() {
+    if (!available()) {
+      if (lsGet(marker) !== null) {
+        const err = new Error(
+          "this store was moved to the browser's durable database (IndexedDB), which is not available right now — " +
+          "refusing to start over with an empty one. Reload, or allow site data for this app.",
+        );
+        err.code = "NO_DURABLE_STORAGE";
+        throw err;
+      }
+      mode = "ls";
+      cache = { blob: lsGet(blobKey), witness: lsGet(genKey) };
+      return cache;
+    }
+    const got = await getMany([blobKey, genKey]);
+    mode = "idb";
+    if (got[blobKey] === null && got[genKey] === null) {
+      const legacy = { blob: lsGet(blobKey), witness: lsGet(genKey) };
+      // Review round 1 (Low) + round 2 (I-1): nothing in IndexedDB but the
+      // marker says the store WAS moved there — emptied storage (eviction, a
+      // deletion). Whatever localStorage holds then (the witness mirror, or a
+      // copy an old-version tab wrote) is not migrated: the store refuses
+      // loudly (DELETED adoption, with its explicit override) instead of
+      // starting a fresh, pin-less one or quietly resurrecting a stale copy.
+      if (lsGet(marker) !== null) {
+        cache = { blob: null, witness: null, lost: true };
+        return cache;
+      }
+      if (legacy.blob !== null || legacy.witness !== null) {
+        // Conditional: another tab may have migrated (and even saved) between
+        // our read and this write. Then its copy stands and we re-read it.
+        const moved = await writeIfAbsent({ [blobKey]: legacy.blob, [genKey]: legacy.witness });
+        const back = await getMany([blobKey, genKey]);
+        if (moved && (back[blobKey] !== legacy.blob || back[genKey] !== legacy.witness)) {
+          throw new Error("moving this store to the durable database did not read back identically — nothing was removed; reload and try again");
+        }
+        ls().setItem(marker, "1");
+        ls().removeItem(blobKey);
+        mirror(back[genKey]);
+        cache = { blob: back[blobKey], witness: back[genKey] };
+        return cache;
+      }
+      cache = legacy;
+      return cache;
+    }
+    // IndexedDB holds the store. A localStorage BLOB beside it is either an
+    // interrupted migration's leftover (identical: dropped) or — review round
+    // 2 (L-2) — what a tab still running the previous version wrote after the
+    // migration. That used to be deleted here unseen ("IndexedDB wins"), which
+    // silently undid e.g. a Remove (a pin revocation) made in the old tab. It
+    // is now handed to the store as a CONFLICT, resolved in unlock() with the
+    // passphrase: the higher authenticated generation wins (resolve()).
+    if (lsGet(marker) === null) ls().setItem(marker, "1");
+    const lsBlob = lsGet(blobKey);
+    if (lsBlob !== null && lsBlob !== got[blobKey]) {
+      cache = { blob: got[blobKey], witness: got[genKey], conflict: { blob: lsBlob, witness: lsGet(genKey) } };
+      return cache;
+    }
+    if (lsBlob !== null) ls().removeItem(blobKey);
+    mirror(got[genKey]);
+    cache = { blob: got[blobKey], witness: got[genKey] };
+    return cache;
+  }
+
+  // Review round 2 (L-3 / L-2): once the store lives in IndexedDB, localStorage
+  // keeps a MIRROR of its generation witness (never the blob). An older client
+  // — a downgrade, or a tab left open across the upgrade — reads localStorage
+  // only: with the witness there and the blob gone it takes its own loud
+  // "your saved contacts have been DELETED" branch instead of silently starting
+  // a fresh, pin-less store, and an old tab's compare-and-swap sees every
+  // generation the new code commits (STALE instead of a lost update).
+  function mirror(witness) {
+    if (witness === null || witness === undefined) return;
+    // Review round 3 (info): best effort. The mirror is a hint for older
+    // clients; a failure (quota) after IndexedDB committed must not turn a
+    // committed save into a "failed" one (the next save then reported a
+    // false STALE). read() re-mirrors on every load.
+    try {
+      if (lsGet(genKey) !== witness) ls().setItem(genKey, witness);
+    } catch { /* the store itself is saved; the mirror catches up on the next read */ }
+  }
+
+  // Preload at module load, so hasStore() can answer synchronously. Until it
+  // settles, known() says TRUE: "unknown" must read as "a store exists" (the
+  // loud pins-unreadable path in app.js), never as a clean first run.
+  // Review round 1 (Low): a preload that FAILED is still "unknown", so known()
+  // keeps answering true until a later read succeeds.
+  let failed = false;
+  const ready = read().then(() => { failed = false; }, () => { failed = true; }).finally(() => { pending = false; });
+
+  return {
+    ready,
+    read: async () => {
+      await ready;
+      try {
+        const r = await read();
+        failed = false;
+        return r;
+      } catch (e) {
+        failed = true;
+        throw e;
+      }
+    },
+    async readWitness() {
+      await ready;
+      if (mode === "ls" || !available()) return lsGet(genKey);
+      return get(genKey);
+    },
+    // True when the last read went to IndexedDB (writes are durable there).
+    durable: () => mode === "idb",
+    // Review round 3 (F1): a blob in localStorage beside the IndexedDB store —
+    // written by a tab still running the previous version after this one read
+    // the store. A save now would commit over it and its witness would outrank
+    // ours at the next unlock; the caller refuses the save (STALE) instead, and
+    // the next unlock settles the conflict with the passphrase.
+    foreignCopy: () => mode === "idb" && lsGet(blobKey) !== null,
+    // Review round 4 (L-1): the store was LOST (IndexedDB emptied beside the
+    // marker) and the user explicitly chose to start over ("Open anyway"). A
+    // blob left in localStorage then belongs to nothing that can be verified —
+    // IndexedDB has no store to compare salts or generations with — and left in
+    // place it made every save of the fresh store a STALE refusal, forever
+    // (only Forget got out). It is discarded; returns true when there was one,
+    // so the caller can say so.
+    dropStray() {
+      if (lsGet(blobKey) === null) return false;
+      ls().removeItem(blobKey);
+      return true;
+    },
+    // Review round 4 (info): the wipe counter, read by a save when it STARTS
+    // and handed back to write(), which then refuses to write anything once a
+    // wipe (Forget) happened in between — deliberately, instead of relying on
+    // lock() having nulled the salt the save would still need.
+    epoch: () => epoch,
+    // Review round 2 (L-2): settle a conflict read() reported. `adopt` = the
+    // localStorage copy is the newer authenticated generation (the caller
+    // checked, with the passphrase): it becomes the IndexedDB store. Otherwise
+    // it is an older / equal copy and is dropped (the caller says so).
+    async resolve(conflict, adopt) {
+      if (adopt) {
+        await write({ [blobKey]: conflict.blob, [genKey]: conflict.witness });
+        cache = { blob: conflict.blob, witness: conflict.witness };
+      }
+      ls().removeItem(blobKey);
+      mirror(cache.witness);
+    },
+    async write(blob, witness, startEpoch = epoch) {
+      await ready;
+      if (startEpoch !== epoch) return false; // wiped since the save began (review round 4)
+      if (mode === null) throw new Error("the durable database could not be read — reload and try again");
+      if (mode !== "idb") {
+        ls().setItem(blobKey, blob);
+        ls().setItem(genKey, witness);
+      } else {
+        await write({ [blobKey]: blob, [genKey]: witness });
+        if (startEpoch !== epoch) return true; // wiped meanwhile (review round 3): leave it wiped
+        try { if (lsGet(marker) === null) ls().setItem(marker, "1"); } catch { /* best effort, as mirror() */ }
+        mirror(witness);
+      }
+      cache = { blob, witness };
+      return true;
+    },
+    async wipe() {
+      epoch += 1;
+      cache = { blob: null, witness: null };
+      ls().removeItem(blobKey);
+      ls().removeItem(genKey);
+      ls().removeItem(marker);
+      if (available()) await write({ [blobKey]: null, [genKey]: null });
+    },
+    known() {
+      return pending || failed || cache.blob !== null || cache.witness !== null ||
+        lsGet(marker) !== null || lsGet(blobKey) !== null || lsGet(genKey) !== null;
+    },
+  };
+}

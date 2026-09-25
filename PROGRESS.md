@@ -27,13 +27,27 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   chunked pad RNG, int32 ceiling + PadFloor record cap, FLAG_SECURE on every
   dialog window, console off logcat in release, taskAffinity, Kotlin
   source-anchor test. On-device checks owed: android/README.md.
-- **Open HIGH (pre-existing), next = package 3b:** Chromium localStorage can
-  stay off disk ~1 min after setItem → a crash can reopen an OTP pad at an
-  old offset (two-time pad); on Android the native floor can end up ahead of
-  the data (bricked store). Owner decisions: OTP heals forward to a durable
-  record; contacts + chats move to IndexedDB (strict durability), floor
-  advanced only after the durable write.
-- **Next:** package 3b (durable storage), package 4 (RSA removal, guest-side
+- **Package 3b done on `fix/durable-storage`, NOT merged (2026-09-25):** the
+  durability HIGH (Chromium localStorage off disk ~1 min after setItem → a
+  crash reopened an OTP pad at a spent offset = two-time pad; on Android the
+  native floor ended up ahead of the data = bricked store). Owner decisions
+  (2026-09-25), implemented as decided: **OTP heals forward** to a sealed
+  durable record in IndexedDB (strict durability; native floor and legacy
+  watermark only refuse, never heal); **contacts + chats moved to IndexedDB**
+  (strict, store+witness in one transaction), native floor advanced only after
+  the durable write. Four review rounds (round 1 HIGH: heal on a v1 blob's
+  unauthenticated role → fixed, geometry now sealed; round 2 Lows: overlapping
+  saves could arm the floor ahead of data → persist serialized; old-version tab
+  / downgrade → witness mirrored in localStorage, conflicts settled by
+  authenticated generation; round 3 Lows: saves beside an old tab's copy
+  refused (STALE), a localStorage copy authenticated — domain, generation,
+  salt — before it may replace the store, adoption reported). Real-Chromium SIGKILL test `e2e/durable-crash.mjs`
+  fails on 0786d47, passes on 3b. **Release notes 0.4.0 must say:** first start
+  moves contacts/chats to IndexedDB; **downgrading afterwards is not supported**
+  (an older client refuses loudly); **reload every open tab after updating**;
+  OTP needs IndexedDB (refused in private modes without it). On-device checks
+  owed: android/README.md ("Owed on the phone (package 3b …)") + iOS twin.
+- **Next:** merge package 3b after the owner's review, package 4 (RSA removal, guest-side
   approval, chats single tab, F-ATREST-008). Then release 0.4.0 (APK first if the wire
   contract changes), deploy, phone APK, archive `phase7-local`.
 - **Relay deployed:** still 0.3.1 (`v0.3.1`).

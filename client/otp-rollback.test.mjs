@@ -2,6 +2,7 @@
 // back to reuse consumed keystream) is refused by the separate high-water
 // tripwire. Run: node otp-rollback.test.mjs
 import assert from "node:assert";
+import { fakeIdb } from "./fake-idb.test.mjs"; // package 3b: IndexedDB for node
 import { readFile } from "node:fs/promises";
 
 const mem = new Map();
@@ -30,9 +31,23 @@ assert.strictEqual(unlockedOk.record.sendOffset, 500, "current pad unlocks norma
 console.log("OK  pad unlocks at its true (advanced) offset");
 
 // Attacker restores the OLD blob (offset 0) wholesale — valid GCM ciphertext.
+// Until package 3b this was refused. The owner's decision (2026-09-25) is to
+// HEAL FORWARD instead: a blob behind its authenticated records is exactly
+// what a crash leaves (localStorage is not durable), and skipping pad bytes is
+// harmless — reuse is the only danger. So the property is now "never reopens
+// at the old offset", checked on the offset AND on the bytes.
 localStorage.setItem(padK, oldBlob);
-await assert.rejects(otp.unlockPad(rec.padId, PASS), /rolled back/, "rolled-back blob must be refused");
-console.log("OK  M-01: a wholesale old-blob restore (offset rollback) is refused");
+{
+  const healed = await otp.unlockPad(rec.padId, PASS);
+  assert.strictEqual(healed.record.sendOffset, 500, "M-01 / 3b: a restored old blob reopens at the recorded offset, never at 0");
+  assert.ok(healed.record.bytes.subarray(0, 500).every((b) => b === 0),
+    "3b: the healed-over (consumed) span is zeroed, as the cipher would have zeroed it");
+  // The heal is written back, so localStorage catches up.
+  const again = await otp.unlockPad(rec.padId, PASS);
+  assert.strictEqual(again.record.sendOffset, 500, "3b: …and the healed state was saved");
+}
+localStorage.setItem(padK, oldBlob);
+console.log("OK  M-01 / 3b: a wholesale old-blob restore reopens at the recorded offset (healed), never the old one");
 
 // Pentest 2026-07-26 P-05: forgetPad must KEEP the tripwire. It used to delete
 // it, which made "Forget pad" the easiest route to a two-time pad: an export
@@ -125,8 +140,18 @@ console.log("OK  P-01: padId re-key (M-01 watermark bypass) is refused");
     "watermark stores only iv+ct — no plaintext offset field");
 
   // Restore the pristine blob AND delete the watermark — the reported PoC.
+  // Package 3b: the durable record (IndexedDB) still knows the pad reached 85,
+  // so the pad heals forward to it instead of refusing…
   localStorage.setItem(hKey, pristine);
   localStorage.removeItem("sc.otp.wm.v1." + h.padId);
+  assert.strictEqual((await otp.unlockPad(h.padId, PASS)).record.sendOffset, 85,
+    "3b: with the watermark deleted the durable record still reopens the pad at 85, never 0");
+  // …and with the durable record deleted as well, the pre-3b rules apply
+  // unchanged: a pad that has demonstrably run here with no record at all
+  // fails closed.
+  localStorage.setItem(hKey, pristine);
+  localStorage.removeItem("sc.otp.wm.v1." + h.padId);
+  fakeIdb.removeItem("sc.otp.dur.v1." + h.padId); // 3b: and its durable record (the pre-3b rules)
   await assert.rejects(
     otp.unlockPad(h.padId, PASS), /rollback record for this pad is missing/,
     "H-3: deleting the watermark must FAIL CLOSED, not reset the tripwire to 0",
@@ -163,13 +188,15 @@ console.log("OK  H-3: deleting or forging the OTP watermark fails closed");
 
   // Restore the copy taken before the receiving: sendOffset is IDENTICAL, so
   // the old send-only tripwire saw nothing wrong.
+  // Package 3b: healed forward (the watermark and the durable record both
+  // say 119), so no delivered frame can authenticate again.
   localStorage.setItem(mKey, beforeReceiving);
-  await assert.rejects(
-    otp.unlockPad(m.padId, PASS), /receive state was rolled back/,
-    "M-7: a receive-side rollback is refused even when sendOffset is unchanged",
-  );
+  const healed = await otp.unlockPad(m.padId, PASS);
+  assert.strictEqual(healed.record.recvHighWater, 119,
+    "M-7 / 3b: a receive-side rollback reopens at the recorded high-water, even when sendOffset is unchanged");
+  assert.strictEqual(healed.record.sendOffset, 200, "…and the send side is untouched");
 }
-console.log("OK  M-7: OTP recvHighWater rollback (replay across a reload) is refused");
+console.log("OK  M-7 / 3b: an OTP recvHighWater rollback reopens at the recorded high-water (no replay)");
 
 // --- Pentest 2026-07-27 L-3: `exported` is authenticated ---------------------
 // The double-export gate lived in the plaintext index, so clearing one field
@@ -298,7 +325,8 @@ async function makeV2Blob(padId, key, mutate) {
     { name: "AES-GCM", iv: iv2 }, mAtRest.key, enc.encode(JSON.stringify(innerPlain)),
   ));
   localStorage.setItem(mKey, JSON.stringify({ v: 2, kdf: cur.kdf, iv: b64(iv2), ct: b64(ct2) }));
-  localStorage.removeItem("sc.otp.wm.v1." + m.padId);    // never existed pre-fix
+  localStorage.removeItem("sc.otp.wm.v1." + m.padId);
+  fakeIdb.removeItem("sc.otp.dur.v1." + m.padId); // 3b: and its durable record (the pre-3b rules)    // never existed pre-fix
   localStorage.removeItem("sc.otp.used.v1." + m.padId);  // stamped only post-fix
   localStorage.setItem("sc.otp.hw.v1." + m.padId, String(USED)); // what old code wrote
 
@@ -337,6 +365,7 @@ async function makeV2Blob(padId, key, mutate) {
   await otp.savePadProgress(m, mAtRest);
   localStorage.setItem(mKey, post);
   localStorage.removeItem("sc.otp.wm.v1." + m.padId);
+  fakeIdb.removeItem("sc.otp.dur.v1." + m.padId); // 3b: and its durable record (the pre-3b rules)
   await assert.rejects(
     otp.unlockPad(m.padId, PASS), /rollback record for this pad is missing/,
     "H-3 still fails closed for a v3 blob whose watermark was deleted",
@@ -364,6 +393,7 @@ console.log("OK  v2→v3: a USED pre-fix pad migrates (and keeps its floor), H-3
   // Pre-fix shape, blob rewound to 0, legacy tripwire still recording 1234.
   await makeV2Blob(f.padId, fAtRest.key, (inner) => { inner.sendOffset = 0; });
   localStorage.removeItem("sc.otp.wm.v1." + f.padId);
+  fakeIdb.removeItem("sc.otp.dur.v1." + f.padId); // 3b: and its durable record (the pre-3b rules)
   localStorage.removeItem("sc.otp.used.v1." + f.padId);
   localStorage.setItem("sc.otp.hw.v1." + f.padId, String(REACHED));
 
@@ -387,6 +417,7 @@ console.log("OK  F-3: the legacy watermark is still load-bearing as a rollback f
   a.sendOffset = 400;
   await otp.savePadProgress(a, aAtRest);
   localStorage.removeItem("sc.otp.wm.v1." + a.padId);
+  fakeIdb.removeItem("sc.otp.dur.v1." + a.padId); // 3b: and its durable record (the pre-3b rules)
   localStorage.removeItem("sc.otp.used.v1." + a.padId);
   localStorage.removeItem("sc.otp.hw.v1." + a.padId);
   await assert.rejects(
@@ -403,6 +434,7 @@ console.log("OK  F-3: the legacy watermark is still load-bearing as a rollback f
   await otp.savePadProgress(b, bAtRest);
   await makeV2Blob(b.padId, bAtRest.key);
   localStorage.removeItem("sc.otp.wm.v1." + b.padId);
+  fakeIdb.removeItem("sc.otp.dur.v1." + b.padId); // 3b: and its durable record (the pre-3b rules)
   localStorage.removeItem("sc.otp.hw.v1." + b.padId);
   await assert.rejects(
     otp.unlockPad(b.padId, PASS), /rollback record for this pad is missing/,
@@ -431,6 +463,7 @@ console.log("OK  F-4: each knownUsedHere clause fails closed on its own");
 
   await makeV2Blob(v.padId, vAtRest.key, (inner) => { inner.sendOffset = 0; });
   localStorage.removeItem("sc.otp.wm.v1." + v.padId);
+  fakeIdb.removeItem("sc.otp.dur.v1." + v.padId); // 3b: and its durable record (the pre-3b rules)
   localStorage.removeItem("sc.otp.used.v1." + v.padId);
   localStorage.removeItem("sc.otp.hw.v1." + v.padId);   // the full 3-key PoC
 
@@ -464,6 +497,7 @@ console.log("OK  F-4: each knownUsedHere clause fails closed on its own");
   // Same PoC, plus consent — the strongest form of the attack.
   await makeV2Blob(n.padId, nAtRest.key, (inner) => { inner.sendOffset = 0; });
   localStorage.removeItem("sc.otp.wm.v1." + n.padId);
+  fakeIdb.removeItem("sc.otp.dur.v1." + n.padId); // 3b: and its durable record (the pre-3b rules)
   localStorage.removeItem("sc.otp.used.v1." + n.padId);
   localStorage.removeItem("sc.otp.hw.v1." + n.padId);
 
@@ -548,12 +582,14 @@ console.log("OK  F-1: v2 two-time-pad PoC is loud in the browser, refused outrig
   const cAtRest = await otpC.saveNewPad(c, PASS);
   const snapBlob = localStorage.getItem("sc.otp.pad.v1." + c.padId);
   const snapWm = localStorage.getItem("sc.otp.wm.v1." + c.padId);
+  const snapWmDur = fakeIdb.getItem("sc.otp.dur.v1." + c.padId); // 3b: a coordinated snapshot takes the durable record too
   c.sendOffset = 900;
   await otpC.savePadProgress(c, cAtRest);
   assert.strictEqual(floors.get(c.padId), 900, "precondition: the floor advanced");
 
   localStorage.setItem("sc.otp.pad.v1." + c.padId, snapBlob);   // rewind the pad
   localStorage.setItem("sc.otp.wm.v1." + c.padId, snapWm);      // and its watermark
+  fakeIdb.setItem("sc.otp.dur.v1." + c.padId, snapWmDur);
   floors.delete(c.padId);                                       // what clear() did
   await assert.rejects(
     otpC.unlockPad(c.padId, PASS, { adoptLegacy: true }),
@@ -685,6 +721,7 @@ console.log("OK  H-1: the native floor cannot be cleared or feature-detected awa
   // …and the consequences that mattered: re-import and unlock both still refuse.
   otpA.forgetPad(p.padId);
   for (const k of ["used", "wm", "hw"]) localStorage.removeItem(`sc.otp.${k}.v1.${p.padId}`);
+  fakeIdb.removeItem("sc.otp.dur.v1." + p.padId); // 3b: and its durable record (the pre-3b rules)
   await assert.rejects(
     otpA.importPad(file, XFER),
     /already been used on this device/,
@@ -776,6 +813,14 @@ console.log("OK  H-A: a bridge that LIES is refused, not just one that is delete
     Number.isFinite = REAL.isFinite;
     Math.max = (...a) => (a.length === 4 ? 0 : REAL.max(...a));
     localStorage.setItem("sc.otp.pad.v1." + p.padId, pristine);   // rewind the blob
+    // Package 3b: a rewound blob beside its records now HEALS forward; the
+    // poison must not make it open anywhere below 3000 either.
+    assert.strictEqual((await otpP.unlockPad(p.padId, PASS, { adoptLegacy: true })).record.sendOffset, 3000,
+      "H-1 / 3b: a poisoned Math.max must not pull the healed offset below the records");
+    // …and with the data records gone, the native floor alone must still refuse.
+    localStorage.setItem("sc.otp.pad.v1." + p.padId, pristine);
+    localStorage.removeItem("sc.otp.wm.v1." + p.padId);
+    fakeIdb.removeItem("sc.otp.dur.v1." + p.padId);
     await assert.rejects(
       otpP.unlockPad(p.padId, PASS, { adoptLegacy: true }),
       /rolled back|rollback record|deleted/,
@@ -788,6 +833,7 @@ console.log("OK  H-A: a bridge that LIES is refused, not just one that is delete
     globalThis.parseInt = () => 0;
     otpP.forgetPad(p.padId);
     for (const k of ["used", "wm", "hw"]) localStorage.removeItem(`sc.otp.${k}.v1.${p.padId}`);
+    fakeIdb.removeItem("sc.otp.dur.v1." + p.padId); // 3b: and its durable record (the pre-3b rules)
     await assert.rejects(
       otpP.importPad(file, XFER),
       /already been used on this device/,
@@ -857,6 +903,7 @@ console.log("OK  H-1: poisoning parseInt/isFinite/Math.max cannot lower a floor"
   otpI.forgetPad(p.padId);
   localStorage.removeItem("sc.otp.used.v1." + p.padId);
   localStorage.removeItem("sc.otp.wm.v1." + p.padId);
+  fakeIdb.removeItem("sc.otp.dur.v1." + p.padId); // 3b: and its durable record (the pre-3b rules)
   localStorage.removeItem("sc.otp.hw.v1." + p.padId);
 
   await assert.rejects(
@@ -923,6 +970,7 @@ console.log("    re-import still succeeds — documented residual, not covered b
   // only remaining source before the upgrading unlock.
   await makeV2Blob(x.padId, xAtRest.key);
   localStorage.removeItem("sc.otp.wm.v1." + x.padId);
+  fakeIdb.removeItem("sc.otp.dur.v1." + x.padId); // 3b: and its durable record (the pre-3b rules)
   localStorage.removeItem("sc.otp.used.v1." + x.padId);
   localStorage.removeItem("sc.otp.hw.v1." + x.padId);
   const idx = JSON.parse(localStorage.getItem("sc.otp.index.v1"));
@@ -964,6 +1012,7 @@ console.log("OK  F-2: `exported` cannot be cleared through the legacy migration"
   // The attacker's coordinated snapshot: blob AND watermark, both after sending.
   const padSnap = localStorage.getItem("sc.otp.pad.v1." + r.padId);
   const wmSnap = localStorage.getItem("sc.otp.wm.v1." + r.padId);
+  const wmSnapDur = fakeIdb.getItem("sc.otp.dur.v1." + r.padId); // 3b: a coordinated snapshot takes the durable record too
   // Then a stretch of receiving.
   r.recvHighWater = 119;
   await otpR.savePadProgress(r, rAtRest);
@@ -973,6 +1022,7 @@ console.log("OK  F-2: `exported` cannot be cleared through the legacy migration"
   // this unlocked at recv 0 and every already-delivered frame replayed.
   localStorage.setItem("sc.otp.pad.v1." + r.padId, padSnap);
   localStorage.setItem("sc.otp.wm.v1." + r.padId, wmSnap);
+  fakeIdb.setItem("sc.otp.dur.v1." + r.padId, wmSnapDur);
   await assert.rejects(otpR.unlockPad(r.padId, PASS), /receive state was rolled back/,
     "F-ATREST-001: a both-restored receive rollback is refused where a floor exists");
   // A forged recv floor is TAMPERED, never "no floor".
@@ -1021,10 +1071,12 @@ console.log("OK  F-2: `exported` cannot be cleared through the legacy migration"
   const bAtRest = await otpB.saveNewPad(b, PASS);
   const bPad = localStorage.getItem("sc.otp.pad.v1." + b.padId);
   const bWm = localStorage.getItem("sc.otp.wm.v1." + b.padId);
+  const bWmDur = fakeIdb.getItem("sc.otp.dur.v1." + b.padId); // 3b: a coordinated snapshot takes the durable record too
   b.recvHighWater = 50;
   await otpB.savePadProgress(b, bAtRest);
   localStorage.setItem("sc.otp.pad.v1." + b.padId, bPad);
   localStorage.setItem("sc.otp.wm.v1." + b.padId, bWm);
+  fakeIdb.setItem("sc.otp.dur.v1." + b.padId, bWmDur);
   assert.strictEqual((await otpB.unlockPad(b.padId, PASS)).record.recvHighWater, 0,
     "browser: both-restored receive rollback is the documented residual");
 }
@@ -1051,12 +1103,14 @@ console.log("OK  F-ATREST-001: the receive high-water mark has a native floor on
   await otpE.saveNewPad(e, PASS);
   const padSnap = localStorage.getItem("sc.otp.pad.v1." + e.padId);
   const wmSnap = localStorage.getItem("sc.otp.wm.v1." + e.padId);
+  const wmSnapDur = fakeIdb.getItem("sc.otp.dur.v1." + e.padId); // 3b: a coordinated snapshot takes the durable record too
   const u = await otpE.unlockPad(e.padId, PASS);
   assert.strictEqual(u.record.exported, false);
   await otpE.markExported(u.record, u.atRest);
   assert.strictEqual(floors.get("exported:" + e.padId), 1, "the export is recorded natively");
   localStorage.setItem("sc.otp.pad.v1." + e.padId, padSnap);
   localStorage.setItem("sc.otp.wm.v1." + e.padId, wmSnap);
+  fakeIdb.setItem("sc.otp.dur.v1." + e.padId, wmSnapDur);
   assert.strictEqual((await otpE.unlockPad(e.padId, PASS)).record.exported, true,
     "F-ATREST-002: a restored pre-export blob must not re-arm export where a floor exists");
   delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
@@ -1067,10 +1121,12 @@ console.log("OK  F-ATREST-001: the receive high-water mark has a native floor on
   await otpB.saveNewPad(b, PASS);
   const bPad = localStorage.getItem("sc.otp.pad.v1." + b.padId);
   const bWm = localStorage.getItem("sc.otp.wm.v1." + b.padId);
+  const bWmDur = fakeIdb.getItem("sc.otp.dur.v1." + b.padId); // 3b: a coordinated snapshot takes the durable record too
   const ub = await otpB.unlockPad(b.padId, PASS);
   await otpB.markExported(ub.record, ub.atRest);
   localStorage.setItem("sc.otp.pad.v1." + b.padId, bPad);
   localStorage.setItem("sc.otp.wm.v1." + b.padId, bWm);
+  fakeIdb.setItem("sc.otp.dur.v1." + b.padId, bWmDur);
   assert.strictEqual((await otpB.unlockPad(b.padId, PASS)).record.exported, false,
     "browser: the pre-export restore re-arms export — documented residual");
 }
@@ -1142,12 +1198,14 @@ function kotlinFloor(disk, ctl = {}) {
   await o2.saveNewPad(b, PASS);
   const padSnap = localStorage.getItem("sc.otp.pad.v1." + b.padId);
   const wmSnap = localStorage.getItem("sc.otp.wm.v1." + b.padId);
+  const wmSnapDur = fakeIdb.getItem("sc.otp.dur.v1." + b.padId); // 3b: a coordinated snapshot takes the durable record too
   const ub = await o2.unlockPad(b.padId, PASS);
   await o2.exportPad(ub.record, XFER);
   await o2.markExported(ub.record, ub.atRest);
   assert.strictEqual(disk.get("exported:" + b.padId), 1);
   localStorage.setItem("sc.otp.pad.v1." + b.padId, padSnap);
   localStorage.setItem("sc.otp.wm.v1." + b.padId, wmSnap);
+  fakeIdb.setItem("sc.otp.dur.v1." + b.padId, wmSnapDur);
   disk.delete("exported:" + b.padId);
   globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinFloor(disk);
   const o3 = await import("./otp.js?p3=item13-export");
@@ -1182,10 +1240,12 @@ console.log("OK  item 13: deleting the recv: or exported: slot is refused on dev
   await o.savePadProgress(a, aAt);
   await resealInner(a.padId, aAt.key, preFlag);
   const aSnap = [localStorage.getItem("sc.otp.pad.v1." + a.padId), localStorage.getItem("sc.otp.wm.v1." + a.padId)];
+  aSnap.push(fakeIdb.getItem("sc.otp.dur.v1." + a.padId)); // 3b: and the durable record
   a.recvHighWater = 800;
   await o.savePadProgress(a, aAt);
   localStorage.setItem("sc.otp.pad.v1." + a.padId, aSnap[0]);
   localStorage.setItem("sc.otp.wm.v1." + a.padId, aSnap[1]);
+  fakeIdb.setItem("sc.otp.dur.v1." + a.padId, aSnap[2]);
   disk.delete("recv:" + a.padId);
   globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinFloor(disk);
   const o2 = await import("./otp.js?p3r1=older-a");
@@ -1198,10 +1258,12 @@ console.log("OK  item 13: deleting the recv: or exported: slot is refused on dev
   const bAt = await o2.saveNewPad(b, PASS);
   await resealInner(b.padId, bAt.key, preFlag);
   const bSnap = [localStorage.getItem("sc.otp.pad.v1." + b.padId), localStorage.getItem("sc.otp.wm.v1." + b.padId)];
+  bSnap.push(fakeIdb.getItem("sc.otp.dur.v1." + b.padId)); // 3b: and the durable record
   const file = await o2.exportPad(b, XFER);
   await o2.markExported(b, bAt);
   localStorage.setItem("sc.otp.pad.v1." + b.padId, bSnap[0]);
   localStorage.setItem("sc.otp.wm.v1." + b.padId, bSnap[1]);
+  fakeIdb.setItem("sc.otp.dur.v1." + b.padId, bSnap[2]);
   disk.delete("exported:" + b.padId);
   globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinFloor(disk);
   const o3 = await import("./otp.js?p3r1=older-b");
@@ -1235,6 +1297,7 @@ console.log("OK  item 13: deleting the recv: or exported: slot is refused on dev
   await o4.markExported(d, dAt);
   o4.forgetPad(d.padId);
   for (const k of ["used", "wm", "hw"]) localStorage.removeItem(`sc.otp.${k}.v1.${d.padId}`);
+  fakeIdb.removeItem("sc.otp.dur.v1." + d.padId); // 3b: and its durable record (the pre-3b rules)
   assert.strictEqual(disk.get(d.padId), 0, "precondition: the send floor is 0 (nothing sent)");
   assert.strictEqual(disk.get("recv:" + d.padId), 0, "precondition: recv 0");
   assert.ok(file, "fixture");
@@ -1398,6 +1461,7 @@ console.log("OK  7b: out-of-range floor values are refused before the bridge; od
   outer.v = 3;
   localStorage.setItem("sc.otp.pad.v1." + p.padId, JSON.stringify(outer));
   for (const k of ["wm", "used", "hw"]) localStorage.removeItem(`sc.otp.${k}.v1.${p.padId}`);
+  fakeIdb.removeItem("sc.otp.dur.v1." + p.padId); // 3b: and its durable record (the pre-3b rules)
   await assert.rejects(otp.unlockPad(p.padId, PASS), (e) => e.code === "LEGACY_PAD_ADOPTION",
     "F-P7-5: a v2 blob claiming `v: 3` outside the AEAD must still hit the adoption gate, not open at offset 0");
   // …and when the user does adopt it, it is really upgraded (the migration is
@@ -1419,6 +1483,7 @@ console.log("OK  F-P7-5: rewriting the outer `v` cannot skip the pad adoption ga
   await otp.savePadProgress(p, pAt);
   localStorage.setItem("sc.otp.pad.v1." + p.padId, pristine);
   for (const k of ["wm", "used", "hw"]) localStorage.removeItem(`sc.otp.${k}.v1.${p.padId}`);
+  fakeIdb.removeItem("sc.otp.dur.v1." + p.padId); // 3b: and its durable record (the pre-3b rules)
   const REAL = Number.isInteger;
   // Selective, as an attacker would write it: false only for the restored
   // blob's watermark values, so the KDF and region-size checks still pass.
@@ -1475,6 +1540,7 @@ console.log("OK  F-CRYPTO-012: 64 KiB, 256 KiB and 1 MiB pads all generate (chun
   imp.sendOffset = 500;
   await otp.savePadProgress(imp, at);
   for (const k of ["wm", "used", "hw"]) localStorage.removeItem(`sc.otp.${k}.v1.${imp.padId}`);
+  fakeIdb.removeItem("sc.otp.dur.v1." + imp.padId); // 3b: and its durable record (the pre-3b rules)
   const e = await otp.unlockPad(imp.padId, PASS).then(() => null, (x) => x);
   assert.ok(e && /rollback record for this pad is missing/.test(e.message), "fixture: refused");
   assert.doesNotMatch(e.message, /import the same file again/,
@@ -1489,6 +1555,7 @@ console.log("OK  F-CRYPTO-012: 64 KiB, 256 KiB and 1 MiB pads all generate (chun
   const imp2 = await o.importPad(file2, XFER);
   await o.saveNewPad(imp2, PASS);
   localStorage.removeItem("sc.otp.wm.v1." + imp2.padId);
+  fakeIdb.removeItem("sc.otp.dur.v1." + imp2.padId); // 3b: and its durable record (the pre-3b rules)
   const e2 = await o.unlockPad(imp2.padId, PASS).then(() => null, (x) => x);
   assert.ok(e2 && /import the same file again/.test(e2.message), "fix round 2: with a native floor the re-import advice stays");
   o.forgetPad(imp2.padId);
