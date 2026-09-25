@@ -260,6 +260,86 @@ console.log("OK  F-ATREST-005: chat store is tagged, versioned and witnessed; de
 }
 console.log("OK  F-ATREST-005 on device: the chat store has a native floor");
 
+// ---- Package 3 (ROUND-3 F-1 / F-4, A4 F-A1-R1, 7b): chat floor writes checked --
+// Same PadFloor.kt model as contacts.test.mjs: memory before file, a failed
+// commit() answers -3 and latches, out-of-range is -4; `disk` survives restarts.
+{
+  mem.clear();
+  const disk = new Map();
+  let failCommit = null;
+  const kotlinModel = () => {
+    const m = new Map(disk);
+    let latched = false;
+    return {
+      read: (id) => (m.has(id) ? m.get(id) : -1),
+      bump: (id, v) => {
+        if (v < 0 || v > 0x7fffffff) return -4;
+        if (latched) return -3;
+        const cur = m.has(id) ? m.get(id) : -1;
+        const next = cur === -1 ? v : (v > cur ? v : cur);
+        if (next === cur) return cur;
+        m.set(id, next);
+        if (failCommit && failCommit(id, next)) { latched = true; return -3; }
+        disk.set(id, next);
+        return next;
+      },
+    };
+  };
+  const ID = "e".repeat(64);
+  failCommit = () => true;
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinModel();
+  const c1 = await import("./chats.js?p3=arm-fail");
+  await assert.rejects(c1.unlock(PASS, { floorId: ID }), (e) => e.code === "FLOOR_WRITE_FAILED",
+    "F-4: a chat-store floor write that did not commit fails the save");
+  assert.ok(!c1.isUnlocked());
+  assert.strictEqual(localStorage.getItem("sc.chats.v1"), null,
+    "F-A1-R1: no blob claims a floor whose slot never landed");
+  failCommit = null;
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinModel();
+  const c2 = await import("./chats.js?p3=arm-restart");
+  assert.deepStrictEqual(await c2.unlock(PASS, { floorId: ID }), { created: true },
+    "F-A1-R1: the restart is a clean first run, not a DELETED alarm or a brick");
+  // Armed at 0 but the blob write failed (quota): a first run, not DELETED.
+  {
+    const IDQ = "9".repeat(64);
+    const realSet = localStorage.setItem;
+    const saved = new Map(mem);
+    mem.clear();
+    localStorage.setItem = (k, v) => { if (k === "sc.chats.v1") throw new Error("QuotaExceededError"); return realSet(k, v); };
+    const cq = await import("./chats.js?p3=quota");
+    try {
+      await assert.rejects(cq.unlock(PASS, { floorId: IDQ }), /QuotaExceededError/);
+    } finally {
+      localStorage.setItem = realSet;
+    }
+    assert.strictEqual(disk.get("chats:" + IDQ), 0, "precondition: armed at 0");
+    assert.deepStrictEqual(await cq.unlock(PASS, { floorId: IDQ }), { created: true },
+      "F-A1-R1: an armed-but-never-saved chat floor (0) is a first run, not a DELETED alarm");
+    cq.lock();
+    mem.clear();
+    for (const [k, v] of saved) mem.set(k, v);
+  }
+  await c2.ensure("bob");
+  failCommit = () => true;
+  await assert.rejects(c2.markSeen("bob", "env-p3"), (e) => e.code === "FLOOR_WRITE_FAILED",
+    "F-1/F-4: a chat save whose floor did not advance is reported as failed");
+  assert.ok(!c2.isUnlocked(), "…and the chat store locks");
+  failCommit = null;
+  // 7b: the ceiling is a loud refusal before anything is written.
+  mem.clear();
+  const ID2 = "f".repeat(64);
+  disk.set("chats:" + ID2, 0x7fffffff);
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinModel();
+  const c3 = await import("./chats.js?p3=ceiling");
+  await assert.rejects(c3.unlock(PASS, { floorId: ID2, adoptDeleted: true }),
+    (e) => e.code === "FLOOR_WRITE_FAILED" && /highest generation/.test(e.message),
+    "7b: the chat store refuses to advance past the ceiling, loudly");
+  assert.strictEqual(localStorage.getItem("sc.chats.v1"), null);
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+  mem.clear();
+}
+console.log("OK  Package 3: chat-store floor writes are checked; first-save failure is not a brick; int32 ceiling is loud");
+
 // ---- second fix round (re-review of 9a38d97, I-1): a planted, unparseable ----
 // store is refused with a fixed sentence — never the SyntaxError, which
 // echoes ~20 characters of the planted value (a newline, U+202E) into the

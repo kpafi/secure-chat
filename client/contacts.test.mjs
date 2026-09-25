@@ -123,23 +123,57 @@ console.log("OK  H-01: pins cover all four keys");
 
 // v2→v3 migration: a verified contact WITH encryption keys was verified
 // against a signing-only fingerprint — the mark must be dropped on unlock.
-// (The version byte lives in the outer plaintext wrapper, so rewriting it
-// simulates a pre-fix blob; the encrypted payload is unchanged.)
+//
+// Package 3, F-ATREST-006: this test used to SIMULATE a pre-fix blob by
+// rewriting the outer `v` byte to 2 — i.e. it asserted the bug: plaintext
+// outside the AEAD decided the migration. The migration is now keyed on the
+// authenticated shape (an untagged store), so both directions are pinned: a
+// current store whose outer byte is rewritten keeps its genuine verifications,
+// and a genuinely pre-tag store cannot skip the migration by claiming `v: 3`.
+async function sealLegacyStore(inner, outerV) {
+  const outer = JSON.parse(localStorage.getItem("sc.contacts.v1"));
+  const te = new TextEncoder();
+  const u8 = (b64s) => Uint8Array.from(Buffer.from(b64s, "base64"));
+  const toB64 = (u) => Buffer.from(u).toString("base64");
+  const base = await crypto.subtle.importKey("raw", te.encode(PASS), "PBKDF2", false, ["deriveKey"]);
+  const key = await crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt: u8(outer.salt), iterations: 600000, hash: "SHA-256" },
+    base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"],
+  );
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, te.encode(JSON.stringify(inner))));
+  localStorage.setItem("sc.contacts.v1", JSON.stringify({ v: outerV, iters: 600000, salt: outer.salt, iv: toB64(iv), ct: toB64(ct) }));
+}
 {
   const outer = JSON.parse(localStorage.getItem("sc.contacts.v1"));
   assert.strictEqual(outer.v, 4, "store persists as v4 now (L-1 generation counter)");
+  // (1) The outer byte rewritten on a CURRENT store: nothing inside the AEAD
+  // says it predates the four-key fingerprint, so carol's verification stands.
   outer.v = 2;
   localStorage.setItem("sc.contacts.v1", JSON.stringify(outer));
   contacts.lock();
   await contacts.unlock(PASS);
-  assert.strictEqual(contacts.get("carol").verified, false, "v2 verified+enc-keys downgraded");
+  assert.strictEqual(contacts.get("carol").verified, true,
+    "F-ATREST-006: rewriting the plaintext `v` of a current store must not drop genuine verifications");
+  assert.ok(!contacts.get("carol").reverify);
+
+  // (2) A genuinely pre-tag store (no `d`, no `gen` inside the AEAD) whose outer
+  // byte CLAIMS v3. Before the fix `(blob.v || 1) < 3` was false, so the
+  // signing-only mark survived the upgrade.
+  const carol = contacts.get("carol");
+  await sealLegacyStore({ contacts: [{ ...carol, verified: true }], pins: {} }, 3);
+  localStorage.removeItem("sc.contacts.gen.v1");
+  contacts.lock();
+  await contacts.unlock(PASS, { adoptLegacy: true });
+  assert.strictEqual(contacts.get("carol").verified, false,
+    "F-ATREST-006: a pre-tag store cannot skip the H-01 migration by writing `v: 3` outside the AEAD");
   assert.ok(contacts.get("carol").reverify, "downgrade flagged for the UI");
   assert.strictEqual(JSON.parse(localStorage.getItem("sc.contacts.v1")).v, 4, "re-persisted as v4");
   // Re-verifying clears the flag.
   await contacts.setVerified("carol", true);
   assert.ok(!contacts.get("carol").reverify, "fresh verification clears the reverify flag");
 }
-console.log("OK  H-01: v2→v3 migration downgrades signing-only verifications");
+console.log("OK  H-01 / F-ATREST-006: the v2→v3 migration is keyed inside the AEAD, not on the outer byte");
 
 // Audit 2026-07-18 L-01: the iteration count in the (plaintext) outer wrapper
 // is bounded before PBKDF2 runs — a planted blob with a huge count must not
@@ -508,6 +542,43 @@ console.log("OK  F-PROTO-005: a vouch result for superseded keys is discarded; t
 }
 console.log("OK  F-ATREST-007: Unverify and Remove revoke the pin (kept for change detection)");
 
+// ---- Package 3, F-ATREST-007 / 2026-08-08 item 17: the room: pins too --------
+// A session started from a room code pins the peer under `room:<id>`; those
+// pins were never revoked, so a revoked peer re-entering a remembered room
+// auto-unlocked on "matches your saved pin". (app-behaviour.test.mjs drives
+// that end to end; this pins the store's half.)
+{
+  localStorage.clear();
+  await contacts.unlock(PASS);
+  const dan = { ed: "REVEDA==", mldsa: "REVMLA==", ecdh: "REVECA==", mlkem: "REVKMA==" };
+  const eve = { ed: "OTHEDA==", mldsa: "OTHMLA==" };
+  await contacts.upsert({ username: "dan", token: "t", ...dan, verified: true });
+  await contacts.savePin("room:" + "1".repeat(64), dan);
+  // Same SIGNING identity, pinned before the encryption keys were: still dan.
+  await contacts.savePin("room:" + "2".repeat(64), { ed: dan.ed, mldsa: dan.mldsa });
+  await contacts.savePin("room:" + "3".repeat(64), eve);           // somebody else
+  await contacts.savePin("user:dan", dan);
+  await contacts.setVerified("dan", false);
+  assert.strictEqual(contacts.getPin("room:" + "1".repeat(64)).revoked, true,
+    "item 17: Unverify revokes a room: pin under the contact's identity");
+  assert.strictEqual(contacts.getPin("room:" + "2".repeat(64)).revoked, true,
+    "item 17: …including one made before the encryption keys were pinned (same signing keys)");
+  assert.strictEqual(contacts.getPin("room:" + "3".repeat(64)).revoked, undefined,
+    "item 17: another identity's room pin is untouched");
+  assert.strictEqual(contacts.getPin("room:" + "1".repeat(64)).ed, dan.ed, "the keys stay for change detection");
+
+  // Remove does the same, from the record as it was before removal.
+  await contacts.savePin("room:" + "1".repeat(64), dan);   // re-verified in that room
+  await contacts.setVerified("dan", true);
+  await contacts.remove("dan");
+  assert.strictEqual(contacts.getPin("room:" + "1".repeat(64)).revoked, true, "item 17: Remove revokes room: pins too");
+  assert.strictEqual(contacts.getPin("room:" + "3".repeat(64)).revoked, undefined);
+  contacts.lock();
+  await contacts.unlock(PASS);
+  assert.strictEqual(contacts.getPin("room:" + "1".repeat(64)).revoked, true, "…and it is persisted");
+}
+console.log("OK  item 17: Unverify / Remove revoke every room: pin under the contact's signing identity");
+
 // ---- Pentest 2026-08-07 F-ATREST-003/004: the native floor, where it exists --
 // A second module instance captures the bridge at load, exactly as on the
 // device (the app injects it at document-start, before any module runs).
@@ -614,6 +685,119 @@ console.log("OK  F-ATREST-007: Unverify and Remove revoke the pin (kept for chan
     "browser: both deleted opens as a fresh store (documented residual; app.js warns on `created`)");
 }
 console.log("OK  F-ATREST-003/004: on device the contact store fails closed; browser residual pinned");
+
+// ---- Package 3 (ROUND-3 F-1 / F-4, A4 F-A1-R1, 7b): floor writes are CHECKED --
+// The bridge below models PadFloor.kt as fixed: SharedPreferences updates its
+// in-memory map before the file, a failed commit() is answered COMMIT_FAILED
+// (-3) and latched for the process, and a value outside 0..2^31-1 is INVALID
+// (-4). `disk` is what survives a restart. Before the fix every store threw
+// the bump's answer away.
+{
+  localStorage.clear();
+  const disk = new Map();
+  let failCommit = null; // (id, value) => true: that commit() returns false
+  const kotlinModel = () => {
+    const mem = new Map(disk);
+    let latched = false;
+    return {
+      read: (id) => (mem.has(id) ? mem.get(id) : -1),
+      bump: (id, v) => {
+        if (v < 0 || v > 0x7fffffff) return -4;
+        if (latched) return -3;
+        const cur = mem.has(id) ? mem.get(id) : -1;
+        const next = cur === -1 ? v : (v > cur ? v : cur);
+        if (next === cur) return cur;
+        mem.set(id, next);
+        if (failCommit && failCommit(id, next)) { latched = true; return -3; }
+        disk.set(id, next);
+        return next;
+      },
+    };
+  };
+  const ID = "c".repeat(64);
+
+  // (1) A first save whose floor write does not commit. Before: the blob was
+  // sealed CLAIMING a floor, the failure was discarded, the unlock "succeeded",
+  // and after a restart the missing slot read as a deletion — refused with no
+  // override. Now: the save fails, nothing is sealed, the restart is a clean
+  // first run.
+  failCommit = () => true;
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinModel();
+  const c1 = await import("./contacts.js?p3=arm-fail");
+  await assert.rejects(c1.unlock(PASS, { floorId: ID }),
+    (e) => e.code === "FLOOR_WRITE_FAILED" && /storage full or not writable/.test(e.message),
+    "F-4: a floor write that did not commit fails the save, loudly");
+  assert.ok(!c1.isUnlocked(), "…and leaves the store locked, not open over unsaved state");
+  assert.strictEqual(localStorage.getItem("sc.contacts.v1"), null,
+    "F-A1-R1: nothing claiming a floor is sealed before the floor slot provably exists");
+  failCommit = null;
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinModel(); // restart: only `disk` survives
+  const c2 = await import("./contacts.js?p3=arm-restart");
+  assert.deepStrictEqual(await c2.unlock(PASS, { floorId: ID }), { created: true },
+    "F-A1-R1: after a restart it is an ordinary first run — no DELETED alarm, no brick");
+
+  // (1b) The arm lands but the BLOB write fails (storage quota). The slot is
+  // now at 0 with nothing stored: "armed, never saved", which must read as a
+  // first run — not as "your saved contacts (generation 0) have been DELETED".
+  {
+    const IDQ = "9".repeat(64);
+    localStorage.clear();
+    const realSet = localStorage.setItem;
+    localStorage.setItem = (k, v) => { if (k === "sc.contacts.v1") throw new Error("QuotaExceededError"); return realSet(k, v); };
+    const cq = await import("./contacts.js?p3=quota");
+    try {
+      await assert.rejects(cq.unlock(PASS, { floorId: IDQ }), /QuotaExceededError/);
+    } finally {
+      localStorage.setItem = realSet;
+    }
+    assert.strictEqual(disk.get("contacts:" + IDQ), 0, "precondition: the slot was armed at 0 before the write");
+    assert.deepStrictEqual(await cq.unlock(PASS, { floorId: IDQ }), { created: true },
+      "F-A1-R1: an armed-but-never-saved floor (0) is a first run, not a DELETED alarm");
+    // …and a genuinely pre-L-1 store next to such a floor gets the adoption
+    // prompt (a choice), not the no-override "had one" refusal.
+    cq.lock();
+    await sealLegacyStore({ contacts: [], pins: {} }, 3);
+    localStorage.removeItem("sc.contacts.gen.v1");
+    disk.set("contacts:" + "8".repeat(64), 0);
+    globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinModel();
+    const cl = await import("./contacts.js?p3=legacy-zero");
+    await assert.rejects(cl.unlock(PASS, { floorId: "8".repeat(64) }), (e) => e.code === "LEGACY_CONTACTS_ADOPTION",
+      "F-A1-R1: a floor of 0 does not prove a post-fix store existed");
+    localStorage.clear();
+  }
+
+  // (2) An established store whose advance does not commit: the save fails and
+  // the store locks (its in-memory state is ahead of what is protected).
+  await c2.savePin("user:fay", { ed: "FED==", mldsa: "FML==" });
+  assert.strictEqual(disk.get("contacts:" + ID), 2, "precondition: the floor follows the generation");
+  failCommit = () => true;
+  await assert.rejects(c2.savePin("user:gus", { ed: "GED==", mldsa: "GML==" }),
+    (e) => e.code === "FLOOR_WRITE_FAILED",
+    "F-1/F-4: a save whose floor did not advance is reported as FAILED, not done");
+  assert.ok(!c2.isUnlocked(), "…and the store is locked");
+  failCommit = null;
+
+  // (3) 7b: a floor parked at the int32 ceiling (a page-realm bump, or a store
+  // that got there) and the user's Forget-then-start-over. The recreated store
+  // continues from the floor, so its next generation is 2^31. Before: sealed at
+  // 2^31, `bump(id, v | 0)` went NEGATIVE, the bridge ignored it, and the floor
+  // froze while the store kept counting — every later rollback undetected, all
+  // silently. Now: a loud refusal, and nothing is written.
+  localStorage.clear();
+  const ID2 = "d".repeat(64);
+  disk.set("contacts:" + ID2, 0x7fffffff);
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinModel();
+  const c3 = await import("./contacts.js?p3=ceiling");
+  await assert.rejects(c3.unlock(PASS, { floorId: ID2 }), (e) => e.code === "DELETED_CONTACTS_ADOPTION");
+  await assert.rejects(c3.unlock(PASS, { floorId: ID2, adoptDeleted: true }),
+    (e) => e.code === "FLOOR_WRITE_FAILED" && /highest generation/.test(e.message),
+    "7b: a store must refuse to advance past the floor's ceiling, loudly");
+  assert.strictEqual(localStorage.getItem("sc.contacts.v1"), null, "7b: …before anything is written");
+  assert.strictEqual(disk.get("contacts:" + ID2), 0x7fffffff);
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+  localStorage.clear();
+}
+console.log("OK  Package 3: contact-store floor writes are checked; first-save failure is not a brick; int32 ceiling is loud");
 
 // ---- second fix round (re-review of 9a38d97, I-1): a planted, unparseable ----
 // store is refused with a fixed sentence — never the SyntaxError, which

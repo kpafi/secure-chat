@@ -79,6 +79,34 @@ object PadFloor {
     /** Present but the MAC did not verify: forged or corrupted. Fails closed. */
     const val TAMPERED = -2L
 
+    /**
+     * Package 3 (ROUND-3 F-4): [bump]'s answer when `SharedPreferences.commit()`
+     * returned false, i.e. the new value did NOT reach disk. Must match
+     * NATIVE_COMMIT_FAILED in client/nativefloor.js.
+     */
+    const val COMMIT_FAILED = -3L
+
+    /**
+     * Package 3 (7b): [bump]'s answer for a value outside `0..MAX_VALUE`. Must
+     * match NATIVE_INVALID in client/nativefloor.js.
+     */
+    const val INVALID = -4L
+
+    /**
+     * The highest value a floor may hold: the int32 range the JS side can
+     * validate without a poisonable global (`(v | 0) === v`). Must match
+     * FLOOR_MAX in client/nativefloor.js.
+     */
+    const val MAX_VALUE = 0x7fffffffL
+
+    /**
+     * Latched by the first failed `commit()` of this process. See [bump]: after a
+     * failed commit the in-memory map is ahead of the file, so no later answer
+     * from this object can be trusted to describe what a restart will see.
+     */
+    @Volatile
+    private var commitFailed = false
+
     private fun prefs(ctx: Context) = ctx.getSharedPreferences(FILE, Context.MODE_PRIVATE)
 
     /**
@@ -130,15 +158,41 @@ object PadFloor {
      * Raise the floor to [value] if it is higher. Never lowers. Returns the floor
      * in force afterwards, or [TAMPERED] if the stored one did not verify (in
      * which case nothing is written — a forged record must not be healed into a
-     * valid one by the next legitimate save).
+     * valid one by the next legitimate save), [INVALID] for a value outside
+     * `0..MAX_VALUE`, or [COMMIT_FAILED] if the new value did not reach disk.
+     *
+     * Package 3 (7b int32 ceiling). A negative [value] used to be answered with
+     * the current floor, as if it were a harmless no-op. The JS side passed
+     * `v | 0`, so a generation of 2^31 arrived here NEGATIVE and was silently
+     * dropped: the floor froze at its last value while the store went on
+     * counting, and every later rollback was undetectable. Now it is a refusal,
+     * which the JS side turns into a failed save.
+     *
+     * Package 3 (ROUND-3 F-4). `commit()` returns false when the write did not
+     * reach disk, and that boolean used to be DISCARDED — `next` came back as if
+     * it had been stored. The JS side then sealed a blob claiming the floor, and
+     * after a restart the floor was absent or behind: a pad refused as
+     * "deleted", a contact store locked with no override. The answer is now
+     * [COMMIT_FAILED]. It is also LATCHED for the rest of the process:
+     * SharedPreferences applies an edit to its in-memory map before writing the
+     * file and does not undo that on failure, so after one failed commit [read]
+     * reports values a restart will not see. A second bump of the same value
+     * would find `next == current` and return success without writing anything
+     * — the exact false claim this fixes. Until the app restarts, every bump
+     * fails and every save that depends on one fails loudly.
      */
     fun bump(ctx: Context, padId: String, value: Long): Long {
-        if (value < 0) return read(ctx, padId)
+        if (value < 0 || value > MAX_VALUE) return INVALID
+        if (commitFailed) return COMMIT_FAILED
         val current = read(ctx, padId)
         if (current == TAMPERED) return TAMPERED
         val next = if (current == ABSENT) value else maxOf(current, value)
         if (next == current) return current
-        prefs(ctx).edit().putString(padId, "$next:${tag(padId, next)}").commit()
+        val committed = prefs(ctx).edit().putString(padId, "$next:${tag(padId, next)}").commit()
+        if (!committed) {
+            commitFailed = true
+            return COMMIT_FAILED
+        }
         return next
     }
 

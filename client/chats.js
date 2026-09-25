@@ -43,7 +43,9 @@ const LS_CHATS_GEN = "sc.chats.gen.v1";
 const CHATS_DOMAIN = "secure-chat/chats-store/v2";
 const CHATS_GEN_DOMAIN = "secure-chat/chats-generation/v1";
 const EPOCH_KEY = "sc.chats.epoch.v1";
-import { captureNativeFloor, NATIVE_ABSENT, NATIVE_TAMPERED, floorUnavailableError } from "./nativefloor.js";
+import {
+  captureNativeFloor, NATIVE_ABSENT, NATIVE_TAMPERED, floorUnavailableError, bumpFloor, FLOOR_MAX,
+} from "./nativefloor.js";
 const nativeFloor = captureNativeFloor();
 const KDF_ITERS = 600000;
 const MAX_MESSAGES_PER_CHAT = 500; // keep the newest; bound the blob size
@@ -186,7 +188,10 @@ export async function unlock(passphrase, opts = {}) {
   const raw = localStorage.getItem(LS_CHATS);
   if (!raw) {
     const w = await readWitness(passphrase);
-    if (w !== null || floor > NATIVE_ABSENT) {
+    // Package 3: `floor > 0` — a floor of 0 is a slot persist() armed for a
+    // first save that never completed; it is not evidence of a store (see
+    // contacts.js, same branch).
+    if (w !== null || floor > 0) {
       // A store existed here (witness, or on Android the floor) and is gone:
       // the replay ring and negotiated modes with it. Explicit choice, never a
       // silent fresh start — the same rule as the contact store.
@@ -281,7 +286,8 @@ export async function unlock(passphrase, opts = {}) {
     // Pre-v2 blob (no witness, or it would have been refused above). On a
     // device that has run this code before, that is a restore; adoption is
     // the user's call. On a fresh upgrade it is simply the old format.
-    if (floor > NATIVE_ABSENT) {
+    // (`> 0`: an armed-but-never-saved slot proves nothing — Package 3.)
+    if (floor > 0) {
       lock();
       throw new Error("your chat history has no rollback record but this device says it had one — an earlier copy has been restored; refusing to open it");
     }
@@ -333,10 +339,27 @@ async function persist() {
   // the note at the top of the file.
   const w = await readWitness();
   if (w && !w.corrupt && w.gen > generation) generation = w.gen;
+  // Package 3 (ROUND-3 F-1 / F-4, A4 F-A1-R1, 7b): the same arm-check-claim
+  // order as contacts.js persist() — the slot must provably exist before the
+  // blob claims it, the advance below is checked, a failed floor write locks
+  // the store, and the int32 ceiling is a loud refusal rather than a freeze.
+  const floored = !!(nativeFloor && floorKey);
+  if (floored) {
+    if (generation >= FLOOR_MAX) {
+      lock();
+      const err = new Error(
+        "your chat history has reached the highest generation this device's rollback record can hold — " +
+        "refusing to save further changes, because they could no longer be protected against rollback",
+      );
+      err.code = "FLOOR_WRITE_FAILED";
+      throw err;
+    }
+    armOrLock(generation);
+  }
   generation += 1;
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const plain = enc.encode(JSON.stringify({
-    d: CHATS_DOMAIN, chats, gen: generation, nativeFloor: !!(nativeFloor && floorKey),
+    d: CHATS_DOMAIN, chats, gen: generation, nativeFloor: floored,
   }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, dataKey, plain));
   localStorage.setItem(
@@ -344,8 +367,19 @@ async function persist() {
     JSON.stringify({ v: 2, iters: KDF_ITERS, salt: b64(salt), iv: b64(iv), ct: b64(ct) }),
   );
   await writeWitness();
-  if (nativeFloor && floorKey) nativeFloor.bump(floorKey, generation);
+  if (floored) armOrLock(generation);
   localStorage.setItem(EPOCH_KEY, "1");
+}
+
+// bumpFloor, plus: a floor write that failed locks the store (see contacts.js
+// armOrLock for why — the in-memory state is ahead of what is protected).
+function armOrLock(value) {
+  try {
+    bumpFloor(nativeFloor, floorKey, value, "your chat history");
+  } catch (e) {
+    lock();
+    throw e;
+  }
 }
 
 export function wipe() {

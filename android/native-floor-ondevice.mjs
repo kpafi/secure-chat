@@ -202,6 +202,22 @@ check(bare64 === -1, "the bare 64-hex id is untouched by contacts:/chats: bumps"
 const cross = await evaluate(`window.__SECURE_CHAT_PAD_FLOOR__.read(${JSON.stringify("recv:" + hex64)})`);
 check(cross === -1, "recv:<64 hex> is a different key from contacts:/chats:<64 hex>", `read() = ${cross}`);
 
+// Package 3 (7b int32 ceiling): the raw Kotlin bump refuses a value outside
+// 0..2^31-1 with INVALID (-4) instead of answering the current floor (which
+// made `2**31 | 0` a silent no-op that froze the floor). Probed on the RAW
+// bridge object via the frozen copy's bound method, with a fresh namespaced id
+// so nothing real is touched. COMMIT_FAILED (-3) cannot be provoked from here
+// without filling the disk; it is pinned at source (android-source.test.mjs).
+{
+  const j = JSON.stringify("recv:" + randomBytes(16).toString("hex"));
+  const neg = await evaluate(`window.__SECURE_CHAT_PAD_FLOOR__.bump(${j}, -1)`);
+  check(neg === -4, "bump(-1) is refused with INVALID (-4), not answered as a no-op", `= ${neg}`);
+  const big = await evaluate(`window.__SECURE_CHAT_PAD_FLOOR__.bump(${j}, 2147483648)`);
+  check(big === -4, "bump(2^31) is refused with INVALID (-4)", `= ${big}`);
+  const top = await evaluate(`window.__SECURE_CHAT_PAD_FLOOR__.bump(${j}, 2147483647)`);
+  check(top === 2147483647, "bump(2^31-1) is the highest accepted value", `= ${top}`);
+}
+
 console.log("\n--- cleanup ---");
 // There is deliberately no lowering operation, so the probe's floor cannot be
 // removed from JS. It is namespaced to a padId no real pad can have, which is
