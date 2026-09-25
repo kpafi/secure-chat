@@ -255,6 +255,17 @@ const retiredSockets = new WeakSet();
 // starts to be built; handleMessage captures it with the socket and re-checks
 // both after every await (sessionLive), and sends on the captured socket.
 let sessionGen = 0;
+// Fix round 3 (review of d0c4074, M-1). sessionGen deliberately does NOT move
+// on a relay close — frames the relay sent just before hanging up are still
+// handled (e2e/hostile-relay.mjs sections 6 and 8). But the verification GATE
+// must never be drawn, or acted on, for a connection that is gone: in Firefox
+// the safety-number digest resolves on a later task, so a gate for Bob could be
+// drawn after the close, survive into the next session, and "It matches" then
+// pinned whatever peer that session held (a relay-routed Mallory). gateGen
+// moves on EVERY close and every new session; gateFor is the one bundle (and
+// generation) the gate on screen was drawn for, and onVerifyOk pins only that.
+let gateGen = 0;
+let gateFor = null; // { bundle, gen } of the gate on screen, or null
 function sessionLive(sock, gen) {
   return sock === ws && gen === sessionGen && !retiredSockets.has(sock);
 }
@@ -2639,6 +2650,11 @@ async function connectInner() {
   // queued may reach the cipher and nonces this call is about to replace.
   if (ws) retiredSockets.add(ws);
   sessionGen += 1; // L-2: anything still suspended in the old session is stale from here on
+  // M-1: no gate of an earlier connection survives into this one.
+  gateGen += 1;
+  gateFor = null;
+  currentPinKey = null;
+  els.verify.hidden = true;
   const room = roomCode();
   const alg = algValue();
   if (!ROOM_RE.test(room)) {
@@ -2782,6 +2798,8 @@ async function connectInner() {
   };
 
   ws.onclose = () => {
+    gateGen += 1; // M-1: a gate still being computed for this connection is never drawn
+    gateFor = null;
     setStatus("disconnected", "err");
     if (joined) addLine("sys", "", "disconnected", true);
     joined = false;
@@ -3180,6 +3198,11 @@ const keyConfirm = makeKeyConfirmation({
 });
 
 async function onChannelReady(room) {
+  // Fix round 3: a handler still in flight when the relay hung up must not
+  // start key confirmation for the dead connection — onclose has just reset
+  // keyConfirm, and onChains would re-arm its 15 s deadline, whose failure
+  // later overwrote the room screen's close reason.
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
   currentRoom = room;
   await keyConfirm.onChains(cipher.confirmation);
 }
@@ -3641,10 +3664,14 @@ async function enterVerification(room, verifiedBundle) {
   // Use the bundle passed from the pinned first handshake — never re-read a
   // mutable global that a later frame might have changed (C-01).
   const bundle = verifiedBundle || peerBundle;
-  const gen = sessionGen; // L-2: the gate is drawn only for the session that asked
+  // M-1: only for a connection that is still open, and only if it is still the
+  // same one after every await (gateGen moves on every close and new session).
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const gen = gateGen;
   const sn = await Identity.safetyNumber(myBundle, bundle);
   const peerFp = await Identity.fingerprintOf(bundle);
-  if (gen !== sessionGen) return;
+  if (gen !== gateGen) return;
+  gateFor = { bundle, gen }; // what "It matches" may pin — this and nothing else
   els.safetyNumber.textContent = sn;
   els.peerFingerprint.textContent = "Contact fingerprint: " + peerFp;
   currentPinKey = expectedPeerName ? contacts.pinKeyFor(expectedPeerName) : "room:" + room;
@@ -3684,7 +3711,7 @@ async function enterVerification(room, verifiedBundle) {
   }
 
   const pin = await getPin(currentPinKey);
-  if (gen !== sessionGen) return;
+  if (gen !== gateGen) return; // M-1 (Low variant): no unlockMessaging() after the close
   if (sameBundle(pin, bundle) && !pin.revoked) {
     // Seen and verified before — accept without re-prompting.
     addLine("sys", "", expectedPeerName
@@ -3761,13 +3788,25 @@ function unlockMessaging() {
 }
 
 async function onVerifyOk() {
-  if (!peerBundle || !currentPinKey) return;
+  // M-1: pin exactly the bundle the gate on screen was drawn for, in the same
+  // live connection, and only while it is still this connection's peer.
+  // Anything else is refused out loud — never pinned.
+  const g = gateFor;
+  if (!g || g.gen !== gateGen || !ws || ws.readyState !== WebSocket.OPEN || !currentPinKey ||
+      !peerBundle || !sameBundle(g.bundle, peerBundle)) {
+    gateFor = null;
+    els.verify.hidden = true;
+    addLine("sys", "", "[the safety number on screen did not belong to this connection — nothing was pinned]", true);
+    hint("That safety number belonged to an earlier connection. Nothing was pinned — reconnect and compare again.", true);
+    return;
+  }
+  const verifiedPeer = g.bundle;
   // P-02: savePin now rejects when the store is locked. The user's in-person
   // check still holds for THIS session, so messaging is allowed — but say
   // plainly that it was not remembered, or they would expect a change warning
   // next time that can never come.
   try {
-    await savePin(currentPinKey, peerBundle);
+    await savePin(currentPinKey, verifiedPeer);
   } catch (e) {
     addLine("sys", "", "[verified for this session only — the pin could NOT be saved: " + e.message + "]", true);
   }
@@ -3779,11 +3818,13 @@ async function onVerifyOk() {
     const parsed = account.parseHandle(els.contact.value.trim());
     await contacts.upsert({
       username: expectedPeerName, token: parsed ? parsed.token : null,
-      ed: peerBundle.ed, mldsa: peerBundle.mldsa,
-      ecdh: peerBundle.ecdh || null, mlkem: peerBundle.mlkem || null,
+      ed: verifiedPeer.ed, mldsa: verifiedPeer.mldsa,
+      ecdh: verifiedPeer.ecdh || null, mlkem: verifiedPeer.mlkem || null,
       verified: true,
     }).catch(() => { /* contact mirroring must never block messaging */ });
   }
+  if (g.gen !== gateGen) return; // closed while the pin was being written: no unlock for a dead connection
+  gateFor = null;
   addLine("sys", "", "contact verified and pinned", true);
   unlockMessaging();
 }

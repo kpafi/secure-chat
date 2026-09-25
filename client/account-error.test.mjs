@@ -175,12 +175,14 @@ try {
     const e4 = await unvouch(jb, "t", "bob").catch((x) => x);
     eq(e4.message, "unvouch failed: the directory returned a malformed answer");
     const e5 = await register(jb, fakeId, "alice").catch((x) => x);
-    eq(e5.message, "registration failed: the directory returned a malformed answer");
-    const e6 = await sendMail(jb, "bob#tok", "env").catch((x) => x);
-    eq(e6.message, "send failed: the directory returned a malformed answer");
+    // Fix round 3 (Info): no doubled prefix — app.js says "Registration failed: ".
+    eq(e5.message, "the directory returned a malformed answer");
+    // Fix round 3 (Info): a 200 means the relay QUEUED the envelope; failing it
+    // over the answer's body made the sender drop it from their own history.
+    eq(await sendMail(jb, "bob#tok", "env"), true);
     const e7 = await fetchVouches(jb, "bob#tok").catch((x) => x);
     eq(e7.message, "vouch lookup failed: the directory returned a malformed answer");
-    for (const e of [e1, e2, e3, e4, e5, e6, e7]) { assert.ok(clean(e), e && e.message); n++; }
+    for (const e of [e1, e2, e3, e4, e5, e7]) { assert.ok(clean(e), e && e.message); n++; }
   } finally {
     js.close();
   }
@@ -197,6 +199,31 @@ try {
     eq(e.message, "verify failed: the directory returned a malformed answer");
   } finally {
     vs.close();
+  }
+}
+
+// ---- fix round 3, L-1: a body that never finishes is "no answer", not "malformed" --
+// The reviewer's PoC: a 200 with a partial body, then a stall past the vouch's
+// AbortSignal.timeout. The contact sheet says "may still have been published"
+// only for AbortError / TimeoutError / TypeError; okJson used to turn every
+// body-read failure into a plain Error, so the user was told "Could not
+// publish" about a vouch the relay had stored.
+{
+  const stall = createServer((req, res) => {
+    req.resume();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.write('{"status":'); // headers + a partial body, then nothing
+  });
+  await new Promise((r) => stall.listen(0, "127.0.0.1", r));
+  try {
+    const fakeId = { publicBundle: () => ({ ed: "", mldsa: "" }), sign: async () => ({ ed: "", mldsa: "" }) };
+    const e = await vouch("http://127.0.0.1:" + stall.address().port, fakeId, "t", "bob", { ed: "", mldsa: "" },
+      AbortSignal.timeout(400)).catch((x) => x);
+    assert.ok(e && (e.name === "TimeoutError" || e.name === "AbortError" || e instanceof TypeError),
+      `L-1: a stalled 200 body surfaces as no-answer (${e && e.name}: ${e && e.message}), so the caller says "may still have been published"`); n++;
+  } finally {
+    stall.closeAllConnections();
+    stall.close();
   }
 }
 console.log(`account-error: ${n} assertions OK`);

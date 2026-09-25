@@ -20,7 +20,7 @@ import { readFileSync } from "node:fs";
 import { installDom, El } from "./dom-stub.test.mjs";
 import { makeCipher, bufToB64, b64ToBuf } from "./crypto.js";
 import { Identity, b64, unb64 } from "./identity.js";
-import { freshNonce, signHandshake } from "./auth.js";
+import { freshNonce, signHandshake, signKnock } from "./auth.js";
 import * as sealed from "./sealed.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -566,6 +566,273 @@ const SAFE_HINT = /^[\x20-\x7e\u2014\u2013\u2026\u00d7\u2713\u201c\u201d\u2018\u
     "L-2: ...and reaches key confirmation");
   await dom.el("disconnect").click();
   console.log("OK  fix round L-2: a handshake suspended across a reconnect never resumes into the new session (executed)");
+}
+
+// ==== fix round 3 (review of d0c4074) ===========================================
+// Hold the next crypto.subtle[name] call that matches `pred` until released
+// (optionally failing it then) — to suspend a handler exactly at one await.
+function holdSubtle(name, pred = () => true, fail = false) {
+  const subtle = crypto.subtle;
+  const orig = subtle[name];
+  let release;
+  let entered = false;
+  const gate = new Promise((r) => { release = r; });
+  subtle[name] = function (...a) {
+    if (!pred(...a)) return orig.apply(this, a);
+    entered = true;
+    subtle[name] = orig;
+    return gate.then(() => (fail ? Promise.reject(new Error("held operation failed")) : orig.apply(this, a)));
+  };
+  return { release: () => release(), entered: () => entered, restore: () => { subtle[name] = orig; } };
+}
+const algName = (a) => (typeof a === "string" ? a : a && a.name);
+const settle = async (n = 60) => { for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 5)); };
+async function handshakeToConfirm(peer) {
+  const { ws, nonces } = await guestAwaitingHandshake("DHKE");
+  const pc = makeCipher("DHKE", ROOM);
+  await pc.init();
+  const pub = await pc.handshakePayload();
+  const sig = await signHandshake(peer, ROOM, nonces, pub);
+  await ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub, reply: false, idb: peer.publicBundle(), sig }) });
+  await drain(ws);
+  const answer = ws.sent.map((f) => (f.type === "key" ? unpack(f.payload) : null)).find((p) => p && p.sig && p.reply);
+  await pc.onPeerKey(answer.pub);
+  return { ws, pc };
+}
+const confirmFrame = (pc) => ({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ confirm: pc.confirmation.mine }) });
+const pinFor = () => contacts.getPin("room:" + ROOM);
+
+// ---- M-1 (Medium): a gate computed for a closed connection never appears ------
+// Reviewer's chain (reproduced in Firefox): session 1 is genuine Bob; the relay
+// delivers Bob's confirm and hangs up while the safety-number digest is still
+// running; the gate for Bob is drawn AFTER the close and survives into the
+// next session, where the relay routes Mallory and withholds her confirm; the
+// user compares Bob's number with Bob in person, it matches, "It matches" —
+// and Mallory is pinned.
+{
+  const bob = await Identity.generate();
+  const mallory = await Identity.generate();
+  const bobSN = await Identity.safetyNumber(myBundle, bob.publicBundle());
+  // session 1
+  const s1 = await handshakeToConfirm(bob);
+  const h = holdSubtle("digest");
+  s1.ws.onmessage({ data: JSON.stringify(confirmFrame(s1.pc)) });
+  await until(h.entered, "the safety-number digest to be running");
+  s1.ws.close(); // the relay hangs up
+  h.release();
+  await settle();
+  assert.strictEqual(dom.el("verify").hidden, true, "M-1: a gate computed for a closed connection is never drawn");
+  assert.notStrictEqual(dom.el("safetyNumber").textContent, bobSN, "M-1: ...nothing of it is written (not even the number)");
+  // session 2: Mallory, confirm withheld; the user clicks "It matches" anyway
+  const s2 = await guestAwaitingHandshake("DHKE");
+  assert.strictEqual(dom.el("verify").hidden, true, "M-1: the new session starts with no gate on screen");
+  const mc = makeCipher("DHKE", ROOM);
+  await mc.init();
+  const mpub = await mc.handshakePayload();
+  const msig = await signHandshake(mallory, ROOM, s2.nonces, mpub);
+  await s2.ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub: mpub, reply: false, idb: mallory.publicBundle(), sig: msig }) });
+  await drain(s2.ws);
+  const lines0 = lines().length;
+  await dom.el("verifyOk").click();
+  await settle(20);
+  assert.ok(!lines().slice(lines0).some((l) => /contact verified and pinned/.test(l)), "M-1: nothing is pinned without a gate for this connection");
+  assert.ok(!sameKeyPin(pinFor(), mallory.publicBundle()), "M-1: Mallory is NOT the pinned identity");
+  assert.ok(lines().slice(lines0).some((l) => /did not belong to this connection — nothing was pinned/.test(l)), "M-1: ...and it says so");
+  await dom.el("disconnect").click();
+  console.log("OK  fix round 3 M-1: a gate for a closed connection is never drawn, and 'It matches' pins nothing it was not drawn for (executed)");
+}
+function sameKeyPin(pin, b) { return !!pin && pin.ed === b.ed && pin.mldsa === b.mldsa; }
+
+// ---- M-1, the Low variant: no unlock for a pinned peer after the close ----------
+{
+  const bob = await Identity.generate();
+  // pin Bob legitimately first
+  const a = await handshakeToConfirm(bob);
+  await a.ws.deliver(confirmFrame(a.pc));
+  await until(() => !dom.el("verify").hidden, "Bob's gate");
+  await dom.el("verifyOk").click();
+  await until(() => sameKeyPin(pinFor(), bob.publicBundle()), "Bob to be pinned");
+  await dom.el("disconnect").click();
+  // Bob again; the relay hangs up while the digest runs
+  const b = await handshakeToConfirm(bob);
+  const h = holdSubtle("digest");
+  b.ws.onmessage({ data: JSON.stringify(confirmFrame(b.pc)) });
+  await until(h.entered, "the digest to be running");
+  const lines0 = lines().length;
+  b.ws.close();
+  h.release();
+  await settle();
+  assert.ok(!lines().slice(lines0).some((l) => /matches your saved pin|secure channel established/.test(l)),
+    "M-1 (Low): a pinned peer's session is not unlocked after its connection closed");
+  assert.strictEqual(dom.el("text").disabled, true, "...and sending stays disabled");
+  console.log("OK  fix round 3 M-1 (Low): no unlockMessaging() for a connection that closed during the check (executed)");
+}
+
+// ---- M-1: connectInner itself clears the gate (a second connect with a gate up) --
+// Only reachable in the stub (the Connect button is disabled while a socket is
+// live), but it binds the resets at the top of connectInner: gate hidden,
+// generation moved, gateFor and currentPinKey cleared.
+{
+  const carol = await Identity.generate();
+  const c = await handshakeToConfirm(carol);
+  await c.ws.deliver(confirmFrame(c.pc));
+  await until(() => !dom.el("verify").hidden, "Carol's gate");
+  await dom.el("connect").click(); // a second connect while the first is still open
+  const fresh = dom.socket();
+  fresh.open();
+  await tick();
+  current = fresh;
+  assert.strictEqual(dom.el("verify").hidden, true, "M-1: a new session starts with the old gate gone");
+  const lines0 = lines().length;
+  await dom.el("verifyOk").click();
+  await settle(20);
+  assert.ok(!sameKeyPin(pinFor(), carol.publicBundle()) && !lines().slice(lines0).some((l) => /contact verified and pinned/.test(l)),
+    "M-1: the previous session's gate pins nothing in the new one");
+  await dom.el("disconnect").click();
+  console.log("OK  fix round 3 M-1: connectInner clears the previous session's gate (executed)");
+}
+
+// ---- M-1: "It matches" after the connection closed pins nothing ------------------
+// onVerifyOk pins only the bundle the gate was drawn for, in the same live
+// connection. onclose hides the gate, but currentPinKey and peerBundle outlive
+// it; a click that still arrives (the stub bypasses the hidden button, a
+// browser could deliver one queued) must not pin a peer of a dead connection.
+{
+  const dave = await Identity.generate();
+  const d = await handshakeToConfirm(dave);
+  await d.ws.deliver(confirmFrame(d.pc));
+  await until(() => !dom.el("verify").hidden, "Dave's gate");
+  d.ws.close(); // the relay hangs up with the gate on screen
+  const lines0 = lines().length;
+  await dom.el("verifyOk").click();
+  await settle(20);
+  assert.ok(!sameKeyPin(pinFor(), dave.publicBundle()), "M-1: a click after the close pins nothing");
+  assert.ok(lines().slice(lines0).some((l) => /did not belong to this connection — nothing was pinned/.test(l)), "M-1: ...and says so");
+  console.log("OK  fix round 3 M-1: 'It matches' for a closed connection pins nothing (executed)");
+}
+
+// ---- Info: a handler still in flight at a relay close starts no key confirmation --
+// (its reset keyConfirm used to arm a 15 s deadline whose failure later
+// overwrote the room screen's close reason). Section 8's semantics stay: the
+// frame itself is still handled.
+{
+  const { ws, nonces } = await guestAwaitingHandshake("DHKE");
+  const peer = await Identity.generate();
+  const pc = makeCipher("DHKE", ROOM);
+  await pc.init();
+  const pub = await pc.handshakePayload();
+  const sig = await signHandshake(peer, ROOM, nonces, pub);
+  const h = holdSubtle("verify", (a) => algName(a) === "Ed25519");
+  ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub, reply: false, idb: peer.publicBundle(), sig }) }) });
+  await until(h.entered, "the handshake verify to be running");
+  const sent0 = ws.sent.length;
+  ws.close();
+  h.release();
+  await settle();
+  assert.ok(!ws.sent.slice(sent0).some((f) => f.type === "key" && typeof unpack(f.payload).confirm === "string"),
+    "Info: no key confirmation is started (or its deadline armed) for a connection that already closed");
+  console.log("OK  fix round 3 Info: onChannelReady does nothing for a closed connection (executed)");
+}
+
+// ---- L-2 coverage: each re-check after an await, suspended across a reconnect ----
+// E1 queueKnock, after verifyKnock: the knock was for the replaced session.
+{
+  const ws = await connect("AES256");
+  await ws.deliver({ type: "joined", role: "owner" });
+  const k = await Identity.generate();
+  const sig = await signKnock(k, ROOM);
+  const h = holdSubtle("verify", (a) => algName(a) === "Ed25519");
+  ws.onmessage({ data: JSON.stringify({ type: "knock", room: ROOM, jid: "0123456789abcdef", payload: pack({ idb: k.publicBundle(), sig }) }) });
+  await until(h.entered, "the knock verify to be running");
+  const fresh = await connect("AES256");
+  await fresh.deliver({ type: "joined", role: "owner" });
+  h.release();
+  await settle();
+  assert.strictEqual(dom.el("admit").hidden, true, "L-2 (queueKnock): a knock verified for the replaced session is not shown in the new one");
+  console.log("OK  L-2: queueKnock re-checks the session after its verify (executed)");
+}
+// E2 sendSignedKey, after signing: nothing is sent for a replaced session.
+{
+  const ws = await connect("DHKE");
+  await ws.deliver({ type: "pending" });
+  await ws.deliver({ type: "joined", role: "guest" });
+  await drain(ws);
+  const h = holdSubtle("sign", (a) => algName(a) === "Ed25519");
+  ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ hello: true, n: freshNonce(), reply: false }) }) });
+  await until(h.entered, "our handshake signature to be running");
+  const sent0 = ws.sent.length;
+  await connect("DHKE");
+  h.release();
+  await settle();
+  assert.strictEqual(ws.sent.length, sent0, "L-2 (sendSignedKey): a handshake signed for a replaced session is never sent");
+  console.log("OK  L-2: sendSignedKey re-checks the session after signing (executed)");
+}
+// E3 pending, after the knock introduction is signed.
+{
+  const ws = await connect("DHKE");
+  const h = holdSubtle("sign", (a) => algName(a) === "Ed25519");
+  ws.onmessage({ data: JSON.stringify({ type: "pending" }) });
+  await until(h.entered, "the knock signature to be running");
+  const sent0 = ws.sent.length;
+  await connect("DHKE");
+  h.release();
+  await settle();
+  assert.ok(!ws.sent.slice(sent0).some((f) => f.type === "knock"), "L-2 (pending): a knock signed for a replaced session is never sent");
+  console.log("OK  L-2: the pending arm re-checks the session after signing the knock (executed)");
+}
+// E4 hello, after setNonces (AES256): the replaced session's nonces never unlock the new one.
+{
+  const ws = await connect("AES256");
+  await ws.deliver({ type: "joined", role: "owner" });
+  await drain(ws);
+  const h = holdSubtle("deriveKey", (a) => algName(a) === "HKDF");
+  ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "AES256", payload: pack({ hello: true, n: freshNonce(), reply: true }) }) });
+  await until(h.entered, "the session chains to be deriving");
+  await connect("AES256");
+  h.release();
+  await settle();
+  assert.strictEqual(dom.el("text").disabled, true, "L-2 (setNonces): the replaced session's key setup does not unlock sending in the new one");
+  console.log("OK  L-2: the hello arm re-checks the session after deriving the chains (executed)");
+}
+// E5 the catch: a failure of the replaced session is not shown in the new one.
+{
+  const { ws, nonces } = await guestAwaitingHandshake("DHKE");
+  const peer = await Identity.generate();
+  const pc = makeCipher("DHKE", ROOM);
+  await pc.init();
+  const pub = await pc.handshakePayload();
+  const sig = await signHandshake(peer, ROOM, nonces, pub);
+  const h = holdSubtle("deriveBits", (a) => algName(a) === "ECDH", true);
+  ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub, reply: false, idb: peer.publicBundle(), sig }) }) });
+  await until(h.entered, "the key agreement to be running");
+  await connect("DHKE");
+  h.release();
+  await settle();
+  const shown = dom.el("roomHint").textContent + " " + dom.el("hint").textContent;
+  assert.ok(!/Key exchange failed/.test(shown), `L-2 (catch): the replaced session's failure is not shown in the new one: ${JSON.stringify(shown)}`);
+  console.log("OK  L-2: the key arm's catch re-checks the session (executed)");
+}
+// E6 msg, after decrypt: a message of the replaced session is never rendered.
+{
+  const ws = await connect("AES256");
+  await ws.deliver({ type: "joined", role: "owner" });
+  const hello = ws.sent.map((f) => (f.type === "key" ? unpack(f.payload) : null)).find((p) => p && p.hello);
+  const peer = makeCipher("AES256", ROOM, { passphrase: PASS });
+  await peer.init();
+  const peerNonce = freshNonce();
+  await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: pack({ hello: true, n: peerNonce, reply: true }) });
+  await peer.setNonces(peerNonce, hello.n);
+  await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: pack({ confirm: peer.confirmation.mine }) });
+  assert.strictEqual(dom.el("text").disabled, false, "fixture: the AES256 session is confirmed");
+  const ct = await peer.encrypt("stale-session-text");
+  const h = holdSubtle("decrypt", (a) => algName(a) === "AES-GCM");
+  ws.onmessage({ data: JSON.stringify({ type: "msg", room: ROOM, alg: "AES256", payload: ct }) });
+  await until(h.entered, "the decrypt to be running");
+  await connect("AES256");
+  h.release();
+  await settle();
+  assert.ok(!said(/stale-session-text/), "L-2 (msg): a message decrypted for the replaced session is never rendered");
+  console.log("OK  L-2: the msg arm re-checks the session after decrypting (executed)");
 }
 
 // ---- item 1, the transcript's own rule: addLine cleans whatever reaches it ----

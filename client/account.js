@@ -101,8 +101,12 @@ const FORMAT_DETAIL_MAX = 200;
 async function okJson(res, what) {
   try {
     return await res.json();
-  } catch {
-    throw new Error(what + ": the directory returned a malformed answer");
+  } catch (e) {
+    // Fix round 3 (L-1): a body that never finished arriving (abort, timeout,
+    // network) is NOT a malformed answer — the request may have been carried
+    // out. Callers tell those apart by the error's type, so it passes through.
+    if (e && (e.name === "AbortError" || e.name === "TimeoutError" || e instanceof TypeError)) throw e;
+    throw new Error((what ? what + ": " : "") + "the directory returned a malformed answer");
   }
 }
 
@@ -139,7 +143,7 @@ export async function register(base, identity, username) {
     err.status = status;
     throw err;
   }
-  return okJson(res, "registration failed");
+  return okJson(res, null); // the caller says "Registration failed: "
 }
 
 // Fetch a peer's public identity bundle from a `username#token` handle. Returns
@@ -348,7 +352,10 @@ export async function sendMail(base, handle, envelope) {
   if (res.status === 404) throw new Error("recipient unknown (check the handle)");
   if (res.status === 429) throw new Error("recipient inbox full or rate limited — try again later");
   if (!res.ok) throw new Error("send failed: " + (await asError(res)));
-  return okJson(res, "send failed");
+  // Fix round 3: a 200 means the relay queued it. Nobody reads the answer, and
+  // failing a delivered message over its body made the sender skip recording
+  // it in the chat history.
+  return true;
 }
 
 // Package 2, item 9 (F-WEB-003): the relay's own bounds (backend/config.py):
