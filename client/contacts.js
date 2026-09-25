@@ -741,14 +741,27 @@ export async function setVerified(username, on) {
 // is still this person. `keys` is the contact record as it was BEFORE the
 // change (remove() deletes it). Compared as decoded bytes, like app.js
 // sameSigning, so a respelled key cannot slip past.
+//
+// Fix round 1 (pentest L): "the contact's identity" is TWO key sets, not one.
+// The record's keys can move without the user re-verifying (a directory
+// refresh or re-add stores new keys and drops `verified`), while the user:
+// pin still holds the keys they actually compared — and the room: pins made
+// in the same period hold those too. Sweeping by the record alone left the
+// room pin for the old, verified keys live after Remove. So both sets count.
+// Decision, stated: user: pins under OTHER labels are NOT touched. Such a pin
+// belongs to a separate contact entry the user verified separately (its
+// record still shows 🟢); withdrawing one entry does not withdraw the other,
+// and doing it silently would leave that entry claiming a trust its pin no
+// longer honours.
 function revokePin(username, keys = null) {
   const pin = pins && pins[pinKeyFor(username)];
+  const sets = [keys, pin].filter((s) => s && s.ed && s.mldsa);
   if (pin) pin.revoked = true;
-  if (!pins || !keys || !keys.ed || !keys.mldsa) return;
+  if (!pins || sets.length === 0) return;
   for (const k of Object.keys(pins)) {
     if (!k.startsWith("room:")) continue;
     const p = pins[k];
-    if (p && sameKeyBytes(p.ed, keys.ed) && sameKeyBytes(p.mldsa, keys.mldsa)) p.revoked = true;
+    if (p && sets.some((s) => sameKeyBytes(p.ed, s.ed) && sameKeyBytes(p.mldsa, s.mldsa))) p.revoked = true;
   }
 }
 

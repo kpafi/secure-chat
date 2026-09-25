@@ -4045,8 +4045,12 @@ async function ensureUnlocked(padId) {
       : "";
     if (!confirm(
       warn + e.message +
-      "\n\nAdopt it anyway? Only do this if you are certain the pad has never " +
-      "been used to send a message from this device.",
+      (e.recvRecord
+        // Package 3 fix round 1: the receive-record variant (otp.js).
+        ? "\n\nAdopt it anyway? Only do this if you are certain this pad has never " +
+          "received a message on this device, or that this device last used it with a version from before v0.1.0."
+        : "\n\nAdopt it anyway? Only do this if you are certain the pad has never " +
+          "been used to send a message from this device."),
     )) {
       throw new Error("Pad not adopted. Exchange a fresh pad in person.");
     }

@@ -689,7 +689,8 @@ export async function unlockPad(padId, passphrase, opts = {}) {
   // through. Unlike `usedKey`, this evidence is not deletable from JS.
   if (native > NATIVE_ABSENT && outerWm === null) {
     throw new Error(
-      "the rollback record for this pad is missing — refusing to use the pad, because pad reuse could no longer be detected; exchange a fresh pad",
+      "the rollback record for this pad is missing — refusing to use the pad, because pad reuse could no longer be detected. " +
+        "If this pad has never sent or received a message here (e.g. the app was closed while it was first being saved), Forget it and import the same file again — the import checks whether it was used; otherwise exchange a fresh pad.",
     );
   }
   // …and the converse (2026-07-29 H-1): a blob written WHILE a floor was in
@@ -741,7 +742,8 @@ export async function unlockPad(padId, passphrase, opts = {}) {
     // its watermark FAILS CLOSED. (No record AND no evidence = a pad written
     // before this fix, adopted below.)
     throw new Error(
-      "the rollback record for this pad is missing — refusing to use the pad, because pad reuse could no longer be detected; exchange a fresh pad",
+      "the rollback record for this pad is missing — refusing to use the pad, because pad reuse could no longer be detected. " +
+        "If this pad has never sent or received a message here (e.g. the app was closed while it was first being saved), Forget it and import the same file again — the import checks whether it was used; otherwise exchange a fresh pad.",
     );
   }
   // max(outer, inner, legacy, native): each is a floor this device is known to
@@ -810,6 +812,29 @@ export async function unlockPad(padId, passphrase, opts = {}) {
       localStorage.getItem(usedKey(padId)) !== null;
     throw err;
   }
+  // Package 3 fix round 1 (pentest M, item-13 residual, receive half). The
+  // `derivedFloors` check above only binds blobs written by this build, and a
+  // file-level attacker simply restores an OLDER blob (one without the flag)
+  // together with its watermark and deletes `recv:<id>`: the pad then opened
+  // at the old receive offset and replayed every frame delivered since. The
+  // flag cannot be made retroactive, but the SEND slot can stand in for it:
+  // every build that wrote the send slot since 22318a1 (v0.1.0) also wrote
+  // `recv:` on the same save, and this build arms `recv:` before the send slot.
+  // So "send slot present, recv slot absent" is a deletion — or a pad last
+  // saved by a pre-v0.1.0 build, which cannot be told apart. That is exactly
+  // the adoption gate's job: refuse by default, open only on the user's
+  // explicit consent (the next save arms `recv:` and the question never comes
+  // back for this pad).
+  if (native > NATIVE_ABSENT && nativeRecv === NATIVE_ABSENT && !opts.adoptLegacy) {
+    const err = new Error(
+      "this pad's device-protected receive record is missing. If you have received messages with this pad on this device, that record has been deleted and old messages could be replayed as new — exchange a fresh pad.",
+    );
+    err.code = "LEGACY_PAD_ADOPTION";
+    err.padId = padId;
+    err.suspicious = true; // a floor exists: this device has run floor-era code with this pad
+    err.recvRecord = true; // app.js words the consent for the receive side
+    throw err;
+  }
   wmCache.set(padId, wm);
   const regionSize = src.regionSize;
   const role = src.role;
@@ -854,9 +879,19 @@ export async function unlockPad(padId, passphrase, opts = {}) {
     // valid AEAD, and its send floor is 0 because exportPad only ever exports
     // a pristine pad — so the floor is the one record of the export that a
     // snapshot restore cannot rewind. TAMPERED was refused above.
-    exported: nativeExported >= 1 || (inner.exported !== undefined
-      ? !!inner.exported
-      : true),
+    //
+    // Package 3 fix round 1 (pentest M, export half): and when the send slot
+    // exists but `exported:` does not, the flag is UNKNOWN, so it is TRUE.
+    // Before this build `exported:` was written only BY an export, so its
+    // absence could not be told from its deletion: restore a pre-export blob
+    // (no `derivedFloors`), delete the slot, and a pad already exported under
+    // v0.3.x offered a silent second export — a two-time pad. Unlike the
+    // receive side this needs no prompt: assuming "exported" only costs a
+    // confirm on re-export (exportPad refuses a used pad anyway), and the next
+    // save latches it (writePadBlob advances `exported:` to 1).
+    exported: nativeExported >= 1 ||
+      (native > NATIVE_ABSENT && nativeExported === NATIVE_ABSENT) ||
+      (inner.exported !== undefined ? !!inner.exported : true),
   };
   const atRest = { key, salt, iters };
   // Rewrite a genuine legacy blob in the v2 (fully authenticated) format

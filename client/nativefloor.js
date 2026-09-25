@@ -40,6 +40,9 @@ export const NATIVE_COMMIT_FAILED = -3;
 // Package 3 (7b int32 ceiling): a bump value that is not an integer in
 // [0, FLOOR_MAX]. Refused on both sides, never truncated — see bump() below.
 export const NATIVE_INVALID = -4;
+// Fix round 1: PadFloor.bump's answer when a NEW record would exceed its record
+// cap (4096, as on iOS). Something on the page has been creating floor ids.
+export const NATIVE_FULL = -5;
 // The highest value a floor can hold. The bridge carries a Kotlin Long, but the
 // JS side validates with `(v | 0) === v` (the poison-proof integer test, see
 // num() below), which is exactly the int32 range. A store that would need a
@@ -164,6 +167,7 @@ export function bumpFloor(nativeFloor, id, value, what) {
   const why = got === NATIVE_COMMIT_FAILED ? "the device refused the write — storage full or not writable"
     : got === NATIVE_INVALID ? "the value is beyond what the device record can hold"
     : got === NATIVE_TAMPERED ? "the device record is damaged or unreachable"
+    : got === NATIVE_FULL ? "the device record store is full — something has been creating records in it"
     : "the device record did not move";
   const err = new Error(
     `could not update the device-protected rollback record for ${what} (${why}), so the change was NOT ` +

@@ -579,6 +579,53 @@ console.log("OK  F-ATREST-007: Unverify and Remove revoke the pin (kept for chan
 }
 console.log("OK  item 17: Unverify / Remove revoke every room: pin under the contact's signing identity");
 
+// ---- fix round 1 (pentest L): the keys the user VERIFIED, not only the record's
+// poc4: Bob verified with K1 (user:bob + a room: pin), then a directory refresh
+// stores K2 in his record. Remove used to sweep room: pins by K2 only, so the
+// room pin for the K1 he had verified stayed live and auto-accepted K1.
+{
+  localStorage.clear();
+  await contacts.unlock(PASS);
+  const K1 = { ed: "RURCMQ==", mldsa: "TUxCMQ==", ecdh: "RUMx", mlkem: "TUsx" };
+  const K2 = { ed: "RVZJTA==", mldsa: "TUxFVg==", ecdh: "RUMy", mlkem: "TUsy" };
+  const R = "room:" + "4".repeat(64);
+  await contacts.upsert({ username: "bob", ...K1, verified: true });
+  await contacts.savePin(contacts.pinKeyFor("bob"), K1);
+  await contacts.savePin(R, K1);
+  await contacts.upsert({ username: "bob", ...K2 });
+  await contacts.remove("bob");
+  assert.strictEqual(contacts.getPin(R).revoked, true,
+    "fix round 1: a room: pin under the keys the user verified (user:bob's pin) is revoked, even after the record's keys moved");
+
+  // J10: the comparison is on decoded BYTES — a respelled key (same bytes,
+  // non-canonical base64) is the same identity.
+  const Q = { ed: "QQ==", mldsa: "Qg==" };
+  const R2 = "room:" + "5".repeat(64);
+  await contacts.upsert({ username: "quinn", ...Q, verified: true });
+  await contacts.savePin(R2, { ed: "QR==", mldsa: "Qh==" }); // decode to the same bytes as Q
+  await contacts.setVerified("quinn", false);
+  assert.strictEqual(contacts.getPin(R2).revoked, true,
+    "fix round 1: room: pins are matched on decoded key bytes, not on the base64 spelling");
+
+  // …and the RECORD's keys still count on their own: a contact verified only in
+  // a room session (no user: pin) is removed — its room pin must go too.
+  const E = { ed: "RUVE", mldsa: "RU1M" };
+  const R3 = "room:" + "6".repeat(64);
+  await contacts.upsert({ username: "erin", ...E, verified: true });
+  await contacts.savePin(R3, E);
+  await contacts.remove("erin");
+  assert.strictEqual(contacts.getPin(R3).revoked, true,
+    "Remove revokes room: pins under the removed record's keys even with no user: pin");
+
+  // Decision pinned: another contact ENTRY with the same keys keeps its own pin.
+  await contacts.upsert({ username: "quinn2", ...Q, verified: true });
+  await contacts.savePin(contacts.pinKeyFor("quinn2"), Q);
+  await contacts.setVerified("quinn", false);
+  assert.strictEqual(contacts.getPin(contacts.pinKeyFor("quinn2")).revoked, undefined,
+    "a separately verified entry's user: pin is not withdrawn by unverifying another entry");
+}
+console.log("OK  fix round 1: revocation follows the verified keys (user: pin) and decoded bytes");
+
 // ---- Pentest 2026-08-07 F-ATREST-003/004: the native floor, where it exists --
 // A second module instance captures the bridge at load, exactly as on the
 // device (the app injects it at document-start, before any module runs).

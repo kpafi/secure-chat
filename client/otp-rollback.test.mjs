@@ -989,12 +989,18 @@ console.log("OK  F-2: `exported` cannot be cleared through the legacy migration"
   await assert.rejects(otpR.unlockPad(r.padId, PASS), /record has been deleted/,
     "item 13: deleting the recv: slot under a restored blob must not reopen it at the old receive offset");
   // A blob from BEFORE the derived slots were armed (no `derivedFloors` inside
-  // its AEAD) is not caught by that rule — ABSENT then genuinely means "never
-  // armed", so it still contributes 0 and the pad opens. That is the pre-fix
-  // residual, limited to blobs no save since this fix has rewritten.
+  // its AEAD) is not caught by that rule. The first cut of this block called
+  // that a residual "limited to blobs no save since this fix has rewritten" —
+  // wrong (fix round 1, pentest M): the attacker picks WHICH blob to restore,
+  // so any pre-upgrade copy kept it open forever. The send slot now stands in:
+  // every floor-era build wrote `recv:` with it, so "send present, recv absent"
+  // goes to the explicit adoption gate, never opens silently.
   await resealInner(r.padId, rAtRest.key, (inner) => { delete inner.derivedFloors; });
-  const older = await otpR.unlockPad(r.padId, PASS);
-  assert.strictEqual(older.record.recvHighWater, 0, "a pre-item-13 blob with no derived slot still opens (documented residual)");
+  await assert.rejects(otpR.unlockPad(r.padId, PASS),
+    (e) => e.code === "LEGACY_PAD_ADOPTION" && e.suspicious === true && /receive record is missing/.test(e.message),
+    "fix round 1: a pre-item-13 blob with its recv: slot deleted must not open silently (send slot present)");
+  const older = await otpR.unlockPad(r.padId, PASS, { adoptLegacy: true });
+  assert.strictEqual(older.record.recvHighWater, 0, "…only the user's explicit adoption opens it");
 
   // The `:` namespace cannot be reached from a pad file: an id that is not 32
   // hex characters is refused at import and at unlock.
@@ -1157,6 +1163,79 @@ function kotlinFloor(disk, ctl = {}) {
 }
 console.log("OK  item 13: deleting the recv: or exported: slot is refused on device (derived-floors marker)");
 
+// --- fix round 1 (pentest M): the item-13 residual for OLDER blob copies -----
+// `derivedFloors` lives in the blob, and the attacker chooses which blob to
+// restore. A copy from before the flag (v0.3.x shape: nativeFloor, no
+// derivedFloors) plus a deleted derived slot must not reopen the hole.
+{
+  const disk = new Map();
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinFloor(disk);
+  const o = await import("./otp.js?p3r1=older");
+  const XFER = "xfer-r1";
+  const preFlag = (inner) => { delete inner.derivedFloors; };
+
+  // Case A: receive replay. Blob + watermark at recv 300, pad later at 800.
+  const a = await o.generatePad({ label: "r1-a", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const aAt = await o.saveNewPad(a, PASS);
+  a.recvHighWater = 300;
+  await o.savePadProgress(a, aAt);
+  await resealInner(a.padId, aAt.key, preFlag);
+  const aSnap = [localStorage.getItem("sc.otp.pad.v1." + a.padId), localStorage.getItem("sc.otp.wm.v1." + a.padId)];
+  a.recvHighWater = 800;
+  await o.savePadProgress(a, aAt);
+  localStorage.setItem("sc.otp.pad.v1." + a.padId, aSnap[0]);
+  localStorage.setItem("sc.otp.wm.v1." + a.padId, aSnap[1]);
+  disk.delete("recv:" + a.padId);
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinFloor(disk);
+  const o2 = await import("./otp.js?p3r1=older-a");
+  await assert.rejects(o2.unlockPad(a.padId, PASS), (e) => e.code === "LEGACY_PAD_ADOPTION",
+    "fix round 1, case A: an older blob + deleted recv: slot must not open at recv 300 (replay of 300..800)");
+
+  // Case B: second export. Exported pad, pre-export pre-flag blob restored,
+  // exported: slot deleted.
+  const b = await o2.generatePad({ label: "r1-b", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const bAt = await o2.saveNewPad(b, PASS);
+  await resealInner(b.padId, bAt.key, preFlag);
+  const bSnap = [localStorage.getItem("sc.otp.pad.v1." + b.padId), localStorage.getItem("sc.otp.wm.v1." + b.padId)];
+  const file = await o2.exportPad(b, XFER);
+  await o2.markExported(b, bAt);
+  localStorage.setItem("sc.otp.pad.v1." + b.padId, bSnap[0]);
+  localStorage.setItem("sc.otp.wm.v1." + b.padId, bSnap[1]);
+  disk.delete("exported:" + b.padId);
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinFloor(disk);
+  const o3 = await import("./otp.js?p3r1=older-b");
+  assert.strictEqual((await o3.unlockPad(b.padId, PASS)).record.exported, true,
+    "fix round 1, case B: an unknown exported: slot (send slot present) reads as EXPORTED, never as a fresh pad to hand out again");
+
+  // Control: the same rule on an honest v0.3.x pad that was never exported —
+  // it opens (no prompt), merely treated as exported (a confirm on export).
+  const c = await o3.generatePad({ label: "r1-c", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const cAt = await o3.saveNewPad(c, PASS);
+  await resealInner(c.padId, cAt.key, preFlag);
+  disk.delete("exported:" + c.padId);
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinFloor(disk);
+  const o4 = await import("./otp.js?p3r1=older-c");
+  const uc = await o4.unlockPad(c.padId, PASS);
+  assert.strictEqual(uc.record.exported, true, "control: an unverifiable exported flag is TRUE (conservative)");
+  assert.strictEqual(uc.record.sendOffset, 0, "control: …and the pad opens");
+
+  // J1 gap: `exported > 0` alone is evidence of use in padWasUsed — the file of
+  // a pad this device exported must not be importable here (two role-1 holders).
+  const d = await o4.generatePad({ label: "r1-d", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const dAt = await o4.saveNewPad(d, PASS);
+  const dFile = await o4.exportPad(d, XFER);
+  await o4.markExported(d, dAt);
+  o4.forgetPad(d.padId);
+  for (const k of ["used", "wm", "hw"]) localStorage.removeItem(`sc.otp.${k}.v1.${d.padId}`);
+  assert.strictEqual(disk.get(d.padId), 0, "precondition: the send floor is 0 (nothing sent)");
+  assert.strictEqual(disk.get("recv:" + d.padId), 0, "precondition: recv 0");
+  assert.ok(file, "fixture");
+  await assert.rejects(o4.importPad(dFile, XFER), /already been used on this device/,
+    "an exported pad (exported: 1, send 0, recv 0) is 'used': its own file must not be re-imported here");
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+}
+console.log("OK  fix round 1: older pre-flag blobs cannot reopen the recv replay or the second export");
+
 // --- ROUND-3 F-1 / F-4 + A4 F-A1-R1: every pad floor write is CHECKED ---------
 {
   const XFER = "xfer-p3";
@@ -1289,6 +1368,10 @@ console.log("OK  ROUND-3 F-1/F-4, A4 F-A1-R1: pad floor writes are checked; a fa
   globalThis.__SECURE_CHAT_PAD_FLOOR__ = { read: () => -3, bump: () => -3 };
   const nf2 = (await import("./nativefloor.js?p3=7b-read")).captureNativeFloor();
   assert.strictEqual(nf2.read("x"), NATIVE_TAMPERED);
+  // Fix round 1 (Info): the record cap's answer (-5) fails a save like any other.
+  const { bumpFloor } = await import("./nativefloor.js?p3=7b-read");
+  assert.throws(() => bumpFloor({ bump: () => -5 }, "x", 1, "test"),
+    (e) => e.code === "FLOOR_WRITE_FAILED" && /store is full/.test(e.message));
   delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
 }
 console.log("OK  7b: out-of-range floor values are refused before the bridge; odd negative reads are TAMPERED");
