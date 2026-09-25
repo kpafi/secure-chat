@@ -31,11 +31,18 @@ def _exec_start(unit: str) -> str:
 
 
 def _directives(unit: str, key: str) -> list[str]:
-    """Values of `key`, ignoring comments — a commented-out line is not config."""
+    """Values of `key` in the [Service] section, ignoring comments — a
+    commented-out line is not config, and a sandboxing key under [Unit] or
+    [Install] is ignored by systemd ("Unknown key ... ignoring"), so it is
+    not config either (package-5 review)."""
     out = []
+    section = None
     for line in unit.splitlines():
         stripped = line.strip()
-        if stripped.startswith("#") or "=" not in stripped:
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1]
+            continue
+        if section != "Service" or stripped.startswith(("#", ";")) or "=" not in stripped:
             continue
         name, _, value = stripped.partition("=")
         if name.strip() == key:
@@ -111,15 +118,23 @@ def test_state_directory_is_not_world_readable(unit):
         assert "-m 0700" in ln, f"migration recipe creates the wrong mode: {ln.strip()!r}"
 
 
-def test_sandboxing_directives_are_present(unit):
-    for directive in (
-        "NoNewPrivileges=yes",
-        "ProtectSystem=strict",
-        "ProtectHome=yes",
-        "PrivateTmp=yes",
-        "PrivateDevices=yes",
-    ):
-        assert directive in unit, f"production unit lost {directive}"
+_FIRST_TIER = {
+    "NoNewPrivileges": ["yes"],
+    "ProtectSystem": ["strict"],
+    "ProtectHome": ["yes"],
+    "PrivateTmp": ["yes"],
+    "PrivateDevices": ["yes"],
+    "StateDirectory": ["secure-chat"],
+}
+
+
+@pytest.mark.parametrize("key", sorted(_FIRST_TIER))
+def test_sandboxing_directives_are_present(unit, key):
+    """Exact values in [Service]: a substring check passed with the line
+    commented out, or with `PrivateTmp=no` added after `PrivateTmp=yes`
+    (the later assignment wins) - package-5 review."""
+    got = _directives(unit, key)
+    assert got == _FIRST_TIER[key], f"{key}: want {_FIRST_TIER[key]!r}, unit has {got!r}"
 
 
 # Pentest F-RELAY-010: the second tier. Each value is the WHOLE list of values
@@ -213,8 +228,12 @@ def test_every_uvicorn_launch_in_the_repo_carries_the_frame_cap():
         for lit in re.findall(r"(?:--ws-max-size[ =]|ws_max_size\s*=\s*)(\d+)", text):
             assert int(lit) == want, f"{rel}: ws max size {lit}, the cap is {want}"
         logical = re.sub(r"\\\n", " ", text)
+        if rel.endswith(".py"):
+            continue  # a Python launcher passes ws_max_size=, checked as a literal above
         for line in logical.splitlines():
-            if re.search(r"\buvicorn\s+main:app\b", line) and not line.lstrip().startswith("#"):
+            # Any spelling: `-m uvicorn --app-dir X main:app`, `.../uvicorn "main:app"`.
+            if (re.search(r"\buvicorn\b", line) and re.search(r"""(^|[\s"'=])main:app\b""", line)
+                    and not line.lstrip().startswith("#")):
                 launches += 1
                 assert f"--ws-max-size {want}" in line, f"{rel}: uvicorn launch without the cap: {line.strip()[:160]}"
     # run.sh, the production unit and the iOS CI relay at least.

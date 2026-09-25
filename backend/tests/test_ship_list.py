@@ -65,6 +65,12 @@ def _patterns(path: Path) -> list[str]:
     for line in path.read_text().splitlines():
         s = line.strip()
         if s and not s.startswith(("#", ";")):
+            # Plain names and globs only. rsync reads "+ x" as an INCLUDE rule
+            # and "!" as "clear the list" (a "+ accounts.db*" line above the
+            # exclude would ship the DB), and Ant has no [...] classes, so a
+            # bracket pattern would mean different things in Gradle and rsync
+            # (package-5 review).
+            assert re.fullmatch(r"[A-Za-z0-9._*-]+", s), f"{path.name}: not a plain pattern: {line!r}"
             out.append(s)
     return out
 
@@ -144,12 +150,19 @@ def test_every_blocked_pattern_really_404s_on_the_relay(ship_patterns, tmp_path,
     monkeypatch.setattr(mount, "app", static)
     monkeypatch.setattr(mount, "_base_app", static)
     client = TestClient(main.app)
-    for rel in served:
-        assert client.get("/" + rel).status_code == 200, f"control {rel} not served"
-    for rel in blocked:
-        r = client.get("/" + rel)
-        assert r.status_code == 404, f"/{rel} -> {r.status_code}"
-        assert r.content == b"", f"/{rel} returned content"
+    # Package-5 review (Medium): the gate skipped every path that merely
+    # STARTED with /api/, and the static mount then normalized
+    # /api/../package.json to /package.json and served it. httpx collapses a
+    # literal "/../" itself, so the dot-dot is sent percent-encoded; uvicorn
+    # and the TestClient both decode it into scope["path"].
+    prefixes = ("", "/api/%2e%2e", "/api/users/%2e%2e/%2e%2e", "/api//%2e%2e")
+    for pre in prefixes:
+        for rel in served:
+            assert client.get(pre + "/" + rel).status_code == 200, f"control {pre}/{rel} not served"
+        for rel in blocked:
+            r = client.get(pre + "/" + rel)
+            assert r.status_code == 404, f"{pre}/{rel} -> {r.status_code}"
+            assert r.content == b"", f"{pre}/{rel} returned content"
 
 
 def test_gradle_sync_applies_the_ship_list_at_any_depth():
@@ -158,17 +171,24 @@ def test_gradle_sync_applies_the_ship_list_at_any_depth():
     assert m, "syncWebClient task not found in build.gradle.kts"
     task = m.group(1)
     # Reads the one list...
-    assert re.search(r'val shipExcludesFile = rootProject\.file\("\.\./deploy/ship-excludes\.txt"\)\n'
-                     r'val shipExcludes = shipExcludesFile\.readLines\(\)', src), (
-        "build.gradle.kts must read deploy/ship-excludes.txt")
+    # The whole statement, not a prefix of it: an extra condition in the
+    # filter (say `&& !it.contains(".")`) would silently drop entries from the
+    # APK's excludes (package-5 review). Same comment/blank rules as rsync.
+    reader = (
+        'val shipExcludesFile = rootProject.file("../deploy/ship-excludes.txt")\n'
+        'val shipExcludes = shipExcludesFile.readLines()\n'
+        '    .map { it.trim() }\n'
+        '    .filter { it.isNotEmpty() && !it.startsWith("#") && !it.startsWith(";") }\n'
+        'val syncWebClient'
+    )
+    assert reader in src, "build.gradle.kts must read deploy/ship-excludes.txt exactly so"
+    assert src.count("shipExcludes") == 2 + src.count("shipExcludesFile"), "shipExcludes is reassigned or filtered elsewhere"
     assert "inputs.file(shipExcludesFile)" in task, "editing the list must invalidate the Sync task"
     # ...and applies every entry as both **/<p> and **/<p>/**: Ant's plain
     # "<p>" only matches at the ROOT of the copy (the F-P7-18 APK leak).
     assert re.search(r'shipExcludes\.forEach \{ exclude\("\*\*/\$it", "\*\*/\$it/\*\*"\) \}', task), task
     # No second, hand-kept list beside it.
     assert task.count("exclude(") == 1, task
-    # The same comment/blank rules as rsync's --exclude-from.
-    assert re.search(r'!it\.startsWith\("#"\)', src) and re.search(r'!it\.startsWith\(";"\)', src)
 
 
 def _run_sync_web(dest_root: Path) -> set[str]:
@@ -185,20 +205,63 @@ def _run_sync_web(dest_root: Path) -> set[str]:
     return _files(web)
 
 
-def _rsync_like_the_deploy(dest: Path) -> set[str]:
-    subprocess.run(["rsync", "-a", "--exclude-from", str(SHIP_LIST), "--exclude-from", str(BOX_LIST),
-                    str(CLIENT), str(dest)], check=True, capture_output=True, text=True)
-    return _files(dest / "client")
+_BOX_TARGET = '"$BOX":/opt/secure-chat/'
+
+
+def _deploy_rsync(script: Path) -> str:
+    """The one rsync command of a deploy script, continuation lines joined."""
+    src = script.read_text()
+    cmds = re.findall(r"^rsync .*?(?<!\\)\n", src, re.S | re.M)
+    assert len(cmds) == 1, f"{script.name}: expected one rsync, got {len(cmds)}"
+    cmd = re.sub(r"\\\n\s*", " ", cmds[0]).strip()
+    assert cmd.endswith(" backend client " + _BOX_TARGET), f"{script.name}: {cmd}"
+    # Only the rsync itself may run below: no second command, no substitution.
+    assert not re.search(r"[;&|`<>]|\$\(", cmd), f"{script.name}: {cmd}"
+    assert cmd.count("$") == 1, f"{script.name}: {cmd}"
+    return cmd
+
+
+def _run_deploy_rsync(script: Path, work: Path, backend: Path) -> Path:
+    """Run the script's REAL rsync command, with the box replaced by a local
+    directory, from a scratch repo root holding the two lists, the given
+    backend/ and a copy of client/. Returns the fake /opt/secure-chat/."""
+    root = work / "repo"
+    (root / "deploy").mkdir(parents=True)
+    shutil.copy(SHIP_LIST, root / "deploy" / SHIP_LIST.name)
+    shutil.copy(BOX_LIST, root / "deploy" / BOX_LIST.name)
+    shutil.copytree(CLIENT, root / "client", symlinks=True)
+    shutil.copytree(backend, root / "backend", symlinks=True)
+    box = work / "opt-secure-chat"
+    box.mkdir()
+    cmd = _deploy_rsync(script).replace(_BOX_TARGET, "'" + str(box) + "/'")
+    subprocess.run(["bash", "-c", cmd], cwd=root, check=True, capture_output=True, text=True)
+    return box
+
+
+def _fake_backend(where: Path) -> Path:
+    """A backend/ with everything that must never reach the box beside the
+    code that must: the dev DB and its WAL/SHM, a venv, caches, tests."""
+    b = where / "backend"
+    for rel in ("main.py", "run.sh", "accounts.db", "accounts.db-wal", "accounts.db-shm",
+                "other.db", ".venv/bin/python", "__pycache__/main.cpython-313.pyc",
+                ".pytest_cache/v/x", "tests/test_x.py", ".env"):
+        (b / rel).parent.mkdir(parents=True, exist_ok=True)
+        (b / rel).write_text("x")
+    return b
 
 
 def test_the_four_channels_ship_the_same_client(ship_patterns, shipped_by_relay, tmp_path):
     assert shutil.which("rsync"), "rsync is needed to run the deploy and iOS copies"
     ios = _run_sync_web(tmp_path / "ios")
-    deploy = _rsync_like_the_deploy(tmp_path / "box")
+    scripts = _deploy_scripts()
+    assert scripts, "no current deploy script"
     expected = {f for f in _files(CLIENT) if not _dev_only(f, ship_patterns)}
     assert shipped_by_relay == expected, sorted(shipped_by_relay ^ expected)
     assert ios == expected, sorted(ios ^ expected)
-    assert deploy == expected, sorted(deploy ^ expected)
+    for i, script in enumerate(scripts):
+        box = _run_deploy_rsync(script, tmp_path / f"deploy{i}", _fake_backend(tmp_path / f"src{i}"))
+        deploy = _files(box / "client")
+        assert deploy == expected, (script.name, sorted(deploy ^ expected))
     # Sanity on the result itself.
     assert "index.html" in expected and "app.js" in expected
     for f in expected:
@@ -225,13 +288,11 @@ def test_deploy_scripts_use_the_shared_lists():
     scripts = _deploy_scripts()
     assert scripts, "no current deploy script: the newest one is the template"
     for script in scripts:
-        src = script.read_text()
-        rsyncs = re.findall(r"^rsync .*?(?<!\\)\n", src, re.S | re.M)
-        assert rsyncs, f"{script.name}: no rsync"
-        for cmd in rsyncs:
-            assert "--exclude-from deploy/ship-excludes.txt" in cmd, (script.name, cmd)
-            assert "--exclude-from deploy/rsync-excludes.txt" in cmd, (script.name, cmd)
-            assert not re.search(r"--exclude[ =]", cmd), (script.name, "inline --exclude", cmd)
+        cmd = _deploy_rsync(script)
+        assert "--exclude-from deploy/ship-excludes.txt" in cmd, (script.name, cmd)
+        assert "--exclude-from deploy/rsync-excludes.txt" in cmd, (script.name, cmd)
+        # No second, inline list and no rule that overrides the lists.
+        assert not re.search(r"--(exclude|include|filter)[ =]|\s-[A-Za-z]*F", cmd), (script.name, cmd)
 
 
 def test_deploy_scripts_leave_the_code_root_owned():
@@ -244,7 +305,7 @@ def test_deploy_scripts_leave_the_code_root_owned():
         src = script.read_text()
         assert not re.search(r"chown\b[^\n]*securechat", src), (
             f"{script.name} hands something to the service user")
-        chown = "chown -R root:root /opt/secure-chat/backend /opt/secure-chat/client"
+        chown = "chown -R root:root /opt/secure-chat/backend /opt/secure-chat/client /opt/secure-chat/venv"
         chmod = "chmod -R u=rwX,go=rX /opt/secure-chat/backend /opt/secure-chat/client"
         audit = "find /opt/secure-chat -user securechat"
         for need in (chown, chmod, audit):
@@ -255,9 +316,17 @@ def test_deploy_scripts_leave_the_code_root_owned():
         assert rsync_at < src.index(chmod) < start_at, f"{script.name}: chmod must sit between rsync and start"
 
 
-def test_box_only_excludes_keep_the_database_out():
+def test_box_only_excludes_keep_the_database_out(tmp_path):
     """rsync-excludes.txt is what the ship list does not cover: the relay's own
-    state and caches. The accounts.db lines are the ones that must never go."""
+    state and caches. The accounts.db lines are the ones that must never go.
+    Each deploy script's real rsync is run over a backend/ that holds a dev
+    DB, its WAL/SHM, a venv, caches and tests: only the code may arrive (an
+    `--include 'accounts.db*'` beside the lists, or a `+ accounts.db*` line
+    in a list, would otherwise pass every string check - package-5 review)."""
     pats = _patterns(BOX_LIST)
     for need in ("accounts.db*", "*.db", "*.db-wal", "*.db-shm", "__pycache__", ".venv", "tests"):
         assert need in pats, f"{BOX_LIST.name} lost {need!r}"
+    for i, script in enumerate(_deploy_scripts()):
+        box = _run_deploy_rsync(script, tmp_path / f"d{i}", _fake_backend(tmp_path / f"s{i}"))
+        arrived = _files(box / "backend")
+        assert arrived == {"main.py", "run.sh"}, (script.name, sorted(arrived))

@@ -208,6 +208,11 @@ app.include_router(mailbox.router)
 _DEV_ONLY_PATTERNS = ("*.test.mjs", "package*.json", "node_modules", ".*", "README.md")
 
 
+def _normalized_path(path: str) -> str:
+    """Collapse "//", "/./" and any "/x/../" the way the static mount will."""
+    return posixpath.normpath("/" + path.strip("/"))
+
+
 def _is_blocked_static(path: str) -> bool:
     """True if `path` names a development/tooling file that must not be served.
 
@@ -222,9 +227,7 @@ def _is_blocked_static(path: str) -> bool:
     copies are all caught, and the control no longer depends on the deploy-time
     excludes being right.
     """
-    # Collapse "//", "/./" and any "/x/../" the way the static mount will.
-    normalized = posixpath.normpath("/" + path.strip("/"))
-    segments = [s for s in normalized.split("/") if s]
+    segments = [s for s in _normalized_path(path).split("/") if s]
     # Every segment, not just the basename: /node_modules/x.js, /.git/config
     # and /vendor/README.md alike. Dotfiles (.package-lock.json, .env, .git*)
     # are never client assets.
@@ -326,7 +329,12 @@ async def security_headers(request: Request, call_next):
     # Host header, which can desync it from the routed path and bypass this
     # gate (GHSA-86qp-5c8j-p5mr). scope["path"] is what routing actually uses.
     path = request.scope["path"]
-    api = path.startswith("/api/")
+    # Package-5 review (Medium): decide "/api" on the NORMALIZED path, the
+    # same one StaticFiles resolves. On the raw path, `/api/../package.json`
+    # (or `/api/%2e%2e/vendor/README.md`, which uvicorn decodes to the same)
+    # counted as /api, skipped the gate, matched no route and fell through to
+    # the static mount, which normalized it and served the dev file.
+    api = _normalized_path(path).startswith("/api/")
     # Phase-7 pentest 2026-09-16 F-P7-16: the gate is for the static mount only.
     # Run on every path, it made legal usernames (a leading ".", a ".test.mjs"
     # suffix) register fine and then 404 on every /api/users lookup,

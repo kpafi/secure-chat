@@ -262,10 +262,11 @@ writes exactly one thing, the accounts DB with its `-wal`/`-shm`, in
 `chown -R securechat:securechat /opt/secure-chat/backend`; that was harmless
 under `ProtectSystem=strict` (the code tree is read-only to the service either
 way) but it let the service user own its own source outside the sandbox. From
-the next deploy on, step 2 of the deploy script does
-`chown -R root:root` + `chmod -R u=rwX,go=rX` on both trees and lists anything
-under `/opt/secure-chat` still owned by `securechat` (want: nothing; check
-`/opt/secure-chat/venv` in particular, whose owner was never recorded here).
+the next deploy on, step 2 of the deploy script does `chown -R root:root` on
+backend/, client/ and the venv (whose owner was never recorded here),
+`chmod -R u=rwX,go=rX` on backend/ and client/ (the venv keeps pip's modes),
+and counts what under `/opt/secure-chat` is still owned by `securechat`
+(want 0).
 
 ## Pending on the box (repo ahead of the live setup since 2026-09-25)
 
@@ -278,10 +279,9 @@ box, in this order:
 2. Remove the dev file the old rsync left behind (no `--delete`):
    `rm -f /opt/secure-chat/client/vendor/README.md` (the new relay 404s it
    anyway).
-3. Ownership: the script's step 2 (`chown -R root:root` + `chmod -R
-   u=rwX,go=rX` on backend/ and client/); then `find /opt/secure-chat -user
-   securechat` must print nothing. If the venv shows up, `chown -R root:root
-   /opt/secure-chat/venv`.
+3. Ownership: the script's step 2 (`chown -R root:root` on backend/,
+   client/ and venv/, `chmod -R u=rwX,go=rX` on backend/ and client/); its
+   count of files still owned by `securechat` must say 0.
 4. Unit: `install -m 0644 -o root -g root deploy/secure-chat.service
    /etc/systemd/system/`, `systemd-analyze verify`, `systemctl daemon-reload`,
    `systemctl restart secure-chat`, `systemd-analyze security secure-chat`
