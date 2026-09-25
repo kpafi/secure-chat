@@ -23,6 +23,44 @@ Check it after any change:
 ss -ltnp | grep 8000        # must show 127.0.0.1:8000, never 0.0.0.0 or *
 ```
 
+## The unit's sandbox
+
+`secure-chat.service` has two tiers. The first (`NoNewPrivileges`,
+`ProtectSystem=strict`, the 0700 `StateDirectory`, `ProtectHome`, `PrivateTmp`,
+`PrivateDevices`) keeps the relay from writing anywhere but its database. The
+second (pentest F-RELAY-010, added for 0.4.0) fences what a compromised relay
+process could still do: sockets only `AF_UNIX`/`AF_INET`/`AF_INET6`, IP traffic
+only to and from localhost (`IPAddressDeny=any` + `IPAddressAllow=localhost`;
+the relay makes **no** outbound connection), a `@system-service` syscall
+allow-list minus `@privileged @resources` with `EPERM` for the rest,
+`MemoryDenyWriteExecute`, an empty capability bounding set, the `Protect*`
+kernel/clock/hostname/proc switches, `RestrictNamespaces/Realtime/SUIDSGID`,
+`LockPersonality`, `RemoveIPC` and `UMask=0077`. `systemd-analyze security
+--offline=yes deploy/secure-chat.service` (systemd 261): **7.7 EXPOSED before,
+1.1 OK after**. Each line is pinned by `backend/tests/test_service_unit.py`.
+
+Measured, not assumed: the backend suite and the three client integration
+suites against a real uvicorn pass under the same properties via
+`systemd-run --user` on the dev box. `ProtectProc=` could not be exercised
+that way (a user manager ignores it); `PrivateUsers=` is left out on purpose
+(see the comment in the unit).
+
+**Installing a changed unit** (the rsync never copies it):
+
+```bash
+install -m 0644 -o root -g root deploy/secure-chat.service /etc/systemd/system/secure-chat.service
+systemd-analyze verify /etc/systemd/system/secure-chat.service
+systemctl daemon-reload && systemctl restart secure-chat && systemctl is-active secure-chat
+systemd-analyze security secure-chat | tail -1      # want ~1.1 OK
+curl -s http://127.0.0.1:8000/healthz
+```
+
+If it does not come up, `journalctl -u secure-chat -n 50` names the failing
+line; rolling back is copying the previous unit from git and repeating the
+daemon-reload. **MailDigest on the same box is unaffected**: it runs in Docker
+under its own units, and nothing here touches `docker.service`, Caddy's unit
+or any other service. `IPAddressDeny=` applies to this unit's cgroup only.
+
 ## Two front ends, one process
 
 Caddy and Tor both proxy to the *same* `127.0.0.1:8000`. That is deliberate:

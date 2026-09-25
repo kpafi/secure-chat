@@ -122,6 +122,52 @@ def test_sandboxing_directives_are_present(unit):
         assert directive in unit, f"production unit lost {directive}"
 
 
+# Pentest F-RELAY-010: the second tier. Each value is the WHOLE list of values
+# the unit may give that key (systemd accumulates most of these across lines,
+# so a second `IPAddressAllow=any` further down would silently widen the first).
+_SECOND_TIER = {
+    # The relay listens on loopback and makes no outbound connection at all.
+    "RestrictAddressFamilies": ["AF_UNIX AF_INET AF_INET6"],
+    "IPAddressDeny": ["any"],
+    "IPAddressAllow": ["localhost"],
+    "SystemCallArchitectures": ["native"],
+    "SystemCallFilter": ["@system-service", "~@privileged @resources"],
+    "SystemCallErrorNumber": ["EPERM"],
+    "MemoryDenyWriteExecute": ["yes"],
+    "CapabilityBoundingSet": [""],
+    "AmbientCapabilities": [""],
+    "ProtectKernelTunables": ["yes"],
+    "ProtectKernelModules": ["yes"],
+    "ProtectKernelLogs": ["yes"],
+    "ProtectControlGroups": ["yes"],
+    "ProtectClock": ["yes"],
+    "ProtectHostname": ["yes"],
+    "ProtectProc": ["invisible"],
+    "RestrictNamespaces": ["yes"],
+    "RestrictRealtime": ["yes"],
+    "RestrictSUIDSGID": ["yes"],
+    "LockPersonality": ["yes"],
+    "RemoveIPC": ["yes"],
+    "UMask": ["0077"],
+}
+
+
+@pytest.mark.parametrize("key", sorted(_SECOND_TIER))
+def test_second_tier_sandboxing(unit, key):
+    got = _directives(unit, key)
+    assert got == _SECOND_TIER[key], f"{key}: want {_SECOND_TIER[key]!r}, unit has {got!r}"
+
+
+def test_no_directive_reopens_what_the_sandbox_closes(unit):
+    """Keys that would undo the tiers above from a line nobody reads: a
+    writable or bind-mounted path, a device allow-list, a switch of the
+    service user (root would get the capabilities the bounding set removes)."""
+    assert _directives(unit, "User") == ["securechat"]
+    assert _directives(unit, "Group") == ["securechat"]
+    for key in ("ReadWritePaths", "BindPaths", "DeviceAllow", "ExecPaths",
+                "PermissionsStartOnly", "ExecStartPre", "ExecStartPost"):
+        assert not _directives(unit, key), f"{key} is set: {_directives(unit, key)!r}"
+
 
 def test_ws_max_size_matches_the_frame_cap_everywhere(unit):
     """Phase-7 pentest 2026-09-16 F-P7-26: `66560` was a literal in run.sh, the
