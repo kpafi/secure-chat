@@ -94,6 +94,18 @@ export function formatDetail(detail, status) {
 }
 const FORMAT_DETAIL_MAX = 200;
 
+// Second fix round (re-review of 9a38d97, L-1): a success body is relay bytes
+// too, and a SyntaxError echoes ~20 of them (U+202E, U+2028 included) into
+// whatever sentence the caller builds. Every success-path parse goes through
+// here and fails with a fixed sentence.
+async function okJson(res, what) {
+  try {
+    return await res.json();
+  } catch {
+    throw new Error(what + ": the directory returned a malformed answer");
+  }
+}
+
 async function asError(res) {
   let detail = null;
   try {
@@ -127,7 +139,7 @@ export async function register(base, identity, username) {
     err.status = status;
     throw err;
   }
-  return res.json();
+  return okJson(res, "registration failed");
 }
 
 // Fetch a peer's public identity bundle from a `username#token` handle. Returns
@@ -294,7 +306,7 @@ export async function vouch(base, identity, sessionToken, targetUsername, target
     signal,
   });
   if (!res.ok) throw new Error("vouch failed: " + (await asError(res)));
-  return res.json();
+  return okJson(res, "vouch failed");
 }
 
 export async function unvouch(base, sessionToken, targetUsername, signal = undefined) {
@@ -304,7 +316,7 @@ export async function unvouch(base, sessionToken, targetUsername, signal = undef
     signal,
   });
   if (!res.ok) throw new Error("unvouch failed: " + (await asError(res)));
-  return res.json();
+  return okJson(res, "unvouch failed");
 }
 
 // Vouches ABOUT a contact (requires their username#token handle, same gate as
@@ -318,7 +330,8 @@ export async function fetchVouches(base, handle) {
   );
   if (res.status === 404) return null;
   if (!res.ok) throw new Error("vouch lookup failed: " + (await asError(res)));
-  return (await res.json()).vouches;
+  const v = (await okJson(res, "vouch lookup failed")).vouches;
+  return Array.isArray(v) ? v : [];
 }
 
 // ---- mailbox (store-and-forward for sealed envelopes) ---------------------
@@ -335,7 +348,7 @@ export async function sendMail(base, handle, envelope) {
   if (res.status === 404) throw new Error("recipient unknown (check the handle)");
   if (res.status === 429) throw new Error("recipient inbox full or rate limited — try again later");
   if (!res.ok) throw new Error("send failed: " + (await asError(res)));
-  return res.json();
+  return okJson(res, "send failed");
 }
 
 // Package 2, item 9 (F-WEB-003): the relay's own bounds (backend/config.py):
@@ -397,5 +410,5 @@ export async function me(base, token) {
     headers: { authorization: "Bearer " + token },
   });
   if (!res.ok) throw new Error("me failed: " + (await asError(res)));
-  return (await res.json()).username;
+  return (await okJson(res, "me failed")).username;
 }

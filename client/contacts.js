@@ -194,7 +194,15 @@ export async function unlock(passphrase, opts = {}) {
     return { created: true };
   }
   expectedStore = true;
-  const blob = JSON.parse(raw);
+  // Second fix round (re-review of 9a38d97, I-1): a SyntaxError echoes ~20
+  // characters of what is in localStorage — a planted value with a newline or
+  // U+202E — into the locked panel and the transcript. A fixed sentence.
+  let blob;
+  try {
+    blob = JSON.parse(raw);
+  } catch {
+    throw new Error("the contact store on this device is not readable (damaged or replaced)");
+  }
   salt = unb64(blob.salt);
   dataKey = await deriveKey(passphrase, salt, blob.iters || KDF_ITERS);
   let plain;

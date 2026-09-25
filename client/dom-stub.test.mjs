@@ -89,6 +89,26 @@ class El {
     for (let p = n; p; p = p.parentNode) if (p === this) return true;
     return false;
   }
+  // Sibling moves (the contact sheet reorders its two buttons).
+  insertBefore(n, ref) {
+    if (n.parentNode) n.parentNode.removeChild(n);
+    const i = ref ? this.children.indexOf(ref) : -1;
+    n.parentNode = this;
+    this.children.splice(i < 0 ? this.children.length : i, 0, n);
+    return n;
+  }
+  after(n) {
+    const p = this.parentNode;
+    if (!p) return;
+    if (n.parentNode) n.parentNode.removeChild(n);
+    n.parentNode = p;
+    p.children.splice(p.children.indexOf(this) + 1, 0, n);
+  }
+  get nextElementSibling() {
+    const p = this.parentNode;
+    if (!p) return null;
+    return p.children.slice(p.children.indexOf(this) + 1).find((c) => c instanceof El) || null;
+  }
   closest(sel) {
     const match = compileSelector(sel);
     for (let p = this; p; p = p.parentNode) if (p instanceof El && match(p)) return p;

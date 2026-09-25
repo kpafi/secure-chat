@@ -9,7 +9,7 @@
 // I-1 `[""]` rendered "" instead of the status.
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { formatDetail, fetchMail, register } from "./account.js";
+import { formatDetail, fetchMail, register, fetchBundle, login, vouch, unvouch, sendMail, fetchVouches } from "./account.js";
 
 let n = 0;
 const eq = (a, b) => { assert.equal(a, b); n++; };
@@ -151,6 +151,52 @@ try {
     assert.ok(e2 instanceof Error && /malformed/.test(e2.message)); n++;
   } finally {
     mb.close();
+  }
+}
+
+// ---- fix rounds: a 200 answer that is not JSON never echoes the relay's bytes --
+// A SyntaxError carries ~20 characters of its source (U+202E / U+2028
+// included) into whatever sentence the caller builds. Each success-path parse
+// fails with a fixed sentence instead.
+{
+  const junk = "\u202e{\u2028[verified by you]";
+  const js = createServer((req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end(junk); });
+  await new Promise((r) => js.listen(0, "127.0.0.1", r));
+  const jb = "http://127.0.0.1:" + js.address().port;
+  const clean = (e) => e instanceof Error && !/[\u202e\u2028]|verified by you|Unexpected|JSON/.test(e.message);
+  try {
+    const fakeId = { publicBundle: () => ({ ed: "", mldsa: "" }), sign: async () => ({ ed: "", mldsa: "" }) };
+    const e1 = await fetchBundle(jb, "alice#tok").catch((x) => x);
+    eq(e1.message, "the directory returned a malformed answer");
+    const e2 = await login(jb, fakeId, "alice").catch((x) => x);
+    eq(e2.message, "challenge failed: the directory returned a malformed answer");
+    const e3 = await vouch(jb, fakeId, "t", "bob", { ed: "", mldsa: "" }).catch((x) => x);
+    eq(e3.message, "vouch failed: the directory returned a malformed answer");
+    const e4 = await unvouch(jb, "t", "bob").catch((x) => x);
+    eq(e4.message, "unvouch failed: the directory returned a malformed answer");
+    const e5 = await register(jb, fakeId, "alice").catch((x) => x);
+    eq(e5.message, "registration failed: the directory returned a malformed answer");
+    const e6 = await sendMail(jb, "bob#tok", "env").catch((x) => x);
+    eq(e6.message, "send failed: the directory returned a malformed answer");
+    const e7 = await fetchVouches(jb, "bob#tok").catch((x) => x);
+    eq(e7.message, "vouch lookup failed: the directory returned a malformed answer");
+    for (const e of [e1, e2, e3, e4, e5, e6, e7]) { assert.ok(clean(e), e && e.message); n++; }
+  } finally {
+    js.close();
+  }
+  // login's SECOND parse (the verify answer): a real challenge, then junk.
+  let step = 0;
+  const vs = createServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(step++ === 0 ? JSON.stringify({ challenge: Buffer.alloc(32).toString("base64") }) : junk);
+  });
+  await new Promise((r) => vs.listen(0, "127.0.0.1", r));
+  try {
+    const fakeId = { publicBundle: () => ({ ed: "", mldsa: "" }), sign: async () => ({ ed: "", mldsa: "" }) };
+    const e = await login("http://127.0.0.1:" + vs.address().port, fakeId, "alice").catch((x) => x);
+    eq(e.message, "verify failed: the directory returned a malformed answer");
+  } finally {
+    vs.close();
   }
 }
 console.log(`account-error: ${n} assertions OK`);

@@ -247,6 +247,17 @@ let clientClosing = false;
 // used to pass the gate in that window and drive the NEW session's cipher).
 // handleMessage handles no further frame from a retired socket (see there).
 const retiredSockets = new WeakSet();
+// Second fix round (re-review of 9a38d97, L-2): the retire check above ran only
+// at DISPATCH. A frame suspended inside an await (a signature verify) across a
+// relay close and a reconnect resumed into the NEW session's shared state —
+// cipher, peerBundle, nonces — and a genuine new peer was then refused as "a
+// SECOND identity". Every session has a generation, bumped where a new one
+// starts to be built; handleMessage captures it with the socket and re-checks
+// both after every await (sessionLive), and sends on the captured socket.
+let sessionGen = 0;
+function sessionLive(sock, gen) {
+  return sock === ws && gen === sessionGen && !retiredSockets.has(sock);
+}
 function closeWs(refusal = null, sock = ws) {
   if (!sock) return;
   retiredSockets.add(sock);
@@ -396,6 +407,7 @@ function canonicalBundle(b) {
 // ---- UI helpers -----------------------------------------------------------
 
 function setStatus(text, cls = "") {
+  text = hintSafe(text); // second fix round: every status line is a sink for e.message
   els.status.textContent = text;
   els.status.className = "status" + (cls ? " " + cls : "");
   // Mirror onto the chat top bar (only one of the two is visible at a time).
@@ -690,7 +702,7 @@ function algValue() {
 // ---- identity management --------------------------------------------------
 
 function setIdentityStatus(text, cls = "") {
-  els.idStatus.textContent = text;
+  els.idStatus.textContent = hintSafe(text);
   els.idStatus.className = "hint" + (cls ? " " + cls : "");
 }
 
@@ -1129,11 +1141,11 @@ function refreshUsers() {
   els.usersLocked.hidden = unlocked;
   els.usersUnlocked.hidden = !unlocked;
   if (!unlocked) {
-    els.usersLocked.querySelector("p").textContent = contactsStale && identity ? STALE_LINE : contactsError
+    els.usersLocked.querySelector("p").textContent = hintSafe(contactsStale && identity ? STALE_LINE : contactsError
       ? "Contact store error: " + contactsError +
         (contactsAdoptable ? "" :
           " (Forget + recreate the identity resets it — contacts are bound to the identity passphrase.)")
-      : "Locked. Enter your passphrase.";
+      : "Locked. Enter your passphrase.");
     // F-ATREST-003/004/005: the override is offered, never taken for the user.
     els.usersAdopt.hidden = !contactsAdoptable;
     els.usersAdoptHint.hidden = !contactsAdoptable;
@@ -1662,7 +1674,7 @@ function renderContactActions(c) {
 const BUSY_LINE = "Still saving the last change — one moment.";
 function busyNotice() { contactStatus(BUSY_LINE); }
 function contactStatus(text, isErr = false) {
-  els.contactStatus.textContent = text;
+  els.contactStatus.textContent = hintSafe(text);
   els.contactStatus.className = "hint" + (isErr ? " err" : "");
 }
 
@@ -2034,9 +2046,9 @@ function refreshChats() {
     // Fix review 2026-09-21: a chat store that refused while contacts opened
     // had no visible error and no override anywhere — a dead end whose only
     // exit was Forget identity. The Chats view now carries both.
-    els.chatsLocked.querySelector("p").textContent = contactsStale && identity ? STALE_LINE : contactsError && identity
+    els.chatsLocked.querySelector("p").textContent = hintSafe(contactsStale && identity ? STALE_LINE : contactsError && identity
       ? "Chat store error: " + contactsError
-      : "Locked. Enter your passphrase.";
+      : "Locked. Enter your passphrase.");
     els.chatsAdopt.hidden = !contactsAdoptable;
     els.chatsAdoptHint.hidden = !contactsAdoptable;
     return;
@@ -2626,6 +2638,7 @@ async function connectInner() {
   // built (the button is only live once it is closed), so nothing it still has
   // queued may reach the cipher and nonces this call is about to replace.
   if (ws) retiredSockets.add(ws);
+  sessionGen += 1; // L-2: anything still suspended in the old session is stale from here on
   const room = roomCode();
   const alg = algValue();
   if (!ROOM_RE.test(room)) {
@@ -2810,7 +2823,7 @@ async function knockIntro(room) {
 // Owner side: file an inbound knock for a human decision. Everything here is
 // UNTRUSTED input from the relay — validate it, never render it as markup, and
 // never let it decide anything by itself.
-async function queueKnock(m) {
+async function queueKnock(m, live = () => true) {
   if (roomRole !== "owner") return; // only the owner is asked; ignore the rest
   if (typeof m.jid !== "string" || !/^[0-9a-f]{16}$/.test(m.jid)) return;
   if (knockQueue.some((k) => k.jid === m.jid)) return;
@@ -2856,6 +2869,7 @@ async function queueKnock(m) {
       idb = null;
     }
     const ok = idb ? await verifyKnock(idb, sessionRoom, p.sig).catch(() => false) : false;
+    if (!live()) return; // L-2: the knock was for a session that has been replaced
     entry = { jid: m.jid, bundle: ok ? idb : null, anon: false, unproven: !ok };
   }
   knockQueue.push(entry);
@@ -3084,9 +3098,10 @@ async function signedHandshake(room) {
   return { pub, sig };
 }
 
-function sendSignedKey(room, reply) {
+function sendSignedKey(room, reply, sock = ws, live = () => true) {
   return signedHandshake(room).then(({ pub, sig }) => {
-    ws.send(JSON.stringify({
+    if (!live()) return; // L-2: signed for a session that has since been replaced
+    sock.send(JSON.stringify({
       type: "key", room, alg: sessionAlg,
       payload: packKey({ pub, reply, idb: myBundle, sig }),
     }));
@@ -3207,6 +3222,8 @@ async function handleMessage(room, raw, sock) {
   // L2, e2e/hostile-relay.mjs sections 6 and 8). A frame already being handled
   // when the socket closes finishes either way.
   if (!ws || sock !== ws || retiredSockets.has(sock)) return;
+  const gen = sessionGen;
+  const live = () => sessionLive(sock, gen); // re-asked after every await below
   let m;
   try {
     m = JSON.parse(raw);
@@ -3244,9 +3261,9 @@ async function handleMessage(room, raw, sock) {
       setStatus("waiting for approval");
       addLine("sys", "", "waiting — the person who created this chat has to let you in", true);
       hint("Waiting for the other person to approve you. They see the fingerprint of your key and decide.");
-      ws.send(JSON.stringify({
-        type: "knock", room, payload: packKey(await knockIntro(room)),
-      }));
+      const intro = await knockIntro(room);
+      if (!live()) return;
+      sock.send(JSON.stringify({ type: "knock", room, payload: packKey(intro) }));
       break;
     }
 
@@ -3290,7 +3307,7 @@ async function handleMessage(room, raw, sock) {
     // Owner side: someone is asking to be let in. NEVER auto-admit — the whole
     // point is that a human looks at the key.
     case "knock": {
-      await queueKnock(m);
+      await queueKnock(m, live);
       break;
     }
 
@@ -3309,7 +3326,7 @@ async function handleMessage(room, raw, sock) {
       const before = knockQueue.length;
       knockQueue = knockQueue.filter((k) => k.jid !== m.jid);
       // Re-render only if the prompt could be showing the entry we just removed.
-      if (knockQueue.length !== before) await showNextKnock();
+      if (knockQueue.length !== before) await showNextKnock(); // re-reads the queue head after its own await
       break;
     }
 
@@ -3374,7 +3391,7 @@ async function handleMessage(room, raw, sock) {
       // signed handshake follows once we also know the peer's nonce; for
       // AES256 (usesNonces, no key material on the wire) the nonces alone fix
       // the session's ratchet chains, closing cross-session frame replay.
-      ws.send(JSON.stringify({
+      sock.send(JSON.stringify({
         type: "key", room, alg: sessionAlg,
         payload: packKey({ hello: true, n: myNonce, reply: false }),
       }));
@@ -3403,17 +3420,19 @@ async function handleMessage(room, raw, sock) {
           if (peerNonce === null) peerNonce = p.n;
           if (!p.reply && !helloAnswered) {
             helloAnswered = true;
-            ws.send(JSON.stringify({
+            sock.send(JSON.stringify({
               type: "key", room, alg: sessionAlg,
               payload: packKey({ hello: true, n: myNonce, reply: true }),
             }));
-            if (cipher.needsHandshake) await sendSignedKey(room, false);
+            if (cipher.needsHandshake) await sendSignedKey(room, false, sock, live);
+            if (!live()) return;
           }
           // AES256: both nonces known — derive the session's ratchet chains
           // and unlock. No identity gate here: the shared passphrase IS the
           // out-of-band verification, so receiving unlocks with sending.
           if (cipher.usesNonces && !cipher.ready) {
             await cipher.setNonces(myNonce, peerNonce);
+            if (!live()) return;
             await onChannelReady(room);
           } else if (!cipher.needsHandshake && !cipher.usesNonces && !verified) {
             // OTP: no key material and no nonces — the pre-shared pad IS the
@@ -3435,7 +3454,7 @@ async function handleMessage(room, raw, sock) {
           // relay can hammer — see MAX_PEER_CONFIRMS.
           currentRoom = room;
           await keyConfirm.onPeerTag(p.confirm, cipher.confirmation);
-          break;
+          break; // (keyConfirm is reset by onclose and connectInner, so a stale finish is inert)
         }
 
         // Phase 2 — signed handshake. AES256 exchanges no key material, so a
@@ -3478,6 +3497,10 @@ async function handleMessage(room, raw, sock) {
           throw new Error("reflected handshake rejected (that is your own identity)");
         }
         const ok = await verifyHandshake(idbCanon, room, [myNonce, peerNonce], pub, sig);
+        // L-2: the verify is the long await. A reconnect meanwhile replaced
+        // everything below (peerBundle, admission, cipher): this frame belongs
+        // to a session that no longer exists.
+        if (!live()) return;
         if (!ok) {
           addLine("sys", "", "[handshake signature INVALID — refusing to connect; a relay may be tampering with the key exchange]", true);
           closeWs("Authentication failed — disconnecting. This is what a MITM attempt looks like.", sock);
@@ -3557,16 +3580,19 @@ async function handleMessage(room, raw, sock) {
         // keeps its first key; repeat/answer frames from this identity are
         // folded idempotently.
         await cipher.onPeerKey(pub);
+        if (!live()) return;
 
         // Answer the initiator exactly once with our own signed key.
         if (!reply) {
-          await sendSignedKey(room, true);
+          await sendSignedKey(room, true, sock, live);
+          if (!live()) return;
         }
 
         if (cipher.ready) {
           await onChannelReady(room);
         }
       } catch (e) {
+        if (!live()) return; // a stale session's failure is not this session's news
         hint("Key exchange failed: " + e.message, true);
       }
       break;
@@ -3583,6 +3609,7 @@ async function handleMessage(room, raw, sock) {
       }
       try {
         const text = await cipher.decrypt(m.payload);
+        if (!live()) return;
         addLine("peer", "peer", text);
         // P-04: recvHighWater must reach disk too — an unpersisted receive
         // watermark lets an already-delivered frame be replayed after a reload.
@@ -3614,8 +3641,10 @@ async function enterVerification(room, verifiedBundle) {
   // Use the bundle passed from the pinned first handshake — never re-read a
   // mutable global that a later frame might have changed (C-01).
   const bundle = verifiedBundle || peerBundle;
+  const gen = sessionGen; // L-2: the gate is drawn only for the session that asked
   const sn = await Identity.safetyNumber(myBundle, bundle);
   const peerFp = await Identity.fingerprintOf(bundle);
+  if (gen !== sessionGen) return;
   els.safetyNumber.textContent = sn;
   els.peerFingerprint.textContent = "Contact fingerprint: " + peerFp;
   currentPinKey = expectedPeerName ? contacts.pinKeyFor(expectedPeerName) : "room:" + room;
@@ -3655,6 +3684,7 @@ async function enterVerification(room, verifiedBundle) {
   }
 
   const pin = await getPin(currentPinKey);
+  if (gen !== sessionGen) return;
   if (sameBundle(pin, bundle) && !pin.revoked) {
     // Seen and verified before — accept without re-prompting.
     addLine("sys", "", expectedPeerName
@@ -3824,7 +3854,7 @@ async function sendText(e) {
 // ---- one-time pad UI ------------------------------------------------------
 
 function otpStatusMsg(text, isErr = false) {
-  els.otpStatus.textContent = text;
+  els.otpStatus.textContent = hintSafe(text);
   els.otpStatus.className = "hint" + (isErr ? " err" : "");
 }
 
@@ -4167,7 +4197,7 @@ els.login.addEventListener("click", loginAccount);
 // always started locked with no way to unlock without navigating to the Live
 // room. Each locked view now unlocks in place.
 const setUnlockStatus = (el) => (text, isErr = false) => {
-  el.textContent = text;
+  el.textContent = hintSafe(text);
   el.className = "hint" + (isErr ? " err" : "");
 };
 wireViewUnlock(els.profileUnlockPass, els.profileUnlock,

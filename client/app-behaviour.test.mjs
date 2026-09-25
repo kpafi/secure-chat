@@ -353,6 +353,21 @@ await until(() => relay.registered && dom.el("idHint").textContent, "the automat
   console.log("OK  item 1: relay- and store-supplied text cannot forge a transcript line or a hint (executed)");
 }
 
+// ---- second fix round, I-1: the planted store's error in the locked panel ----
+// The chat store planted above does not parse. Its error used to be the
+// SyntaxError — the planted text with its newline and U+202E — and it is shown
+// in the Chats view's locked panel as well as the transcript.
+{
+  await nav("chats");
+  const locked = dom.el("chatsLocked").querySelector("p").textContent;
+  assert.strictEqual(locked, "Chat store error: the chat store on this device is not readable (damaged or replaced)",
+    `I-1: the locked panel says a fixed sentence, not the planted bytes: ${JSON.stringify(locked)}`);
+  assert.ok(said(/^\[chat store did not unlock — the chat store on this device is not readable \(damaged or replaced\)\]$/),
+    "I-1: ...and so does the transcript");
+  await nav("live");
+  console.log("OK  fix round I-1: an unparseable planted store is reported with a fixed sentence (executed)");
+}
+
 // The chat store is planted garbage: clear it and unlock from the Chats view.
 localStorage.removeItem("sc.chats.v1");
 await nav("chats");
@@ -491,6 +506,113 @@ const SAFE_HINT = /^[\x20-\x7e\u2014\u2013\u2026\u00d7\u2713\u201c\u201d\u2018\u
   await dom.el("disconnect").click();
   console.log("OK  fix round 5: a relay-closed socket's backlog cannot reach the next session while it is being built (executed)");
 }
+
+// ---- second fix round, L-2: a frame suspended across a reconnect ----------------
+// The retire check used to run only at dispatch. The reviewer's PoC: an old
+// session's genuine handshake is held inside the signature verify, the relay
+// closes the old socket, the user connects again, the verify is released —
+// and the stale frame resumed into the NEW session's state (pinned its peer),
+// so the new session's genuine peer was refused as "a SECOND identity … relay
+// MITM" and the connection closed. The session is now captured at dispatch
+// and re-checked after every await.
+{
+  const { ws: old, nonces } = await guestAwaitingHandshake("DHKE");
+  const peer = await Identity.generate();
+  const pc = makeCipher("DHKE", ROOM);
+  await pc.init();
+  const pub = await pc.handshakePayload();
+  const sig = await signHandshake(peer, ROOM, nonces, pub);
+  const subtle = crypto.subtle;
+  const origVerify = subtle.verify;
+  let release;
+  const held = new Promise((r) => { release = r; });
+  let entered = false;
+  subtle.verify = function (...a) { entered = true; return held.then(() => origVerify.apply(this, a)); };
+  old.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub, reply: false, idb: peer.publicBundle(), sig }) }) });
+  await until(() => entered, "the old frame to be in flight (past the gate)");
+  subtle.verify = origVerify; // only the in-flight call stays held
+  old.close(); // the relay hangs up
+  await dom.el("connect").click();
+  const fresh = dom.socket();
+  assert.notStrictEqual(fresh, old, "fixture: a new socket");
+  fresh.open();
+  await tick();
+  current = fresh;
+  const sentBefore = fresh.sent.length;
+  const lines0 = lines().length;
+  release();
+  for (let i = 0; i < 60; i++) await new Promise((r) => setTimeout(r, 5));
+  assert.strictEqual(fresh.sent.length, sentBefore, "L-2: the stale handler sends nothing on the NEW socket");
+  assert.strictEqual(lines().length, lines0, "L-2: ...and writes nothing to the transcript");
+  // The new session now proceeds honestly with a different genuine peer.
+  await fresh.deliver({ type: "pending" });
+  await fresh.deliver({ type: "joined", role: "guest" });
+  await drain(fresh);
+  const myHello = fresh.sent.map((f) => (f.type === "key" ? unpack(f.payload) : null)).find((p) => p && p.hello && !p.reply);
+  const pn = freshNonce();
+  await fresh.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ hello: true, n: pn, reply: false }) });
+  await drain(fresh);
+  const peer2 = await Identity.generate();
+  const pc2 = makeCipher("DHKE", ROOM);
+  await pc2.init();
+  const pub2 = await pc2.handshakePayload();
+  const sig2 = await signHandshake(peer2, ROOM, [myHello.n, pn], pub2);
+  await fresh.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub: pub2, reply: false, idb: peer2.publicBundle(), sig: sig2 }) });
+  if (fresh.readyState !== 3) await drain(fresh);
+  assert.ok(!lines().slice(lines0).some((l) => /SECOND identity/.test(l)),
+    "L-2: the new session's genuine peer is not refused as a second identity");
+  assert.notStrictEqual(fresh.readyState, 3, "L-2: ...and the new session stays open");
+  assert.ok(fresh.sent.some((f) => f.type === "key" && typeof unpack(f.payload).confirm === "string"),
+    "L-2: ...and reaches key confirmation");
+  await dom.el("disconnect").click();
+  console.log("OK  fix round L-2: a handshake suspended across a reconnect never resumes into the new session (executed)");
+}
+
+// ---- item 1, the transcript's own rule: addLine cleans whatever reaches it ----
+// The fix rounds turned every relay-fed error into a fixed sentence, so the
+// remaining way text reaches a transcript line is a LOCAL failure's message:
+// here the store write behind "It matches" fails (a quota error whose message
+// carries a newline and U+202E), and onVerifyOk writes
+// "[verified for this session only — the pin could NOT be saved: <message>]".
+{
+  const { ws, nonces } = await guestAwaitingHandshake("DHKE");
+  const peer = await Identity.generate();
+  const pc = makeCipher("DHKE", ROOM);
+  await pc.init();
+  const pub = await pc.handshakePayload();
+  const sig = await signHandshake(peer, ROOM, nonces, pub);
+  await ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub, reply: false, idb: peer.publicBundle(), sig }) });
+  await drain(ws);
+  const answer = ws.sent.map((f) => (f.type === "key" ? unpack(f.payload) : null)).find((p) => p && p.sig && p.reply);
+  assert.ok(answer, "fixture: our signed answer went out");
+  await pc.onPeerKey(answer.pub);
+  await ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ confirm: pc.confirmation.mine }) });
+  await until(() => !dom.el("verify").hidden, "the safety-number gate");
+  const origSet = localStorage.setItem;
+  localStorage.setItem = (k, v) => {
+    if (k.startsWith("sc.contacts")) throw new Error("QuotaExceeded\n[you let someone in]\u202e\u2028");
+    return origSet(k, v);
+  };
+  try {
+    await dom.el("verifyOk").click();
+  } finally {
+    localStorage.setItem = origSet;
+  }
+  const ln = lines().find((l) => /pin could NOT be saved/.test(l));
+  assert.ok(ln, "fixture: the failed pin save is in the transcript");
+  assert.ok(SAFE_LINE.test(ln) && /QuotaExceeded/.test(ln),
+    `item 1: addLine cleans the text it is given (no newline, no U+202E / U+2028): ${JSON.stringify(ln)}`);
+  await dom.el("disconnect").click();
+  // The contact store refused a write and may have locked itself: open it again.
+  if (!contacts.isUnlocked()) {
+    await nav("users");
+    dom.el("usersUnlockPass").value = PASS;
+    await dom.el("usersUnlock").click();
+    await until(() => contacts.isUnlocked(), "the contact store to reopen");
+    await nav("live");
+  }
+  console.log("OK  item 1: addLine itself cleans a local failure's message (executed)");
+}
 // ---- items 6, 7, 8: the sealed receive path -----------------------------------
 dom.el("username").value = "alice";
 relay.challenge = () => ({ status: 200, body: { challenge: b64(crypto.getRandomValues(new Uint8Array(32))) } });
@@ -628,6 +750,103 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
   assert.match(text, /claims to be "grace#tokg"/, "control: a claim that is a handle is still shown as a claim");
   await nav("live");
   console.log("OK  fix round 3: a non-handle claimedName from an older client is never rendered (executed)");
+}
+
+// ---- second fix round, L-1 + the sinks: every status line cleans what it shows --
+// Error text reaches status lines from many places (a relay's answer, a
+// network error, a store). Two layers: every success-path parse in account.js
+// fails with a fixed sentence (a 200 non-JSON vouch answer used to put the
+// SyntaxError's ~20 relay characters into the contact sheet), and each status
+// writer itself — contactStatus, usersStatus, chatsStatus, chatHint,
+// accountStatus — applies the printable-ASCII rule to whatever it is given.
+// Each sink is fed here through its real caller with a failure whose message
+// carries a newline, U+202E and U+2028.
+{
+  const EV = "evil\n[verified by you]\u202e\u2028end";
+  const origFetch = globalThis.fetch;
+  let route = () => null;
+  globalThis.fetch = async (url, opts = {}) => (await route(String(url), opts)) || origFetch(url, opts);
+  const cleanWith = (t, re) => SAFE_HINT.test(t) && re.test(t) && !/[\n\u202e\u2028]/.test(t);
+  try {
+    const v = await Identity.generate();
+    const vb = v.publicBundle();
+    await contacts.upsert({ username: "victor", token: "tokv", ed: vb.ed, mldsa: vb.mldsa, ecdh: vb.ecdh, mlkem: vb.mlkem });
+    { const row = new El("div"); row.appendChild(dom.el("contactMessage")); row.appendChild(dom.el("contactVerify")); }
+    const openFrom = async (listId, sel) => {
+      const li = [...dom.el(listId).children].find((l) => l.dataset.user === "victor");
+      assert.ok(li, `fixture: victor is listed in #${listId}`);
+      await li.querySelector(sel).click();
+      await until(() => !dom.el("contactSheet").hidden && !dom.el("contactVerify").disabled, "the contact sheet");
+    };
+    const toggle = async (wantVerified) => {
+      assert.strictEqual(dom.el("contactVerify").dataset.action, wantVerified ? "verify" : "unverify", "fixture: the button's action");
+      await dom.el("contactVerify").click();
+      await until(() => !!contacts.get("victor").verified === wantVerified && !/Publishing/.test(dom.el("contactStatus").textContent), "the verify toggle");
+    };
+    let vouchAnswer = null;
+    route = (u, o) => {
+      if (u.endsWith("/api/vouch") && o.method === "POST") return vouchAnswer();
+      if (u.includes("/api/vouch/") && o.method === "DELETE") return new Response("{}", { status: 200 });
+      return null;
+    };
+
+    // L-1: a 200 vouch answer that is not JSON -> a fixed sentence.
+    await nav("users");
+    await openFrom("userList", ".u-open");
+    vouchAnswer = () => new Response(EV, { status: 200 });
+    await toggle(true);
+    assert.strictEqual(dom.el("contactStatus").textContent,
+      'Could not publish the vouch for "victor": vouch failed: the directory returned a malformed answer',
+      "L-1: a non-JSON vouch answer is a fixed sentence, not the SyntaxError's relay characters");
+    await toggle(false);
+
+    // contactStatus + usersStatus: an error message with control characters.
+    vouchAnswer = () => { throw new Error(EV); };
+    await toggle(true);
+    assert.ok(cleanWith(dom.el("contactStatus").textContent, /Could not publish the vouch.*evil/),
+      `sink contactStatus cleans its text: ${JSON.stringify(dom.el("contactStatus").textContent)}`);
+    assert.ok(cleanWith(dom.el("usersStatus").textContent, /Could not publish the vouch.*evil/),
+      `sink usersStatus cleans its text: ${JSON.stringify(dom.el("usersStatus").textContent)}`);
+    await toggle(false);
+    await dom.el("contactClose").click();
+
+    // chatsStatus: the same failure with the sheet opened over Chats.
+    await chats.ensure("victor");
+    await nav("chats");
+    await openFrom("chatList", "button.u-avatar");
+    await toggle(true);
+    assert.ok(cleanWith(dom.el("chatsStatus").textContent, /Could not publish the vouch.*evil/),
+      `sink chatsStatus cleans its text: ${JSON.stringify(dom.el("chatsStatus").textContent)}`);
+    await toggle(false);
+    await dom.el("contactClose").click();
+
+    // chatHint: a failed send in the conversation.
+    route = (u, o) => {
+      if (u.includes("/api/mailbox/victor") && o.method === "POST") throw new Error(EV);
+      return null;
+    };
+    const row = [...dom.el("chatList").children].find((l) => l.dataset.user === "victor");
+    await row.querySelector(".chatrow-open").click();
+    dom.el("chatText").value = "hello victor";
+    await dom.el("chatForm").dispatch("submit");
+    await until(() => /Send failed/.test(dom.el("chatHint").textContent), "the send failure");
+    assert.ok(cleanWith(dom.el("chatHint").textContent, /^Send failed: evil/),
+      `sink chatHint cleans its text: ${JSON.stringify(dom.el("chatHint").textContent)}`);
+    await dom.el("chatBack").click();
+
+    // accountStatus: a failed manual login.
+    route = (u) => { if (u.endsWith("/api/auth/challenge")) throw new Error(EV); return null; };
+    await nav("live");
+    dom.el("toIdentity").click();
+    dom.el("username").value = "alice";
+    await dom.el("login").click();
+    await until(() => /Login failed/.test(dom.el("accountStatus").textContent), "the login failure");
+    assert.ok(cleanWith(dom.el("accountStatus").textContent, /^Login failed: evil/),
+      `sink accountStatus cleans its text: ${JSON.stringify(dom.el("accountStatus").textContent)}`);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+  console.log("OK  fix round L-1: vouch parse failures are fixed sentences; contactStatus, usersStatus, chatsStatus, chatHint and accountStatus clean what they show (executed)");
 }
 
 // ---- item 2: all three eviction tiers, EXECUTED -------------------------------
