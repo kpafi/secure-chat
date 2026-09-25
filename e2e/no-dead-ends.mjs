@@ -175,7 +175,17 @@ check("the current-view mark moves with the view",
   await p2.type("#idPass", PASS);
   await p2.click("#idCreate");
   await p2.waitForFunction(() => !document.querySelector("#idExport").hidden, { timeout: 60000 });
-  await p2.evaluate(() => localStorage.removeItem("sc.chats.v1")); // the one removeItem
+  // The one deletion. Package 3b: the chat store lives in IndexedDB now.
+  await p2.evaluate(() => new Promise((resolve, reject) => {
+    const r = indexedDB.open("secure-chat");
+    r.onerror = () => reject(r.error);
+    r.onsuccess = () => {
+      const tx = r.result.transaction("kv", "readwrite");
+      tx.objectStore("kv").delete("sc.chats.v1");
+      tx.oncomplete = () => { r.result.close(); resolve(); };
+      tx.onerror = () => reject(tx.error);
+    };
+  }));
   await p2.reload({ waitUntil: "networkidle0" });
   await p2.click('.navitem[data-view="chats"]');
   await p2.waitForFunction(() => !document.querySelector("#viewChats").hidden, { timeout: 10000 });

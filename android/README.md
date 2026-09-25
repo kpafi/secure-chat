@@ -106,3 +106,13 @@ The bundled web client is **generated at build time** from `../client` by the
   verified; unlock and login against the deployed relay observed.
 - The handshake modes (DHKE / RSA / PQKEM) and every other mode are covered in
   real browsers by `e2e/all-modes.mjs`, which drives the same client code.
+- **Owed on the phone (package 3b, durable storage):** (1) the v0.3.x → 0.4.0
+  upgrade with data kept: contacts and chats open intact and have moved to
+  IndexedDB (`localStorage` no longer holds `sc.contacts.v1` / `sc.chats.v1`;
+  the `sc.*.idb.v1` markers are set), existing pads unlock where they were;
+  (2) an OTP send followed within a second or two by a force-stop
+  (`adb shell am force-stop`) reopens the pad past the sent message, with no
+  "rolled back" refusal; (3) the same for a received message and for Export
+  (the re-export warning appears). The node suite simulates all three
+  (`client/durable.test.mjs`) and `e2e/durable-crash.mjs` proves (2) in desktop
+  Chromium; neither runs the Android WebView.

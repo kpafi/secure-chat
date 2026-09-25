@@ -178,6 +178,14 @@ only one tab at a time. Honest caveats:
    AndroidKeyStore HMAC; iOS: see `ios/README.md`). A browser has no such
    storage, so there a coordinated restore of the pad *and* its usage record
    still rewinds undetected — use pads in the app.
+4. Crashes: `localStorage` is not durable (Chromium commits it in batches, up
+   to a minute late), so every pad save also writes a sealed progress record to
+   **IndexedDB with strict durability** and waits for it before a message is
+   sent or shown or a pad file is handed out. After a crash the pad reopens at
+   the highest offset any of its records reached (skipped bytes are harmless;
+   reuse is not); the native floor is advanced only after that write. OTP
+   therefore needs IndexedDB — without it (some private-browsing modes) OTP is
+   refused.
 
 ## Accounts (optional directory)
 The server doubles as a passwordless **public-key directory** under `/api`. You
@@ -200,6 +208,12 @@ key that disagrees with the published one is flagged loudly.
 Everything these views store on the device — the contact list and the full chat
 history — is encrypted at rest (PBKDF2-600k → AES-256-GCM under your identity
 passphrase; the key lives only in memory while the identity is unlocked).
+Both stores live in the browser's **IndexedDB**, written with strict
+durability (since 0.4.0; the first start moves them there from
+`localStorage` once). Going back to an older version after that is **not
+supported**: an older client does not look in IndexedDB and would behave as if
+there were no saved contacts or chats. Without IndexedDB the stores stay in
+`localStorage` and the apps' rollback floor is not advanced for them.
 
 **Users** — your contacts with their public keys and a **trust mark**:
 🟢 *verified by you* (compared in person, or confirmed at the live-room gate),
