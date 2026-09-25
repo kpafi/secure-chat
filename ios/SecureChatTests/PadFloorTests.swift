@@ -26,12 +26,30 @@ final class PadFloorTests: XCTestCase {
         XCTAssertEqual(floor.read("p1"), PadFloor.absent)
         XCTAssertEqual(floor.bump("p1", 5), 5)
         XCTAssertEqual(floor.bump("p1", 3), 5, "never lowers")
-        XCTAssertEqual(floor.bump("p1", -1), 5, "negative is a read")
+        XCTAssertEqual(floor.bump("p1", -1), PadFloor.invalid, "a negative bump is refused (INVALID), like PadFloor.kt")
+        XCTAssertEqual(floor.read("p1"), 5, "...and changes nothing")
         XCTAssertEqual(floor.bump("p1", 9), 9)
         XCTAssertEqual(floor.read("p1"), 9)
         XCTAssertEqual(floor.read("p2"), PadFloor.absent)
         XCTAssertEqual(floor.bump("p2", 0), 0, "a floor of 0 is distinct from absent")
         XCTAssertEqual(floor.read("p2"), 0)
+    }
+
+    /// Package 4: out-of-range values are INVALID (-4), the Kotlin answer —
+    /// never the current floor, never written, never creating a record.
+    func testOutOfRangeBumpIsInvalid() throws {
+        XCTAssertEqual(PadFloor.invalid, -4, "must match PadFloor.kt INVALID and nativefloor.js NATIVE_INVALID")
+        XCTAssertEqual(floor.bump("fresh", -1), PadFloor.invalid)
+        XCTAssertEqual(floor.read("fresh"), PadFloor.absent, "a refused bump creates no record")
+        XCTAssertEqual(floor.bump("p1", 7), 7)
+        for bad: Int64 in [-1, -2, -4, Int64(Int32.min), Int64(Int32.max) + 1] {
+            XCTAssertEqual(floor.bump("p1", bad), PadFloor.invalid, "\(bad)")
+        }
+        XCTAssertEqual(floor.bump("p1", Int64(Int32.max)), Int64(Int32.max), "the int32 ceiling itself is valid")
+        XCTAssertEqual(floor.read("p1"), Int64(Int32.max))
+        let p = FloorBridge.prefix
+        XCTAssertEqual(FloorBridge.answer("\(p)bump\u{1}p2\u{1}-3", floor: floor), "-4",
+                       "the bridge answers a negative bump with INVALID, not the current floor")
     }
 
     func testEditedValueIsTamperedAndNotHealed() throws {

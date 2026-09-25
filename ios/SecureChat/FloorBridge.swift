@@ -53,8 +53,8 @@ enum FloorBridge {
         guard !id.isEmpty, id.count <= 160,
               id.unicodeScalars.allSatisfy({ idAllowed.contains($0) }) else { return nil }
         // An int32 in plain decimal, optional leading '-': no whitespace, no
-        // '+', no exponent, no hex. A negative bump is answered like Android's
-        // (PadFloor.bump returns the current floor and writes nothing).
+        // '+', no exponent, no hex. A negative bump is REFUSED like Android's
+        // (PadFloor.bump answers INVALID, -4, and writes nothing).
         let digits = raw.hasPrefix("-") ? raw.dropFirst() : Substring(raw)
         guard !digits.isEmpty, digits.count <= 10,
               digits.unicodeScalars.allSatisfy({ asciiDigits.contains($0) }),
