@@ -24,7 +24,7 @@
 //     script — Kotlin raw string, JavaScript inside — is checked as its own text.
 import assert from "node:assert";
 import { readFile } from "node:fs/promises";
-import { NATIVE_COMMIT_FAILED, NATIVE_INVALID, FLOOR_MAX } from "./nativefloor.js";
+import { NATIVE_COMMIT_FAILED, NATIVE_INVALID, NATIVE_FULL, FLOOR_MAX } from "./nativefloor.js";
 
 const SRC = new URL("../android/app/src/main/java/org/securechat/app/", import.meta.url);
 const activityRaw = await readFile(new URL("MainActivity.kt", SRC), "utf8");
@@ -182,6 +182,18 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
     "F-P7-A5: the flag must be unconditional — directly in onCreate's body, not inside if/when/try");
   assert.ok(!/^(if|when|try|else)\b/.test(onCreate[flagAt - 1] || ""), "F-P7-A5: …and not under a brace-less `if (…)`");
   assert.ok(!lines.some((l) => /clearFlags\(/.test(l)), "F-P7-A5: nothing in MainActivity.kt may clear window flags");
+  // Fix round 1 (coverage): clearFlags is not the only way to drop the flag.
+  // `setFlags(0, FLAG_SECURE)` anywhere (e.g. in loadWithRelay, or on a dialog
+  // after show()) clears it, and so does rewriting the window attributes. So:
+  // every setFlags call in the file passes FLAG_SECURE as BOTH arguments, there
+  // are exactly two (onCreate, secureShow), and nothing touches `attributes`.
+  const setFlagCalls = lines.map((l, i) => (/\bsetFlags\(/.test(l) ? i : -1)).filter((i) => i >= 0);
+  assert.strictEqual(setFlagCalls.length, 2, `exactly two setFlags calls (onCreate, secureShow), found ${setFlagCalls.length}`);
+  for (const i of setFlagCalls) {
+    assert.ok(secureFlags(callAt(lines, i)), `every setFlags passes FLAG_SECURE as flags AND mask: ${lines[i]}`);
+  }
+  assert.ok(!lines.some((l) => /\battributes\b|setAttributes\(|\.flags\s*=/.test(l)),
+    "nothing may rewrite window attributes / flags directly (that can clear FLAG_SECURE too)");
   ok("F-ANDROID-003: the Activity sets FLAG_SECURE unconditionally, before setContentView, and never clears it");
 }
 
@@ -316,11 +328,13 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
   const bump = kotlinFun(/^fun bump\(ctx: Context, padId: String, value: Long\): Long \{$/, "PadFloor.bump", floorLines);
   assert.deepStrictEqual(bump.slice(1, -1), [
     "if (value < 0 || value > MAX_VALUE) return INVALID",
+    "if (padId.isEmpty() || padId.length > MAX_ID_LENGTH) return INVALID",
     "if (commitFailed) return COMMIT_FAILED",
     "val current = read(ctx, padId)",
     "if (current == TAMPERED) return TAMPERED",
     "val next = if (current == ABSENT) value else maxOf(current, value)",
     "if (next == current) return current",
+    "if (current == ABSENT && prefs(ctx).all.size >= MAX_RECORDS) return FULL",
     'val committed = prefs(ctx).edit().putString(padId, "$next:${tag(padId, next)}").commit()',
     "if (!committed) {",
     "commitFailed = true",
@@ -330,6 +344,14 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
   ], "ROUND-3 F-4 / 7b: PadFloor.bump must refuse out-of-range values, answer COMMIT_FAILED for a commit() that " +
     "returned false (and latch it: the in-memory map is ahead of disk), and return a value only once it is on disk");
   assert.ok(!floorLines.some((l) => /\.apply\(\)/.test(l)), "PadFloor must never use apply() (asynchronous, no result)");
+  // Fix round 1 (coverage): pinning bump's body did not pin the latch — a
+  // `commitFailed = false` anywhere else (read(), a helper) silently re-arms
+  // the false-success path. The latch is declared false once and only ever set true.
+  assert.deepStrictEqual(floorLines.filter((l) => /\bcommitFailed\s*=/.test(l)),
+    ["private var commitFailed = false", "commitFailed = true"],
+    "the COMMIT_FAILED latch is only ever SET (never reset) for the life of the process");
+  assert.strictEqual(constOf("FULL"), `${NATIVE_FULL}L`, "FULL matches nativefloor.js");
+  assert.strictEqual(constOf("MAX_RECORDS"), "4096", "record cap as on iOS (PadFloor.maxRecords)");
   ok("ROUND-3 F-4 / 7b: PadFloor.bump reports COMMIT_FAILED (latched) and INVALID; constants match nativefloor.js");
 }
 
@@ -340,6 +362,11 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
   assert.ok(activityTag, "the manifest declares MainActivity");
   assert.match(activityTag[0], /android:taskAffinity=""/,
     "F-ANDROID-001: MainActivity must have an empty taskAffinity, so no other app can join its task");
+  // Fix round 1 (coverage): allowTaskReparenting="true" (on the activity or the
+  // application) lets the activity MOVE into another app's task with a matching
+  // affinity — the other half of the task-hijack family.
+  assert.doesNotMatch(noComments, /allowTaskReparenting="true"/,
+    "F-ANDROID-001: allowTaskReparenting must not be enabled anywhere in the manifest");
   assert.doesNotMatch(activityTag[0], /android:launchMode=/,
     "F-ANDROID-001: launchMode stays the default (a singleTask/singleInstance change needs its own device check)");
   assert.strictEqual((noComments.match(/<activity\b/g) || []).length, 1, "one activity");

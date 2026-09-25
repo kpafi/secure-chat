@@ -50,6 +50,15 @@ that a user cannot screenshot the safety number or an invite QR from inside
 the app. **Not yet checked on a device:** a capture (`adb shell screencap`, or
 a screen recording) taken while a passphrase prompt is open must be black.
 
+**Known gap, needs a device check:** a `<select>` popup (`#chatNew` — contact
+names, `#otpSelect` — pad labels, `#chatModeSel`) is drawn by the WebView
+itself in its own native popup window, which `secureShow` never sees, so it
+very likely does NOT carry `FLAG_SECURE`. Check with a screen recording while
+each list is open. If it is capturable, the fix is to render those three lists
+in-page (a listbox inside the WebView surface, which the activity flag covers)
+instead of native `<select>`s — not done here because it is a UI change to
+three screens, not a flag.
+
 Also since Package 3: `WebChromeClient.onConsoleMessage` swallows the web
 client's console output in release builds (it used to reach logcat), and
 `MainActivity` has `android:taskAffinity=""` (F-ANDROID-001) with the default

@@ -100,6 +100,19 @@ object PadFloor {
     const val MAX_VALUE = 0x7fffffffL
 
     /**
+     * Fix round 1 (Info, parity with iOS PadFloor.maxRecords): [bump]'s answer
+     * when creating a NEW record would exceed [MAX_RECORDS]. Page JS can bump
+     * fresh ids at will; without a bound it could grow the prefs file until
+     * commits fail, which trips the [commitFailed] latch and locks every store
+     * for the session. Must match NATIVE_FULL in client/nativefloor.js.
+     */
+    const val FULL = -5L
+    const val MAX_RECORDS = 4096
+
+    /** Longest id the client uses is `contacts:` + 64 hex = 73 characters. */
+    const val MAX_ID_LENGTH = 96
+
+    /**
      * Latched by the first failed `commit()` of this process. See [bump]: after a
      * failed commit the in-memory map is ahead of the file, so no later answer
      * from this object can be trusted to describe what a restart will see.
@@ -183,11 +196,13 @@ object PadFloor {
      */
     fun bump(ctx: Context, padId: String, value: Long): Long {
         if (value < 0 || value > MAX_VALUE) return INVALID
+        if (padId.isEmpty() || padId.length > MAX_ID_LENGTH) return INVALID
         if (commitFailed) return COMMIT_FAILED
         val current = read(ctx, padId)
         if (current == TAMPERED) return TAMPERED
         val next = if (current == ABSENT) value else maxOf(current, value)
         if (next == current) return current
+        if (current == ABSENT && prefs(ctx).all.size >= MAX_RECORDS) return FULL
         val committed = prefs(ctx).edit().putString(padId, "$next:${tag(padId, next)}").commit()
         if (!committed) {
             commitFailed = true
