@@ -1119,6 +1119,8 @@ async function unlockContacts(pass, opts = {}) {
     contactsError = null;
     if (contactOpts.adoptLegacy || contactOpts.adoptDeleted) {
       storeNotice = "Contacts opened WITHOUT a verifiable history — treat every contact as unverified until you re-check the safety number.";
+      // 3b review round 4 (L-1): a leftover copy in the old storage was discarded on the way.
+      if (r && r.conflictDropped) storeNotice += " An older copy left in this browser's old storage was discarded.";
     } else if (r && r.created && opts.expectStore) {
       storeNotice = "No saved contacts were found for this identity. If you have used this device before, " +
         "they were deleted and key-change warnings for earlier contacts are gone — treat every contact as unverified.";

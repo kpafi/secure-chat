@@ -349,6 +349,23 @@ export function storeSlot({ blobKey, genKey, marker }) {
     // ours at the next unlock; the caller refuses the save (STALE) instead, and
     // the next unlock settles the conflict with the passphrase.
     foreignCopy: () => mode === "idb" && lsGet(blobKey) !== null,
+    // Review round 4 (L-1): the store was LOST (IndexedDB emptied beside the
+    // marker) and the user explicitly chose to start over ("Open anyway"). A
+    // blob left in localStorage then belongs to nothing that can be verified —
+    // IndexedDB has no store to compare salts or generations with — and left in
+    // place it made every save of the fresh store a STALE refusal, forever
+    // (only Forget got out). It is discarded; returns true when there was one,
+    // so the caller can say so.
+    dropStray() {
+      if (lsGet(blobKey) === null) return false;
+      ls().removeItem(blobKey);
+      return true;
+    },
+    // Review round 4 (info): the wipe counter, read by a save when it STARTS
+    // and handed back to write(), which then refuses to write anything once a
+    // wipe (Forget) happened in between — deliberately, instead of relying on
+    // lock() having nulled the salt the save would still need.
+    epoch: () => epoch,
     // Review round 2 (L-2): settle a conflict read() reported. `adopt` = the
     // localStorage copy is the newer authenticated generation (the caller
     // checked, with the passphrase): it becomes the IndexedDB store. Otherwise
@@ -361,20 +378,21 @@ export function storeSlot({ blobKey, genKey, marker }) {
       ls().removeItem(blobKey);
       mirror(cache.witness);
     },
-    async write(blob, witness) {
+    async write(blob, witness, startEpoch = epoch) {
       await ready;
+      if (startEpoch !== epoch) return false; // wiped since the save began (review round 4)
       if (mode === null) throw new Error("the durable database could not be read — reload and try again");
       if (mode !== "idb") {
         ls().setItem(blobKey, blob);
         ls().setItem(genKey, witness);
       } else {
-        const e = epoch;
         await write({ [blobKey]: blob, [genKey]: witness });
-        if (e !== epoch) return; // wiped meanwhile (review round 3): leave it wiped
+        if (startEpoch !== epoch) return true; // wiped meanwhile (review round 3): leave it wiped
         try { if (lsGet(marker) === null) ls().setItem(marker, "1"); } catch { /* best effort, as mirror() */ }
         mirror(witness);
       }
       cache = { blob, witness };
+      return true;
     },
     async wipe() {
       epoch += 1;

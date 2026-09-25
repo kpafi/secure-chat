@@ -141,12 +141,12 @@ async function readWitness(passphrase = null, raw = undefined) {
 }
 
 // Sealed and RETURNED: persist() writes it with the store in one transaction.
-async function sealWitness(gen, key) {
+async function sealWitness(gen, key, saltBytes) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const plain = enc.encode(JSON.stringify({ d: CHATS_GEN_DOMAIN, gen }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain));
   return JSON.stringify({
-    salt: b64(salt), iters: KDF_ITERS, iv: b64(iv), ct: b64(ct),
+    salt: b64(saltBytes), iters: KDF_ITERS, iv: b64(iv), ct: b64(ct),
   });
 }
 
@@ -260,13 +260,16 @@ export async function unlock(passphrase, opts = {}) {
         );
       }
     }
+    // Review round 4 (L-1): see contacts.js — drop a stray localStorage copy
+    // before starting over, or the fresh store could never save.
+    const strayDropped = lost && opts.adoptDeleted ? slot.dropStray() : false;
     salt = crypto.getRandomValues(new Uint8Array(16));
     dataKey = await deriveKey(passphrase, salt, KDF_ITERS);
     chats = newStore();
     generation = floor > NATIVE_ABSENT ? floor : 0;
     await persist();
     expectedStore = false;
-    return { created: true };
+    return strayDropped ? { created: true, conflictDropped: true } : { created: true };
   }
   expectedStore = true;
   // Second fix round (re-review of 9a38d97, I-1): a SyntaxError echoes ~20
@@ -410,6 +413,11 @@ function persist() {
 
 async function persistNow() {
   if (!dataKey) throw new Error("chat store is locked");
+  // Review round 4 (info): what this save belongs to, fixed when it starts —
+  // the wipe epoch (a Forget in between makes write() refuse) and the salt
+  // (so nothing below depends on lock() having nulled it meanwhile).
+  const epochAtStart = slot.epoch();
+  const saltAtStart = salt;
   // Review round 3 (F1): see contacts.js — an older-version tab wrote the store
   // to localStorage since we read it; refuse rather than race it.
   if (slot.foreignCopy()) {
@@ -453,10 +461,10 @@ async function persistNow() {
     d: CHATS_DOMAIN, chats, gen: next, nativeFloor: floored,
   }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain));
-  const blobStr = JSON.stringify({ v: 2, iters: KDF_ITERS, salt: b64(salt), iv: b64(iv), ct: b64(ct) });
+  const blobStr = JSON.stringify({ v: 2, iters: KDF_ITERS, salt: b64(saltAtStart), iv: b64(iv), ct: b64(ct) });
   // Package 3b: one strict transaction for store + witness, completed before
   // this returns; the native floor only after it (never ahead of the data).
-  await slot.write(blobStr, await sealWitness(next, key));
+  if (!(await slot.write(blobStr, await sealWitness(next, key, saltAtStart), epochAtStart))) return; // wiped (Forget) since this save began
   if (dataKey !== key) return; // locked meanwhile
   generation = next;
   if (floored) armOrLock(generation);

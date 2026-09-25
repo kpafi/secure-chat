@@ -251,6 +251,9 @@ export async function unlock(passphrase, opts = {}) {
         );
       }
     }
+    // Review round 4 (L-1): starting over after a LOST store — drop a stray
+    // localStorage copy first, or the fresh store could never save (STALE).
+    const strayDropped = lost && opts.adoptDeleted ? slot.dropStray() : false;
     salt = crypto.getRandomValues(new Uint8Array(16));
     dataKey = await deriveKey(passphrase, salt, KDF_ITERS);
     contacts = [];
@@ -259,7 +262,7 @@ export async function unlock(passphrase, opts = {}) {
     dropLegacyPins();
     await persist(); // a failed floor write locks the store and throws (Package 3)
     expectedStore = false;
-    return { created: true };
+    return strayDropped ? { created: true, conflictDropped: true } : { created: true };
   }
   expectedStore = true;
   // Second fix round (re-review of 9a38d97, I-1): a SyntaxError echoes ~20
@@ -478,12 +481,12 @@ async function readWitness(passphrase = null, raw = undefined) {
 
 // Seals the witness and RETURNS it: persist() writes it together with the store
 // in one durable transaction (package 3b).
-async function sealWitness(gen, key) {
+async function sealWitness(gen, key, saltBytes) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const plain = enc.encode(JSON.stringify({ d: GEN_DOMAIN, gen }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain));
   return JSON.stringify({
-    salt: b64(salt), iters: KDF_ITERS, iv: b64(iv), ct: b64(ct),
+    salt: b64(saltBytes), iters: KDF_ITERS, iv: b64(iv), ct: b64(ct),
   });
 }
 
@@ -573,6 +576,11 @@ function persist() {
 
 async function persistNow() {
   if (!dataKey) throw new Error("contact store is locked");
+  // Review round 4 (info): what this save belongs to, fixed when it starts —
+  // the wipe epoch (a Forget in between makes write() refuse) and the salt
+  // (so nothing below depends on lock() having nulled it meanwhile).
+  const epochAtStart = slot.epoch();
+  const saltAtStart = salt;
   // Review round 3 (F1): a tab still running the previous version has written
   // the store to localStorage since we read it. Committing now would put our
   // generation beside its — and the next unlock would adopt whichever is
@@ -658,14 +666,14 @@ async function persistNow() {
     d: STORE_DOMAIN, contacts, pins, gen: next, nativeFloor: floored,
   }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain));
-  const blobStr = JSON.stringify({ v: 4, iters: KDF_ITERS, salt: b64(salt), iv: b64(iv), ct: b64(ct) });
+  const blobStr = JSON.stringify({ v: 4, iters: KDF_ITERS, salt: b64(saltAtStart), iv: b64(iv), ct: b64(ct) });
   // Package 3b: store and witness go to IndexedDB in ONE strict transaction,
   // and this line returns only once it has COMPLETED. (Under localStorage the
   // witness was written last so that a crash between the two left the store
   // ahead of it; one atomic transaction makes that split impossible.) A failed
   // write rejects this save exactly as a failed setItem did (quota): the
   // caller reports it, and the floor below is not touched.
-  await slot.write(blobStr, await sealWitness(next, key));
+  if (!(await slot.write(blobStr, await sealWitness(next, key, saltAtStart), epochAtStart))) return; // wiped (Forget) since this save began
   if (dataKey !== key) return; // locked (or re-unlocked) meanwhile: nothing here is ours any more
   generation = next;
   // Native floor only AFTER the durable write completed — the ordering that

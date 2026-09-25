@@ -1079,5 +1079,76 @@ if (r2("r3info")) {
   console.log("OK  review r3 info: wipe() during a save stays wiped; a mirror write failure is not a failed save");
 }
 
+// ============================================================================
+// R4. Review round 4 (pentest of f9702d5)
+// ============================================================================
+// L-1: IndexedDB emptied (eviction, site-data clear, deletion) while a blob
+// sits in localStorage (an honest old-version tab's save, or any planted
+// string). read() took the `lost` path and left that blob alone; "Open
+// anyway" created a fresh store whose first save hit foreignCopy() → STALE →
+// nothing written → reload → the same state forever. Only Forget got out.
+// Now the explicit adoption clears the leftover (and says so).
+if (r2("r4wedge")) {
+  for (const mod of ["contacts.js", "chats.js"]) {
+    const PASSX = "identity passphrase r4";
+    mem.clear(); freshIdb();
+    const a = await fresh(mod, "r4-" + mod);
+    await a.unlock(PASSX);
+    if (mod === "contacts.js") await a.upsert({ username: "bob", ed: "RUQx", mldsa: "TUwx" });
+    else await a.append("bob", { dir: "in", text: "x", ts: 1, id: "e1" });
+    a.lock();
+    const k = mod === "contacts.js" ? "sc.contacts.v1" : "sc.chats.v1";
+    const g = mod === "contacts.js" ? "sc.contacts.gen.v1" : "sc.chats.gen.v1";
+    mem.set(k, fake.getItem(k));           // a copy in localStorage…
+    fake.removeItem(k); fake.removeItem(g); // …and IndexedDB emptied
+    const code = mod === "contacts.js" ? "DELETED_CONTACTS_ADOPTION" : "DELETED_CHATS_ADOPTION";
+    const m = await fresh(mod, "r4-" + mod + "-r");
+    await assert.rejects(m.unlock(PASSX), (e) => e.code === code, `fixture (${mod}): the loud DELETED refusal`);
+    const r = await m.unlock(PASSX, { adoptDeleted: true });
+    assert.strictEqual(r.created, true);
+    assert.strictEqual(r.conflictDropped, true, `review r4 L-1 (${mod}): "Open anyway" discards the leftover localStorage copy and says so`);
+    if (mod === "contacts.js") await m.upsert({ username: "new", ed: "RUQn", mldsa: "TUwn" });
+    else await m.append("new", { dir: "in", text: "y", ts: 2, id: "e2" });
+    assert.ok(fake.getItem(k), `review r4 L-1 (${mod}): …and the fresh store SAVES (no STALE wedge)`);
+    m.lock();
+    const again = await fresh(mod, "r4-" + mod + "-again");
+    assert.strictEqual((await again.unlock(PASSX)).created, false, `review r4 L-1 (${mod}): …and reopens normally`);
+    again.lock();
+  }
+  console.log("OK  review r4 L-1: 'Open anyway' after an emptied IndexedDB clears a leftover localStorage copy — no STALE wedge (contacts + chats)");
+}
+
+// Info: a save whose encryption is still running when wipe() (Forget) happens
+// must not write the store back into IndexedDB. The guard is the wipe epoch
+// read at the START of the save — not the incidental null salt after lock().
+if (r2("r4epoch")) {
+  for (const mod of ["contacts.js", "chats.js"]) {
+    mem.clear(); freshIdb();
+    const C = await fresh(mod, "r4e-" + mod);
+    await C.unlock("id pass");
+    const orig = crypto.subtle.encrypt.bind(crypto.subtle);
+    let started, release;
+    const inEncrypt = new Promise((r) => { started = r; });
+    const gate = new Promise((r) => { release = r; });
+    let first = true;
+    crypto.subtle.encrypt = async (...a) => {
+      if (first) { first = false; started(); await gate; }
+      return orig(...a);
+    };
+    const p = mod === "contacts.js" ? C.upsert({ username: "late", ed: "RUQl", mldsa: "TUwl" })
+      : C.append("late", { dir: "in", text: "z", ts: 1, id: "e9" });
+    p.catch(() => {});
+    await inEncrypt;
+    const w = C.wipe();
+    release();
+    await p.catch(() => {}); await w;
+    crypto.subtle.encrypt = orig;
+    const k = mod === "contacts.js" ? "sc.contacts.v1" : "sc.chats.v1";
+    assert.strictEqual(fake.getItem(k), null,
+      `review r4 info (${mod}): a save in flight across Forget does not write the store back into IndexedDB`);
+  }
+  console.log("OK  review r4 info: the wipe epoch, read when a save starts, keeps a Forget wiped");
+}
+
 console.log("\nAll durable-storage checks passed.");
 process.exit(0);
