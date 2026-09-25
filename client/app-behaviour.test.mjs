@@ -71,7 +71,13 @@ globalThis.fetch = async (url, opts = {}) => {
   return json(404, { detail: "not found" });
 };
 
+const realLocks = globalThis.navigator.locks; // node's real Web Locks (package 4, decision 3)
 const dom = installDom(join(HERE, "index.html"));
+// The stub's `locks` serializes every request on one chain (enough for the OTP
+// pad lock it was written for); the store lock of decision 3 is held for as
+// long as the stores are open, and its tests need ifAvailable / steal. Node
+// implements the real thing — one process plays one browser tab.
+globalThis.navigator.locks = realLocks;
 // Structure the stub cannot infer from an id: the encryption radios, the tab
 // bar's buttons (the tab bar is put under <body> so showView's
 // document.querySelectorAll(".navitem") finds them), the chat top bar, and the
@@ -1582,6 +1588,73 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
     await dom.el("disconnect").click();
   }
   console.log("OK  decision 2: a guest sees and decides the seated identity (deny: closed, nothing pinned; approve: pinned, a second identity refused); in-person-verified + pinned contacts auto-approve (executed)");
+}
+
+// ==== package 4, owner decision 3: contacts + chats live in ONE tab ================
+// Node has real Web Locks; the test plays the OTHER tab of the same browser by
+// requesting the same lock. Before: nothing held the stores to one tab — a
+// second tab opened them too, and only 3b's STALE refusal of a later save
+// noticed.
+{
+  await nav("live");
+  if (current && current.readyState === 1) await dom.el("disconnect").click();
+  await nav("users");
+  if (!contacts.isUnlocked()) {
+    dom.el("usersUnlockPass").value = PASS;
+    await dom.el("usersUnlock").click();
+    await until(() => contacts.isUnlocked() && chats.isUnlocked(), "the stores to be open");
+  }
+  const held = (await navigator.locks.query()).held.map((l) => l.name).filter((n) => n.startsWith("sc.stores.lock.v1."));
+  assert.strictEqual(held.length, 1, `decision 3: this tab holds exactly one store lock while the stores are open (${held})`);
+  const lockName = held[0];
+  const edHash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", unb64(myBundle.ed))), (b) => b.toString(16).padStart(2, "0")).join("");
+  assert.strictEqual(lockName, "sc.stores.lock.v1." + edHash, "...keyed on this identity");
+
+  // (a) another tab presses "Use here": this one locks both stores and says why.
+  let otherLost = null;
+  const other = navigator.locks.request(lockName, { steal: true }, () => new Promise(() => {}))
+    .catch((e) => { otherLost = e.name; });
+  await until(() => !contacts.isUnlocked() && !chats.isUnlocked(), "the stores to lock after the other tab took them");
+  assert.ok(said(/your contacts and chats were opened in another tab — they are locked here/), "decision 3: the tab that lost them says why");
+  assert.match(dom.el("usersLocked").querySelector("p").textContent, /were opened in another tab or window, so they were locked here/,
+    "...on the Users view too");
+  assert.strictEqual(dom.el("usersTakeover").hidden, false, "...which offers Use here");
+
+  // (b) unlocking here while the other tab holds them does NOT open them.
+  dom.el("usersUnlockPass").value = PASS;
+  await dom.el("usersUnlock").click();
+  await settle(10);
+  assert.ok(!contacts.isUnlocked() && !chats.isUnlocked(), "decision 3: a second tab does not open the stores");
+  assert.match(dom.el("usersLocked").querySelector("p").textContent, /open in another tab or window/, "...and says they are open elsewhere");
+  await nav("chats");
+  assert.match(dom.el("chatsLocked").querySelector("p").textContent, /open in another tab or window/, "...on the Chats view as well");
+  assert.strictEqual(dom.el("chatsTakeover").hidden, false, "...with Use here");
+
+  // (c) "Use here" takes them back; the other tab loses its lock.
+  dom.el("chatsUnlockPass").value = PASS;
+  await dom.el("chatsTakeover").click();
+  await until(() => contacts.isUnlocked() && chats.isUnlocked(), "Use here to open the stores");
+  await other;
+  assert.strictEqual(otherLost, "AbortError", "decision 3: Use here took the lock from the other tab (steal)");
+  assert.strictEqual(dom.el("chatsTakeover").hidden, true, "...and the button is gone");
+  const heldNow = (await navigator.locks.query()).held.filter((l) => l.name === lockName).length;
+  assert.strictEqual(heldNow, 1, "...and this tab holds it again");
+
+  // (d) no Web Locks: the stores still open (3b's STALE is the control), said once.
+  const realNav = globalThis.navigator;
+  contacts.lock(); chats.lock();
+  Object.defineProperty(globalThis, "navigator", { value: { ...realNav, locks: undefined }, configurable: true, writable: true });
+  try {
+    await nav("users");
+    dom.el("usersUnlockPass").value = PASS;
+    await dom.el("usersUnlock").click();
+    await until(() => contacts.isUnlocked() && chats.isUnlocked(), "the stores to open without Web Locks");
+    assert.ok(said(/this browser cannot keep your contacts and chats to one tab/), "decision 3: without Web Locks the fallback is said");
+  } finally {
+    Object.defineProperty(globalThis, "navigator", { value: realNav, configurable: true, writable: true });
+  }
+  await nav("live");
+  console.log("OK  decision 3: contacts+chats live in one tab — a second tab does not open them; Use here takes over and the other tab locks and says why; no Web Locks falls back to 3b (executed)");
 }
 
 console.log("\nAll app.js behavioural checks passed.");

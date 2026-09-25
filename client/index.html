@@ -494,6 +494,10 @@
             <button id="usersUnlock" type="button" class="primary">Unlock</button>
           </div>
           <p class="hint" id="usersUnlockStatus"></p>
+          <!-- Package 4: the stores are open in another tab of this browser.
+               Only one tab may hold them; this takes them over (the other
+               tab locks them and says why). Needs the passphrase above. -->
+          <button id="usersTakeover" type="button" hidden>Use here</button>
           <p class="hint err" id="usersAdoptHint" hidden>
             This store cannot be opened safely on its own. Open it only if you
             know why, then treat every contact as unverified until you re-check
@@ -574,6 +578,10 @@
             <button id="chatsUnlock" type="button" class="primary">Unlock</button>
           </div>
           <p class="hint" id="chatsUnlockStatus"></p>
+          <!-- Package 4: the stores are open in another tab of this browser.
+               Only one tab may hold them; this takes them over (the other
+               tab locks them and says why). Needs the passphrase above. -->
+          <button id="chatsTakeover" type="button" hidden>Use here</button>
           <p class="hint err" id="chatsAdoptHint" hidden>
             This store cannot be opened safely on its own. Open it only if you
             know why — already-delivered messages may then be shown again.

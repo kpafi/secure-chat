@@ -694,8 +694,16 @@ console.log("\n5b. store refused");
   const STALE = "Your contacts were changed in another tab — enter your passphrase to load that version.";
   // A second tab of the same device unlocks and writes: the store's
   // generation moves past what alice's tab holds.
+  // Package 4, decision 3: a second tab can no longer open the stores while
+  // alice's tab holds them (Web Locks). What this section pins is 3b's
+  // BACKSTOP, so the writing tab runs without Web Locks — the one case where
+  // two tabs can still hold the stores, and exactly where 3b's STALE is the
+  // control. Section 5c drives the lock itself.
   const staleWrite = async (verified) => {
     const tab2 = await alice.ctx.newPage();
+    await tab2.evaluateOnNewDocument(() => {
+      Object.defineProperty(Navigator.prototype, "locks", { get() { return undefined; }, configurable: true });
+    });
     tab2.on("dialog", (d) => d.accept());
     await tab2.setViewport({ width: 1000, height: 900 });
     await tab2.goto(APP, { waitUntil: "networkidle0" });
@@ -765,6 +773,55 @@ console.log("\n5b. store refused");
   await relock("chats");
   // Back to unverified for the phone checks (the key-changed layout).
   await store(alice.page, async (u) => { await (await import("./contacts.js")).setVerified(u, false); }, bob.username);
+  await view(alice.page, "users");
+}
+
+// --- 5c. package 4, decision 3: contacts + chats live in ONE tab ---------------------
+// A second tab of the same browser (real Web Locks) does not open the stores
+// while alice's tab holds them; "Use here" takes them over, and alice's tab
+// locks them and says why; alice's own Use here takes them back.
+console.log("\n5c. one tab at a time");
+{
+  const tab2 = await alice.ctx.newPage();
+  await tab2.setViewport({ width: 1000, height: 900 });
+  await tab2.goto(APP, { waitUntil: "networkidle0" });
+  await tab2.click('.navitem[data-view="users"]');
+  await tab2.type("#usersUnlockPass", aliceSpec.passphrase);
+  await tab2.click("#usersUnlock");
+  await tab2.waitForFunction(() => /open in another tab or window/.test(document.querySelector("#usersLocked p").textContent),
+    { timeout: 40000 }).catch(() => {});
+  const second = await tab2.evaluate(() => ({
+    unlocked: !document.querySelector("#usersUnlocked").hidden,
+    text: document.querySelector("#usersLocked p").textContent,
+    useHere: !document.querySelector("#usersTakeover").hidden,
+  }));
+  check("decision 3: a second tab does not open the stores and says they are open elsewhere, offering Use here",
+    !second.unlocked && /open in another tab or window/.test(second.text) && second.useHere, JSON.stringify(second));
+  await tab2.type("#usersUnlockPass", aliceSpec.passphrase);
+  await tab2.click("#usersTakeover");
+  await tab2.waitForFunction(() => !document.querySelector("#usersUnlocked").hidden, { timeout: 40000 }).catch(() => {});
+  await alice.page.bringToFront();
+  await view(alice.page, "users");
+  await alice.page.waitForFunction(() => !document.querySelector("#usersLocked").hidden, { timeout: 15000 }).catch(() => {});
+  const lostHere = await alice.page.evaluate(() => ({
+    locked: !document.querySelector("#usersLocked").hidden,
+    text: document.querySelector("#usersLocked p").textContent,
+    useHere: !document.querySelector("#usersTakeover").hidden,
+    line: document.querySelector("#log").textContent.includes("opened in another tab — they are locked here"),
+  }));
+  check("decision 3: Use here in the second tab opens it there; the first tab locks its stores and says why",
+    (await tab2.evaluate(() => !document.querySelector("#usersUnlocked").hidden)) &&
+    lostHere.locked && /were opened in another tab or window, so they were locked here/.test(lostHere.text) && lostHere.useHere && lostHere.line,
+    JSON.stringify(lostHere));
+  await alice.page.type("#usersUnlockPass", aliceSpec.passphrase);
+  await alice.page.click("#usersTakeover");
+  await alice.page.waitForFunction(() => !document.querySelector("#usersUnlocked").hidden, { timeout: 40000 }).catch(() => {});
+  await tab2.waitForFunction(() => !document.querySelector("#usersLocked").hidden, { timeout: 15000 }).catch(() => {});
+  check("decision 3: taking them back works the other way round",
+    (await alice.page.evaluate(() => !document.querySelector("#usersUnlocked").hidden)) &&
+    (await tab2.evaluate(() => !document.querySelector("#usersLocked").hidden)));
+  await tab2.close();
+  await alice.page.bringToFront();
   await view(alice.page, "users");
 }
 

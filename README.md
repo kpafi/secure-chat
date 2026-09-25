@@ -296,6 +296,11 @@ secret and make a new one per conversation.
 (no length padding yet). This is the minimal routing metadata a relay cannot
 avoid.
 
+**One tab for contacts and chats (package 4).** Like a one-time pad, your
+contacts and chats are open in one tab or window of a browser at a time. A
+second tab says so and offers **Use here**, which moves them: the first tab
+locks them and says why.
+
 **Other known limits.**
 - The web client trusts the server to serve honest code (see above).
 - The onion shares a host with the clearnet site, so it does not hide the

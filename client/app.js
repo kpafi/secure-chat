@@ -84,6 +84,7 @@ const els = {
   chatsUnlockPass: $("chatsUnlockPass"), chatsUnlock: $("chatsUnlock"),
   chatsUnlockStatus: $("chatsUnlockStatus"),
   chatsAdopt: $("chatsAdopt"), chatsAdoptHint: $("chatsAdoptHint"),
+  usersTakeover: $("usersTakeover"), chatsTakeover: $("chatsTakeover"),
   profileName: $("profileName"), profileAvatar: $("profileAvatar"),
   profileHandleText: $("profileHandleText"),
   profileHandleActions: $("profileHandleActions"),
@@ -931,6 +932,9 @@ async function forgetIdentity() {
   // stores live in IndexedDB now, so their deletion is awaited — and a failure
   // is said, not swallowed (the records would outlive the identity).
   const wiped = await Promise.allSettled([contacts.wipe(), chats.wipe()]);
+  releaseStoreLock(); // decision 3: nothing of this identity is held open any more
+  storesElsewhere = false;
+  storesTakenOver = false;
   if (wiped.some((r) => r.status === "rejected")) {
     addLine("sys", "", "[could not delete the saved contacts / chat history from this device's database — reload and Forget again]", true);
   }
@@ -1087,6 +1091,78 @@ async function storeFloorId() {
 }
 let apiToken = null;      // directory session token (from Log in), memory only
 
+// ---- package 4, owner decision 3: contacts + chats in ONE tab at a time ------
+// Like an OTP pad (package 3), the contact and chat stores are now live in only
+// one tab or window of this browser at a time. Package 3b made a second tab's
+// write fail loudly (STALE) and settled conflicts at unlock; that stays, as the
+// backstop. The primary control is an exclusive Web Lock per IDENTITY (both
+// stores open and close together, and a second identity in another tab is a
+// different user's data), taken before either store is opened and held for as
+// long as they are.
+//
+// A second tab does not open them: its Users / Chats views say they are open
+// elsewhere and offer "Use here", which TAKES the lock (`steal: true`). The tab
+// that loses it locks both stores at once and says why — never a silent lock.
+// (Decided over a plain refusal: the other tab may be on another screen, or
+// hung, and a refusal would leave no way in but closing it.)
+//
+// Without Web Locks (none of the browsers this app supports; they all have it
+// in a secure context): the stores still open and 3b's STALE refusals are the
+// control, with one line saying so. Refusing to open them instead would switch
+// off key-change detection, which lives in the contact store — a worse outcome
+// than a refused cross-tab save.
+const STORES_ELSEWHERE_LINE = "Your contacts and chats are open in another tab or window. " +
+  "Use them there — or enter your passphrase and press \u201cUse here\u201d (the other tab then locks them).";
+const STORES_TAKEN_LINE = "Your contacts and chats were opened in another tab or window, so they were locked here. " +
+  "Enter your passphrase and press \u201cUse here\u201d to use them in this tab again.";
+let storeLock = null;          // { name, release } while this tab holds the stores
+let storesElsewhere = false;   // the last unlock found them held by another tab
+let storesTakenOver = false;   // another tab took them from this one
+let saidNoStoreLock = false;
+
+// Resolves "held" (this tab holds the lock for `floorId` now), "elsewhere"
+// (another tab holds it; not taken) or "none" (no Web Locks: 3b fallback).
+async function holdStoreLock(floorId, takeover) {
+  const locks = typeof navigator !== "undefined" ? navigator.locks : null;
+  if (!locks || typeof locks.request !== "function") return "none";
+  const name = "sc.stores.lock.v1." + floorId;
+  if (storeLock && storeLock.name === name) return "held";
+  releaseStoreLock(); // another identity's lock, if any
+  const mine = { name, release: null };
+  const got = await new Promise((resolveGot) => {
+    locks.request(name, takeover ? { steal: true } : { ifAvailable: true }, (lock) => {
+      if (!lock) { resolveGot(false); return undefined; }
+      resolveGot(true);
+      return new Promise((r) => { mine.release = r; }); // held until released
+    }).catch(() => {
+      // AbortError: another tab stole it (the only way this rejects while held).
+      if (storeLock === mine) storesStolen();
+      resolveGot(false);
+    });
+  });
+  if (!got) return "elsewhere";
+  storeLock = mine;
+  return "held";
+}
+function releaseStoreLock() {
+  const l = storeLock;
+  storeLock = null;
+  if (l && l.release) l.release();
+}
+// Another tab pressed "Use here". Its copy is authoritative from now on, so
+// ours is locked at once — anything we wrote later would be a lost update the
+// 3b checks would have to catch — and the views say why.
+function storesStolen() {
+  storeLock = null;
+  storesTakenOver = true;
+  closeContact(false);
+  if (contacts.isUnlocked()) contacts.lock();
+  if (chats.isUnlocked()) chats.lock();
+  addLine("sys", "", "[your contacts and chats were opened in another tab — they are locked here]", true);
+  refreshUsers();
+  refreshChats();
+}
+
 // Unlock the contact store with the identity passphrase. Called wherever the
 // identity itself is created/unlocked, BEFORE the passphrase field is cleared.
 // P-02: a failure here leaves the identity usable but the PIN STORE LOCKED,
@@ -1118,6 +1194,26 @@ async function unlockContacts(pass, opts = {}) {
   });
   const contactOpts = flags("LEGACY_CONTACTS_ADOPTION", "DELETED_CONTACTS_ADOPTION");
   const chatOpts = flags("LEGACY_CHATS_ADOPTION", "DELETED_CHATS_ADOPTION");
+  // Decision 3: one tab at a time, decided BEFORE either store is read.
+  const held = floorId ? await holdStoreLock(floorId, !!opts.takeover) : "none";
+  if (held === "elsewhere") {
+    storesElsewhere = true;
+    storesTakenOver = false;
+    closeContact(false);
+    if (contacts.isUnlocked()) contacts.lock();
+    if (chats.isUnlocked()) chats.lock();
+    contactsError = null;
+    contactsAdoptable = false;
+    adoptCodes.clear();
+    addLine("sys", "", "[your contacts and chats are open in another tab — not opened here]", true);
+    return;
+  }
+  storesElsewhere = false;
+  storesTakenOver = false;
+  if (held === "none" && !saidNoStoreLock) {
+    saidNoStoreLock = true;
+    addLine("sys", "", "[this browser cannot keep your contacts and chats to one tab — use them in one tab only]", true);
+  }
   contactsAdoptable = false;
   adoptCodes.clear();
   storeNotice = null;
@@ -1183,9 +1279,13 @@ function refreshUsers() {
   usersStatus("");
   const unlocked = contacts.isUnlocked();
   els.usersLocked.hidden = unlocked;
+  // Decision 3: "Use here" only while another tab holds (or took) the stores.
+  els.usersTakeover.hidden = unlocked || !(identity && (storesElsewhere || storesTakenOver));
   els.usersUnlocked.hidden = !unlocked;
   if (!unlocked) {
-    els.usersLocked.querySelector("p").textContent = hintSafe(contactsStale && identity ? STALE_LINE : contactsError
+    els.usersLocked.querySelector("p").textContent = hintSafe(!els.usersTakeover.hidden
+      ? (storesTakenOver ? STORES_TAKEN_LINE : STORES_ELSEWHERE_LINE)
+      : contactsStale && identity ? STALE_LINE : contactsError
       ? "Contact store error: " + contactsError +
         (contactsAdoptable ? "" :
           " (Forget + recreate the identity resets it — contacts are bound to the identity passphrase.)")
@@ -2085,12 +2185,16 @@ function renderMark(el, c, note = true) {
 function refreshChats() {
   const unlocked = chats.isUnlocked() && contacts.isUnlocked();
   els.chatsLocked.hidden = unlocked;
+  // Decision 3: "Use here" only while another tab holds (or took) the stores.
+  els.chatsTakeover.hidden = unlocked || !(identity && (storesElsewhere || storesTakenOver));
   els.chatsUnlocked.hidden = !unlocked;
   if (!unlocked) {
     // Fix review 2026-09-21: a chat store that refused while contacts opened
     // had no visible error and no override anywhere — a dead end whose only
     // exit was Forget identity. The Chats view now carries both.
-    els.chatsLocked.querySelector("p").textContent = hintSafe(contactsStale && identity ? STALE_LINE : contactsError && identity
+    els.chatsLocked.querySelector("p").textContent = hintSafe(!els.chatsTakeover.hidden
+      ? (storesTakenOver ? STORES_TAKEN_LINE : STORES_ELSEWHERE_LINE)
+      : contactsStale && identity ? STALE_LINE : contactsError && identity
       ? "Chat store error: " + contactsError
       : "Locked. Enter your passphrase.");
     els.chatsAdopt.hidden = !contactsAdoptable;
@@ -4521,6 +4625,24 @@ function wireAdopt(btnEl, passEl, statusEl, render) {
   });
 }
 wireAdopt(els.usersAdopt, els.usersUnlockPass, els.usersUnlockStatus, refreshUsers);
+// Decision 3: "Use here" takes the stores over from the other tab.
+function wireTakeover(btnEl, passEl, statusEl, render) {
+  btnEl.addEventListener("click", async () => {
+    const pass = passEl.value;
+    const status = setUnlockStatus(statusEl);
+    if (!identity) { status("Unlock your identity first.", true); return; }
+    if (!pass) { status("Enter your identity passphrase, then press Use here.", true); return; }
+    status("Opening…");
+    await unlockContacts(pass, { expectStore: true, takeover: true });
+    passEl.value = "";
+    status(contactsError ? contactsError : "", !!contactsError);
+    refreshUsers();
+    refreshChats();
+    render();
+  });
+}
+wireTakeover(els.usersTakeover, els.usersUnlockPass, els.usersUnlockStatus, refreshUsers);
+wireTakeover(els.chatsTakeover, els.chatsUnlockPass, els.chatsUnlockStatus, refreshChats);
 wireAdopt(els.chatsAdopt, els.chatsUnlockPass, els.chatsUnlockStatus, refreshChats);
 wireViewUnlock(els.chatsUnlockPass, els.chatsUnlock,
   setUnlockStatus(els.chatsUnlockStatus), refreshChats);
