@@ -234,6 +234,27 @@ def test_deploy_scripts_use_the_shared_lists():
             assert not re.search(r"--exclude[ =]", cmd), (script.name, "inline --exclude", cmd)
 
 
+def test_deploy_scripts_leave_the_code_root_owned():
+    """Package 5: deploys up to 0.3.1 ran `chown -R securechat:securechat
+    /opt/secure-chat/backend`, so the service user owned its own source. The
+    relay writes only its DB under StateDirectory (systemd owns that for it),
+    so the code is root:root 0755/0644, set AFTER the rsync (rsync -a as root
+    carries the dev box's uid over) and BEFORE the service starts."""
+    for script in _deploy_scripts():
+        src = script.read_text()
+        assert not re.search(r"chown\b[^\n]*securechat", src), (
+            f"{script.name} hands something to the service user")
+        chown = "chown -R root:root /opt/secure-chat/backend /opt/secure-chat/client"
+        chmod = "chmod -R u=rwX,go=rX /opt/secure-chat/backend /opt/secure-chat/client"
+        audit = "find /opt/secure-chat -user securechat"
+        for need in (chown, chmod, audit):
+            assert need in src, f"{script.name} lost {need!r}"
+        rsync_at = src.index("\nrsync ")
+        start_at = src.index("systemctl start secure-chat")
+        assert rsync_at < src.index(chown) < start_at, f"{script.name}: chown must sit between rsync and start"
+        assert rsync_at < src.index(chmod) < start_at, f"{script.name}: chmod must sit between rsync and start"
+
+
 def test_box_only_excludes_keep_the_database_out():
     """rsync-excludes.txt is what the ship list does not cover: the relay's own
     state and caches. The accounts.db lines are the ones that must never go."""

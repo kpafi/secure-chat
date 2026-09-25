@@ -186,6 +186,41 @@ def test_ws_max_size_matches_the_frame_cap_everywhere(unit):
     assert "ws_max_size=config.MAX_FRAME_BYTES + 1024" in (root / "backend" / "main.py").read_text()
 
 
+def test_every_uvicorn_launch_in_the_repo_carries_the_frame_cap():
+    """F-P7-26 residual (package 5): the test above names the launchers that
+    existed. A NEW one - a per-release deploy script that restarts uvicorn by
+    hand, a second CI job, a helper script - would not be covered. So scan
+    every tracked file that is not prose (Markdown is history and docs): each
+    logical line that launches `uvicorn main:app` must carry the flag, and
+    every --ws-max-size / ws_max_size literal anywhere must equal the cap."""
+    import subprocess
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import config
+    want = config.MAX_FRAME_BYTES + 1024
+    root = Path(__file__).resolve().parents[2]
+    tracked = subprocess.run(["git", "ls-files", "-z"], cwd=root, check=True,
+                             capture_output=True).stdout.decode().split("\0")
+    launches = 0
+    for rel in tracked:
+        if not rel or rel.endswith(".md") or rel.startswith("backend/tests/"):
+            continue
+        path = root / rel
+        try:
+            text = path.read_text()
+        except (UnicodeDecodeError, FileNotFoundError, IsADirectoryError):
+            continue
+        for lit in re.findall(r"(?:--ws-max-size[ =]|ws_max_size\s*=\s*)(\d+)", text):
+            assert int(lit) == want, f"{rel}: ws max size {lit}, the cap is {want}"
+        logical = re.sub(r"\\\n", " ", text)
+        for line in logical.splitlines():
+            if re.search(r"\buvicorn\s+main:app\b", line) and not line.lstrip().startswith("#"):
+                launches += 1
+                assert f"--ws-max-size {want}" in line, f"{rel}: uvicorn launch without the cap: {line.strip()[:160]}"
+    # run.sh, the production unit and the iOS CI relay at least.
+    assert launches >= 3, f"found only {launches} uvicorn launches - the scan is broken"
+
+
 # ---- Caddy (the clearnet front end) ------------------------------------------
 
 _CADDYFILE = Path(__file__).resolve().parents[2] / "deploy" / "Caddyfile"

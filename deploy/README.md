@@ -252,6 +252,50 @@ unzip -l android/app/build/outputs/apk/*/app-*.apk | grep assets/web/ \
   | grep -E 'README|package.*\.json|\.test\.mjs|node_modules|/\.'   # want nothing
 ```
 
+## Code ownership on the box
+
+`/opt/secure-chat/{backend,client}` are `root:root`, directories 0755 and
+files 0644: the service user reads its code and never owns it. The relay
+writes exactly one thing, the accounts DB with its `-wal`/`-shm`, in
+`/var/lib/secure-chat`, which systemd creates and owns for it
+(`StateDirectory=`, mode 0700). Deploys up to 0.3.1 ran
+`chown -R securechat:securechat /opt/secure-chat/backend`; that was harmless
+under `ProtectSystem=strict` (the code tree is read-only to the service either
+way) but it let the service user own its own source outside the sandbox. From
+the next deploy on, step 2 of the deploy script does
+`chown -R root:root` + `chmod -R u=rwX,go=rX` on both trees and lists anything
+under `/opt/secure-chat` still owned by `securechat` (want: nothing; check
+`/opt/secure-chat/venv` in particular, whose owner was never recorded here).
+
+## Pending on the box (repo ahead of the live setup since 2026-09-25)
+
+Package 5 changed only repository files. The next deploy (0.4.0) must, on the
+box, in this order:
+
+1. Copy the next deploy script from the newest `deploy-*.sh` (it already uses
+   `ship-excludes.txt` + `rsync-excludes.txt` and root ownership); run it from
+   a checkout that has both lists.
+2. Remove the dev file the old rsync left behind (no `--delete`):
+   `rm -f /opt/secure-chat/client/vendor/README.md` (the new relay 404s it
+   anyway).
+3. Ownership: the script's step 2 (`chown -R root:root` + `chmod -R
+   u=rwX,go=rX` on backend/ and client/); then `find /opt/secure-chat -user
+   securechat` must print nothing. If the venv shows up, `chown -R root:root
+   /opt/secure-chat/venv`.
+4. Unit: `install -m 0644 -o root -g root deploy/secure-chat.service
+   /etc/systemd/system/`, `systemd-analyze verify`, `systemctl daemon-reload`,
+   `systemctl restart secure-chat`, `systemd-analyze security secure-chat`
+   (want about 1.1), healthz, and a login + a sealed message from a phone
+   (the sandbox's first run on the real box; see "The unit's sandbox").
+5. Caddy: `cp deploy/Caddyfile /etc/caddy/Caddyfile` (it includes the `/ios/`
+   block; see "iOS app downloads" if that is not wanted yet), `caddy validate
+   --config /etc/caddy/Caddyfile`, `systemctl reload caddy`. After some traffic,
+   `journalctl -u caddy --since -10min` must hold no client IP (with the
+   default logger discarded it should hold nothing but ACME lines). Note the
+   trade-off: Caddy's own runtime messages no longer reach journald either
+   (a failed `caddy reload` still prints its error to the terminal and keeps
+   the old config); `caddy validate` before every reload is the check.
+
 ## iOS app downloads (SideStore / AltStore)
 
 > **Not yet on the box.** The `/ios/` block in `Caddyfile` was added with the

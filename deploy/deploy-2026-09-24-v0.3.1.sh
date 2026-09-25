@@ -49,8 +49,15 @@ rsync -az --itemize-changes \
   --exclude-from deploy/rsync-excludes.txt \
   backend client "$BOX":/opt/secure-chat/
 
-echo "==> 2. restart"
-ssh "$BOX" 'chown -R securechat:securechat /opt/secure-chat/backend \
+echo "==> 2. ownership, then restart"
+# Code is root:root, dirs 0755 / files 0644 (executables keep their x bit):
+# the service user reads its code and never owns it. The ONLY thing it writes
+# is the accounts DB (+ -wal/-shm) in /var/lib/secure-chat, which systemd's
+# StateDirectory= creates and owns for it. rsync -a as root would otherwise
+# carry the dev box's uid over. The `find` must print nothing.
+ssh "$BOX" 'chown -R root:root /opt/secure-chat/backend /opt/secure-chat/client \
+  && chmod -R u=rwX,go=rX /opt/secure-chat/backend /opt/secure-chat/client \
+  && find /opt/secure-chat -user securechat | sed "s/^/    STILL OWNED BY securechat: /" \
   && systemctl start secure-chat \
   && sleep 2 \
   && systemctl is-active secure-chat'
