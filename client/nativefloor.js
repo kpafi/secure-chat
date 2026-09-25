@@ -32,6 +32,24 @@
 
 export const NATIVE_ABSENT = -1;
 export const NATIVE_TAMPERED = -2;
+// Package 3 (ROUND-3 F-4): PadFloor.bump's answer when SharedPreferences
+// `commit()` returned false — the value did NOT reach disk. Before this the
+// Kotlin side discarded that boolean and returned the new value as if it had
+// been written, so every caller below believed in a floor a restart erases.
+export const NATIVE_COMMIT_FAILED = -3;
+// Package 3 (7b int32 ceiling): a bump value that is not an integer in
+// [0, FLOOR_MAX]. Refused on both sides, never truncated — see bump() below.
+export const NATIVE_INVALID = -4;
+// Fix round 1: PadFloor.bump's answer when a NEW record would exceed its record
+// cap (4096, as on iOS). Something on the page has been creating floor ids.
+export const NATIVE_FULL = -5;
+// The highest value a floor can hold. The bridge carries a Kotlin Long, but the
+// JS side validates with `(v | 0) === v` (the poison-proof integer test, see
+// num() below), which is exactly the int32 range. A store that would need a
+// floor beyond this must refuse to advance (bumpFloor fails its save), not wrap:
+// `2**31 | 0` is negative, which the old bridge turned into a silent no-op that
+// froze the floor for good while the store's generation kept climbing.
+export const FLOOR_MAX = 0x7fffffff;
 
 // Pentest 2026-07-29 H-1. Feature-detecting the bridge alone was a silent
 // downgrade: `SecureChatPadFloor` is an ordinary writable global, so
@@ -102,10 +120,61 @@ export function captureNativeFloor() {
     if ((v | 0) !== v) return NATIVE_TAMPERED;      // NaN, Infinity, fractions
     return v;
   };
-  return {
-    read: (id) => { try { return num(b.read(id)); } catch { return NATIVE_TAMPERED; } },
-    bump: (id, v) => { try { return num(b.bump(id, v | 0)); } catch { return NATIVE_TAMPERED; } },
+  // A READ has exactly two negative answers, ABSENT and TAMPERED. Anything
+  // else below zero (COMMIT_FAILED / INVALID are bump-only answers) is folded
+  // into TAMPERED here, once: every store tests `=== NATIVE_ABSENT` for
+  // "deleted" and `> NATIVE_ABSENT` for "a floor exists", so an unexpected -3
+  // would otherwise satisfy neither and silently skip BOTH checks.
+  const readNum = (v) => {
+    const n = num(v);
+    return n < NATIVE_ABSENT ? NATIVE_TAMPERED : n;
   };
+  return {
+    read: (id) => { try { return readNum(b.read(id)); } catch { return NATIVE_TAMPERED; } },
+    // Package 3 (7b): this used to pass `v | 0`, which turned 2^31 into a
+    // negative number that PadFloor.bump treated as a no-op read — the store
+    // carried on at a generation the floor would never record again, and
+    // every later rollback went undetected. A value the floor cannot hold is
+    // now refused before the bridge is called, and bumpFloor fails the save.
+    bump: (id, v) => {
+      if (typeof v !== "number" || (v | 0) !== v || v < 0) return NATIVE_INVALID;
+      try { return num(b.bump(id, v)); } catch { return NATIVE_TAMPERED; }
+    },
+  };
+}
+
+// Package 3, ROUND-3 F-1 / F-4: raise floor `id` to `value` and PROVE it took.
+//
+// Every store used to call `nativeFloor.bump(...)` and throw the answer away.
+// A bump that did not land — a failed `commit()` (disk full, unwritable prefs
+// file), a forged record (bump refuses to heal it), a value the floor cannot
+// hold — was invisible, and the store sealed a blob CLAIMING the floor
+// (`nativeFloor: true`). The next unlock found the floor absent or behind and
+// refused with the tamper wording and no override: a burned pad, or a locked
+// contact / chat store, caused by a disk hiccup.
+//
+// The bump's own return is the witness: the floor in force afterwards. It must
+// be a non-negative number of at least `value`; anything else —
+// NATIVE_COMMIT_FAILED, NATIVE_TAMPERED, NATIVE_INVALID, a floor that stayed
+// below — fails the SAVE, loudly, with `code = "FLOOR_WRITE_FAILED"`. A
+// read-back is deliberately NOT the check: SharedPreferences updates its
+// in-memory map before the disk write, so after a failed commit a read reports
+// the new value that a restart loses. (That is also why PadFloor.bump keeps
+// answering COMMIT_FAILED for the rest of the process once a commit failed.)
+export function bumpFloor(nativeFloor, id, value, what) {
+  const got = nativeFloor.bump(id, value);
+  if (typeof got === "number" && got >= 0 && got >= value) return got;
+  const why = got === NATIVE_COMMIT_FAILED ? "the device refused the write — storage full or not writable"
+    : got === NATIVE_INVALID ? "the value is beyond what the device record can hold"
+    : got === NATIVE_TAMPERED ? "the device record is damaged or unreachable"
+    : got === NATIVE_FULL ? "the device record store is full — something has been creating records in it"
+    : "the device record did not move";
+  const err = new Error(
+    `could not update the device-protected rollback record for ${what} (${why}), so the change was NOT ` +
+    "saved safely. Free some storage, restart the app and try again.",
+  );
+  err.code = "FLOOR_WRITE_FAILED";
+  throw err;
 }
 
 // Max without `Math.max` (H-1). `Math.max` is writable, and the rollback verdict

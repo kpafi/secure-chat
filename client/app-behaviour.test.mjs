@@ -1280,5 +1280,38 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
   console.log("OK  item 12: the knock's known-contact match uses sameSigning (anchored on code)");
 }
 
+// ---- Package 3, F-ATREST-007 / 2026-08-08 item 17: room: pins are revoked too ---
+// A session started from a room code pins the peer under `room:<id>`. Unverify
+// and Remove revoked only `user:<name>`, so the revoked peer re-entering the
+// remembered room was greeted with "contact identity matches your saved pin"
+// and messaging unlocked — the revocation ignored exactly where it could be
+// reached from a room link.
+{
+  const gil = await Identity.generate();
+  const gb = gil.publicBundle();
+  const a = await handshakeToConfirm(gil);
+  await a.ws.deliver(confirmFrame(a.pc));
+  await until(() => !dom.el("verify").hidden, "Gil's gate");
+  await dom.el("verifyOk").click();
+  await until(() => sameKeyPin(pinFor(), gb), "Gil to be pinned under room:");
+  await dom.el("disconnect").click();
+  // Gil is also a saved, verified contact — then the user withdraws that.
+  await contacts.upsert({ username: "gil", token: "tok-gil", ed: gb.ed, mldsa: gb.mldsa, ecdh: gb.ecdh, mlkem: gb.mlkem, verified: true });
+  await contacts.setVerified("gil", false);
+  // Gil re-enters the remembered room. Judged on the gate's own state, not on
+  // transcript lines (the transcript is bounded and folds repeats, so a slice
+  // of it can be empty and prove nothing).
+  const b = await handshakeToConfirm(gil);
+  await b.ws.deliver(confirmFrame(b.pc));
+  await settle(30);
+  assert.strictEqual(dom.el("verify").hidden, false,
+    "item 17: a peer whose verification was withdrawn must not be auto-accepted from a room: pin — the in-person gate must be on screen");
+  assert.strictEqual(dom.el("chatVerified").hidden, true, "item 17: …and the session is not marked verified");
+  assert.match(dom.el("verifyTitle").textContent, /You withdrew your verification of this contact/,
+    "item 17: …and the gate says why");
+  await dom.el("disconnect").click();
+  console.log("OK  item 17: Unverify revokes the room: pin — a withdrawn peer is not auto-accepted in a remembered room (executed)");
+}
+
 console.log("\nAll app.js behavioural checks passed.");
 process.exit(0); // key confirmation's deadline timer would otherwise hold the process open

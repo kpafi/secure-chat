@@ -29,12 +29,18 @@ final class InPageTests: XCTestCase {
               const e = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
               out.ecdh = !!e.privateKey;
             } catch (e) { out.ecdh = String(e); }
+            // Package 3 (F-CRYPTO-014): OTP now REFUSES to run without Web Locks
+            // (the localStorage lease fallback is gone), so the WKWebView must have them.
+            try {
+              out.locks = await navigator.locks.request('sc.test.lock', { ifAvailable: true }, (l) => !!l);
+            } catch (e) { out.locks = String(e); }
             return out;
             """) as? [String: Any]
         XCTAssertEqual(r?["secure"] as? Bool, true, "\(String(describing: r))")
         XCTAssertEqual(r?["subtle"] as? Bool, true)
         XCTAssertEqual(r?["ed25519"] as? Bool, true, "\(String(describing: r))")
         XCTAssertEqual(r?["ecdh"] as? Bool, true, "\(String(describing: r))")
+        XCTAssertEqual(r?["locks"] as? Bool, true, "Web Locks missing: OTP would be refused on iOS — \(String(describing: r))")
         XCTAssertEqual(r?["origin"] as? String, AppOrigin.origin)
         TestApp.screenshot("01-first-screen")
     }

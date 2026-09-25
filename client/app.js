@@ -167,7 +167,6 @@ let cipher = null;
 let otpRecord = null;      // the OTP pad in use this session (bytes + offsets), or null
 let otpAtRest = null;      // cached at-rest key {key,salt,iters} for cheap re-saves
 let otpLockRelease = null; // releases this pad's exclusive same-origin lock
-const TAB_ID = Math.random().toString(36).slice(2) + Date.now().toString(36);
 let joined = false;
 let verified = false; // in-person gate passed; gates RECEIVING as well as sending
 // Pentest 2026-07-26 P-19: the room id and algorithm this session actually
@@ -2705,7 +2704,13 @@ async function connectInner() {
     }
     // Exclusive same-origin lock: a pad must be live in only ONE tab/window at a
     // time, or two sessions would draw the same keystream (two-time pad).
-    otpLockRelease = await acquirePadLock(padId);
+    const got = await acquirePadLock(padId);
+    if (got === NO_WEB_LOCKS) {
+      hint("One-time pads are disabled in this browser: it cannot lock a pad to a single tab " +
+        "(no Web Locks support), and a pad open twice would reuse key material. Use the app or a current browser.", true);
+      return;
+    }
+    otpLockRelease = got;
     if (!otpLockRelease) {
       hint("This one-time pad is open in another tab or window. Close it there first \u2014 using a pad twice at once would break its security.", true);
       return;
@@ -3643,14 +3648,26 @@ async function handleMessage(room, raw, sock) {
       try {
         const text = await cipher.decrypt(m.payload);
         if (!live()) return;
-        addLine("peer", "peer", text);
         // P-04: recvHighWater must reach disk too — an unpersisted receive
         // watermark lets an already-delivered frame be replayed after a reload.
+        //
+        // Package 3, ROUND-3 F-2: and it must reach disk BEFORE the text is
+        // shown. This used to display first and persist second, so a crash, a
+        // kill or a failed save in between left the user having READ a frame
+        // the pad still counted as undelivered — and after a reload the relay
+        // could hand the same frame over again and it re-authenticated as new.
+        // Now a message whose receipt cannot be recorded is never displayed:
+        // the session stops (otpPersistFailed) and the frame stays
+        // undelivered, which is the honest state. Same rule as sending
+        // (persist before transmit).
         try {
           await persistOtpProgress();
         } catch (err) {
           otpPersistFailed(err);
+          return;
         }
+        if (!live()) return;
+        addLine("peer", "peer", text);
       } catch {
         addLine("sys", "", "[undecryptable message — wrong key or tampered]");
       }
@@ -3970,36 +3987,33 @@ function otpPersistFailed(err) {
 
 // ---- pad exclusive lock (one live session per pad) ------------------------
 // Prevents the concurrent-use two-time-pad break: two tabs each loading the same
-// pad at the same offset. Uses the Web Locks API (auto-released if the tab dies)
-// where available, with a localStorage-heartbeat lease as a fallback.
+// pad at the same offset. Uses the Web Locks API, which the browser releases
+// itself if the tab dies.
+//
+// Package 3, F-CRYPTO-014: Web Locks or no OTP. There used to be a fallback, a
+// localStorage "lease" (read it, see nobody fresh holds it, write our id, read
+// it back), and it was not a lock: two tabs could both read "free" before
+// either wrote, both write, and each read back ITS OWN write if the second
+// read happened between the other tab's write and its own — both then drew
+// pad bytes from the same offset. Its owner id came from a non-crypto PRNG, which is
+// not even guaranteed unique. There is no way to build mutual exclusion out of
+// localStorage, so rather than a lock that is usually right, a browser without
+// `navigator.locks` gets a refusal that says why (every browser that runs this
+// app — Chromium/Android WebView 69+, Firefox 96+, Safari/WKWebView 15.4+ —
+// has it in a secure context, which the app requires anyway for WebCrypto).
+const NO_WEB_LOCKS = Symbol("no-web-locks");
 function acquirePadLock(padId) {
   const name = "sc.otp.lock.v1." + padId;
-  if (navigator.locks && navigator.locks.request) {
-    return new Promise((resolveGot) => {
-      let releaseHeld;
-      navigator.locks.request(name, { ifAvailable: true }, (lock) => {
-        if (!lock) { resolveGot(null); return; } // held elsewhere
-        resolveGot(() => { if (releaseHeld) releaseHeld(); });
-        return new Promise((r) => { releaseHeld = r; }); // hold until released
-      }).catch(() => resolveGot(null));
-    });
-  }
-  return Promise.resolve(acquireLeaseFallback(name));
-}
-function acquireLeaseFallback(name) {
-  const STALE = 12000;
-  try {
-    const cur = JSON.parse(localStorage.getItem(name) || "null");
-    if (cur && Date.now() - cur.ts < STALE && cur.owner !== TAB_ID) return null;
-  } catch { /* fall through */ }
-  const write = () => localStorage.setItem(name, JSON.stringify({ owner: TAB_ID, ts: Date.now() }));
-  write();
-  try { if (JSON.parse(localStorage.getItem(name)).owner !== TAB_ID) return null; } catch { return null; }
-  const hb = setInterval(write, 4000);
-  return () => {
-    clearInterval(hb);
-    try { if (JSON.parse(localStorage.getItem(name)).owner === TAB_ID) localStorage.removeItem(name); } catch { /* ignore */ }
-  };
+  const locks = navigator.locks;
+  if (!locks || typeof locks.request !== "function") return Promise.resolve(NO_WEB_LOCKS);
+  return new Promise((resolveGot) => {
+    let releaseHeld;
+    locks.request(name, { ifAvailable: true }, (lock) => {
+      if (!lock) { resolveGot(null); return; } // held elsewhere
+      resolveGot(() => { if (releaseHeld) releaseHeld(); });
+      return new Promise((r) => { releaseHeld = r; }); // hold until released
+    }).catch(() => resolveGot(null));
+  });
 }
 function releaseOtpLock() {
   if (otpLockRelease) { try { otpLockRelease(); } catch { /* ignore */ } otpLockRelease = null; }
@@ -4024,15 +4038,25 @@ async function ensureUnlocked(padId) {
     // attack the victim is looking at a pad they have used for months, and
     // "no usage record" is the sentence that should stop them.
     if (e.code !== "LEGACY_PAD_ADOPTION") throw e;
-    const warn = e.suspicious
+    // Fix round 2 (Info): the receive-record variant says what is actually
+    // missing, and what the right answer almost always is.
+    const warn = e.recvRecord
+      ? "WARNING: this pad's receive record is missing, although this device has a " +
+        "protected record of the pad itself — a strong sign it was deleted. Unless you " +
+        "used this pad with a development build from before v0.1.0, do NOT adopt it.\n\n"
+      : e.suspicious
       ? "WARNING: this device HAS used one-time pads under the current version, " +
         "so this pad having no usage record is a strong sign its rollback " +
         "protection was tampered with.\n\n"
       : "";
     if (!confirm(
       warn + e.message +
-      "\n\nAdopt it anyway? Only do this if you are certain the pad has never " +
-      "been used to send a message from this device.",
+      (e.recvRecord
+        // Package 3 fix round 1: the receive-record variant (otp.js).
+        ? "\n\nAdopt it anyway? Only do this if you are certain this pad has never " +
+          "received a message on this device, or that this device last used it with a version from before v0.1.0."
+        : "\n\nAdopt it anyway? Only do this if you are certain the pad has never " +
+          "been used to send a message from this device."),
     )) {
       throw new Error("Pad not adopted. Exchange a fresh pad in person.");
     }
@@ -4180,13 +4204,26 @@ async function otpExport() {
     // causes key reuse. Warn once and require a second click to confirm.
     if (record.exported && pendingReexportId !== id) {
       pendingReexportId = id;
-      otpStatusMsg("This pad was already exported. A pad must be imported on only ONE device — re-exporting risks catastrophic key reuse. Click Export again to confirm you know what you are doing.", true);
+      // Fix round 2 (Info): when "exported" is only INFERRED (a pad from before
+      // v0.3.2 whose export history cannot be verified), say that — telling an
+      // honest never-exported pad it "was already exported" teaches users to
+      // click through the one warning that matters. The confirm stays.
+      otpStatusMsg(record.exportedInferred
+        ? "This pad's export history can't be verified on this device (it predates the current version). If you have already given it to someone, exporting it again would reuse key material. Click Export again to confirm it has not been exported before."
+        : "This pad was already exported. A pad must be imported on only ONE device — re-exporting risks catastrophic key reuse. Click Export again to confirm you know what you are doing.", true);
       return;
     }
     pendingReexportId = null;
     const text = await otp.exportPad(record, els.otpXferPass.value);
-    downloadText(`secure-chat-pad-${record.label || record.padId}.json`, text);
+    // Package 3, F-ATREST-002 residual: latch FIRST, file second. This used to
+    // download and then mark, so a markExported that failed (a full disk, a
+    // floor write that did not commit) had already handed out a file nothing
+    // recorded — the re-export warning never armed, and the same pristine pad
+    // could go to a second importer: a two-time pad by construction. A failed
+    // latch now means no file at all ("Export failed: …"); the reverse failure
+    // (latched, then the download is lost) only costs a confirm on re-export.
     await otp.markExported(record, atRest);
+    downloadText(`secure-chat-pad-${record.label || record.padId}.json`, text);
     otpStatusMsg("Exported. Give the file to your contact in person; they Import it with the same TRANSFER passphrase.");
   } catch (e) {
     otpStatusMsg("Export failed: " + e.message, true);
