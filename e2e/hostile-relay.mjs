@@ -370,6 +370,16 @@ check("P2: the user's own Disconnect is not relabelled by a parked relay reason"
 //       confirmation; the M-5 refusal must be on screen after the close.
 //   (b) pentest P2: the relay parks "room closed" while the gate is up and the
 //       user presses "It differs"; the room screen shows the app's own words.
+// Package 4, decision 2: a guest approves the owner's key (the same sheet,
+// data-mode="peer") before its key exchange runs; after the same 500 ms guard.
+async function guestApproves(page) {
+  await page.waitForFunction(() => {
+    const a = document.querySelector("#admit");
+    return !a.hidden && a.dataset.mode === "peer" && document.querySelector("#admitFingerprint").textContent.trim().length > 20;
+  }, { timeout: 45000 });
+  await sleep(700);
+  await page.$eval("#admitOk", (e) => e.click());
+}
 console.log("\n7. at the safety-number gate: a replayed handshake; a parked reason before 'It differs'");
 const gOwner = await scriptedAgent("gate-owner");
 const gGuest = await scriptedAgent("gate-guest", { width: 390, height: 844, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
@@ -382,6 +392,7 @@ await gGuest.page.$eval("#connect", (e) => e.click());
 await gOwner.page.waitForFunction(() => !document.querySelector("#admit").hidden, { timeout: 30000 });
 await sleep(700); // past the admission guard
 await gOwner.page.click("#admitOk");
+await guestApproves(gGuest.page); // package 4, decision 2
 for (const p of [gOwner.page, gGuest.page]) {
   await p.waitForFunction(() => !document.querySelector("#verify").hidden, { timeout: 60000 });
 }
@@ -421,6 +432,7 @@ async function gatePair(tag) {
   await o.page.waitForFunction(() => !document.querySelector("#admit").hidden, { timeout: 30000 });
   await sleep(700);
   await o.page.click("#admitOk");
+  await guestApproves(g.page); // package 4, decision 2
   await g.page.waitForFunction(() => !document.querySelector("#verify").hidden, { timeout: 60000 });
   return g;
 }

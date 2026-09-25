@@ -98,6 +98,7 @@ const PLAN = [
   ["14", "live-owner-connected", "Live room: owner connected, nobody else in the room yet"],
   ["15", "live-guest-waiting", "Live room: guest waiting for the owner's approval (bob's screen)"],
   ["16", "live-admission-prompt", "Live room: owner's admission prompt (#admit, #admitFingerprint)"],
+  ["16b", "live-guest-approval", "Live room: the guest's approval prompt — the owner's key (#admit data-mode=peer), bob's screen"],
   ["17", "live-verify-owner", "Live room: safety-number gate (#verify, #safetyNumber), owner side"],
   ["18", "live-verify-guest", "Live room: safety-number gate, guest side (bob's screen)"],
   ["19", "live-chat-connected", "Live room: connected, messages in #log"],
@@ -1108,12 +1109,26 @@ await step("live-admission-prompt", async () => {
   await capture(p, "live-admission-prompt");
 });
 
-await step("live-verify-owner", async () => {
+await step("live-guest-approval", async () => {
   if (!live.guestWaiting) throw new Error("no guest is waiting (see 15)");
   const p = alice.page, b = others.bob.page;
   // app.js ignores admit/deny in the prompt's first 500 ms (tap-through guard).
   await sleep(600);
   await click(p, "#admitOk");
+  live.admitted = true;
+  // Package 4, decision 2: the guest now approves the owner's key.
+  await b.waitForFunction(() => {
+    const a = document.querySelector("#admit");
+    return !a.hidden && a.dataset.mode === "peer" && document.querySelector("#admitFingerprint").textContent.trim().length > 20;
+  }, { timeout: 30000 }).catch(() => { throw new Error("the guest's approval prompt never appeared"); });
+  await capture(b, "live-guest-approval");
+  await sleep(600);
+  await click(b, "#admitOk");
+});
+
+await step("live-verify-owner", async () => {
+  if (!live.admitted) throw new Error("the owner never let the guest in (see 16b)");
+  const p = alice.page, b = others.bob.page;
   await Promise.all([waitGate(p), waitGate(b)]);
   live.gates = true;
   await capture(p, "live-verify-owner");

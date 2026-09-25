@@ -48,6 +48,7 @@ const relay = {
   registered: null,          // the last /api/register body (our public bundle)
   challenge: () => ({ status: 200, body: { challenge: b64(crypto.getRandomValues(new Uint8Array(32))) } }),
   verify: () => ({ status: 200, body: { token: "tkn", ttl: 3600 } }),
+  users: new Map(),          // package 4: directory answers for /api/users/<name>
   mailbox: [],               // envelopes handed out on the next GET /api/mailbox
   posted: [],                // envelopes we POSTed to a contact
 };
@@ -61,6 +62,10 @@ globalThis.fetch = async (url, opts = {}) => {
     const messages = relay.mailbox.map((envelope) => ({ envelope, created_at: 0 }));
     relay.mailbox = [];
     return json(200, { messages });
+  }
+  if (u.includes("/api/users/")) {
+    const name = decodeURIComponent(u.split("/api/users/")[1].split("?")[0]);
+    return relay.users.has(name) ? json(200, { username: name, ...relay.users.get(name) }) : json(404, { detail: "not found" });
   }
   if (u.includes("/api/mailbox/") && opts.method === "POST") { relay.posted.push(JSON.parse(opts.body).envelope); return json(200, { ok: true }); }
   return json(404, { detail: "not found" });
@@ -142,6 +147,12 @@ const drain = async (ws) => {
   ws.onmessage({ data: JSON.stringify({ type: "error", reason: tag }) });
   await until(() => dom.el("hint").textContent.includes(tag), "the pump to drain");
 };
+// Package 4, decision 2: a guest now approves the peer's key before its
+// handshake runs. Blocks whose subject is something else approve it here.
+async function approvePeer(what = "the guest-side approval prompt") {
+  await until(() => !dom.el("admit").hidden && dom.el("admit").dataset.mode === "peer", what);
+  await dom.el("admitOk").click();
+}
 const junk = (i) => ({ type: "msg", room: ROOM, alg: "AES256", payload: Buffer.from(JSON.stringify({ iv: "AAAAAAAAAAAAAAAA", ct: "AAAA", n: 1000 + i })).toString("base64") });
 
 // ---- item 3 (F-PROTO-002): nothing runs after a refusal ------------------------
@@ -440,6 +451,7 @@ const myBundle = { ed: me.ed, mldsa: me.mldsa, ecdh: me.ecdh, mlkem: me.mlkem };
   const pub = await pc.handshakePayload();
   const sig = await signHandshake(peer, ROOM, [myHello.n, peerNonce], pub);
   await ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub, reply: false, idb: peer.publicBundle(), sig }) });
+  await approvePeer();
   if (ws.readyState !== 3) await drain(ws);
   assert.ok(!said(/a SECOND identity tried to complete the key exchange/),
     "F-PROTO-003: a reflected own key frame must not pin our identity as the peer's (the real peer is then 'a SECOND identity')");
@@ -483,6 +495,7 @@ const SAFE_HINT = /^[\x20-\x7e\u2014\u2013\u2026\u00d7\u2713\u201c\u201d\u2018\u
   const pub = Buffer.from("\u202e{\u2028x", "utf8").toString("base64");
   const sig = await signHandshake(peer, ROOM, nonces, pub);
   ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "PQKEM", payload: pack({ pub, reply: false, idb: peer.publicBundle(), sig }) }) });
+  await approvePeer();
   await until(() => /Key exchange failed: (?!malformed key frame)/.test(dom.el("hint").textContent), "the cipher's refusal");
   const h = dom.el("hint").textContent;
   assert.ok(SAFE_HINT.test(h), `finding 2 (b): the cipher's parse error of relay bytes reaches the hint cleaned: ${JSON.stringify(h)}`);
@@ -591,6 +604,7 @@ const SAFE_HINT = /^[\x20-\x7e\u2014\u2013\u2026\u00d7\u2713\u201c\u201d\u2018\u
   const pub2 = await pc2.handshakePayload();
   const sig2 = await signHandshake(peer2, ROOM, [myHello.n, pn], pub2);
   await fresh.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub: pub2, reply: false, idb: peer2.publicBundle(), sig: sig2 }) });
+  await approvePeer();
   if (fresh.readyState !== 3) await drain(fresh);
   assert.ok(!lines().slice(lines0).some((l) => /SECOND identity/.test(l)),
     "L-2: the new session's genuine peer is not refused as a second identity");
@@ -627,6 +641,7 @@ async function handshakeToConfirm(peer) {
   const pub = await pc.handshakePayload();
   const sig = await signHandshake(peer, ROOM, nonces, pub);
   await ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub, reply: false, idb: peer.publicBundle(), sig }) });
+  await approvePeer();
   await drain(ws);
   const answer = ws.sent.map((f) => (f.type === "key" ? unpack(f.payload) : null)).find((p) => p && p.sig && p.reply);
   await pc.onPeerKey(answer.pub);
@@ -664,6 +679,7 @@ const pinFor = () => contacts.getPin("room:" + ROOM);
   const mpub = await mc.handshakePayload();
   const msig = await signHandshake(mallory, ROOM, s2.nonces, mpub);
   await s2.ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub: mpub, reply: false, idb: mallory.publicBundle(), sig: msig }) });
+  await approvePeer();
   await drain(s2.ws);
   const lines0 = lines().length;
   await dom.el("verifyOk").click();
@@ -904,6 +920,7 @@ function sameKeyPin(pin, b) { return !!pin && pin.ed === b.ed && pin.mldsa === b
   const sig = await signHandshake(peer, ROOM, nonces, pub);
   const h = holdSubtle("deriveBits", (a) => algName(a) === "ECDH", true);
   ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub, reply: false, idb: peer.publicBundle(), sig }) }) });
+  await approvePeer();
   await until(h.entered, "the key agreement to be running");
   await connect("DHKE");
   h.release();
@@ -949,6 +966,7 @@ function sameKeyPin(pin, b) { return !!pin && pin.ed === b.ed && pin.mldsa === b
   const pub = await pc.handshakePayload();
   const sig = await signHandshake(peer, ROOM, nonces, pub);
   await ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub, reply: false, idb: peer.publicBundle(), sig }) });
+  await approvePeer();
   await drain(ws);
   const answer = ws.sent.map((f) => (f.type === "key" ? unpack(f.payload) : null)).find((p) => p && p.sig && p.reply);
   assert.ok(answer, "fixture: our signed answer went out");
@@ -1299,11 +1317,15 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
   const src = readFileSync(join(HERE, "app.js"), "utf8")
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .replace(/(^|[^:"'`\\])\/\/.*$/gm, "$1");
-  const fn = src.slice(src.indexOf("async function showNextKnock("), src.indexOf("function hideAdmitPrompt("));
-  assert.ok(fn.length > 200, "fixture: showNextKnock found");
-  assert.match(fn, /contacts\.list\(\)\.find\(\(c\) => sameSigning\(c, k\.bundle\)\)/,
+  // Package 4: the lookup moved into describePeer, shared with the guest's
+  // prompt; showNextKnock must still route its bundle through it.
+  const knockFn = src.slice(src.indexOf("async function showNextKnock("), src.indexOf("function describePeer("));
+  assert.match(knockFn, /describePeer\(k\.bundle, "Deny"\)/, "fixture: showNextKnock describes its knock via describePeer");
+  const fn = src.slice(src.indexOf("function describePeer("), src.indexOf("const PEER_PROMPT"));
+  assert.ok(fn.length > 200, "fixture: describePeer found");
+  assert.match(fn, /contacts\.list\(\)\.find\(\(c\) => sameSigning\(c, bundle\)\)/,
     "item 12: the knock's known-contact lookup compares keys with sameSigning");
-  assert.doesNotMatch(fn, /\.ed === k\.bundle\.ed|k\.bundle\.ed === /, "item 12: ...not the key strings");
+  assert.doesNotMatch(fn, /\.ed === bundle\.ed|bundle\.ed === /, "item 12: ...not the key strings");
   console.log("OK  item 12: the knock's known-contact match uses sameSigning (anchored on code)");
 }
 
@@ -1338,6 +1360,228 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
     "item 17: …and the gate says why");
   await dom.el("disconnect").click();
   console.log("OK  item 17: Unverify revokes the room: pin — a withdrawn peer is not auto-accepted in a remembered room (executed)");
+}
+
+// ==== package 4, owner decision 2: the GUEST side approves too ===================
+// Before: only the owner was asked. A relay that knows the code seats ANY
+// identity against a guest; the guest's client verified the signature, pinned
+// whoever it was, answered with its own key and derived the session — the
+// in-person gate was the only thing left. Now the guest's user sees the peer's
+// fingerprint and trust mark before any of that, and decides.
+{
+  const signedOffer = async (who, nonces, alg = "DHKE") => {
+    const c = makeCipher(alg, ROOM);
+    await c.init();
+    const pub = await c.handshakePayload();
+    const sig = await signHandshake(who, ROOM, nonces, pub);
+    return { type: "key", room: ROOM, alg, payload: pack({ pub, reply: false, idb: who.publicBundle(), sig }) };
+  };
+  const promptUp = () => !dom.el("admit").hidden && dom.el("admit").dataset.mode === "peer";
+  const answered = (ws) => ws.sent.some((f) => f.type === "key" && (() => { const p = unpack(f.payload); return !!(p.sig && p.reply) || typeof p.confirm === "string"; })());
+  const mallory = await Identity.generate();
+  const mb = mallory.publicBundle();
+  const malloryFp = await Identity.fingerprintOf(mb);
+
+  // (a) the relay seats Mallory against a guest: the prompt shows HER key; deny.
+  {
+    const { ws, nonces } = await guestAwaitingHandshake("DHKE");
+    const pin0 = pinFor();
+    ws.onmessage({ data: JSON.stringify(await signedOffer(mallory, nonces)) });
+    await until(promptUp, "the guest-side prompt");
+    await until(() => dom.el("admitFingerprint").textContent === malloryFp, "Mallory's fingerprint on the prompt");
+    assert.strictEqual(dom.el("admitFingerprint").textContent, malloryFp,
+      "decision 2: the guest is shown the fingerprint of the identity the relay seated (Mallory's)");
+    assert.match(dom.el("admitWho").textContent, /Not in your users list/, "...with its trust in OUR terms (unknown key)");
+    assert.match(dom.el("admitTitle").textContent, /who you are expecting/, "...in the guest's wording, not the owner's");
+    await settle(10);
+    assert.ok(!answered(ws), "decision 2: while the prompt is up the guest has not answered with its key (no key exchange, no confirmation)");
+    await dom.el("admitNo").click();
+    await settle(10);
+    assert.strictEqual(ws.readyState, 3, "decision 2: deny closes the connection");
+    assert.ok(!answered(ws), "...with nothing exchanged");
+    assert.ok(said(/you refused the key the other side presented — nothing was exchanged/), "...and says so");
+    assert.deepStrictEqual(pinFor(), pin0, "...and nothing is pinned");
+    assert.strictEqual(dom.el("admit").hidden, true, "...and the prompt is gone");
+    assert.strictEqual(dom.el("verify").hidden, true, "...and no safety-number gate is drawn for Mallory");
+    assert.match(dom.el("roomHint").textContent, /You refused the other side's key/, "...and the room screen says why");
+  }
+
+  // (b) approve pins it for the session: a SECOND identity afterwards is refused.
+  {
+    const bob = await Identity.generate();
+    const { ws, nonces } = await guestAwaitingHandshake("DHKE");
+    ws.onmessage({ data: JSON.stringify(await signedOffer(bob, nonces)) });
+    await until(promptUp, "the prompt for Bob");
+    await dom.el("admitOk").click();
+    await drain(ws);
+    assert.ok(said(/you approved the other side — their key is now pinned for this session/), "decision 2: approve pins the key");
+    assert.ok(answered(ws), "...and the handshake then runs (our signed answer went out)");
+    assert.strictEqual(dom.el("admit").hidden, true, "...and the prompt is gone");
+    await ws.deliver(await signedOffer(mallory, nonces)); // the relay swaps the seat afterwards
+    await settle(10);
+    assert.ok(said(/a different identity than the one you approved tried to complete the key exchange — refusing/),
+      "decision 2: a second identity after the approval is refused against the APPROVED key");
+    assert.strictEqual(ws.readyState, 3, "...and the connection closes");
+    assert.strictEqual(dom.el("admit").hidden, true, "...without a second prompt");
+  }
+
+  // (c) two identities queued: the second waits behind the decision and is
+  // judged against it (the pump is serialized) — never a second prompt.
+  {
+    const bob = await Identity.generate();
+    const { ws, nonces } = await guestAwaitingHandshake("DHKE");
+    ws.onmessage({ data: JSON.stringify(await signedOffer(bob, nonces)) });
+    ws.onmessage({ data: JSON.stringify(await signedOffer(mallory, nonces)) });
+    await until(promptUp, "the prompt for the first identity");
+    const fpBob = await Identity.fingerprintOf(bob.publicBundle());
+    await until(() => dom.el("admitFingerprint").textContent === fpBob, "Bob's fingerprint");
+    await dom.el("admitOk").click();
+    await settle(20);
+    assert.ok(ws.readyState === 3 && !promptUp(), "decision 2: the queued second identity is refused, not asked about");
+  }
+
+  // (d) the close while the prompt is up settles it: nothing pinned, no dead prompt.
+  {
+    const { ws, nonces } = await guestAwaitingHandshake("DHKE");
+    ws.onmessage({ data: JSON.stringify(await signedOffer(mallory, nonces)) });
+    await until(promptUp, "the prompt");
+    ws.close(); // the relay hangs up
+    await settle(10);
+    assert.strictEqual(dom.el("admit").hidden, true, "decision 2: a close settles the open prompt (no undismissable sheet)");
+    assert.ok(!answered(ws), "...and nothing was exchanged");
+  }
+
+  // (e) trust mark + mismatch warning: the session named bob#tok (directory
+  // bundle = Bob), a known but unverified contact of ours is seated instead.
+  {
+    const bob = await Identity.generate();
+    const bb = bob.publicBundle();
+    relay.users.set("bob", { ed: bb.ed, mldsa: bb.mldsa, ecdh: bb.ecdh, mlkem: bb.mlkem });
+    const hal = await Identity.generate();
+    const hb = hal.publicBundle();
+    await contacts.upsert({ username: "hal", token: "tok-hal", ed: hb.ed, mldsa: hb.mldsa, ecdh: hb.ecdh, mlkem: hb.mlkem });
+    dom.el("contact").value = "bob#tok";
+    try {
+      const { ws, nonces } = await guestAwaitingHandshake("DHKE");
+      ws.onmessage({ data: JSON.stringify(await signedOffer(hal, nonces)) });
+      await until(promptUp, "the prompt for Hal");
+      await until(() => /hal/.test(dom.el("admitWho").textContent), "Hal's name on the prompt");
+      assert.match(dom.el("admitWho").textContent, /hal.*unverified/, "decision 2: the prompt shows our name for them and the trust mark");
+      assert.match(dom.el("admitWarn").textContent, /NOT the user you selected for this session. Refuse unless you know why/,
+        "decision 2: ...and warns when it is not the contact this session was aimed at");
+      await dom.el("admitNo").click();
+      await settle(5);
+    } finally {
+      dom.el("contact").value = "";
+    }
+  }
+
+  // (f) AUTO-APPROVAL: a contact this user verified in person (🟢) and pinned
+  // (user: pin, not revoked) with exactly these keys is let through without a
+  // prompt, and the transcript says so.
+  {
+    const gina = await Identity.generate();
+    const gb = gina.publicBundle();
+    await contacts.upsert({ username: "gina", token: "tok-gina", ed: gb.ed, mldsa: gb.mldsa, ecdh: gb.ecdh, mlkem: gb.mlkem, verified: true });
+    await contacts.savePin(contacts.pinKeyFor("gina"), gb);
+    const { ws, nonces } = await guestAwaitingHandshake("DHKE");
+    await ws.deliver(await signedOffer(gina, nonces));
+    await drain(ws);
+    assert.ok(!promptUp(), "decision 2: no prompt for a key verified in person and pinned");
+    assert.ok(said(/the other side is "gina", whom you verified in person — approved without asking/), "...and the transcript says why");
+    assert.ok(answered(ws), "...and the handshake runs");
+    await ws.deliver(await signedOffer(mallory, nonces));
+    await settle(10);
+    assert.ok(said(/different identity than the one you approved/) && ws.readyState === 3,
+      "...and the auto-approved key is pinned like a clicked one (a second identity is refused)");
+
+    // A 🟢 contact WITHOUT a pin, or with its pin revoked, still asks.
+    const ivy = await Identity.generate();
+    const ib = ivy.publicBundle();
+    await contacts.upsert({ username: "ivy", token: "tok-ivy", ed: ib.ed, mldsa: ib.mldsa, ecdh: ib.ecdh, mlkem: ib.mlkem, verified: true });
+    const s2 = await guestAwaitingHandshake("DHKE");
+    s2.ws.onmessage({ data: JSON.stringify(await signedOffer(ivy, s2.nonces)) });
+    await until(promptUp, "a prompt for a verified contact that was never pinned");
+    await dom.el("admitNo").click();
+    await settle(5);
+    await contacts.setVerified("gina", false); // revokes gina's pin …
+    await contacts.setVerified("gina", true);  // … and re-marking her 🟢 does not un-revoke it
+    const s3 = await guestAwaitingHandshake("DHKE");
+    s3.ws.onmessage({ data: JSON.stringify(await signedOffer(gina, s3.nonces)) });
+    await until(promptUp, "a prompt for a contact whose pin was revoked");
+    await dom.el("admitNo").click();
+    await settle(5);
+    // …and a 🟢 + pinned contact is still asked about when the session named someone else.
+    await contacts.savePin(contacts.pinKeyFor("gina"), gb);
+    const bob = await Identity.generate();
+    const bb = bob.publicBundle();
+    relay.users.set("bob2", { ed: bb.ed, mldsa: bb.mldsa, ecdh: bb.ecdh, mlkem: bb.mlkem });
+    dom.el("contact").value = "bob2#tok";
+    try {
+      const s4 = await guestAwaitingHandshake("DHKE");
+      s4.ws.onmessage({ data: JSON.stringify(await signedOffer(gina, s4.nonces)) });
+      await until(promptUp, "a prompt for a pinned contact the session was NOT aimed at");
+      await dom.el("admitNo").click();
+      await settle(5);
+    } finally {
+      dom.el("contact").value = "";
+    }
+    // …and a STALE pin does not speak for a record that moved on: jo's user:
+    // pin still holds his old key K1, his record holds K2 (re-verified from the
+    // profile sheet, which does not touch the pin). K1 showing up is asked about.
+    const joOld = await Identity.generate(), joNew = await Identity.generate();
+    const j1 = joOld.publicBundle(), j2 = joNew.publicBundle();
+    await contacts.upsert({ username: "jo", token: "tok-jo", ed: j1.ed, mldsa: j1.mldsa, ecdh: j1.ecdh, mlkem: j1.mlkem, verified: true });
+    await contacts.savePin(contacts.pinKeyFor("jo"), j1);
+    await contacts.upsert({ username: "jo", token: "tok-jo", ed: j2.ed, mldsa: j2.mldsa, ecdh: j2.ecdh, mlkem: j2.mlkem });
+    await contacts.setVerified("jo", true);
+    const s6 = await guestAwaitingHandshake("DHKE");
+    s6.ws.onmessage({ data: JSON.stringify(await signedOffer(joOld, s6.nonces)) });
+    await until(promptUp, "a prompt for a key only a stale pin still holds");
+    await dom.el("admitNo").click();
+    await settle(5);
+    // control: with the pin restored and no other contact named, gina is let through again
+    const s5 = await guestAwaitingHandshake("DHKE");
+    await s5.ws.deliver(await signedOffer(gina, s5.nonces));
+    await drain(s5.ws);
+    assert.ok(!promptUp() && answered(s5.ws), "control: the restored pin auto-approves again");
+    await dom.el("disconnect").click();
+  }
+
+  // (h) keyed on "not the owner", not on "guest": a relay that never says
+  // `pending`/`joined` (roomRole still null) cannot skip the question.
+  {
+    const ws = await connect("DHKE");
+    const pn = freshNonce();
+    await ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ hello: true, n: pn, reply: false }) });
+    await settle(20); // (no drain: with no seat there is no chat screen for its marker)
+    const myHello = ws.sent.map((f) => (f.type === "key" ? unpack(f.payload) : null)).find((p) => p && p.hello);
+    ws.onmessage({ data: JSON.stringify(await signedOffer(mallory, [myHello.n, pn])) });
+    await until(promptUp, "a prompt with no role assigned at all");
+    await dom.el("admitNo").click();
+    await settle(5);
+    assert.ok(ws.readyState === 3 && !answered(ws), "decision 2: a session the relay never seated asks too");
+  }
+
+  // (g) the OWNER is unchanged: it approved via the knock and is never asked again.
+  {
+    const ws = await connect("DHKE");
+    await ws.deliver({ type: "joined", role: "owner" });
+    const knocker = await Identity.generate();
+    await ws.deliver({ type: "knock", room: ROOM, jid: "00000000000000aa", payload: pack({ idb: knocker.publicBundle(), sig: await signKnock(knocker, ROOM) }) });
+    await until(() => !dom.el("admit").hidden && dom.el("admit").dataset.mode === "knock", "the owner's knock prompt");
+    assert.match(dom.el("admitOk").textContent + dom.el("admitTitle").textContent, /^(?!.*Continue)/, "the knock prompt keeps the owner's wording");
+    await dom.el("admitOk").click();
+    const myHello = ws.sent.map((f) => (f.type === "key" ? unpack(f.payload) : null)).find((p) => p && p.hello);
+    const pn = freshNonce();
+    await ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ hello: true, n: pn, reply: false }) });
+    await drain(ws);
+    await ws.deliver(await signedOffer(knocker, [myHello.n, pn]));
+    await drain(ws);
+    assert.ok(!promptUp() && answered(ws), "decision 2: the owner side is not asked a second time");
+    await dom.el("disconnect").click();
+  }
+  console.log("OK  decision 2: a guest sees and decides the seated identity (deny: closed, nothing pinned; approve: pinned, a second identity refused); in-person-verified + pinned contacts auto-approve (executed)");
 }
 
 console.log("\nAll app.js behavioural checks passed.");

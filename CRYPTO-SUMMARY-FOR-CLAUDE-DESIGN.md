@@ -121,6 +121,13 @@ Why each phase exists:
 - **Dual signature (authenticity):** a relay that swaps in its own ephemeral
   key cannot forge Ed25519 **and** ML-DSA-65 over the transcript → MITM key
   substitution is detected, connection refused.
+- **Local approval, both sides (who is let in):** the room owner approves each
+  knocker by fingerprint, and since package 4 the **guest** approves the
+  owner's key too — before its cipher sees the key or answers. Whoever knows
+  the chat code (the relay sees it in every `join`) can hold the other seat,
+  so each side decides locally which identity it will run the exchange with,
+  and pins it for the session. A key the user already verified in person and
+  pinned is approved without a second prompt.
 - **Safety number (the last gap):** a relay could still present an *entirely
   fake identity* and sign consistently. Then the two honest endpoints compute
   **different** safety numbers — the in-person comparison catches exactly

@@ -73,6 +73,15 @@ Client A --[ciphertext]--> Relay server --[ciphertext]--> Client B
   key fingerprint and trust mark. Waiting occupies no member slot, so knowing a
   code does not let a stranger take the room from the person you invited. The
   client pins the identity it admitted and refuses a handshake from any other.
+- **The guest approves too** (DHKE / PQKEM). Whoever knows the code — the
+  relay included — could hold the owner seat, so before the guest's key
+  exchange runs it is shown the owner's key fingerprint and trust mark (and a
+  warning if that is not the contact it looked up) and decides; Refuse
+  disconnects with nothing exchanged, and the approved key is pinned for the
+  session like the owner's. No prompt when the key belongs to a contact you
+  already verified **in person** and whose pin holds exactly that key (the
+  transcript says so). AES-256 / OTP have no identity to show; the shared
+  secret is what authenticates them.
 - Wire format: strict JSON envelope, printable ASCII only, validated by pydantic
   (see [Wire protocol](#wire-protocol)).
 - The encryption mode is a **client** concern; the `alg` field is only an

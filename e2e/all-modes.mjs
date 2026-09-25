@@ -253,6 +253,19 @@ async function runMode(mode, alice, bob) {
   await sleep(600);
   await alice.page.click("#admitOk");
 
+  // Package 4, decision 2: in the identity-authenticated modes the GUEST now
+  // approves too — bob is shown alice's key before his key exchange runs.
+  if (["DHKE", "PQKEM"].includes(mode)) {
+    await bob.page.waitForFunction(() => {
+      const a = document.querySelector("#admit");
+      return !a.hidden && a.dataset.mode === "peer" && document.querySelector("#admitFingerprint").textContent.trim();
+    }, { timeout: T(45000) });
+    const guestFp = await text(bob.page, "#admitFingerprint");
+    check(`${mode}: the guest sees the owner's real fingerprint`, guestFp === alice.fingerprint, `${guestFp.slice(0, 20)}…`);
+    await sleep(600);
+    await bob.page.click("#admitOk");
+  }
+
   // Each mode raises its own gate: the identity-authenticated ones show a
   // safety number, AES256/OTP unlock straight away. Wait for whichever comes.
   const settle = (page) => page.waitForFunction(() => {

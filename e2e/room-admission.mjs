@@ -81,6 +81,30 @@ const visible = (page, sel) => page.evaluate((s) => {
 // fingerprint first anyway; the test pauses the same way before it decides.
 const DECIDE_PAUSE = 600;
 
+// Package 4, decision 2: a GUEST now approves the owner's key too, on the same
+// sheet (data-mode="peer"), before its key exchange runs. "The knocker was let
+// in" is therefore visible on the knocker as that prompt (or, once decided,
+// the safety-number gate) — either one means it was seated and received the
+// owner's signed key.
+const peerPromptUp = (page) => page.evaluate(() => {
+  const a = document.querySelector("#admit");
+  return !a.hidden && a.dataset.mode === "peer" && document.querySelector("#admitFingerprint").textContent.trim().length > 20;
+});
+const seated = async (page) => (await visible(page, "#verify")) || (await peerPromptUp(page));
+const waitSeated = (page) => page.waitForFunction(() => {
+  const a = document.querySelector("#admit");
+  return !document.querySelector("#verify").hidden || (!a.hidden && a.dataset.mode === "peer");
+}, { timeout: 45000 }).catch(() => {});
+// The guest approves the owner's key the way a person would: after reading it.
+async function guestApproves(page) {
+  await page.waitForFunction(() => {
+    const a = document.querySelector("#admit");
+    return !a.hidden && a.dataset.mode === "peer" && document.querySelector("#admitFingerprint").textContent.trim().length > 20;
+  }, { timeout: 45000 });
+  await sleep(DECIDE_PAUSE);
+  await page.click("#admitOk");
+}
+
 // Put `code` in the room field and press Connect.
 async function joinRoom(page, code) {
   await page.evaluate(() => { document.querySelector("#room").value = ""; });
@@ -243,6 +267,23 @@ await alice.page.click("#admitOk");
 
 // --- 4. the squatter did NOT cost the invited peer the room ----------------
 console.log("\n4. the real session completes anyway (the finding itself)");
+// Decision 2: bob, the guest, is shown alice's key before his exchange runs.
+await bob.page.waitForFunction(() => {
+  const a = document.querySelector("#admit");
+  return !a.hidden && a.dataset.mode === "peer" && document.querySelector("#admitFingerprint").textContent.trim().length > 20;
+}, { timeout: 45000 });
+const guestSees = await bob.page.evaluate(() => ({
+  fp: document.querySelector("#admitFingerprint").textContent.trim(),
+  title: document.querySelector("#admitTitle").textContent.trim(),
+  who: document.querySelector("#admitWho").textContent.trim(),
+  gate: !document.querySelector("#verify").hidden,
+  canSend: !document.querySelector("#text").disabled,
+}));
+check("decision 2: the guest is shown the OWNER's real fingerprint before any key exchange",
+  guestSees.fp === alice.fingerprint && /who you are expecting/.test(guestSees.title) &&
+  /not in your users list/i.test(guestSees.who) && !guestSees.gate && !guestSees.canSend, JSON.stringify(guestSees));
+await sleep(DECIDE_PAUSE);
+await bob.page.click("#admitOk");
 await bob.page.waitForFunction(
   () => !document.querySelector("#verify").hidden, { timeout: 45000 });
 await alice.page.waitForFunction(
@@ -349,7 +390,7 @@ await sleep(300);
 const afterTaps = {
   prompt: await olga.page.evaluate(() => !document.querySelector("#admit").hidden),
   guest: (await text(gus.page, "#chatStatus")).toLowerCase(),
-  guestGate: await visible(gus.page, "#verify"),
+  guestGate: await seated(gus.page),
   ownerLog: await text(olga.page, "#log"),
 };
 check("phone: the admission sheet does not cover the tab bar", underThumb === "outside the sheet", underThumb);
@@ -376,8 +417,8 @@ check("phone: the sheet ends above the tab bar (rects, 390x844)",
 // A deliberate decision, after a pause, still works on the phone.
 await sleep(DECIDE_PAUSE);
 await olga.page.tap("#admitOk");
-await gus.page.waitForFunction(() => !document.querySelector("#verify").hidden, { timeout: 45000 }).catch(() => {});
-check("phone: after a pause, Let them in admits the knocker", await visible(gus.page, "#verify"),
+await waitSeated(gus.page);
+check("phone: after a pause, Let them in admits the knocker", await seated(gus.page),
   JSON.stringify((await text(gus.page, "#chatStatus")).toLowerCase()));
 
 // --- 6. the same with reduced motion: the 500 ms guard on its own ---------
@@ -483,8 +524,8 @@ check("keyboard: Shift+Tab to Let them in + Enter inside 500 ms admits no one",
   JSON.stringify(rcKeys));
 await sleep(DECIDE_PAUSE);
 await rc.page.keyboard.press("Enter"); // focus is still on "Let them in"
-await k3.page.waitForFunction(() => !document.querySelector("#verify").hidden, { timeout: 45000 }).catch(() => {});
-check("keyboard: after the pause, Enter on Let them in admits the knocker", await visible(k3.page, "#verify"),
+await waitSeated(k3.page);
+check("keyboard: after the pause, Enter on Let them in admits the knocker", await seated(k3.page),
   JSON.stringify((await text(k3.page, "#chatStatus")).toLowerCase()));
 
 // --- 7. back from the background; input stamped before the prompt ---------
@@ -533,8 +574,8 @@ check("background: the click on Let them in that brings the page back admits no 
   shownWhile === "hidden" && bgFirst.okClicks === 1 && bgFirst.admits === 0 && /waiting for approval/.test(bgFirst.guest), JSON.stringify(bgFirst));
 await sleep(DECIDE_PAUSE);
 await bgOwner.page.mouse.click(bgOk.x, bgOk.y);
-await k4.page.waitForFunction(() => !document.querySelector("#verify").hidden, { timeout: 45000 }).catch(() => {});
-check("background: a click after the pause admits the knocker", await visible(k4.page, "#verify"),
+await waitSeated(k4.page);
+check("background: a click after the pause admits the knocker", await seated(k4.page),
   JSON.stringify((await text(k4.page, "#chatStatus")).toLowerCase()));
 await elsewhere.close();
 
@@ -558,8 +599,8 @@ const rdLate = { okClicks: await okClicks(rd.page), ...(await decided(rd.page)),
 check("PT4b: a tap stamped 100 ms before the prompt, delivered 650 ms after it, admits no one",
   rdLate.okClicks === 1 && rdLate.admits === 0 && /waiting for approval/.test(rdLate.guest), JSON.stringify(rdLate));
 await stampedTap(Date.now() / 1000);
-await k5.page.waitForFunction(() => !document.querySelector("#verify").hidden, { timeout: 45000 }).catch(() => {});
-check("PT4b: the same tap stamped now admits the knocker", await visible(k5.page, "#verify"),
+await waitSeated(k5.page);
+check("PT4b: the same tap stamped now admits the knocker", await seated(k5.page),
   JSON.stringify((await text(k5.page, "#chatStatus")).toLowerCase()));
 
 // c) the head withdraws; a click lands while the next knock's digest is still being computed
@@ -676,6 +717,7 @@ await joinRoom(dA.page, dfCode);
 await df.page.waitForFunction(() => !document.querySelector("#admit").hidden, { timeout: 30000 });
 await sleep(DECIDE_PAUSE);
 await df.page.click("#admitOk");
+await guestApproves(dA.page);
 await df.page.waitForFunction(() => !document.querySelector("#verify").hidden, { timeout: 60000 });
 await joinRoom(dB.page, dfCode);
 await df.page.waitForFunction(() => !document.querySelector("#admit").hidden, { timeout: 30000 });
@@ -720,6 +762,7 @@ async function admitAtGate(owner, peer, code) {
   await owner.page.waitForFunction(() => !document.querySelector("#admit").hidden, { timeout: 30000 });
   await sleep(DECIDE_PAUSE);
   await owner.page.click("#admitOk");
+  await guestApproves(peer.page);
   await owner.page.waitForFunction(() => !document.querySelector("#verify").hidden, { timeout: 60000 });
 }
 await ownerConnected(sw);
@@ -735,6 +778,46 @@ check("S1: after a key-changed gate, the next clean first contact shows the defa
   gateChanged.changed && gateChanged.hint !== defaultHint && swCode2 !== swCode1 &&
   !gateClean.changed && gateClean.hint === defaultHint && defaultHint.length > 0,
   JSON.stringify({ changed: { ...gateChanged, hint: gateChanged.hint.slice(0, 40) }, clean: gateClean }));
+
+// --- 12. package 4, decision 2: the GUEST refuses a stranger in the owner seat --
+// Whoever knows a chat code — the relay included, it sees every `join` — can
+// take the owner seat and let the invited guest in. Before package 4 the guest
+// was never asked: its client pinned whatever identity answered, ran the key
+// exchange, and only the in-person safety number stood in the way. Now the
+// guest sees the seated identity's fingerprint first; Refuse closes with
+// nothing exchanged, and the stranger never reaches a safety-number gate.
+console.log("\n12. decision 2: a stranger holds the owner seat; the guest is shown its key and refuses");
+const st = await agent("stranger-owner"), gv = await agent("guest-refuses");
+const stCode = await ownerConnected(st);
+await joinRoom(gv.page, stCode);
+await st.page.waitForFunction(() => !document.querySelector("#admit").hidden, { timeout: 30000 });
+await sleep(DECIDE_PAUSE);
+await st.page.click("#admitOk");
+await gv.page.waitForFunction(() => {
+  const a = document.querySelector("#admit");
+  return !a.hidden && a.dataset.mode === "peer" && document.querySelector("#admitFingerprint").textContent.trim().length > 20;
+}, { timeout: 45000 });
+const gvSees = await gv.page.evaluate(() => ({
+  fp: document.querySelector("#admitFingerprint").textContent.trim(),
+  ok: document.querySelector("#admitOk").textContent.trim(), no: document.querySelector("#admitNo").textContent.trim(),
+}));
+check("decision 2: the guest is shown the fingerprint of whoever holds the owner seat",
+  gvSees.fp === st.fingerprint && gvSees.fp !== gv.fingerprint && gvSees.no === "Refuse", JSON.stringify({ ...gvSees, fp: gvSees.fp.slice(0, 20) }));
+await sleep(DECIDE_PAUSE);
+await gv.page.click("#admitNo");
+await gv.page.waitForFunction(
+  () => document.querySelector("#chatStatus").textContent.trim() === "disconnected", { timeout: 15000 }).catch(() => {});
+await sleep(1500);
+const refused = {
+  guestStatus: (await text(gv.page, "#chatStatus")).toLowerCase(),
+  guestHint: await text(gv.page, "#roomHint"),
+  guestLog: (await text(gv.page, "#log")).includes("nothing was exchanged"),
+  strangerGate: await visible(st.page, "#verify"),
+  strangerCanSend: await st.page.evaluate(() => !document.querySelector("#text").disabled),
+};
+check("decision 2: Refuse disconnects the guest with nothing exchanged; the stranger gets no gate and cannot send",
+  refused.guestStatus === "disconnected" && /You refused the other side's key/.test(refused.guestHint) && refused.guestLog &&
+  !refused.strangerGate && !refused.strangerCanSend, JSON.stringify(refused));
 
 await browser.close();
 

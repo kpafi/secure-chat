@@ -57,6 +57,7 @@ const els = {
   // room admission (owner approves who may join)
   admit: $("admit"), admitFingerprint: $("admitFingerprint"), admitWho: $("admitWho"),
   admitWarn: $("admitWarn"), admitOk: $("admitOk"), admitNo: $("admitNo"), admitLeave: $("admitLeave"),
+  admitTitle: $("admitTitle"), admitHint: $("admitHint"),
   idHint: $("idHint"), roomHint: $("roomHint"), roomHelp: $("roomHelp"),
   stepIdentity: $("stepIdentity"), stepRoom: $("stepRoom"),
   copyCode: $("copyCode"), algDetails: $("algDetails"), algSummary: $("algSummary"), peerFingerprint: $("peerFingerprint"),
@@ -187,6 +188,12 @@ let roomRole = null;       // "owner" | "guest" for this connection
 let admittedBundle = null; // the identity WE let in (owner side), or null
 let admittedAnon = false;  // we let in someone with no identity at all
 let wasPending = false;    // we sat in the approval queue (M-2, guest side)
+// Package 4, owner decision 2: the GUEST side approves too. `peerApproved` is
+// the identity this device's user approved (or that matched a contact they
+// verified in person) for this connection — pinned exactly like the owner's
+// `admittedBundle`. `peerApproval` is the open prompt: { bundle, resolve }.
+let peerApproved = null;
+let peerApproval = null;
 // Package 2, item 2 (phase7-local M-1 rounds): the two relay-driven arms whose
 // honest relay sends them once per connection are SAID once per connection.
 let saidTurnedAway = false;
@@ -2782,6 +2789,8 @@ async function connectInner() {
   saidRemovedAlg = false;
   keyConfirm.reset();
   knockQueue = [];
+  settlePeerApproval(false); // decision 2: a prompt of the old connection decides nothing
+  peerApproved = null;
   hideAdmitPrompt();
   // P-19: freeze the session's room/alg now; the send path uses these, never the
   // live DOM.
@@ -2846,6 +2855,10 @@ async function connectInner() {
     saidDenied = false;
     keyConfirm.reset();
     knockQueue = [];
+    // Decision 2: an open guest-side prompt is settled as "no" — the handler
+    // parked on it re-checks live() and returns; nothing is pinned.
+    settlePeerApproval(false);
+    peerApproved = null;
     hideAdmitPrompt(); // also lifts the B3 modal: nothing stays inert after a drop
     enableSend(false);
     els.verify.hidden = true;
@@ -3019,35 +3032,7 @@ async function showNextKnock() {
     if (gen !== knockRenderGen || knockQueue[0] !== k) return;
     els.admitFingerprint.textContent = fp;
     els.admitFingerprint.hidden = false;
-    // Who is this, in OUR terms? Matched on the keys themselves — never on a
-    // name the other side chose (F-01).
-    // Package 2, item 12 (A4 item 11 residual): compared as KEYS (decoded
-    // bytes, sameSigning), like every other identity comparison in this file —
-    // not as the strings a store or a relay happened to spell them with.
-    const known = contacts.isUnlocked()
-      ? contacts.list().find((c) => sameSigning(c, k.bundle))
-      : null;
-    if (known) {
-      // B1 (design review): our name for them, then the same trust pill the
-      // lists draw.
-      const name = document.createElement("span");
-      name.className = "u-name"; // H1 (design review): a handle, set like every other one
-      name.textContent = dirName(known);
-      const mark = document.createElement("span");
-      renderMark(mark, known);
-      els.admitWho.textContent = "";
-      els.admitWho.append(name, " ", mark);
-    } else {
-      els.admitWho.textContent = pinsReadable()
-        ? "Not in your users list — you have never verified this key"
-        : "Unknown — your saved users could not be read, so trust cannot be checked";
-    }
-    // If this session was aimed at a specific contact, say whether it is them.
-    if (expectedPeerBundle && !sameBundle(expectedPeerBundle, k.bundle)) {
-      els.admitWarn.textContent =
-        "This is NOT the user you selected for this session. Deny unless you know why.";
-      els.admitWarn.className = "hint err";
-    }
+    describePeer(k.bundle, "Deny");
   } else if (k.unproven) {
     // B6 (design review): no key, no fingerprint well (was an empty "—" box).
     els.admitFingerprint.textContent = "";
@@ -3078,6 +3063,7 @@ async function showNextKnock() {
     els.admitWarn.className = "hint";
   }
   const fresh = els.admit.hidden || admitShownFor !== k;
+  els.admit.dataset.mode = "knock";
   els.admit.hidden = false;
   setAdmitModal(true); // B3; before the guard, so its focus lands on Deny
   if (fresh) armAdmitGuard(k);
@@ -3086,6 +3072,126 @@ async function showNextKnock() {
       (els.admitWarn.textContent ? " " : "") +
       `(${knockQueue.length - 1} more waiting — decide one at a time.)`;
   }
+}
+
+// Who is this, in OUR terms? Shared by the owner's knock prompt and the guest's
+// peer prompt (package 4, decision 2). Matched on the keys themselves — never
+// on a name the other side chose (F-01).
+// Package 2, item 12 (A4 item 11 residual): compared as KEYS (decoded bytes,
+// sameSigning), like every other identity comparison in this file — not as the
+// strings a store or a relay happened to spell them with.
+function describePeer(bundle, refuseWord) {
+  const known = contacts.isUnlocked()
+    ? contacts.list().find((c) => sameSigning(c, bundle))
+    : null;
+  if (known) {
+    // B1 (design review): our name for them, then the same trust pill the
+    // lists draw.
+    const name = document.createElement("span");
+    name.className = "u-name"; // H1 (design review): a handle, set like every other one
+    name.textContent = dirName(known);
+    const mark = document.createElement("span");
+    renderMark(mark, known);
+    els.admitWho.textContent = "";
+    els.admitWho.append(name, " ", mark);
+  } else {
+    els.admitWho.textContent = pinsReadable()
+      ? "Not in your users list — you have never verified this key"
+      : "Unknown — your saved users could not be read, so trust cannot be checked";
+  }
+  // If this session was aimed at a specific contact, say whether it is them.
+  if (expectedPeerBundle && !sameBundle(expectedPeerBundle, bundle)) {
+    els.admitWarn.textContent =
+      `This is NOT the user you selected for this session. ${refuseWord} unless you know why.`;
+    els.admitWarn.className = "hint err";
+  }
+}
+
+// ---- package 4, owner decision 2: the guest side approves too ----------------
+// Until now only the room OWNER was asked who to let in. A relay that knows the
+// code (it is in every `join` frame) can seat ANY identity against a guest — and
+// against a creator whose code was minted in another browser profile, who looks
+// like a guest here — and only the in-person safety-number gate stood in its
+// way. So before the guest's key exchange runs (before its cipher sees the
+// peer's key, before it answers, long before any message can be sent or
+// decrypted) the guest's user sees the owner's fingerprint and trust mark and
+// decides; "no" closes. The approved identity is pinned for the connection
+// exactly like `admittedBundle` on the owner side: a second identity is refused.
+//
+// No wire change: the owner's identity bundle already arrives, signed over this
+// connection's nonces, in its handshake frame — which is what is judged here.
+//
+// AUTO-APPROVAL (decided, stated): no prompt when the key is one this user
+// already verified IN PERSON and pinned — a contact marked verified (🟢) whose
+// four keys equal the offered bundle AND whose user: pin holds those same keys,
+// not revoked (Unverify / Remove revoke it) — and, if this session named a
+// contact, it is that contact. A 🟡 vouch, a room: pin or a directory answer is
+// NOT enough: none of them is this user's own in-person check of this key.
+// Everything else asks. The auto-approval says so in the transcript.
+const PEER_PROMPT = {
+  title: "Is this who you are expecting?",
+  hint: "You are joining someone else's chat. This is the key of the person who let you in. " +
+    "Only continue if it is who you meant to talk to.",
+  ok: "Continue",
+  no: "Refuse",
+};
+let knockLabels = null; // the owner-prompt wording from index.html, restored on hide
+
+function peerVerifiedInPerson(bundle) {
+  if (!contacts.isUnlocked()) return null;
+  if (expectedPeerBundle && !sameBundle(expectedPeerBundle, bundle)) return null;
+  for (const c of contacts.list()) {
+    if (!c.verified || !sameBundle(keysOf(c), bundle)) continue;
+    const pin = contacts.getPin(contacts.pinKeyFor(c.username));
+    if (pin && !pin.revoked && sameBundle(pin, bundle)) return c;
+  }
+  return null;
+}
+
+// Registers the pending decision SYNCHRONOUSLY, then renders: the other order
+// would let a close arriving mid-render find nothing to settle, and the message
+// pump would stay parked on a promise nothing could ever resolve.
+function requestPeerApproval(bundle) {
+  settlePeerApproval(false);
+  const decided = new Promise((resolve) => { peerApproval = { bundle, resolve }; });
+  renderPeerApproval(peerApproval);
+  return decided;
+}
+
+async function renderPeerApproval(req) {
+  const fp = await Identity.fingerprintOf(req.bundle);
+  if (peerApproval !== req) return; // settled (or replaced) while we hashed
+  if (!knockLabels) {
+    knockLabels = {
+      title: els.admitTitle.textContent, hint: els.admitHint.textContent,
+      ok: els.admitOk.textContent, no: els.admitNo.textContent,
+    };
+  }
+  els.admitTitle.textContent = PEER_PROMPT.title;
+  els.admitHint.textContent = PEER_PROMPT.hint;
+  els.admitOk.textContent = PEER_PROMPT.ok;
+  els.admitNo.textContent = PEER_PROMPT.no;
+  els.admitWarn.textContent = "";
+  els.admitWarn.className = "hint";
+  els.admitFingerprint.textContent = fp;
+  els.admitFingerprint.hidden = false;
+  describePeer(req.bundle, "Refuse");
+  els.admitOk.disabled = false;
+  els.admit.dataset.mode = "peer";
+  const fresh = els.admit.hidden || admitShownFor !== req;
+  els.admit.hidden = false;
+  setAdmitModal(true); // B3
+  if (fresh) armAdmitGuard(req); // the same 500 ms tap-through guard as a knock
+}
+
+// Settles the parked handshake. Safe with nothing pending — onclose and
+// connectInner call it unconditionally.
+function settlePeerApproval(ok) {
+  if (!peerApproval) return;
+  const { resolve } = peerApproval;
+  peerApproval = null;
+  hideAdmitPrompt();
+  resolve(ok);
 }
 
 function hideAdmitPrompt() {
@@ -3101,6 +3207,14 @@ function hideAdmitPrompt() {
   els.admitFingerprint.hidden = false; // B6
   els.admitWho.textContent = "";
   els.admitWarn.textContent = "";
+  // Decision 2: the sheet goes back to the owner's wording.
+  delete els.admit.dataset.mode;
+  if (knockLabels) {
+    els.admitTitle.textContent = knockLabels.title;
+    els.admitHint.textContent = knockLabels.hint;
+    els.admitOk.textContent = knockLabels.ok;
+    els.admitNo.textContent = knockLabels.no;
+  }
 }
 
 // The verdict. Admitting PINS the identity we let in: the handshake below
@@ -3630,6 +3744,38 @@ async function handleMessage(room, raw, sock) {
         if (admittedAnon) {
           addLine("sys", "", "[the peer you let in had no identity but now sends one — refusing]", true);
           closeWs("This peer introduced itself without an identity and then produced one. Disconnecting.", sock);
+          return;
+        }
+
+        // Package 4, owner decision 2: the guest's half of the approval (see
+        // requestPeerApproval). Everything above is the OWNER's half; here a
+        // side that approved nobody — a guest, or anyone the relay has not
+        // told it owns the room — asks its user before any key material is
+        // touched. Keyed on "not the owner" rather than "guest" so a relay
+        // that withholds `joined` cannot skip it. Awaited in place: the pump
+        // is serialized, so every later frame (another identity included)
+        // waits behind this decision and is judged against it.
+        if (roomRole !== "owner" && peerApproved === null) {
+          const known = peerVerifiedInPerson(idbCanon);
+          if (known) {
+            peerApproved = idbCanon;
+            addLine("sys", "", `the other side is "${dirName(known)}", whom you verified in person — approved without asking`, true);
+          } else {
+            const allowed = await requestPeerApproval(idbCanon);
+            if (!live()) return; // closed (or replaced) while the prompt was up
+            if (!allowed) {
+              addLine("sys", "", "[you refused the key the other side presented — nothing was exchanged]", true);
+              closeWs("You refused the other side's key. Nothing was exchanged. " +
+                "If you expected them, check the chat code and their fingerprint with them out of band.", sock);
+              return;
+            }
+            peerApproved = idbCanon;
+            addLine("sys", "", "you approved the other side — their key is now pinned for this session", true);
+          }
+        }
+        if (peerApproved && !sameBundle(peerApproved, idbCanon)) {
+          addLine("sys", "", "[a different identity than the one you approved tried to complete the key exchange — refusing]", true);
+          closeWs("The identity that completed the key exchange differs from the one you approved. Disconnecting.", sock);
           return;
         }
 
@@ -4428,7 +4574,14 @@ els.verifyOk.addEventListener("click", onVerifyOk);
 els.verifyNo.addEventListener("click", onVerifyNo);
 for (const [btn, allow] of [[els.admitOk, true], [els.admitNo, false]]) {
   btn.addEventListener("click", (e) => {
-    if (knockQueue[0] !== admitShownFor || e.timeStamp - admitShownAt < 500) return;
+    if (e.timeStamp - admitShownAt < 500) return;
+    // Decision 2: the same sheet asks the guest about the peer. Only the
+    // prompt that is on screen may be decided (a render still in flight is not).
+    if (peerApproval) {
+      if (admitShownFor === peerApproval && els.admit.dataset.mode === "peer") settlePeerApproval(allow);
+      return;
+    }
+    if (knockQueue[0] !== admitShownFor) return;
     decideKnock(allow);
   });
 }
