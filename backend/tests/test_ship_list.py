@@ -205,36 +205,56 @@ def _run_sync_web(dest_root: Path) -> set[str]:
     return _files(web)
 
 
-_BOX_TARGET = '"$BOX":/opt/secure-chat/'
+# The deploy rsync, token for token. Anything else - an extra option, a second
+# source, a changed destination - is a deliberate edit of this list, reviewed
+# here, not something the test picks up and runs (package-5 re-review: the test
+# used to EXECUTE whatever options the script carried, so `--log-file=<path>` or
+# `--remove-source-files` from a tracked file ran on the dev box).
+_DEPLOY_RSYNC = [
+    "rsync", "-az", "--itemize-changes",
+    "--exclude-from", "deploy/ship-excludes.txt",
+    "--exclude-from", "deploy/rsync-excludes.txt",
+    "backend", "client", "$BOX:/opt/secure-chat/",
+]
+# `rsync` as a command word: not deploy/rsync-excludes.txt, not "rsyncs".
+_RSYNC_WORD = re.compile(r"(?<![\w.-])rsync(?![\w.-])")
 
 
-def _deploy_rsync(script: Path) -> str:
-    """The one rsync command of a deploy script, continuation lines joined."""
+def _deploy_rsync(script: Path) -> list[str]:
+    """The one rsync command of a deploy script, as shell tokens, checked to
+    be exactly _DEPLOY_RSYNC."""
+    import shlex
     src = script.read_text()
+    # Every rsync in the script, wherever it stands: `{ rsync ...; }`,
+    # `command rsync`, an indented one inside an `if`, `/usr/bin/rsync`. Only
+    # full-line comments are skipped; one extraction below proves the one.
+    code = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
+    words = _RSYNC_WORD.findall(code)
+    assert len(words) == 1, f"{script.name}: expected exactly one rsync, found {len(words)}"
     cmds = re.findall(r"^rsync .*?(?<!\\)\n", src, re.S | re.M)
-    assert len(cmds) == 1, f"{script.name}: expected one rsync, got {len(cmds)}"
-    cmd = re.sub(r"\\\n\s*", " ", cmds[0]).strip()
-    assert cmd.endswith(" backend client " + _BOX_TARGET), f"{script.name}: {cmd}"
-    # Only the rsync itself may run below: no second command, no substitution.
-    assert not re.search(r"[;&|`<>]|\$\(", cmd), f"{script.name}: {cmd}"
-    assert cmd.count("$") == 1, f"{script.name}: {cmd}"
-    return cmd
+    assert len(cmds) == 1, f"{script.name}: the one rsync must start its line"
+    tokens = shlex.split(re.sub(r"\\\n", " ", cmds[0]))
+    assert tokens == _DEPLOY_RSYNC, f"{script.name}: {tokens}"
+    return tokens
 
 
 def _run_deploy_rsync(script: Path, work: Path, backend: Path) -> Path:
-    """Run the script's REAL rsync command, with the box replaced by a local
-    directory, from a scratch repo root holding the two lists, the given
-    backend/ and a copy of client/. Returns the fake /opt/secure-chat/."""
+    """Check the script's rsync is exactly _DEPLOY_RSYNC, then run THAT fixed
+    list (never the script's text), with no shell, from a scratch repo root
+    holding the given backend/ and a copy of client/, and the box replaced by
+    a local directory. Returns the fake /opt/secure-chat/."""
+    _deploy_rsync(script)
     root = work / "repo"
-    (root / "deploy").mkdir(parents=True)
-    shutil.copy(SHIP_LIST, root / "deploy" / SHIP_LIST.name)
-    shutil.copy(BOX_LIST, root / "deploy" / BOX_LIST.name)
+    root.mkdir(parents=True)
     shutil.copytree(CLIENT, root / "client", symlinks=True)
     shutil.copytree(backend, root / "backend", symlinks=True)
     box = work / "opt-secure-chat"
     box.mkdir()
-    cmd = _deploy_rsync(script).replace(_BOX_TARGET, "'" + str(box) + "/'")
-    subprocess.run(["bash", "-c", cmd], cwd=root, check=True, capture_output=True, text=True)
+    argv = ["rsync", "-a",
+            "--exclude-from", str(SHIP_LIST),
+            "--exclude-from", str(BOX_LIST),
+            "backend", "client", str(box) + "/"]
+    subprocess.run(argv, cwd=root, check=True, capture_output=True, text=True)
     return box
 
 
@@ -284,15 +304,13 @@ def test_sync_web_reads_the_one_list():
 
 def test_deploy_scripts_use_the_shared_lists():
     """Every non-historical deploy script (future ones are copies of the newest)
-    rsyncs with both shared lists and no inline --exclude beside them."""
+    rsyncs with both shared lists and nothing else: exactly _DEPLOY_RSYNC, the
+    only rsync in the script (no inline --exclude/--include/-F, no second
+    rsync hidden in a group, an `if` or behind `command`)."""
     scripts = _deploy_scripts()
     assert scripts, "no current deploy script: the newest one is the template"
     for script in scripts:
-        cmd = _deploy_rsync(script)
-        assert "--exclude-from deploy/ship-excludes.txt" in cmd, (script.name, cmd)
-        assert "--exclude-from deploy/rsync-excludes.txt" in cmd, (script.name, cmd)
-        # No second, inline list and no rule that overrides the lists.
-        assert not re.search(r"--(exclude|include|filter)[ =]|\s-[A-Za-z]*F", cmd), (script.name, cmd)
+        assert _deploy_rsync(script) == _DEPLOY_RSYNC
 
 
 def test_deploy_scripts_leave_the_code_root_owned():

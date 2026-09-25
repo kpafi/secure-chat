@@ -50,6 +50,18 @@ def _directives(unit: str, key: str) -> list[str]:
     return out
 
 
+def test_execstart_has_no_privilege_prefix(unit):
+    """Package-5 re-review: systemd reads prefix characters on ExecStart.
+    `+` runs the command with FULL privileges (as root, ignoring User=,
+    the capability bounding set, namespacing and the rest of the sandbox),
+    `!`/`!!` ignore User=/Group= and the capability settings, `-` hides a
+    failure, `@`/`:`/`|` change argv, expansion or the shell. The value must
+    start with the interpreter path itself, nothing before it."""
+    value = _exec_start(unit)[len("ExecStart="):]
+    assert value.startswith("/opt/secure-chat/venv/bin/python "), (
+        f"ExecStart must start with the venv python, no prefix: {value[:60]!r}")
+
+
 def test_execstart_disables_uvicorn_proxy_headers(unit):
     """Without this, uvicorn rewrites request.client before client_key runs (H-4)."""
     assert "--no-proxy-headers" in _exec_start(unit)
