@@ -47,6 +47,12 @@ import {
   captureNativeFloor, NATIVE_ABSENT, NATIVE_TAMPERED, floorUnavailableError, bumpFloor, FLOOR_MAX,
 } from "./nativefloor.js";
 const nativeFloor = captureNativeFloor();
+// Package 3b (owner decision 2026-09-25): store + witness in IndexedDB, strict
+// durability, one-time migration from localStorage — see durable.js storeSlot
+// and the matching notes in contacts.js.
+import { storeSlot } from "./durable.js";
+const slot = storeSlot({ blobKey: LS_CHATS, genKey: LS_CHATS_GEN, marker: "sc.chats.idb.v1" });
+export const ready = slot.ready;
 const KDF_ITERS = 600000;
 const MAX_MESSAGES_PER_CHAT = 500; // keep the newest; bound the blob size
 
@@ -111,8 +117,9 @@ function adoptionError(message, code) {
 
 // The witness: {d: CHATS_GEN_DOMAIN, gen} under the data key with its OWN salt,
 // so it stays readable when the store that would hold the salt is gone.
-async function readWitness(passphrase = null) {
-  const raw = localStorage.getItem(LS_CHATS_GEN);
+// `raw`: the witness read together with the store; left out, read fresh (3b).
+async function readWitness(passphrase = null, raw = undefined) {
+  if (raw === undefined) raw = await slot.readWitness();
   if (!raw) return null;
   let rec;
   try {
@@ -133,13 +140,14 @@ async function readWitness(passphrase = null) {
   }
 }
 
-async function writeWitness() {
+// Sealed and RETURNED: persist() writes it with the store in one transaction.
+async function sealWitness() {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const plain = enc.encode(JSON.stringify({ d: CHATS_GEN_DOMAIN, gen: generation }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, dataKey, plain));
-  localStorage.setItem(LS_CHATS_GEN, JSON.stringify({
+  return JSON.stringify({
     salt: b64(salt), iters: KDF_ITERS, iv: b64(iv), ct: b64(ct),
-  }));
+  });
 }
 
 // Pentest 2026-07-26 P-20: the store is keyed by a directory username, and the
@@ -171,9 +179,9 @@ export function lock() {
 
 // True when a chat store is expected on this device (blob, witness, or a
 // native floor seen by the last unlock), like contacts.hasStore().
+// Package 3b: over the slot's preloaded state; TRUE until the preload settled.
 export function hasStore() {
-  return expectedStore ||
-    localStorage.getItem(LS_CHATS) !== null || localStorage.getItem(LS_CHATS_GEN) !== null;
+  return expectedStore || slot.known();
 }
 
 // Same options as contacts.unlock: `floorId`, `adoptLegacy`, `adoptDeleted`.
@@ -185,9 +193,15 @@ export async function unlock(passphrase, opts = {}) {
     lock();
     throw new Error("the device-protected record for your chat history is damaged or forged — refusing to open it");
   }
-  const raw = localStorage.getItem(LS_CHATS);
+  let raw, rawWitness;
+  try {
+    ({ blob: raw, witness: rawWitness } = await slot.read());
+  } catch (e) {
+    lock();
+    throw e;
+  }
   if (!raw) {
-    const w = await readWitness(passphrase);
+    const w = await readWitness(passphrase, rawWitness);
     // Package 3: `floor > 0` — a floor of 0 is a slot persist() armed for a
     // first save that never completed; it is not evidence of a store (see
     // contacts.js, same branch).
@@ -255,7 +269,7 @@ export async function unlock(passphrase, opts = {}) {
 
   // Rollback / deletion detection, in the contact store's order: witness
   // verdicts first (specific wording), then the floor, then adoption.
-  const w = await readWitness();
+  const w = await readWitness(null, rawWitness);
   if (w === null) {
     if (tagged) {
       lock();
@@ -305,7 +319,7 @@ export async function unlock(passphrase, opts = {}) {
   chats = newStore(map);
   let dirty = sanitizeModes();
   if (!tagged) dirty = true; // upgraded in place so adoption happens once
-  if (floorKey && nativeFloor && data.nativeFloor !== true) dirty = true;
+  if (floorKey && nativeFloor && slot.durable() && data.nativeFloor !== true) dirty = true;
   if (dirty) await persist();
   return { created: false };
 }
@@ -343,7 +357,9 @@ async function persist() {
   // order as contacts.js persist() — the slot must provably exist before the
   // blob claims it, the advance below is checked, a failed floor write locks
   // the store, and the int32 ceiling is a loud refusal rather than a freeze.
-  const floored = !!(nativeFloor && floorKey);
+  // Package 3b: the floor only where the store is durable (IndexedDB) — see
+  // contacts.js persist for why the localStorage fallback must not advance it.
+  const floored = !!(nativeFloor && floorKey) && slot.durable();
   if (floored) {
     if (generation >= FLOOR_MAX) {
       lock();
@@ -362,11 +378,10 @@ async function persist() {
     d: CHATS_DOMAIN, chats, gen: generation, nativeFloor: floored,
   }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, dataKey, plain));
-  localStorage.setItem(
-    LS_CHATS,
-    JSON.stringify({ v: 2, iters: KDF_ITERS, salt: b64(salt), iv: b64(iv), ct: b64(ct) }),
-  );
-  await writeWitness();
+  const blobStr = JSON.stringify({ v: 2, iters: KDF_ITERS, salt: b64(salt), iv: b64(iv), ct: b64(ct) });
+  // Package 3b: one strict transaction for store + witness, completed before
+  // this returns; the native floor only after it (never ahead of the data).
+  await slot.write(blobStr, await sealWitness());
   if (floored) armOrLock(generation);
   localStorage.setItem(EPOCH_KEY, "1");
 }
@@ -382,11 +397,12 @@ function armOrLock(value) {
   }
 }
 
+// Package 3b: returns the promise of the IndexedDB deletion (app.js awaits it).
 export function wipe() {
-  localStorage.removeItem(LS_CHATS);
-  localStorage.removeItem(LS_CHATS_GEN);
+  const done = slot.wipe();
   lock();
   expectedStore = false;
+  return done;
 }
 
 // ---- AES256 inner layer ---------------------------------------------------

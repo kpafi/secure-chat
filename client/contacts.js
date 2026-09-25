@@ -54,6 +54,14 @@ import {
   captureNativeFloor, NATIVE_ABSENT, NATIVE_TAMPERED, floorUnavailableError, bumpFloor, FLOOR_MAX,
 } from "./nativefloor.js";
 const nativeFloor = captureNativeFloor();
+// Package 3b (owner decision 2026-09-25): the store and its witness live in
+// IndexedDB, written with strict durability, migrated once from localStorage.
+// See durable.js storeSlot for the migration, the marker and the fallback.
+import { storeSlot } from "./durable.js";
+const slot = storeSlot({ blobKey: LS_CONTACTS, genKey: LS_GEN, marker: "sc.contacts.idb.v1" });
+// Resolves once the preload (and any migration) has settled; unlock() waits
+// for it itself, so callers need not.
+export const ready = slot.ready;
 // "Post-fix contacts have run on this device." Deletable like everything in
 // localStorage, so it may only ESCALATE a warning, never authorise anything.
 const EPOCH_KEY = "sc.contacts.epoch.v1";
@@ -161,13 +169,22 @@ export async function unlock(passphrase, opts = {}) {
     lock();
     throw new Error("the device-protected record for your saved contacts is damaged or forged — refusing to open the store");
   }
-  const raw = localStorage.getItem(LS_CONTACTS);
+  // Package 3b: the store and its witness live in IndexedDB (durable.js
+  // storeSlot), read together — and migrated there from localStorage on the
+  // first read after the upgrade.
+  let raw, rawWitness;
+  try {
+    ({ blob: raw, witness: rawWitness } = await slot.read());
+  } catch (e) {
+    lock();
+    throw e;
+  }
   if (!raw) {
     // No store. Before creating a fresh (empty, pin-less) one, make sure this
     // really IS a first run and not a store somebody deleted — see L-1. The
     // witness carries its OWN salt precisely so it stays readable when the
     // store that would otherwise hold the salt has been removed.
-    await assertStoreNotDeleted(passphrase);
+    await assertStoreNotDeleted(passphrase, rawWitness);
     // F-ATREST-003: on Android the floor outlives both blobs. "Floor says
     // generation N, nothing in storage" is either an attacker's two
     // removeItem calls or the user's own Forget-then-restore of the same
@@ -263,7 +280,7 @@ export async function unlock(passphrase, opts = {}) {
     pins = data.pins || {};
   }
   generation = Number.isInteger(data.gen) ? data.gen : 0;
-  await assertNotRolledBack(data.gen);
+  await assertNotRolledBack(data.gen, rawWitness);
   // F-ATREST-003/004, the floor half. Runs AFTER the witness checks so the
   // more specific localStorage verdicts keep their wording, but it is the
   // decision the witness could not make: a witness restored together with the
@@ -337,7 +354,8 @@ export async function unlock(passphrase, opts = {}) {
   // current state (there is nothing to roll back TO yet) and start counting.
   if (!Number.isInteger(data.gen)) dirty = true;
   // A store from before the floor existed is re-persisted so it gains one.
-  if (floorKey && nativeFloor && data.nativeFloor !== true) dirty = true;
+  // (Package 3b: only where the floor is actually advanced — see persist.)
+  if (floorKey && nativeFloor && slot.durable() && data.nativeFloor !== true) dirty = true;
   if (dirty) await persist();
   return { created: false };
 }
@@ -384,8 +402,10 @@ function dropLegacyPins() {
 // `key` is optional: when the store blob is gone we have no salt to re-derive
 // from, so the caller passes the passphrase and we use the salt the witness
 // carries itself.
-async function readWitness(passphrase = null) {
-  const raw = localStorage.getItem(LS_GEN);
+// Package 3b: `raw` is the witness string read together with the store (so the
+// two verdicts are about one snapshot); left out, it is read fresh.
+async function readWitness(passphrase = null, raw = undefined) {
+  if (raw === undefined) raw = await slot.readWitness();
   if (!raw) return null;
   let rec;
   try {
@@ -410,17 +430,19 @@ async function readWitness(passphrase = null) {
   }
 }
 
-async function writeWitness() {
+// Seals the witness and RETURNS it: persist() writes it together with the store
+// in one durable transaction (package 3b).
+async function sealWitness() {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const plain = enc.encode(JSON.stringify({ d: GEN_DOMAIN, gen: generation }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, dataKey, plain));
-  localStorage.setItem(LS_GEN, JSON.stringify({
+  return JSON.stringify({
     salt: b64(salt), iters: KDF_ITERS, iv: b64(iv), ct: b64(ct),
-  }));
+  });
 }
 
-async function assertStoreNotDeleted(passphrase) {
-  const w = await readWitness(passphrase);
+async function assertStoreNotDeleted(passphrase, rawWitness) {
+  const w = await readWitness(passphrase, rawWitness);
   if (w === null) return; // no witness either: genuine first run
   lock();
   if (w.corrupt) {
@@ -435,8 +457,8 @@ async function assertStoreNotDeleted(passphrase) {
   );
 }
 
-async function assertNotRolledBack(storeGen) {
-  const w = await readWitness();
+async function assertNotRolledBack(storeGen, rawWitness) {
+  const w = await readWitness(null, rawWitness);
   if (w === null) {
     // No witness. Fine only for a pre-L-1 store, which has no generation
     // either; a store that HAS one lost its witness, which is tampering.
@@ -513,7 +535,14 @@ async function persist() {
     err.code = "STALE"; // app.js tells this benign case apart from a real store error
     throw err;
   }
-  const floored = !!(nativeFloor && floorKey);
+  // Package 3b: the floor is used only where the store itself is durable
+  // (IndexedDB). In the localStorage fallback a write may sit in memory for a
+  // minute, and a floor advanced past it is exactly the Android brick: after a
+  // kill the floor is ahead of the data and the store refuses with no override.
+  // So without IndexedDB the floor is neither armed nor advanced (still READ on
+  // unlock — an existing floor keeps refusing a genuine rollback), and the blob
+  // says so (`nativeFloor: false`).
+  const floored = !!(nativeFloor && floorKey) && slot.durable();
   // Package 3 (ROUND-3 F-1 / F-4, A4 F-A1-R1): the blob below CLAIMS a floor
   // (`nativeFloor: true`), and that claim used to be made before anything had
   // checked that the floor exists — the bump came last and its answer was
@@ -547,19 +576,20 @@ async function persist() {
     d: STORE_DOMAIN, contacts, pins, gen: generation, nativeFloor: floored,
   }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, dataKey, plain));
-  localStorage.setItem(
-    LS_CONTACTS,
-    JSON.stringify({ v: 4, iters: KDF_ITERS, salt: b64(salt), iv: b64(iv), ct: b64(ct) }),
-  );
-  // Witness LAST. Interrupted between the two writes we end up with a store
-  // one generation ahead of its witness, which reads as "newer than recorded"
-  // — not a rollback, so an ordinary crash never locks the user out.
-  await writeWitness();
-  // Native floor after both, for the same reason: a crash before this line
-  // leaves the store one ahead of the floor, never behind it. Package 3: and
-  // its answer is CHECKED. A floor that did not move leaves this generation
-  // unprotected against a restore of the previous one, so the save is reported
-  // as failed (and the store locked, like a STALE write) rather than as done.
+  const blobStr = JSON.stringify({ v: 4, iters: KDF_ITERS, salt: b64(salt), iv: b64(iv), ct: b64(ct) });
+  // Package 3b: store and witness go to IndexedDB in ONE strict transaction,
+  // and this line returns only once it has COMPLETED. (Under localStorage the
+  // witness was written last so that a crash between the two left the store
+  // ahead of it; one atomic transaction makes that split impossible.) A failed
+  // write rejects this save exactly as a failed setItem did (quota): the
+  // caller reports it, and the floor below is not touched.
+  await slot.write(blobStr, await sealWitness());
+  // Native floor only AFTER the durable write completed — the ordering that
+  // makes "floor ahead of the data" impossible short of tampering: a crash
+  // before this line leaves the store one ahead of the floor, never behind it.
+  // Package 3: and its answer is CHECKED. A floor that did not move leaves this
+  // generation unprotected against a restore of the previous one, so the save
+  // is reported as failed (and the store locked, like a STALE write).
   if (floored) armOrLock(generation);
   localStorage.setItem(EPOCH_KEY, "1");
 }
@@ -614,15 +644,18 @@ export async function savePin(key, bundle) {
 // Remove the blob entirely (identity forgotten, or unrecoverable foreign blob).
 // The generation witness goes with it: this is the ONE deletion the user asked
 // for, so leaving the witness behind would make the next unlock refuse to open.
+//
+// Package 3b: the records are in IndexedDB, so this returns the promise of that
+// deletion (app.js awaits it); the in-memory state is gone synchronously.
 export function wipe() {
-  localStorage.removeItem(LS_CONTACTS);
-  localStorage.removeItem(LS_GEN);
+  const done = slot.wipe();
   lock();
   expectedStore = false;
   // The native floor (Android) deliberately stays: it cannot be lowered, and
   // the next unlock of the SAME identity on this device is a loud, explicit
   // "start over" (DELETED_CONTACTS_ADOPTION) rather than a silent clean slate —
   // because an attacker's two removeItem calls look exactly like this.
+  return done;
 }
 
 // True when a contact store is EXPECTED on this device — which includes the
@@ -630,9 +663,12 @@ export function wipe() {
 // reads this through pinsReadable(), so a deleted store now takes the loud
 // "key changes cannot be detected" path instead of rendering every contact as a
 // benign first contact.
+//
+// Package 3b: synchronous over the store slot's preloaded state (read from
+// IndexedDB at module load). Until that preload has settled this answers TRUE —
+// "unknown" must take the loud path, never the benign first-contact one.
 export function hasStore() {
-  return expectedStore ||
-    localStorage.getItem(LS_CONTACTS) !== null || localStorage.getItem(LS_GEN) !== null;
+  return expectedStore || slot.known();
 }
 
 // The pin key for a contact's live sessions. Lived in app.js as an inline

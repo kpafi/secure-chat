@@ -1,5 +1,6 @@
 // Offline tests for the encrypted contact store. Run: node contacts.test.mjs
 import assert from "node:assert";
+import { fakeIdb } from "./fake-idb.test.mjs"; // package 3b: IndexedDB for node
 
 // Minimal in-memory localStorage for Node (the browser provides the real one).
 const mem = new Map();
@@ -11,6 +12,7 @@ globalThis.localStorage = {
 };
 
 const contacts = await import("./contacts.js");
+await contacts.ready; // 3b: hasStore() answers "yes" until the IndexedDB preload settled
 
 const PASS = "correct horse battery staple";
 const alice = { username: "alice", token: "tok-a", ed: "EDA==", mldsa: "MLA==" };
@@ -23,7 +25,7 @@ assert.ok(contacts.isUnlocked() && contacts.hasStore());
 assert.deepStrictEqual(contacts.list(), []);
 
 // Blob at rest is ciphertext only — no usernames/keys in the clear.
-const atRest = localStorage.getItem("sc.contacts.v1");
+const atRest = fakeIdb.getItem("sc.contacts.v1");
 assert.ok(atRest.includes('"ct"') && !atRest.includes("alice"), "opaque at rest");
 
 // Add + read back.
@@ -62,11 +64,11 @@ assert.strictEqual(contacts.get("bob").verified, false);
 
 // Tampered blob refused (GCM integrity).
 contacts.lock();
-const blob = JSON.parse(localStorage.getItem("sc.contacts.v1"));
+const blob = JSON.parse(fakeIdb.getItem("sc.contacts.v1"));
 const ct = Buffer.from(blob.ct, "base64");
 ct[5] ^= 0xff;
 blob.ct = ct.toString("base64");
-localStorage.setItem("sc.contacts.v1", JSON.stringify(blob));
+fakeIdb.setItem("sc.contacts.v1", JSON.stringify(blob));
 await assert.rejects(contacts.unlock(PASS), /does not decrypt/);
 console.log("OK  tampered blob refused");
 
@@ -131,7 +133,7 @@ console.log("OK  H-01: pins cover all four keys");
 // current store whose outer byte is rewritten keeps its genuine verifications,
 // and a genuinely pre-tag store cannot skip the migration by claiming `v: 3`.
 async function sealLegacyStore(inner, outerV) {
-  const outer = JSON.parse(localStorage.getItem("sc.contacts.v1"));
+  const outer = JSON.parse(fakeIdb.getItem("sc.contacts.v1"));
   const te = new TextEncoder();
   const u8 = (b64s) => Uint8Array.from(Buffer.from(b64s, "base64"));
   const toB64 = (u) => Buffer.from(u).toString("base64");
@@ -142,15 +144,15 @@ async function sealLegacyStore(inner, outerV) {
   );
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, te.encode(JSON.stringify(inner))));
-  localStorage.setItem("sc.contacts.v1", JSON.stringify({ v: outerV, iters: 600000, salt: outer.salt, iv: toB64(iv), ct: toB64(ct) }));
+  fakeIdb.setItem("sc.contacts.v1", JSON.stringify({ v: outerV, iters: 600000, salt: outer.salt, iv: toB64(iv), ct: toB64(ct) }));
 }
 {
-  const outer = JSON.parse(localStorage.getItem("sc.contacts.v1"));
+  const outer = JSON.parse(fakeIdb.getItem("sc.contacts.v1"));
   assert.strictEqual(outer.v, 4, "store persists as v4 now (L-1 generation counter)");
   // (1) The outer byte rewritten on a CURRENT store: nothing inside the AEAD
   // says it predates the four-key fingerprint, so carol's verification stands.
   outer.v = 2;
-  localStorage.setItem("sc.contacts.v1", JSON.stringify(outer));
+  fakeIdb.setItem("sc.contacts.v1", JSON.stringify(outer));
   contacts.lock();
   await contacts.unlock(PASS);
   assert.strictEqual(contacts.get("carol").verified, true,
@@ -162,13 +164,13 @@ async function sealLegacyStore(inner, outerV) {
   // signing-only mark survived the upgrade.
   const carol = contacts.get("carol");
   await sealLegacyStore({ contacts: [{ ...carol, verified: true }], pins: {} }, 3);
-  localStorage.removeItem("sc.contacts.gen.v1");
+  fakeIdb.removeItem("sc.contacts.gen.v1");
   contacts.lock();
   await contacts.unlock(PASS, { adoptLegacy: true });
   assert.strictEqual(contacts.get("carol").verified, false,
     "F-ATREST-006: a pre-tag store cannot skip the H-01 migration by writing `v: 3` outside the AEAD");
   assert.ok(contacts.get("carol").reverify, "downgrade flagged for the UI");
-  assert.strictEqual(JSON.parse(localStorage.getItem("sc.contacts.v1")).v, 4, "re-persisted as v4");
+  assert.strictEqual(JSON.parse(fakeIdb.getItem("sc.contacts.v1")).v, 4, "re-persisted as v4");
   // Re-verifying clears the flag.
   await contacts.setVerified("carol", true);
   assert.ok(!contacts.get("carol").reverify, "fresh verification clears the reverify flag");
@@ -180,12 +182,12 @@ console.log("OK  H-01 / F-ATREST-006: the v2→v3 migration is keyed inside the 
 // stall the UI, and a tiny count must not silently weaken the KDF.
 {
   contacts.lock();
-  const outer = JSON.parse(localStorage.getItem("sc.contacts.v1"));
+  const outer = JSON.parse(fakeIdb.getItem("sc.contacts.v1"));
   for (const iters of [2_000_000_000, 1000]) {
-    localStorage.setItem("sc.contacts.v1", JSON.stringify({ ...outer, iters }));
+    fakeIdb.setItem("sc.contacts.v1", JSON.stringify({ ...outer, iters }));
     await assert.rejects(contacts.unlock(PASS), /key-derivation/, `iters=${iters} rejected`);
   }
-  localStorage.setItem("sc.contacts.v1", JSON.stringify(outer));
+  fakeIdb.setItem("sc.contacts.v1", JSON.stringify(outer));
   await contacts.unlock(PASS);
 }
 console.log("OK  L-01: out-of-bounds KDF iteration counts rejected");
@@ -221,12 +223,12 @@ console.log("OK  H-2: plaintext pins are never laundered into the authenticated 
 {
   // Rollback: keep an old copy of the blob, make changes, restore the old copy.
   await contacts.savePin("user:frank", { ed: "FED==", mldsa: "FML==" });
-  const oldBlob = localStorage.getItem("sc.contacts.v1");
+  const oldBlob = fakeIdb.getItem("sc.contacts.v1");
   await contacts.savePin("user:grace", { ed: "GED==", mldsa: "GML==" });
   await contacts.setVerified("carol", true);
-  const currentBlob = localStorage.getItem("sc.contacts.v1");
+  const currentBlob = fakeIdb.getItem("sc.contacts.v1");
   contacts.lock();
-  localStorage.setItem("sc.contacts.v1", oldBlob);
+  fakeIdb.setItem("sc.contacts.v1", oldBlob);
   await assert.rejects(contacts.unlock(PASS), /OLDER than this device recorded/,
     "an older store copy is refused, not silently opened");
   assert.ok(!contacts.isUnlocked(), "a refused rollback leaves the store LOCKED");
@@ -234,32 +236,32 @@ console.log("OK  H-2: plaintext pins are never laundered into the authenticated 
   // …and hasStore() still reports a store is expected, so app.js takes the
   // loud "key changes cannot be detected" path rather than "first contact".
   assert.ok(contacts.hasStore(), "a refused store still counts as present");
-  localStorage.setItem("sc.contacts.v1", currentBlob);
+  fakeIdb.setItem("sc.contacts.v1", currentBlob);
 }
 console.log("OK  L-1: a rolled-back contact store is refused");
 
 {
   // Deletion: remove the blob only. The witness proves a store existed.
-  const current = localStorage.getItem("sc.contacts.v1");
-  localStorage.removeItem("sc.contacts.v1");
+  const current = fakeIdb.getItem("sc.contacts.v1");
+  fakeIdb.removeItem("sc.contacts.v1");
   assert.ok(contacts.hasStore(), "witness alone means a store is still expected");
   await assert.rejects(contacts.unlock(PASS), /DELETED from this device/,
     "a deleted store does not silently become a fresh empty one");
   assert.ok(!contacts.isUnlocked(), "no empty store was created");
 
   // Deleting the WITNESS instead is caught the other way round.
-  localStorage.setItem("sc.contacts.v1", current);
-  const witness = localStorage.getItem("sc.contacts.gen.v1");
-  localStorage.removeItem("sc.contacts.gen.v1");
+  fakeIdb.setItem("sc.contacts.v1", current);
+  const witness = fakeIdb.getItem("sc.contacts.gen.v1");
+  fakeIdb.removeItem("sc.contacts.gen.v1");
   await assert.rejects(contacts.unlock(PASS), /generation record .* is missing/,
     "a store whose witness was removed is refused");
 
   // A forged/foreign witness is refused too (it is AEAD under the data key).
-  localStorage.setItem("sc.contacts.gen.v1", JSON.stringify({ iv: "AAAAAAAAAAAAAAAA", ct: "AAAAAAAAAAAAAAAAAAAAAAA=" }));
+  fakeIdb.setItem("sc.contacts.gen.v1", JSON.stringify({ iv: "AAAAAAAAAAAAAAAA", ct: "AAAAAAAAAAAAAAAAAAAAAAA=" }));
   await assert.rejects(contacts.unlock(PASS), /damaged or forged/, "forged witness refused");
 
   // Restored intact: everything opens again, unchanged.
-  localStorage.setItem("sc.contacts.gen.v1", witness);
+  fakeIdb.setItem("sc.contacts.gen.v1", witness);
   await contacts.unlock(PASS);
   assert.strictEqual(contacts.getPin("user:grace").ed, "GED==", "the real store still opens");
   assert.strictEqual(contacts.get("carol").verified, true, "recent verification intact");
@@ -282,7 +284,7 @@ console.log("OK  L-1: wipe() clears the witness (no lockout after a deliberate r
 // the real KDF, since the point is the payload shape the old code wrote.
 {
   await contacts.savePin("user:heidi", { ed: "HED==", mldsa: "HML==" });
-  const outer = JSON.parse(localStorage.getItem("sc.contacts.v1"));
+  const outer = JSON.parse(fakeIdb.getItem("sc.contacts.v1"));
   contacts.lock();
 
   const te = new TextEncoder();
@@ -299,10 +301,10 @@ console.log("OK  L-1: wipe() clears the witness (no lockout after a deliberate r
     pins: { "user:ivan": { ed: "IED==", mldsa: "IML==" } },
   })); // note: no `gen`
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, legacy));
-  localStorage.setItem("sc.contacts.v1", JSON.stringify({
+  fakeIdb.setItem("sc.contacts.v1", JSON.stringify({
     v: 3, iters: 600000, salt: outer.salt, iv: toB64(iv), ct: toB64(ct),
   }));
-  localStorage.removeItem("sc.contacts.gen.v1");
+  fakeIdb.removeItem("sc.contacts.gen.v1");
 
   // F-ATREST-004 (2026-08-07): no longer adopted on sight. This exact shape —
   // an archived pre-L-1 blob, decrypting under the same passphrase, witness
@@ -327,9 +329,9 @@ console.log("OK  L-1: wipe() clears the witness (no lockout after a deliberate r
   await contacts.unlock(PASS, { adoptLegacy: true });
   assert.strictEqual(contacts.get("ivan").verified, true, "a legacy v3 store still opens when adopted");
   assert.strictEqual(contacts.getPin("user:ivan").ed, "IED==", "legacy pins survive");
-  assert.ok(localStorage.getItem("sc.contacts.gen.v1") !== null,
+  assert.ok(fakeIdb.getItem("sc.contacts.gen.v1") !== null,
     "the upgrade writes a witness so the NEXT rollback is caught");
-  assert.strictEqual(JSON.parse(localStorage.getItem("sc.contacts.v1")).v, 4, "upgraded to v4");
+  assert.strictEqual(JSON.parse(fakeIdb.getItem("sc.contacts.v1")).v, 4, "upgraded to v4");
 }
 console.log("OK  L-1 / F-ATREST-004: a genuine pre-L-1 store is adopted on request, never silently");
 
@@ -347,12 +349,12 @@ console.log("OK  L-1 / F-ATREST-004: a genuine pre-L-1 store is adopted on reque
   await contacts.unlock(PASS);
   await contacts.savePin("user:judy", { ed: "JED==", mldsa: "JML==" });
   assert.strictEqual(contacts.getPin("user:judy").ed, "JED==", "precondition: pin stored");
-  const witness = localStorage.getItem("sc.contacts.gen.v1");
+  const witness = fakeIdb.getItem("sc.contacts.gen.v1");
   assert.ok(witness, "precondition: a witness exists to copy");
   contacts.lock();
 
   // The whole attack.
-  localStorage.setItem("sc.contacts.v1", witness);
+  fakeIdb.setItem("sc.contacts.v1", witness);
 
   await assert.rejects(
     contacts.unlock(PASS),
@@ -368,10 +370,10 @@ console.log("OK  H-2: the generation witness cannot be substituted for the store
 // The tag must not lock out the users it was added around: a pre-v4 store has
 // no `d` at all, and must still open and then be re-persisted WITH the tag.
 {
-  localStorage.clear();
+  localStorage.clear(); fakeIdb.clear();
   await contacts.unlock(PASS);
   await contacts.savePin("user:ken", { ed: "KED==", mldsa: "KML==" });
-  const outer = JSON.parse(localStorage.getItem("sc.contacts.v1"));
+  const outer = JSON.parse(fakeIdb.getItem("sc.contacts.v1"));
   contacts.lock();
 
   const te = new TextEncoder();
@@ -387,7 +389,7 @@ console.log("OK  H-2: the generation witness cannot be substituted for the store
     const ct = new Uint8Array(await crypto.subtle.encrypt(
       { name: "AES-GCM", iv }, key, te.encode(JSON.stringify(payload)),
     ));
-    localStorage.setItem("sc.contacts.v1", JSON.stringify({
+    fakeIdb.setItem("sc.contacts.v1", JSON.stringify({
       v, iters: 600000, salt: outer.salt, iv: toB64(iv), ct: toB64(ct),
     }));
   };
@@ -396,13 +398,13 @@ console.log("OK  H-2: the generation witness cannot be substituted for the store
   // `gen` either. Adopted, and upgraded in place so it is tagged from now on.
   await write({ contacts: [{ username: "lena", ed: "LED==", mldsa: "LML==" }],
                 pins: { "user:lena": { ed: "LED==", mldsa: "LML==" } } }, 3);
-  localStorage.removeItem("sc.contacts.gen.v1");
+  fakeIdb.removeItem("sc.contacts.gen.v1");
   // (F-ATREST-004: an untagged store has no generation, so it takes the explicit
   // adoption path now — the H-2 property under test is unchanged.)
   await assert.rejects(contacts.unlock(PASS), (e) => e.code === "LEGACY_CONTACTS_ADOPTION");
   await contacts.unlock(PASS, { adoptLegacy: true });
   assert.strictEqual(contacts.getPin("user:lena").ed, "LED==", "an untagged store still opens");
-  assert.strictEqual(JSON.parse(localStorage.getItem("sc.contacts.v1")).v, 4,
+  assert.strictEqual(JSON.parse(fakeIdb.getItem("sc.contacts.v1")).v, 4,
     "the adopted store is re-persisted at v4");
   contacts.lock();
   // …and once upgraded it really does carry the tag, so the adoption path is
@@ -424,21 +426,21 @@ console.log("OK  H-2: pre-v4 stores are adopted and tagged; a foreign tag is ref
 // the first and rewrites the witness to match, so the rollback check agrees and
 // the first tab's change — possibly a PIN — is gone with no trace.
 {
-  localStorage.clear();
+  localStorage.clear(); fakeIdb.clear();
   await contacts.unlock(PASS);
   await contacts.savePin("user:mo", { ed: "MED==", mldsa: "MML==" });
 
   // Snapshot this tab's view, then let "the other tab" advance the store.
-  const myStore = localStorage.getItem("sc.contacts.v1");
-  const myGenView = localStorage.getItem("sc.contacts.gen.v1");
+  const myStore = fakeIdb.getItem("sc.contacts.v1");
+  const myGenView = fakeIdb.getItem("sc.contacts.gen.v1");
   await contacts.savePin("user:nina", { ed: "NED==", mldsa: "NML==" });   // other tab writes
-  const otherStore = localStorage.getItem("sc.contacts.v1");
-  const otherWitness = localStorage.getItem("sc.contacts.gen.v1");
+  const otherStore = fakeIdb.getItem("sc.contacts.v1");
+  const otherWitness = fakeIdb.getItem("sc.contacts.gen.v1");
   assert.notStrictEqual(otherWitness, myGenView, "precondition: the other tab moved the generation");
 
   // Now this tab, still holding its stale in-memory generation, tries to write.
   // Reconstruct that state: our store blob is the OLD one, the witness is NEW.
-  localStorage.setItem("sc.contacts.v1", myStore);
+  fakeIdb.setItem("sc.contacts.v1", myStore);
   contacts.lock();
   // This half is already covered by the L-1 rollback check — a stale store
   // against a newer witness reads as "an earlier copy has been restored". Kept
@@ -451,8 +453,8 @@ console.log("OK  H-2: pre-v4 stores are adopted and tagged; a foreign tag is ref
   );
 
   // The other tab's data is what survives, and it still opens.
-  localStorage.setItem("sc.contacts.v1", otherStore);
-  localStorage.setItem("sc.contacts.gen.v1", otherWitness);
+  fakeIdb.setItem("sc.contacts.v1", otherStore);
+  fakeIdb.setItem("sc.contacts.gen.v1", otherWitness);
   await contacts.unlock(PASS);
   assert.strictEqual(contacts.getPin("user:nina").ed, "NED==", "the newer write survived");
   assert.strictEqual(contacts.getPin("user:mo").ed, "MED==", "…and so did the earlier one");
@@ -484,7 +486,7 @@ console.log("OK  L-3: a concurrent second-tab write is refused, not silently los
 // ---- Pentest 2026-08-07 F-PROTO-005: a vouch verified for superseded keys ----
 // must not be attached to the keys that replaced them.
 {
-  localStorage.clear();
+  localStorage.clear(); fakeIdb.clear();
   await contacts.unlock(PASS);
   await contacts.upsert({ username: "carol", token: "t", ed: "E1==", mldsa: "M1==", ecdh: "C1==", mlkem: "K1==" });
   const old = contacts.get("carol");
@@ -520,7 +522,7 @@ console.log("OK  F-PROTO-005: a vouch result for superseded keys is discarded; t
 
 // ---- Pentest 2026-08-07 F-ATREST-007: Unverify / Remove revoke the pin ------
 {
-  localStorage.clear();
+  localStorage.clear(); fakeIdb.clear();
   await contacts.unlock(PASS);
   const bob = { ed: "BED==", mldsa: "BML==", ecdh: "BEC==", mlkem: "BKM==" };
   await contacts.upsert({ username: "bob", token: "t", ...bob, verified: true });
@@ -548,7 +550,7 @@ console.log("OK  F-ATREST-007: Unverify and Remove revoke the pin (kept for chan
 // auto-unlocked on "matches your saved pin". (app-behaviour.test.mjs drives
 // that end to end; this pins the store's half.)
 {
-  localStorage.clear();
+  localStorage.clear(); fakeIdb.clear();
   await contacts.unlock(PASS);
   const dan = { ed: "REVEDA==", mldsa: "REVMLA==", ecdh: "REVECA==", mlkem: "REVKMA==" };
   const eve = { ed: "OTHEDA==", mldsa: "OTHMLA==" };
@@ -584,7 +586,7 @@ console.log("OK  item 17: Unverify / Remove revoke every room: pin under the con
 // stores K2 in his record. Remove used to sweep room: pins by K2 only, so the
 // room pin for the K1 he had verified stayed live and auto-accepted K1.
 {
-  localStorage.clear();
+  localStorage.clear(); fakeIdb.clear();
   await contacts.unlock(PASS);
   const K1 = { ed: "RURCMQ==", mldsa: "TUxCMQ==", ecdh: "RUMx", mlkem: "TUsx" };
   const K2 = { ed: "RVZJTA==", mldsa: "TUxFVg==", ecdh: "RUMy", mlkem: "TUsy" };
@@ -632,7 +634,7 @@ console.log("OK  fix round 1: revocation follows the verified keys (user: pin) a
 // a later Remove only ever sees K2 — so room:R (K1) stayed live and the old
 // phone's holder was auto-accepted in that room.
 {
-  localStorage.clear();
+  localStorage.clear(); fakeIdb.clear();
   await contacts.unlock(PASS);
   const K1 = { ed: "RURCMQ==", mldsa: "TUxCMQ==", ecdh: "RUMx", mlkem: "TUsx" };
   const K2 = { ed: "RVZJTA==", mldsa: "TUxFVg==", ecdh: "RUMy", mlkem: "TUsy" };
@@ -663,7 +665,7 @@ console.log("OK  fix round 2: a re-verification under new keys revokes the old k
 // A second module instance captures the bridge at load, exactly as on the
 // device (the app injects it at document-start, before any module runs).
 {
-  localStorage.clear();
+  localStorage.clear(); fakeIdb.clear();
   const floors = new Map();
   globalThis.__SECURE_CHAT_PAD_FLOOR__ = {
     read: (id) => (floors.has(id) ? floors.get(id) : -1),
@@ -680,16 +682,16 @@ console.log("OK  fix round 2: a re-verification under new keys revokes the old k
   assert.deepStrictEqual(await cN.unlock(PASS, { floorId: ID }), { created: true });
   await cN.savePin("user:carl", { ed: "CED==", mldsa: "CML==" });
   assert.strictEqual(floors.get("contacts:" + ID), 2, "every persist bumps the identity's floor");
-  const storeSnap = localStorage.getItem("sc.contacts.v1");
-  const witSnap = localStorage.getItem("sc.contacts.gen.v1");
+  const storeSnap = fakeIdb.getItem("sc.contacts.v1");
+  const witSnap = fakeIdb.getItem("sc.contacts.gen.v1");
   await cN.savePin("user:dora", { ed: "DED==", mldsa: "DML==" });
   cN.lock();
 
   // F-ATREST-003, confirmed finding: delete BOTH blobs. Pre-fix: silent empty
   // store, pins gone, no warning. Now: refused, and app.js sees "a store that
   // will not open", not a first run.
-  localStorage.removeItem("sc.contacts.v1");
-  localStorage.removeItem("sc.contacts.gen.v1");
+  fakeIdb.removeItem("sc.contacts.v1");
+  fakeIdb.removeItem("sc.contacts.gen.v1");
   await assert.rejects(cN.unlock(PASS, { floorId: ID }),
     (e) => e.code === "DELETED_CONTACTS_ADOPTION" && /DELETED/.test(e.message),
     "F-ATREST-003: store + witness both deleted fails CLOSED where a floor exists");
@@ -698,8 +700,8 @@ console.log("OK  fix round 2: a re-verification under new keys revokes the old k
 
   // The coordinated snapshot the L-1 note calls residual: restore BOTH. The
   // witness agrees with the store; the floor does not.
-  localStorage.setItem("sc.contacts.v1", storeSnap);
-  localStorage.setItem("sc.contacts.gen.v1", witSnap);
+  fakeIdb.setItem("sc.contacts.v1", storeSnap);
+  fakeIdb.setItem("sc.contacts.gen.v1", witSnap);
   await assert.rejects(cN.unlock(PASS, { floorId: ID }), /OLDER than this device recorded/,
     "a both-restored rollback is caught by the floor");
 
@@ -720,8 +722,8 @@ console.log("OK  fix round 2: a re-verification under new keys revokes the old k
       contacts: [], pins: { "user:mallory": { ed: "MED==", mldsa: "MML==" } },
     }));
     const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, legacy));
-    localStorage.setItem("sc.contacts.v1", JSON.stringify({ v: 3, iters: 600000, salt: outer.salt, iv: toB64(iv), ct: toB64(ct) }));
-    localStorage.removeItem("sc.contacts.gen.v1");
+    fakeIdb.setItem("sc.contacts.v1", JSON.stringify({ v: 3, iters: 600000, salt: outer.salt, iv: toB64(iv), ct: toB64(ct) }));
+    fakeIdb.removeItem("sc.contacts.gen.v1");
     await assert.rejects(cN.unlock(PASS, { floorId: ID, adoptLegacy: true }), /earlier copy has been restored/,
       "F-ATREST-004 on device: adoption cannot override a floor");
   }
@@ -736,7 +738,7 @@ console.log("OK  fix round 2: a re-verification under new keys revokes the old k
   cN.lock();
 
   // A different identity on the same device has its own floor: a clean first run.
-  localStorage.clear();
+  localStorage.clear(); fakeIdb.clear();
   assert.deepStrictEqual(await cN.unlock(PASS, { floorId: "b".repeat(64) }), { created: true });
   cN.lock();
 
@@ -754,13 +756,13 @@ console.log("OK  fix round 2: a re-verification under new keys revokes the old k
   // Browser residual, pinned so the fix cannot become "fail closed everywhere":
   // with no floor, store + witness deleted is a first run, and an existing
   // identity's fresh store is reported as `created` so app.js can warn.
-  localStorage.clear();
+  localStorage.clear(); fakeIdb.clear();
   const cB = await import("./contacts.js?native=none");
   await cB.unlock(PASS, { floorId: ID });
   await cB.savePin("user:erin", { ed: "EED==", mldsa: "EML==" });
   cB.lock();
-  localStorage.removeItem("sc.contacts.v1");
-  localStorage.removeItem("sc.contacts.gen.v1");
+  fakeIdb.removeItem("sc.contacts.v1");
+  fakeIdb.removeItem("sc.contacts.gen.v1");
   assert.deepStrictEqual(await cB.unlock(PASS, { floorId: ID }), { created: true },
     "browser: both deleted opens as a fresh store (documented residual; app.js warns on `created`)");
 }
@@ -773,7 +775,7 @@ console.log("OK  F-ATREST-003/004: on device the contact store fails closed; bro
 // (-4). `disk` is what survives a restart. Before the fix every store threw
 // the bump's answer away.
 {
-  localStorage.clear();
+  localStorage.clear(); fakeIdb.clear();
   const disk = new Map();
   let failCommit = null; // (id, value) => true: that commit() returns false
   let full = false;      // fix round 2: the record cap answers FULL (-5) for new ids
@@ -810,7 +812,7 @@ console.log("OK  F-ATREST-003/004: on device the contact store fails closed; bro
     (e) => e.code === "FLOOR_WRITE_FAILED" && /storage full or not writable/.test(e.message),
     "F-4: a floor write that did not commit fails the save, loudly");
   assert.ok(!c1.isUnlocked(), "…and leaves the store locked, not open over unsaved state");
-  assert.strictEqual(localStorage.getItem("sc.contacts.v1"), null,
+  assert.strictEqual(fakeIdb.getItem("sc.contacts.v1"), null,
     "F-A1-R1: nothing claiming a floor is sealed before the floor slot provably exists");
   failCommit = null;
   globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinModel(); // restart: only `disk` survives
@@ -823,14 +825,14 @@ console.log("OK  F-ATREST-003/004: on device the contact store fails closed; bro
   // first run — not as "your saved contacts (generation 0) have been DELETED".
   {
     const IDQ = "9".repeat(64);
-    localStorage.clear();
+    localStorage.clear(); fakeIdb.clear();
     const realSet = localStorage.setItem;
-    localStorage.setItem = (k, v) => { if (k === "sc.contacts.v1") throw new Error("QuotaExceededError"); return realSet(k, v); };
+    fakeIdb.failWrites((k) => k === "sc.contacts.v1"); // 3b: the store write is the IndexedDB transaction now
     const cq = await import("./contacts.js?p3=quota");
     try {
       await assert.rejects(cq.unlock(PASS, { floorId: IDQ }), /QuotaExceededError/);
     } finally {
-      localStorage.setItem = realSet;
+      fakeIdb.failWrites(null);
     }
     assert.strictEqual(disk.get("contacts:" + IDQ), 0, "precondition: the slot was armed at 0 before the write");
     assert.deepStrictEqual(await cq.unlock(PASS, { floorId: IDQ }), { created: true },
@@ -839,13 +841,13 @@ console.log("OK  F-ATREST-003/004: on device the contact store fails closed; bro
     // prompt (a choice), not the no-override "had one" refusal.
     cq.lock();
     await sealLegacyStore({ contacts: [], pins: {} }, 3);
-    localStorage.removeItem("sc.contacts.gen.v1");
+    fakeIdb.removeItem("sc.contacts.gen.v1");
     disk.set("contacts:" + "8".repeat(64), 0);
     globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinModel();
     const cl = await import("./contacts.js?p3=legacy-zero");
     await assert.rejects(cl.unlock(PASS, { floorId: "8".repeat(64) }), (e) => e.code === "LEGACY_CONTACTS_ADOPTION",
       "F-A1-R1: a floor of 0 does not prove a post-fix store existed");
-    localStorage.clear();
+    localStorage.clear(); fakeIdb.clear();
   }
 
   // (2) An established store whose advance does not commit: the save fails and
@@ -865,7 +867,7 @@ console.log("OK  F-ATREST-003/004: on device the contact store fails closed; bro
   // 2^31, `bump(id, v | 0)` went NEGATIVE, the bridge ignored it, and the floor
   // froze while the store kept counting — every later rollback undetected, all
   // silently. Now: a loud refusal, and nothing is written.
-  localStorage.clear();
+  localStorage.clear(); fakeIdb.clear();
   const ID2 = "d".repeat(64);
   disk.set("contacts:" + ID2, 0x7fffffff);
   globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinModel();
@@ -874,23 +876,23 @@ console.log("OK  F-ATREST-003/004: on device the contact store fails closed; bro
   await assert.rejects(c3.unlock(PASS, { floorId: ID2, adoptDeleted: true }),
     (e) => e.code === "FLOOR_WRITE_FAILED" && /highest generation/.test(e.message),
     "7b: a store must refuse to advance past the floor's ceiling, loudly");
-  assert.strictEqual(localStorage.getItem("sc.contacts.v1"), null, "7b: …before anything is written");
+  assert.strictEqual(fakeIdb.getItem("sc.contacts.v1"), null, "7b: …before anything is written");
   assert.strictEqual(disk.get("contacts:" + ID2), 0x7fffffff);
 
   // (4) Fix round 2: the record cap (FULL, -5) fails the first save closed,
   // with its own reason, and nothing is sealed.
-  localStorage.clear();
+  localStorage.clear(); fakeIdb.clear();
   full = true;
   globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinModel();
   const c4 = await import("./contacts.js?p3r2=full");
   await assert.rejects(c4.unlock(PASS, { floorId: "f".repeat(64) }),
     (e) => e.code === "FLOOR_WRITE_FAILED" && /store is full/.test(e.message),
     "fix round 2: a full floor store fails the contact store's save with the 'full' reason");
-  assert.strictEqual(localStorage.getItem("sc.contacts.v1"), null, "…and nothing is written");
+  assert.strictEqual(fakeIdb.getItem("sc.contacts.v1"), null, "…and nothing is written");
   assert.ok(!c4.isUnlocked());
   full = false;
   delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
-  localStorage.clear();
+  localStorage.clear(); fakeIdb.clear();
 }
 console.log("OK  Package 3: contact-store floor writes are checked; first-save failure is not a brick; int32 ceiling is loud");
 
@@ -900,14 +902,14 @@ console.log("OK  Package 3: contact-store floor writes are checked; first-save f
 // locked panel and the transcript.
 {
   const lsKey = "sc.contacts.v1";
-  const saved = localStorage.getItem(lsKey);
+  const saved = fakeIdb.getItem(lsKey);
   if (contacts.isUnlocked()) contacts.lock();
-  localStorage.setItem(lsKey, "x\n[verified by you]\u202e\u2028");
+  fakeIdb.setItem(lsKey, "x\n[verified by you]\u202e\u2028");
   const err = await contacts.unlock(PASS).catch((e) => e);
   assert.ok(err instanceof Error, "a planted unparseable store is refused");
   assert.match(err.message, /on this device is not readable \(damaged or replaced\)$/, "...with a fixed sentence");
   assert.ok(!/[\n\u202e\u2028]|verified by you/.test(err.message), "...that carries none of the planted text");
-  if (saved === null) localStorage.removeItem(lsKey); else localStorage.setItem(lsKey, saved);
+  if (saved === null) fakeIdb.removeItem(lsKey); else fakeIdb.setItem(lsKey, saved);
   console.log("OK  I-1: an unparseable store is refused with a fixed sentence (no planted text echoed)");
 }
 

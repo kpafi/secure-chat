@@ -16,6 +16,7 @@
 // Same scope note as app-behaviour: the stub is not a browser. What is proven
 // is app.js's DECISIONS and ORDER. Run: node app-otp.test.mjs
 import assert from "node:assert";
+import { fakeIdb } from "./fake-idb.test.mjs"; // package 3b: IndexedDB for node
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { installDom } from "./dom-stub.test.mjs";
@@ -273,6 +274,57 @@ async function resealPad(padId, mutate) {
   await dom.el("otpExport").click();
   assert.strictEqual(downloads, d0 + 1, "the confirming click exports");
   console.log("OK  fix round 2: an inferred export gets the 'history can't be verified' warning (executed)");
+}
+
+// ---- package 3b: transmit / display / download wait for the DURABLE write ------
+// The three orderings above were proven against localStorage.setItem, which
+// returns long before the data is on disk (Chromium batches it). They now have
+// to hold against the IndexedDB write that actually reaches the disk: with the
+// durable commit held in flight, nothing may leave, be shown or be handed out.
+{
+  const ws = await otpConnect();
+  assert.ok(ws && ws.readyState === 1, "fixture: a fresh OTP session");
+  // (a) receive: not displayed while the durable write is in flight.
+  fakeIdb.hold();
+  const delivered = ws.deliver({ type: "msg", room: ROOM, alg: "OTP", payload: await peer.encrypt("durable three") });
+  await settle(10);
+  assert.ok(!said(/durable three/),
+    "3b: a received OTP message is not displayed while its receipt's durable write has not completed");
+  fakeIdb.release();
+  await delivered;
+  await settle(10);
+  assert.ok(said(/durable three/), "…and is displayed once it has");
+
+  // (b) send: nothing on the wire while the durable write is in flight.
+  const sentMsgs = () => ws.sent.filter((f) => f.type === "msg").length;
+  const m0 = sentMsgs();
+  fakeIdb.hold();
+  dom.el("text").value = "durable four";
+  const submitted = dom.el("sendForm").dispatch("submit");
+  await settle(10);
+  assert.strictEqual(sentMsgs(), m0,
+    "3b: an OTP ciphertext is not transmitted while the pad's durable write has not completed");
+  fakeIdb.release();
+  await submitted;
+  await settle(10);
+  assert.strictEqual(sentMsgs(), m0 + 1, "…and is transmitted once it has");
+
+  // (c) export: no file while the durable write of the latch is in flight.
+  const p3 = await otp.generatePad({ label: "durable-export", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  await otp.saveNewPad(p3, PAD_PASS);
+  dom.el("otpSelect").value = p3.padId;
+  dom.el("otpPass").value = PAD_PASS;
+  dom.el("otpXferPass").value = "transfer passphrase";
+  const d0 = downloads;
+  fakeIdb.hold();
+  const clicked = dom.el("otpExport").click();
+  await settle(40);
+  assert.strictEqual(downloads, d0, "3b: the pad file is not handed out while the export latch's durable write has not completed");
+  fakeIdb.release();
+  await clicked;
+  await settle(10);
+  assert.strictEqual(downloads, d0 + 1, "…and is handed out once it has");
+  console.log("OK  3b: OTP transmit, display and export wait for the durable (IndexedDB) write (executed)");
 }
 
 console.log("\nAll app.js OTP-path checks passed.");

@@ -917,8 +917,13 @@ async function forgetIdentity() {
   retractNotice = null;
   contactsStale = false; // nothing of this identity is left to reload (cold r5 MINOR-B)
   contactsError = null;
-  contacts.wipe(); // bound to the identity passphrase; unusable without it
-  chats.wipe();
+  // Bound to the identity passphrase; unusable without it. Package 3b: both
+  // stores live in IndexedDB now, so their deletion is awaited — and a failure
+  // is said, not swallowed (the records would outlive the identity).
+  const wiped = await Promise.allSettled([contacts.wipe(), chats.wipe()]);
+  if (wiped.some((r) => r.status === "rejected")) {
+    addLine("sys", "", "[could not delete the saved contacts / chat history from this device's database — reload and Forget again]", true);
+  }
   // Pentest 2026-07-27 L-4: the handle and the lookup token are PLAINTEXT and
   // used to survive this. "Forget identity" is the control a user reaches for
   // when handing the device on or when they think they are compromised, and it
