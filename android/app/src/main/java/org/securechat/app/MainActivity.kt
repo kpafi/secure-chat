@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.text.InputType
 import android.view.WindowManager
+import android.webkit.ConsoleMessage
 import android.webkit.JsPromptResult
 import android.webkit.JsResult
 import android.webkit.WebChromeClient
@@ -81,11 +82,12 @@ class MainActivity : AppCompatActivity() {
         // keeps a snapshot of it for the recents switcher, and any component
         // with screen-capture rights (or a screen recorder) can read it off the
         // display. FLAG_SECURE blanks the recents card and blocks capture of
-        // this window, including the native prompt dialogs raised for
-        // window.prompt (secrets, passphrases). Set BEFORE the content view so
-        // no frame is ever composed without it. Cost, deliberately accepted:
-        // the user cannot screenshot the safety number or an invite QR from
-        // inside the app.
+        // THIS window. It does not reach the native dialogs (alert / confirm /
+        // prompt, the relay prompt): a Dialog has its own Window, so each of
+        // those sets the flag on its own window — see [secureShow]. Set BEFORE
+        // the content view so no frame is ever composed without it. Cost,
+        // deliberately accepted: the user cannot screenshot the safety number
+        // or an invite QR from inside the app.
         window.setFlags(
             WindowManager.LayoutParams.FLAG_SECURE,
             WindowManager.LayoutParams.FLAG_SECURE,
@@ -189,23 +191,27 @@ class MainActivity : AppCompatActivity() {
             override fun onJsAlert(
                 view: WebView, url: String?, message: String?, result: JsResult,
             ): Boolean {
-                AlertDialog.Builder(this@MainActivity)
-                    .setMessage(message)
-                    .setCancelable(false)
-                    .setPositiveButton(android.R.string.ok) { _, _ -> result.confirm() }
-                    .show()
+                secureShow(
+                    AlertDialog.Builder(this@MainActivity)
+                        .setMessage(message)
+                        .setCancelable(false)
+                        .setPositiveButton(android.R.string.ok) { _, _ -> result.confirm() }
+                        .create(),
+                )
                 return true
             }
 
             override fun onJsConfirm(
                 view: WebView, url: String?, message: String?, result: JsResult,
             ): Boolean {
-                AlertDialog.Builder(this@MainActivity)
-                    .setMessage(message)
-                    .setCancelable(false)
-                    .setPositiveButton(android.R.string.ok) { _, _ -> result.confirm() }
-                    .setNegativeButton(android.R.string.cancel) { _, _ -> result.cancel() }
-                    .show()
+                secureShow(
+                    AlertDialog.Builder(this@MainActivity)
+                        .setMessage(message)
+                        .setCancelable(false)
+                        .setPositiveButton(android.R.string.ok) { _, _ -> result.confirm() }
+                        .setNegativeButton(android.R.string.cancel) { _, _ -> result.cancel() }
+                        .create(),
+                )
                 return true
             }
 
@@ -235,16 +241,52 @@ class MainActivity : AppCompatActivity() {
                     }
                     setText(defaultValue ?: "")
                 }
-                AlertDialog.Builder(this@MainActivity)
-                    .setMessage(shown)
-                    .setView(input)
-                    .setCancelable(false)
-                    .setPositiveButton(android.R.string.ok) { _, _ -> result.confirm(input.text.toString()) }
-                    .setNegativeButton(android.R.string.cancel) { _, _ -> result.cancel() }
-                    .show()
+                secureShow(
+                    AlertDialog.Builder(this@MainActivity)
+                        .setMessage(shown)
+                        .setView(input)
+                        .setCancelable(false)
+                        .setPositiveButton(android.R.string.ok) { _, _ -> result.confirm(input.text.toString()) }
+                        .setNegativeButton(android.R.string.cancel) { _, _ -> result.cancel() }
+                        .create(),
+                )
                 return true
             }
+
+            // Package 3, F-P7-23: the default WebChromeClient writes every
+            // console message to logcat, in RELEASE builds too, and app.js logs
+            // (for example) why a mailbox envelope was dropped. Logcat is
+            // readable over adb and by bug-report tooling; nothing the client
+            // says belongs there. Returning true marks the message handled, so
+            // it is swallowed. Debug builds keep the default (logged).
+            override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean =
+                !BuildConfig.DEBUG || super.onConsoleMessage(consoleMessage)
         }
+    }
+
+    /**
+     * Show [dialog] with FLAG_SECURE on the DIALOG'S OWN window.
+     *
+     * Package 3 (F-ANDROID-003 remainder, F-P7-17). FLAG_SECURE marks a
+     * surface, and a Dialog gets its own Window, so the flag set on the
+     * Activity in onCreate never reached the native dialogs. A screen capture
+     * or recording taken while one was open blacked out the activity behind it
+     * and rendered the dialog legibly: the window.prompt() dialog (chat and pad
+     * passphrases, masked on screen but typed in view of a recorder) and the
+     * alert/confirm dialogs that carry contact usernames and consent text. The
+     * comment in onCreate and android/README.md claimed they were covered; they
+     * were not. Every dialog this activity shows goes through here, which
+     * client/android-source.test.mjs pins by refusing any other `show()` in
+     * this file. Set before show(), so no frame of the dialog is composed
+     * without it; unconditional, because a dialog that is not secret today is
+     * one wording change away from being one.
+     */
+    private fun secureShow(dialog: AlertDialog) {
+        checkNotNull(dialog.window) { "dialog has no window to secure" }.setFlags(
+            WindowManager.LayoutParams.FLAG_SECURE,
+            WindowManager.LayoutParams.FLAG_SECURE,
+        )
+        dialog.show()
     }
 
     /** Point the client at [relay], (re)inject the config script, and load. */
@@ -363,12 +405,14 @@ class MainActivity : AppCompatActivity() {
         if (refusedToRun || isFinishing || isDestroyed) return
         refusedToRun = true
         binding.webview.loadUrl("about:blank")
-        AlertDialog.Builder(this)
-            .setTitle(R.string.webview_unsupported_title)
-            .setMessage(R.string.webview_unsupported_msg)
-            .setCancelable(false)
-            .setPositiveButton(R.string.close) { _, _ -> finish() }
-            .show()
+        secureShow(
+            AlertDialog.Builder(this)
+                .setTitle(R.string.webview_unsupported_title)
+                .setMessage(R.string.webview_unsupported_msg)
+                .setCancelable(false)
+                .setPositiveButton(R.string.close) { _, _ -> finish() }
+                .create(),
+        )
     }
 
     private fun csp(relay: RelayUrls?): String {
@@ -409,7 +453,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-        dialog.show()
+        secureShow(dialog)
     }
 
     override fun onCreateOptionsMenu(menu: android.view.Menu): Boolean {

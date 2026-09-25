@@ -15,9 +15,17 @@
         android:networkSecurityConfig="@xml/network_security_config"
         android:theme="@style/Theme.SecureChat">
 
+        <!-- Package 3, F-ANDROID-001: taskAffinity="" so no other app can
+             declare OUR affinity and have its activity placed into this task
+             (the StrandHogg-style overlay: a lookalike screen asking for the
+             passphrase, sitting in secure-chat's own task and recents card).
+             launchMode stays the default (standard): a launcher tap still finds
+             and resumes the existing task, which Android matches by the root
+             activity's component when the task has no affinity. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:taskAffinity=""
             android:configChanges="orientation|screenSize|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

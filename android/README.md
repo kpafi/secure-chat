@@ -40,9 +40,21 @@ ciphertext.
 ## Screen capture is blocked (FLAG_SECURE)
 Pentest 2026-08-07 F-ANDROID-003: the activity window sets `FLAG_SECURE`
 before its first frame, so the recents-switcher snapshot is blank and
-screenshots / screen recording of the app (including the native secret and
-passphrase prompts) are refused by the OS. The accepted cost is that a user
-cannot screenshot the safety number or an invite QR from inside the app.
+screenshots / screen recording of the app are refused by the OS. A dialog is a
+separate window that the activity's flag does NOT cover (this README used to
+claim it did), so since Package 3 every native dialog — the `window.prompt()`
+passphrase prompt, `alert`/`confirm` (contact names, consent text), the relay
+prompt and the unsupported-WebView notice — sets `FLAG_SECURE` on its own
+window before it is shown (`MainActivity.secureShow`). The accepted cost is
+that a user cannot screenshot the safety number or an invite QR from inside
+the app. **Not yet checked on a device:** a capture (`adb shell screencap`, or
+a screen recording) taken while a passphrase prompt is open must be black.
+
+Also since Package 3: `WebChromeClient.onConsoleMessage` swallows the web
+client's console output in release builds (it used to reach logcat), and
+`MainActivity` has `android:taskAffinity=""` (F-ANDROID-001) with the default
+launch mode — launching from the icon and returning via recents should behave
+exactly as before; confirm on a device.
 **Not done, deliberately:** lock-on-background. The unlocked identity, the
 decrypted contact/chat stores and any live session keys are process memory;
 a lock on `onStop` would end every live chat (session keys cannot be
