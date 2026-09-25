@@ -57,16 +57,32 @@ from relay import KeyedRateLimiter
 
 # Per-client-host rate limiter for the HTTP account endpoints. The /ws relay has
 # its own; these endpoints would otherwise be an unthrottled flood target.
+# Behind Tor (and on the shipped clearnet path, where no proxy is trusted) every
+# request shares one client_key, so this is ONE bucket for the whole relay: see
+# config.API_RATE_* for what that means and why login/register are NOT on it.
 _api_limiter = KeyedRateLimiter(config.API_RATE_CAPACITY, config.API_RATE_REFILL_PER_SEC)
 
 # A second, stricter bucket dedicated to the bundle lookup — the one endpoint
 # whose existence answer is security-relevant (anti-enumeration). Even with a
 # valid token, this bounds how fast the namespace can be probed.
+#
+# Phase-7 pentest 2026-09-16 F-P7-3 (ported from phase7-local 018652d/6604d9e):
+# this used to be a `Depends` keyed on the client host and charged BEFORE the
+# token gate, so eleven unauthenticated garbage lookups drained it and, at one
+# request every two seconds, nobody behind Tor could look up any handle (add by
+# handle, the Live-room bundle check, the vouch list, POST /vouch). It is now
+# charged INSIDE each handler, AFTER the token gate, keyed on the TARGET (or on
+# the authenticated voucher for POST /vouch) — see `_charge_lookup`.
 _lookup_limiter = KeyedRateLimiter(config.LOOKUP_RATE_CAPACITY, config.LOOKUP_RATE_REFILL_PER_SEC)
+
+# POST /vouch also gets a per-HOST ceiling: accounts are free, so a per-voucher
+# bucket alone scales with throwaway accounts (6604d9e, review L-3).
+_vouch_host_limiter = KeyedRateLimiter(config.VOUCH_HOST_RATE_CAPACITY, config.VOUCH_HOST_RATE_REFILL_PER_SEC)
 
 # Dedicated, stricter bucket for minting login challenges (M-03). Keyed on the
 # USERNAME (F-RELAY-003, see config), so one client cannot hold login shut for
-# every account; the per-host bucket beside it only bounds total churn.
+# every account; the per-host bucket beside it is the absolute ceiling and is
+# charged FIRST (item 19, see `challenge_rate_limit`).
 _challenge_limiter = KeyedRateLimiter(config.CHALLENGE_RATE_CAPACITY, config.CHALLENGE_RATE_REFILL_PER_SEC)
 _challenge_host_limiter = KeyedRateLimiter(
     config.CHALLENGE_HOST_RATE_CAPACITY, config.CHALLENGE_HOST_RATE_REFILL_PER_SEC
@@ -161,10 +177,16 @@ def _client_addr_was_rewritten(request: Request) -> bool:
     Deliberately one-directional, and that asymmetry is what makes it safe to
     act on rather than merely log:
 
-      * NO false positives. Nothing a remote client can send produces port 0, so
-        this cannot be provoked — that is L-9 closed, and it is why `client_key`
-        may collapse to the shared bucket here without handing an attacker a way
-        to move themselves out of the honest bucket.
+      * No REMOTELY PROVOKABLE false positives in the deployed topology (TCP
+        via Tor / Caddy on loopback): a connected TCP socket cannot have source
+        port 0, so no header a client sends can trip this — that is L-9 closed,
+        and it is why `client_key` may collapse to the shared bucket here
+        without handing an attacker a way out of the honest bucket. That is an
+        argument about this topology, NOT a proof for every ASGI server or
+        transport (2026-07-29 M-B): a server or proxy layer that reports port 0
+        for a genuine peer would read as "rewritten" and be collapsed into the
+        shared bucket — throttled-but-shared, the safe direction, never a way
+        to gain a private bucket.
       * There ARE false negatives: a forged `X-Forwarded-For: 1.2.3.4:5678`
         keeps its port and stays quiet. So this is defence in depth, NOT the
         control. The control is `--no-proxy-headers` on every launch path, which
@@ -218,21 +240,55 @@ def rate_limit(request: Request) -> None:
 def challenge_rate_limit(request: Request, username: str) -> None:
     """Called from the handler (not a `Depends`) because the key is in the body.
 
-    Per-username bucket first (the strict one), then the wide per-host bound.
-    Order matters for the accounting: a request refused by the per-name bucket
-    must not also burn the shared one, or a flood at one name would still
-    drain the bound every other name depends on. A well-formed-but-nonexistent
-    name gets a challenge too (I1), so keying on it leaks nothing the handler
-    does not already say; the caller validates the name before this runs.
+    Pentest 2026-08-08 item 19 (ported from phase7-local 40d132e): the wide
+    per-host bucket is charged FIRST, then the strict per-username one. It used
+    to be the other way round, so a request refused by the per-name bucket cost
+    the sender nothing, and the per-host bucket was not a ceiling on what one
+    client could make this endpoint do.
+
+    With the host bucket first, every request is paid for out of one budget
+    however it is aimed. Holding one victim's name locked out costs
+    CHALLENGE_RATE_REFILL_PER_SEC, so the number of accounts one client can
+    hold offline at once is
+
+        CHALLENGE_HOST_RATE_REFILL_PER_SEC / CHALLENGE_RATE_REFILL_PER_SEC
+
+    which is why the per-username refill was RAISED (see config and
+    tests/test_rate_limit_invariants.py). The targeted lockout itself stays an
+    accepted residual: closing it needs proof-of-work or an authenticated
+    pre-token, a design change.
+
+    A well-formed-but-nonexistent name gets a challenge and a bucket too (I1),
+    so keying on it leaks nothing the handler does not already say; the caller
+    validates the name before this runs.
     """
-    if not _challenge_limiter.allow("u:" + username):
-        raise HTTPException(status_code=429, detail="rate limited")
     if not _challenge_host_limiter.allow(client_key(request)):
         raise HTTPException(status_code=429, detail="rate limited")
+    if not _challenge_limiter.allow("u:" + username):
+        raise HTTPException(status_code=429, detail="rate limited")
 
 
-def lookup_rate_limit(request: Request) -> None:
-    if not _lookup_limiter.allow(client_key(request)):
+def _charge_lookup(key: str) -> None:
+    """F-P7-3: the strict anti-enumeration bucket, charged AFTER the token gate.
+
+    Keyed on the lookup TARGET (`lookup:<name>`, shared by the bundle and the
+    vouch-list lookups of that name) or on the authenticated voucher
+    (`vouch:<name>`). Garbage without a valid token spends nothing; the per-host
+    `_api_limiter` on the router is the ceiling in front of the gate.
+
+    ACCEPTED (6604d9e, review L-4): a holder of a handle's lookup token can
+    exhaust THAT handle's bucket for every other holder (LOOKUP_RATE_CAPACITY
+    lookups, then LOOKUP_RATE_REFILL_PER_SEC to keep it there), so nobody can
+    look that one person up until they stop. Same trade as the per-recipient
+    mailbox bucket (F-RELAY-004): the harm is bounded to one handle its owner
+    shared, instead of every handle on the relay for anyone with no token.
+    """
+    if not _lookup_limiter.allow(key):
+        raise HTTPException(status_code=429, detail="rate limited")
+
+
+def vouch_host_rate_limit(request: Request) -> None:
+    if not _vouch_host_limiter.allow(client_key(request)):
         raise HTTPException(status_code=429, detail="rate limited")
 
 
@@ -241,8 +297,21 @@ def register_rate_limit(request: Request) -> None:
         raise HTTPException(status_code=429, detail="rate limited")
 
 
-# All /api routes share the rate-limit dependency.
+# Every accounts route shares the router-wide `_api_limiter`, EXCEPT the three
+# that make up login and registration, which live on `auth_router` below.
+#
+# Pentest 2026-07-29 M-2 / F-RELAY-003 residual (accepted; re-tuned here): the
+# router-wide bucket is keyed per host, which behind Tor is ONE bucket for the
+# relay, so ~70 junk lookups used to 429 login and registration for everybody.
+# Those three routes each have a dedicated bucket already (challenge: per-host
+# ceiling + per-username; register: per-host), and /auth/verify can do no
+# expensive work without a pending challenge (it pops the challenge before any
+# base64 or signature work, and each challenge buys exactly one verify), so the
+# challenge buckets bound it. Taking them off the shared bucket means junk
+# traffic on the directory routes can no longer deny login or registration.
+# New routes go on `router` (throttled) unless they have a bucket of their own.
 router = APIRouter(prefix="/api", tags=["accounts"], dependencies=[Depends(rate_limit)])
+auth_router = APIRouter(prefix="/api", tags=["accounts"])
 
 _USERNAME_RE = re.compile(r"^[a-z0-9_.-]+$")
 _B64_RE = re.compile(r"^[A-Za-z0-9+/]*={0,2}$")
@@ -320,9 +389,39 @@ def _ed25519_verify(pub_raw: bytes, sig: bytes, msg: bytes) -> bool:
         return False
 
 
+# Pentest 2026-08-08 item 15 (ported from phase7-local 40d132e): `dilithium_py`
+# is NOT thread-safe in this deployment, and every endpoint that verifies an
+# ML-DSA signature (register, /auth/verify, /vouch) is a sync `def`, which
+# FastAPI runs in the anyio threadpool — so these calls really are concurrent.
+#
+# The library prefers `xoflib`, whose `shake256(seed)` returns a FRESH reader per
+# call. Without it, it falls back to `dilithium_py/shake/shake_wrapper.py`, whose
+# `shake128`/`shake256` are MODULE-LEVEL SINGLETONS carrying mutable state
+# (`buf`, `index`, `xof_read`). Two threads verifying at once interleave
+# `absorb`/`read` on the same object and read each other's keystream.
+#
+# There is no xoflib in the venv, and the effect is not subtle: 8 threads over
+# one VALID signature rejected 71-88 of 160 on master. It fails CLOSED (a
+# corrupted verify returns False, never True), so this is a login/registration
+# denial of service, never an auth bypass — but a login path that rejects half
+# of its valid signatures under ordinary concurrency is broken.
+#
+# Serialising is the fix rather than adding the dependency, because it is
+# correct WHATEVER backend is installed. Do NOT delete this lock on the strength
+# of an xoflib pin alone: adopting xoflib is a separate change that must come
+# with `tests/test_concurrency.py` run against the new backend.
+#
+# Cost: one verify is ~15 ms here, so this caps ML-DSA verification at ~66/s
+# process-wide, far above what the challenge/register buckets admit. The lock
+# serialises work that was already CPU-bound (GIL); it adds none. This is the
+# single ML-DSA call site in the request path, so it covers every endpoint.
+_mldsa_lock = threading.Lock()
+
+
 def _mldsa65_verify(pub_raw: bytes, sig: bytes, msg: bytes) -> bool:
     try:
-        return bool(ML_DSA_65.verify(pub_raw, msg, sig))
+        with _mldsa_lock:
+            return bool(ML_DSA_65.verify(pub_raw, msg, sig))
     except Exception:
         # A malformed key/sig must fail closed, never raise past the handler.
         return False
@@ -401,10 +500,32 @@ def _vouch_message(target: str, ed: str, mldsa: str, ecdh: str = "", mlkem: str 
 
 # --- storage ---------------------------------------------------------------
 
+class _Conn(sqlite3.Connection):
+    """A connection whose `with` block also CLOSES it.
+
+    sqlite3.Connection's own context manager only commits or rolls back; every
+    `with _db() as conn:` left its connection (a file descriptor plus the WAL
+    read mark) to the garbage collector. Closing on exit keeps the semantics
+    callers rely on (commit on success, rollback on an exception such as the
+    token gate's 404) and releases the handle deterministically.
+    """
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+
+
 def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(config.DB_PATH)
+    conn = sqlite3.connect(config.DB_PATH, factory=_Conn)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    # §9 L-2 (ported from phase7-local 6604d9e): under a flood, overlapping
+    # writers hit "database is locked" after sqlite's default 5 s and each one
+    # was a 500 plus a traceback on disk (against I2). Wait longer; main.py maps
+    # whatever still fails to a bare 503.
+    conn.execute("PRAGMA busy_timeout=15000")
     return conn
 
 
@@ -473,16 +594,28 @@ def _prune(store: dict[str, tuple[str, float]]) -> None:
 
 # --- request/response models (strict) --------------------------------------
 
+def _b64_len(n: int) -> int:
+    """Length of the canonical (padded) base64 encoding of n bytes."""
+    return 4 * ((n + 2) // 3)
+
+
+# Phase-7 pentest 2026-09-16 F-P7-12: every string field is bounded in the
+# model, so a huge value is refused by pydantic before any handler work, and a
+# chunked body that slips the declared-length check still cannot deliver an
+# unbounded key or signature. Each bound is the exact canonical length
+# `_b64decode_fixed` accepts, so nothing valid is refused.
 class RegisterReq(BaseModel):
     model_config = ConfigDict(extra="forbid")
     username: str = Field(min_length=config.USERNAME_MIN, max_length=config.USERNAME_MAX)
-    ed: str
-    mldsa: str
-    sig: str        # Ed25519 signature over the register message
-    mldsa_sig: str  # ML-DSA-65 signature over the same message (PQ ownership proof)
+    ed: str = Field(max_length=_b64_len(config.ED25519_PUB_BYTES))
+    mldsa: str = Field(max_length=_b64_len(config.MLDSA65_PUB_BYTES))
+    # Ed25519 signature over the register message
+    sig: str = Field(max_length=_b64_len(config.ED25519_SIG_BYTES))
+    # ML-DSA-65 signature over the same message (PQ ownership proof)
+    mldsa_sig: str = Field(max_length=_b64_len(config.MLDSA65_SIG_BYTES))
     # Bundle v2 (both or neither): public encryption keys for sealed messages.
-    ecdh: str | None = None
-    mlkem: str | None = None
+    ecdh: str | None = Field(default=None, max_length=_b64_len(config.ECDH_PUB_BYTES))
+    mlkem: str | None = Field(default=None, max_length=_b64_len(config.MLKEM768_PUB_BYTES))
 
 
 class ChallengeReq(BaseModel):
@@ -493,9 +626,11 @@ class ChallengeReq(BaseModel):
 class VerifyReq(BaseModel):
     model_config = ConfigDict(extra="forbid")
     username: str = Field(min_length=config.USERNAME_MIN, max_length=config.USERNAME_MAX)
-    challenge: str
-    sig: str        # Ed25519 signature over the login message
-    mldsa_sig: str  # ML-DSA-65 signature over the same message (F-RELAY-006)
+    challenge: str = Field(max_length=_b64_len(32))
+    # Ed25519 signature over the login message
+    sig: str = Field(max_length=_b64_len(config.ED25519_SIG_BYTES))
+    # ML-DSA-65 signature over the same message (F-RELAY-006)
+    mldsa_sig: str = Field(max_length=_b64_len(config.MLDSA65_SIG_BYTES))
 
 
 def _check_username(u: str) -> None:
@@ -508,7 +643,7 @@ def _check_username(u: str) -> None:
 
 # --- endpoints (sync defs run in a threadpool; sqlite stays off the loop) --
 
-@router.post("/register", dependencies=[Depends(register_rate_limit)])
+@auth_router.post("/register", dependencies=[Depends(register_rate_limit)])
 def register(req: RegisterReq) -> dict:
     # Pentest 2026-07-26 P-09: registration is the one endpoint that still
     # distinguishes an existing username (409) from a free one (200), so it is a
@@ -596,7 +731,7 @@ def register(req: RegisterReq) -> dict:
     return {"status": "registered", "username": req.username, "lookup_token": token}
 
 
-@router.get("/users/{username}", dependencies=[Depends(lookup_rate_limit)])
+@router.get("/users/{username}")
 def get_user(username: str, t: str = Query(default="", max_length=64)) -> dict:
     # Anti-enumeration (I1): a lookup must present the per-account token. A
     # missing user AND a wrong token return an IDENTICAL 404, so probing a
@@ -612,6 +747,7 @@ def get_user(username: str, t: str = Query(default="", max_length=64)) -> dict:
     stored = row["lookup_token"] if row is not None else secrets.token_urlsafe(config.LOOKUP_TOKEN_BYTES)
     if not token_matches(t, stored) or row is None:
         raise HTTPException(status_code=404, detail="no such user")
+    _charge_lookup("lookup:" + username)  # F-P7-3: after the gate, per target
     # The public identity bundle others will pin + verify in person. Encryption
     # keys (bundle v2) are included when the account has published them.
     out = {"username": username, "ed": row["ed_pub"], "mldsa": row["mldsa_pub"]}
@@ -621,7 +757,7 @@ def get_user(username: str, t: str = Query(default="", max_length=64)) -> dict:
     return out
 
 
-@router.post("/auth/challenge")
+@auth_router.post("/auth/challenge")
 def auth_challenge(req: ChallengeReq, request: Request) -> dict:
     _check_username(req.username)
     challenge_rate_limit(request, req.username)
@@ -638,7 +774,7 @@ def auth_challenge(req: ChallengeReq, request: Request) -> dict:
     return {"challenge": challenge}
 
 
-@router.post("/auth/verify")
+@auth_router.post("/auth/verify")
 def auth_verify(req: VerifyReq) -> dict:
     _check_username(req.username)
     with _store_lock:
@@ -748,12 +884,14 @@ def me(username: str = Depends(current_user)) -> dict:
 class VouchReq(BaseModel):
     model_config = ConfigDict(extra="forbid")
     target: str = Field(min_length=config.USERNAME_MIN, max_length=config.USERNAME_MAX)
-    sig: str        # voucher's Ed25519 signature over the vouch message
-    mldsa_sig: str  # voucher's ML-DSA-65 signature over the same message
+    # voucher's Ed25519 signature over the vouch message
+    sig: str = Field(max_length=_b64_len(config.ED25519_SIG_BYTES))
+    # voucher's ML-DSA-65 signature over the same message
+    mldsa_sig: str = Field(max_length=_b64_len(config.MLDSA65_SIG_BYTES))
 
 
-@router.post("/vouch", dependencies=[Depends(lookup_rate_limit)])
-def vouch(req: VouchReq, username: str = Depends(current_user)) -> dict:
+@router.post("/vouch")
+def vouch(req: VouchReq, request: Request, username: str = Depends(current_user)) -> dict:
     """Publish (or refresh) a dual-signed vouch for `target`.
 
     The server verifies both signatures against the VOUCHER's registered keys
@@ -761,6 +899,13 @@ def vouch(req: VouchReq, username: str = Depends(current_user)) -> dict:
     can only ever hold statements the voucher really signed about the target's
     real directory entry. Clients still re-verify against their own pins.
     """
+    # F-P7-3: both vouch buckets are charged only after `current_user` has
+    # resolved, so a caller with no session spends neither. First the per-host
+    # ceiling (accounts are free, so the per-voucher bound alone would scale
+    # with throwaway accounts), then the anti-enumeration bucket per
+    # AUTHENTICATED voucher (M-7's bound per prober).
+    vouch_host_rate_limit(request)
+    _charge_lookup("vouch:" + username)
     _check_username(req.target)
     if req.target == username:
         raise HTTPException(status_code=422, detail="cannot vouch for yourself")
@@ -781,8 +926,9 @@ def vouch(req: VouchReq, username: str = Depends(current_user)) -> dict:
     # acknowledges, consumes nothing, creates nothing, leaves no directory
     # trace and had no dedicated limiter.
     #
-    # Two changes: the route now shares `lookup_rate_limit`, the same
-    # anti-enumeration bucket `GET /users/{username}` uses; and the existence
+    # Two changes: the route is on the strict `_lookup_limiter`, the same
+    # anti-enumeration bucket `GET /users/{username}` uses (keyed per voucher
+    # since F-P7-3, see `_charge_lookup`); and the existence
     # answer is folded into the signature check below so that a missing target
     # and a bad signature are indistinguishable. A decoy bundle keeps the work
     # (and so the timing) the same either way — the same shape as `get_user`'s
@@ -807,10 +953,13 @@ def vouch(req: VouchReq, username: str = Depends(current_user)) -> dict:
     # Both verifications always run, and the verdict is combined afterwards, so
     # neither the status code nor the number of expensive operations depends on
     # whether the target exists.
-    if missing_target or not ed_ok:
+    # Phase-7 pentest 2026-09-16 F-P7-11 (ported from 4b9d2c6): two different
+    # strings told a holder of the target's bundle whether the target exists —
+    # a valid Ed25519 vouch with junk ML-DSA answered "post-quantum ... invalid"
+    # only for a REAL target (a missing one always failed the Ed25519 check
+    # first). M-7's oracle, without the lookup token. One message for all three.
+    if missing_target or not ed_ok or not mldsa_ok:
         raise HTTPException(status_code=400, detail="vouch signature invalid")
-    if not mldsa_ok:
-        raise HTTPException(status_code=400, detail="post-quantum vouch signature invalid")
 
     with _db() as conn:
         total = conn.execute("SELECT COUNT(*) FROM vouches").fetchone()[0]
@@ -837,7 +986,7 @@ def unvouch(target: str, username: str = Depends(current_user)) -> dict:
     return {"status": "removed", "target": target}
 
 
-@router.get("/users/{username}/vouches", dependencies=[Depends(lookup_rate_limit)])
+@router.get("/users/{username}/vouches")
 def get_vouches(username: str, t: str = Query(default="", max_length=64)) -> dict:
     """Vouches ABOUT `username`, gated by the same lookup token as the bundle.
 
@@ -854,6 +1003,7 @@ def get_vouches(username: str, t: str = Query(default="", max_length=64)) -> dic
         stored = row["lookup_token"] if row is not None else secrets.token_urlsafe(config.LOOKUP_TOKEN_BYTES)
         if not token_matches(t, stored) or row is None:
             raise HTTPException(status_code=404, detail="no such user")
+        _charge_lookup("lookup:" + username)  # F-P7-3: after the gate, per target
         rows = conn.execute(
             """
             SELECT v.voucher, v.sig_ed, v.sig_mldsa, v.created_at, a.ed_pub, a.mldsa_pub

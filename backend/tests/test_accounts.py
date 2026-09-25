@@ -364,20 +364,61 @@ def test_challenge_is_one_time():
 
 def test_api_rate_limit(monkeypatch):
     from relay import KeyedRateLimiter
-    # Tiny budget so the limit is deterministic: 3 allowed, then 429.
+    # Tiny budget so the limit is deterministic: 3 allowed, then 429. Probed on
+    # a directory route: login/register are deliberately NOT on this bucket
+    # (see test_junk_directory_traffic_cannot_lock_out_login_or_register).
     monkeypatch.setattr(accounts, "_api_limiter", KeyedRateLimiter(3, 0.001))
-    codes = [client.post("/api/auth/challenge", json={"username": "whoever"}).status_code for _ in range(6)]
-    assert 429 in codes, codes
-    assert codes.count(429) >= 2, codes  # most of the burst past the cap is blocked
+    codes = [client.get("/api/users/whoever", params={"t": "x"}).status_code for _ in range(6)]
+    assert codes == [404] * 3 + [429] * 3, codes
+
+
+def test_junk_directory_traffic_cannot_lock_out_login_or_register(monkeypatch):
+    """F-RELAY-003 residual / 2026-07-29 M-2: the router-wide /api bucket is
+    ONE bucket behind Tor, and login + registration used to sit on it, so ~70
+    junk lookups 429'd every login and registration on the relay. They have
+    their own buckets and are off the shared one now."""
+    from relay import KeyedRateLimiter
+    monkeypatch.setattr(accounts, "_api_limiter", KeyedRateLimiter(3, 0.001))
+    junk = [client.get(f"/api/users/junk{i}", params={"t": "x"}).status_code for i in range(10)]
+    assert junk.count(429) == 7, junk  # the shared bucket is empty...
+    # ...and a full registration + login still goes through.
+    ident = _new_identity()
+    r = client.post("/api/register", json=_register_body("m2-user", ident))
+    assert r.status_code == 200, r.text
+    ch = client.post("/api/auth/challenge", json={"username": "m2-user"})
+    assert ch.status_code == 200, ch.text
+    ver = client.post("/api/auth/verify", json=_login_body("m2-user", ident, ch.json()["challenge"]))
+    assert ver.status_code == 200, ver.text
+    # The routes that stay on it are still throttled by it.
+    assert client.get("/api/me", headers={"Authorization": "Bearer " + ver.json()["token"]}).status_code == 429
 
 
 def test_lookup_rate_limit(monkeypatch):
     from relay import KeyedRateLimiter
-    # The lookup path has its own, stricter bucket (anti-enumeration).
+    # The lookup path has its own, stricter bucket (anti-enumeration). Phase-7
+    # pentest 2026-09-16 F-P7-3: it is charged AFTER the token gate and keyed on
+    # the TARGET, so garbage without a token spends nothing and a token holder
+    # can only exhaust the one handle they hold a token for.
     monkeypatch.setattr(accounts, "_lookup_limiter", KeyedRateLimiter(3, 0.001))
-    codes = [client.get("/api/users/whoever", params={"t": "x"}).status_code for _ in range(6)]
-    assert 429 in codes, codes
-    assert codes.count(429) >= 2, codes
+    ident = _new_identity()
+    r = client.post("/api/register", json=_register_body("lookup-target", ident))
+    assert r.status_code == 200, r.text
+    token = r.json()["lookup_token"]
+    # 1. Unauthenticated garbage (no token) never reaches the bucket.
+    garbage = [client.get("/api/users/lookup-target", params={"t": "x"}).status_code for _ in range(8)]
+    garbage += [client.get("/api/users/lookup-target/vouches", params={"t": "x"}).status_code for _ in range(4)]
+    assert garbage == [404] * 12, garbage
+    # 2. ...so the target is still reachable with its token afterwards, and the
+    #    bundle and vouch-list lookups of one target share its bucket.
+    codes = [client.get("/api/users/lookup-target", params={"t": token}).status_code for _ in range(2)]
+    codes += [client.get("/api/users/lookup-target/vouches", params={"t": token}).status_code for _ in range(2)]
+    codes += [client.get("/api/users/lookup-target", params={"t": token}).status_code]
+    assert codes == [200, 200, 200, 429, 429], codes
+    # 3. Exhausting one target's bucket says nothing about another's.
+    ident2 = _new_identity()
+    r = client.post("/api/register", json=_register_body("lookup-other", ident2))
+    assert r.status_code == 200, r.text
+    assert client.get("/api/users/lookup-other", params={"t": r.json()["lookup_token"]}).status_code == 200
 
 
 def test_account_cap_enforced(monkeypatch):
@@ -456,24 +497,27 @@ def test_challenge_bucket_is_per_username_not_service_wide():
 
 
 def test_challenge_host_bucket_bounds_total_churn(monkeypatch):
-    # Spreading a flood over many names still hits the (wide) per-host bound —
-    # and a name refused by its own bucket does not burn the shared one.
+    # Spreading a flood over many names still hits the (wide) per-host bound.
     from relay import KeyedRateLimiter
     accounts._challenge_limiter._buckets.clear()
     monkeypatch.setattr(accounts, "_challenge_host_limiter", KeyedRateLimiter(5, 0.001))
     codes = [client.post("/api/auth/challenge", json={"username": f"spread-{i}"}).status_code for i in range(8)]
     assert codes == [200] * 5 + [429] * 3, codes
-    # Per-name refusals are counted against the name only: exhaust one name...
-    accounts._challenge_limiter._buckets.clear()
+
+
+def test_challenge_host_ceiling_is_charged_before_the_per_name_bucket(monkeypatch):
+    """Pentest 2026-08-08 item 19: the per-host bucket is the ceiling on what one
+    client can make /auth/challenge do, so it is charged FIRST — a request the
+    per-name bucket refuses still costs the sender. It used to be charged second,
+    so hammering one name was free, and the host bucket was not a ceiling."""
+    from relay import KeyedRateLimiter
     monkeypatch.setattr(accounts, "_challenge_host_limiter", KeyedRateLimiter(3, 0.001))
     monkeypatch.setattr(accounts, "_challenge_limiter", KeyedRateLimiter(1, 0.001))
     assert client.post("/api/auth/challenge", json={"username": "one-name"}).status_code == 200
-    for _ in range(10):
-        assert client.post("/api/auth/challenge", json={"username": "one-name"}).status_code == 429
-    # ...and the host bucket still has 2 of its 3 tokens for other names.
-    assert client.post("/api/auth/challenge", json={"username": "other-a"}).status_code == 200
-    assert client.post("/api/auth/challenge", json={"username": "other-b"}).status_code == 200
-    assert client.post("/api/auth/challenge", json={"username": "other-c"}).status_code == 429
+    assert client.post("/api/auth/challenge", json={"username": "one-name"}).status_code == 429  # per-name
+    assert client.post("/api/auth/challenge", json={"username": "one-name"}).status_code == 429  # per-name
+    # Those two refusals were paid for out of the host budget: it is empty now.
+    assert client.post("/api/auth/challenge", json={"username": "other-a"}).status_code == 429
 
 
 # --- Pentest 2026-07-27 H-1 (server half) ------------------------------------
@@ -573,3 +617,45 @@ def test_verify_unknown_user_does_the_same_work_as_known_user():
     assert len(base64.b64decode(accounts._DECOY_MLDSA_PUB_B64)) == config.MLDSA65_PUB_BYTES
     ch = client.post("/api/auth/challenge", json={"username": "ghost-timing"}).json()["challenge"]
     assert client.post("/api/auth/verify", json=_login_body("ghost-timing", _new_identity(), ch)).status_code == 401
+
+
+# --- Phase-7 pentest 2026-09-16 F-P7-12: every request string is bounded -------
+
+@pytest.mark.parametrize("field", ["ed", "mldsa", "sig", "mldsa_sig", "ecdh", "mlkem"])
+def test_register_fields_are_length_bounded(field):
+    ident = _new_identity()
+    body = _register_body("bounded-user", ident)
+    body[field] = "A" * 5000
+    r = client.post("/api/register", json=body)
+    assert r.status_code == 422, r.text
+    assert any(e.get("type") == "string_too_long" for e in r.json()["detail"]), r.text
+
+
+@pytest.mark.parametrize("field", ["challenge", "sig", "mldsa_sig"])
+def test_verify_fields_are_length_bounded(field):
+    body = {"username": "whoever", "challenge": "A" * 44, "sig": "A" * 88, "mldsa_sig": "A" * 4412}
+    body[field] = "A" * 5000
+    r = client.post("/api/auth/verify", json=body)
+    assert r.status_code == 422, r.text
+    assert any(e.get("type") == "string_too_long" for e in r.json()["detail"]), r.text
+
+
+def test_db_connections_are_closed_after_use():
+    """Every `with _db() as conn:` used to leave the connection (an fd plus a
+    WAL read mark) to the garbage collector. The block now closes it — and
+    still commits on success and rolls back on an exception."""
+    import sqlite3
+    with accounts._db() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS _closetest (x INTEGER)")
+        conn.execute("INSERT INTO _closetest VALUES (1)")
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
+    with pytest.raises(RuntimeError):
+        with accounts._db() as conn2:
+            conn2.execute("INSERT INTO _closetest VALUES (2)")
+            raise RuntimeError("abort")
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn2.execute("SELECT 1")
+    with accounts._db() as conn3:
+        assert [r[0] for r in conn3.execute("SELECT x FROM _closetest")] == [1]
+        conn3.execute("DROP TABLE _closetest")

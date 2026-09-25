@@ -796,3 +796,30 @@ def test_owner_is_told_when_joins_are_turned_away():
         finally:
             for w in waiters:
                 w.__exit__(None, None, None)
+
+
+
+def test_guest_admitted_mid_wait_gets_the_idle_window(monkeypatch):
+    """Phase-7 pentest 2026-09-16 F-P7-10: the read loop armed its timeout from
+    a PRE-await snapshot, so a guest admitted by the owner while blocked in
+    receive — that then stayed silent — was closed at the PENDING deadline with
+    "approval timeout" instead of getting a member's idle window."""
+    monkeypatch.setattr(config, "KNOCK_TIMEOUT_SEC", 1)
+    monkeypatch.setattr(config, "PENDING_TIMEOUT_SEC", 1)
+    monkeypatch.setattr(config, "IDLE_TIMEOUT_SEC", 3)
+    room = _room()
+    with client.websocket_connect("/ws") as owner, client.websocket_connect("/ws") as guest:
+        assert _join(owner, room)["role"] == "owner"
+        assert _join(guest, room)["type"] == "pending"
+        _knock(guest, room)
+        jid = _recv(owner)["jid"]
+        _admit(owner, room, jid)
+        assert _recv(guest) == {"type": "joined", "role": "guest"}
+        # Silent past the pending deadline: a member is NOT reaped on it.
+        time.sleep(2.0)
+        owner.send_json({"type": "msg", "room": room, "alg": "DHKE", "payload": "aGk="})
+        got = _recv(guest)
+        assert got.get("type") == "msg", f"F-P7-10: the admitted guest was closed on the pending clock: {got}"
+        # ...and IS reaped on the idle clock, with the member's reason.
+        time.sleep(3.5)
+        assert _recv(guest) == {"type": "error", "reason": "idle timeout"}

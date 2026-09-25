@@ -172,6 +172,7 @@ def test_vouch_rejects_bad_signatures_and_auth():
     # which would mask the property under test rather than demonstrate it.
     for absent in ("wot-nobody", "wot-zzz", "wot-ghost2"):
         accounts._lookup_limiter._buckets.clear()
+        accounts._vouch_host_limiter._buckets.clear()
         probe = dict(_vouch_body(alice, bob), target=absent)
         rp = client.post("/api/vouch", json=probe, headers=_auth(tok))
         assert (rp.status_code, rp.json()) == (r_real.status_code, r_real.json()), (
@@ -189,10 +190,15 @@ def test_vouch_is_throttled_on_the_anti_enumeration_bucket():
 
     Identical answers are not enough on their own — an oracle you can hit at
     router speed is still an oracle if any OTHER signal (timing, or simply a
-    later behavioural difference) ever leaks. /vouch shares `lookup_rate_limit`
-    with `GET /users/{username}`, so enumeration is bounded either way.
+    later behavioural difference) ever leaks. /vouch is on the same strict
+    `_lookup_limiter` as `GET /users/{username}`, so enumeration is bounded
+    either way. Phase-7 pentest 2026-09-16 F-P7-3: the bucket is keyed per
+    SUBJECT now — the authenticated voucher here, the target for lookups — and
+    charged after the gate, so nobody without a session can drain it. The bound
+    per prober is unchanged.
     """
     accounts._lookup_limiter._buckets.clear()
+    accounts._vouch_host_limiter._buckets.clear()
     alice = _register("wot-lim-alice")
     bob = _register("wot-lim-bob")
     tok = _login(alice)
@@ -204,10 +210,54 @@ def test_vouch_is_throttled_on_the_anti_enumeration_bucket():
     ]
     assert 429 in codes, f"/vouch is not on the anti-enumeration bucket: {codes}"
 
-    # Cross-check that it is the SAME bucket, not merely some limiter: draining
-    # it via /vouch must throttle a /users lookup too.
+    # Probing many DIFFERENT targets is what enumeration looks like; the
+    # voucher's bucket bounds it whatever the target is.
+    probe = dict(body, target="wot-lim-ghost")
+    assert client.post("/api/vouch", json=probe, headers=_auth(tok)).status_code == 429
+
+    # The bucket is per voucher: another account is not throttled by alice's
+    # probing, and bob's own lookup budget (per target) is untouched by it.
+    carol = _register("wot-lim-carol")
+    r = client.post("/api/vouch", json=_vouch_body(carol, bob), headers=_auth(_login(carol)))
+    assert r.status_code == 200, r.text
     r = client.get(f"/api/users/{bob['username']}", params={"t": bob["token"]})
-    assert r.status_code == 429, "/vouch must share lookup_rate_limit, not have its own"
+    assert r.status_code == 200, "F-P7-3: draining one prober's budget must not deny lookups of the target to everyone"
+
+
+def test_vouch_buckets_are_not_spent_without_a_session(monkeypatch):
+    """F-P7-3: neither vouch bucket may be drained by a caller with no session.
+
+    Both the per-voucher bucket and the per-host ceiling are charged after
+    `current_user`; an unauthenticated flood gets 401 and spends nothing."""
+    from relay import KeyedRateLimiter
+    monkeypatch.setattr(accounts, "_vouch_host_limiter", KeyedRateLimiter(2, 0.001))
+    alice = _register("wot-ns-alice")
+    bob = _register("wot-ns-bob")
+    body = _vouch_body(alice, bob)
+    flood = [client.post("/api/vouch", json=body, headers=_auth("nope")).status_code for _ in range(10)]
+    assert flood == [401] * 10, flood
+    tok = _login(alice)
+    codes = [client.post("/api/vouch", json=body, headers=_auth(tok)).status_code for _ in range(3)]
+    assert codes == [200, 200, 429], codes  # the host ceiling exists, for real vouchers
+
+
+def test_vouch_error_strings_do_not_reveal_the_target():
+    """Phase-7 pentest 2026-09-16 F-P7-11: a valid Ed25519 vouch with junk
+    ML-DSA used to answer "post-quantum vouch signature invalid" for a REAL
+    target and "vouch signature invalid" for a missing one — the M-7 oracle
+    without the lookup token. One string, whatever the target."""
+    alice = _register("wot-str-alice")
+    bob = _register("wot-str-bob")
+    tok = _login(alice)
+    real = _vouch_body(alice, bob)
+    raw = bytearray(base64.b64decode(real["mldsa_sig"]))
+    raw[0] ^= 0x01
+    real["mldsa_sig"] = base64.b64encode(bytes(raw)).decode("ascii")  # ed valid, pq well-formed but wrong
+    ghost = dict(real, target="wot-str-ghost")
+    r_real = client.post("/api/vouch", json=real, headers=_auth(tok))
+    r_ghost = client.post("/api/vouch", json=ghost, headers=_auth(tok))
+    assert (r_real.status_code, r_real.json()) == (r_ghost.status_code, r_ghost.json()) == (
+        400, {"detail": "vouch signature invalid"})
 
 
 def _register_v2(username):

@@ -130,12 +130,45 @@ TURNAWAY_NOTICE_SEC = 5.0
 TRUSTED_PROXY_IPS = frozenset(
     p.strip() for p in os.environ.get("SECURE_CHAT_TRUSTED_PROXIES", "").split(",") if p.strip()
 )
+# Phase-7 pentest 2026-09-16 F-P7-13 (ported from phase7-local 4b9d2c6): the
+# paragraph above was the whole control — with 127.0.0.1 in the set the port-0
+# detector is never consulted, so every limiter was silently defeatable via
+# X-Forwarded-For and nothing at runtime said so. A loopback proxy IP cannot be
+# told apart from Tor's raw forward on the shipped topology, so it is refused
+# at startup unless the operator states they have separated the two
+# (different ports, or a secret header) with
+# SECURE_CHAT_TRUSTED_PROXIES_ALLOW_LOOPBACK=1.
+_LOOPBACK_PROXIES = {
+    ip for ip in TRUSTED_PROXY_IPS
+    if ip in ("localhost", "::1", "0:0:0:0:0:0:0:1") or ip.startswith("127.") or ip.startswith("::ffff:127.")
+}
+if _LOOPBACK_PROXIES and os.environ.get("SECURE_CHAT_TRUSTED_PROXIES_ALLOW_LOOPBACK") != "1":
+    raise RuntimeError(
+        f"SECURE_CHAT_TRUSTED_PROXIES contains a loopback address {sorted(_LOOPBACK_PROXIES)}: on the shipped "
+        "topology Caddy and Tor share 127.0.0.1:8000, so trusting it lets any onion visitor forge its "
+        "rate-limit bucket (F-RELAY-001). Separate the two front ends first, then set "
+        "SECURE_CHAT_TRUSTED_PROXIES_ALLOW_LOOPBACK=1 to state that you have."
+    )
 
 # --- HTTP /api abuse bounds (account directory) ---------------------------
 # The /ws relay has its own token bucket; the HTTP account endpoints need their
-# own. Keyed per client host — behind Tor every request appears from loopback,
-# so this collapses to a single global throttle, which is exactly the meaningful
-# control there. Generous enough for normal register/login bursts.
+# own. Keyed per client host — behind Tor every request appears from loopback
+# (and on the shipped clearnet path no proxy is trusted, so there too), which
+# collapses this to ONE bucket for the whole relay.
+#
+# ACCEPTED service-wide limit, stated honestly (F-RELAY-003 residual, 2026-07-29
+# M-2): anyone, with no account, can hold this bucket empty with
+# API_RATE_REFILL_PER_SEC junk requests, and while they do, every route ON it
+# answers 429 for everybody: handle lookups (GET /users/{u}, /vouches), POST
+# and DELETE /vouch, /me and /auth/logout. Behind Tor client_key carries no
+# information to key on, so no tuning of this bucket can fix that; it is a
+# ceiling against runaway clients, not a fairness control. What was changed is
+# its REACH: login (challenge + verify) and registration are no longer on it
+# (accounts.auth_router), because they have dedicated buckets, so junk on the
+# directory routes cannot lock anyone out of logging in or registering. The
+# mailbox has its own buckets and was never on it. Every per-subject control
+# (lookup per target, vouch per voucher, fetch per user, post per recipient)
+# is charged AFTER its gate and cannot be drained without the gate's secret.
 API_RATE_CAPACITY = 60        # burst allowance (requests)
 API_RATE_REFILL_PER_SEC = 5.0 # sustained requests/second
 
@@ -153,8 +186,35 @@ API_RATE_REFILL_PER_SEC = 5.0 # sustained requests/second
 # targeted flood on one name locks out only that name (the attacker could
 # already do that before, via the shared bucket — the blast radius shrank,
 # it did not grow). Pending state itself is bounded by MAX_PENDING_CHALLENGES.
+#
+# Pentest 2026-08-08 item 19 (ported from phase7-local 40d132e; accepted, but
+# hardened): the per-username bucket IS a targeted, unauthenticated login
+# lockout — for an attacker whose goal is to silence one person, "denies that
+# one account" is the objective, not a rounding error. What it costs the
+# victim: nothing until their session token expires (TOKEN_TTL_SEC); live rooms
+# never touch the account API; after that sealed mail stops arriving (the
+# client retries autoLogin on a capped backoff and recovers once the flood
+# stops). Closing it needs proof-of-work or an authenticated pre-token — a
+# design change — so it is accepted; what is bounded here is the REACH.
+#
+# The per-HOST bucket is charged FIRST (accounts.challenge_rate_limit), so a
+# client's total spend is capped at CHALLENGE_HOST_RATE_REFILL_PER_SEC however
+# it is aimed, and holding one victim's bucket empty costs
+# CHALLENGE_RATE_REFILL_PER_SEC. So
+#
+#     simultaneous victims = CHALLENGE_HOST_RATE_REFILL_PER_SEC
+#                          / CHALLENGE_RATE_REFILL_PER_SEC = 20 / 2 = 10
+#
+# At the old 0.5/s it was 40. Making the per-username bucket LOOSER shrinks the
+# attacker's reach, because the binding constraint on them is the host ceiling.
+# It costs honest users nothing: a login spends one or two challenges and
+# autoLogin's backoff retries far slower than 2/s. Do not "tighten" it back
+# without redoing the division — and do not satisfy the ratio by lowering the
+# host ceiling either: that is the service-wide login DoS threshold (20
+# junk challenges/s behind Tor deny every login; accepted, see API_RATE_*).
+# tests/test_rate_limit_invariants.py pins both directions.
 CHALLENGE_RATE_CAPACITY = 10        # burst allowance per USERNAME (challenges)
-CHALLENGE_RATE_REFILL_PER_SEC = 0.5 # sustained challenges/second per username
+CHALLENGE_RATE_REFILL_PER_SEC = 2.0 # sustained challenges/second per username
 CHALLENGE_HOST_RATE_CAPACITY = 200        # burst allowance per host, all names
 CHALLENGE_HOST_RATE_REFILL_PER_SEC = 20.0 # sustained challenges/second per host
 
@@ -314,8 +374,77 @@ TOKEN_TTL_SEC = 3600         # issued session-token lifetime
 # endpoint is not an existence oracle); fetching requires the recipient's
 # session token and DELETES what it returns. Everything is bounded.
 MAX_ENVELOPE_BYTES = 64 * 1024        # one sealed envelope (matches WS frame cap)
+# Phase-7 pentest 2026-09-16 F-P7-12: no request body on /api is legitimately
+# larger than an envelope plus JSON overhead; a 40 MB body used to be parsed and
+# then ECHOED back verbatim inside the 422. main._ApiBodyLimit answers 413 past
+# this, on the declared length AND on the bytes actually received (chunked).
+MAX_API_BODY_BYTES = 128 * 1024
 MAX_MAILBOX_PER_RECIPIENT = 200       # queued envelopes per inbox
-MAX_MAILBOX_TOTAL = 100_000           # queued envelopes server-wide
+# Pentest F-RELAY-008 / Phase-7 F-P7-1 (ported from phase7-local 018652d ->
+# 6604d9e): the server-wide cap counted ROWS and a full table was a relay-wide
+# 503 "storage full", so ~500 throwaway accounts x 200 one-byte envelopes shut
+# off sealed mail for everyone for the 14-day TTL. Now:
+#   * envelopes have a realistic MINIMUM size. The only sender, the client's
+#     sealed.seal, carries an ML-KEM-768 ciphertext and, INSIDE the AES-GCM
+#     body, the sender's full public bundle (incl. the 1952 B ML-DSA key) and
+#     dual signature (incl. the 3309 B ML-DSA signature). Measured (round-4
+#     review, re-checked with client/sealed.js): an empty text 13 649-13 657 B,
+#     "hi" 13 653-13 661 B, the shortest control message (mode-decline)
+#     13 645 B, 200 chars 13 925 B, 2 000 chars 16 325 B. MIN_ENVELOPE_BYTES =
+#     8 192 is ~40 % below the smallest real envelope, so no honest client is
+#     affected, and filler now costs real disk, not just budget (it was 256);
+#   * each inbox has a hard BYTE share beside its row cap (429, the owner can
+#     fetch);
+#   * the server-wide budget is BYTES, the row cap only bounds table size, and
+#     when either is full queued mail is EVICTED instead of refusing new mail:
+#     the NEWEST envelope of the HEAVIEST inbox other than the recipient's, one
+#     at a time and only until the new envelope fits; if the recipient's own
+#     inbox is the heaviest, the NEW envelope is refused (429) instead. History
+#     and reasoning in mailbox._evict_to_fit: globally-oldest let 80 throwaway
+#     accounts silently delete everyone's mail (fix review F1); heaviest-OLDEST
+#     let a handle holder pad a victim to the cap and, with ~65 accounts in ~2
+#     minutes, evict the honest mail queued before the padding (re-review R2).
+#     Every row is CHARGED at least MAX_MAILBOX_TOTAL_BYTES / MAX_MAILBOX_TOTAL
+#     (~2.6 KiB) against the byte budget, the per-inbox share and the
+#     heaviest-inbox ranking (mailbox._row_charge; round-3 review M-1: the row
+#     cap used to fill first at 25.6 MB of 256 B filler, making every inbox
+#     over 51 200 B "the heaviest" for 500 accounts). The byte budget now
+#     always fills first; the row cap is a backstop only. (With the 8 KiB
+#     minimum envelope the floor no longer binds for any accepted envelope; it
+#     stays so the invariant survives a change of these constants.)
+#     RESIDUAL, stated precisely — the relay cannot distinguish padding from
+#     mail under sealed sender, so only the eviction order can be chosen:
+#       - a HANDLE HOLDER can suppress a victim's new mail CONTINUOUSLY, for as
+#         long as the victim is offline (round-3 M-2): pad the victim's inbox
+#         so it is the heaviest but leave room, keep the budget full with
+#         lighter inboxes of their own (~MAX_MAILBOX_TOTAL_BYTES /
+#         MAX_MAILBOX_PER_RECIPIENT_BYTES + 1 = ~65 accounts), then loop —
+#         fetch some of their own filler to open space, honest mail to the
+#         victim lands (its sender sees 200), post filler again and the
+#         overflow evicts the victim's NEWEST envelope, i.e. that mail. Flat
+#         running cost. Mail queued BEFORE the padding survives until all newer
+#         mail in that inbox is gone. Padding to the cap instead makes new mail
+#         a loud 429;
+#       - WITHOUT the handle, an inbox of L charged bytes is reached only when
+#         it is the heaviest left, i.e. once the attacker holds the whole budget
+#         in inboxes no heavier than it — each at most
+#         min(L, MAX_MAILBOX_PER_RECIPIENT_BYTES), since large envelopes are
+#         charged their size: ~MAX_MAILBOX_TOTAL_BYTES /
+#         min(L, MAX_MAILBOX_PER_RECIPIENT_BYTES) + 1 accounts. That is ~4 300
+#         for a 63 KB inbox, ~98 for a realistic FULL honest inbox (200 x
+#         ~13.7 KB = ~2.7 MB), and as few as ~65 (256 MiB / 4 MiB + 1) for an
+#         inbox at the 4 MiB limit. (An earlier revision claimed "never fewer
+#         than 500"; that only held for minimum-size filler — round-4 L-1.)
+#       - an honest inbox that is simply the heaviest (someone offline receiving
+#         a lot) loses its newest mail first and, while the budget is full, has
+#         new mail refused with 429.
+#     Totals are maintained counters (mailbox_totals / mailbox_inbox), updated
+#     from what each DELETE ... RETURNING actually removed, under a write lock
+#     taken before any read (re-review R1) — never a table scan on requests.
+MIN_ENVELOPE_BYTES = 8192
+MAX_MAILBOX_TOTAL = 100_000                        # rows server-wide (evict-oldest)
+MAX_MAILBOX_TOTAL_BYTES = 256 * 1024 * 1024        # queued bytes server-wide (evict-oldest)
+MAX_MAILBOX_PER_RECIPIENT_BYTES = 4 * 1024 * 1024  # queued bytes per inbox (hard, 429)
 MAILBOX_TTL_SEC = 14 * 24 * 3600      # unfetched mail expires
 # Pentest 2026-08-07 F-RELAY-004: the POST bucket was keyed per host and ran
 # BEFORE the recipient-token gate, so an unauthenticated client (no handle, no
@@ -323,20 +452,31 @@ MAILBOX_TTL_SEC = 14 * 24 * 3600      # unfetched mail expires
 # It is now keyed per RECIPIENT inbox and consumed only AFTER the token gate:
 # a request without the recipient's lookup token is an identical 404 that
 # touches no bucket at all, and a flood at one inbox throttles only that inbox.
-# Service-wide volume is bounded by the general /api limiter and the storage
-# caps below, not by this bucket.
+# (This comment used to say service-wide volume was "bounded by the general
+# /api limiter". It was not: the mailbox router was never on that limiter, and
+# POST had no pre-gate bound at all. See MAILBOX_POST_HOST_RATE_* below.)
 MAILBOX_RATE_CAPACITY = 30            # burst posts per recipient inbox
 MAILBOX_RATE_REFILL_PER_SEC = 1.0     # sustained posts/second per inbox
+
+# The one per-host ceiling on mailbox POST, charged BEFORE the token gate
+# (ported from phase7-local 6604d9e). Behind Tor this is one bucket for
+# everybody, so it is a backstop against runaway clients and nothing more —
+# anyone can hold it empty at this rate and deny mail POSTs relay-wide
+# (accepted; same class as API_RATE_*). POST-only: GET charges nothing before
+# auth, so a POST flood cannot deny fetching.
+MAILBOX_POST_HOST_RATE_CAPACITY = 600
+MAILBOX_POST_HOST_RATE_REFILL_PER_SEC = 50.0
 
 # Dedicated bucket for FETCHING mail (pentest 2026-07-26 P-11). GET used to have
 # no limiter at all; putting it on the shared /api bucket closed that but created
 # a worse problem — clients poll every 6 s, and behind Tor every client shares one
-# bucket, so ~30 concurrent users would have exhausted the general 5/s budget and
-# starved registration/lookup for everyone. This bucket is sized for polling
-# (~180 concurrent pollers) while still bounding a flood, and it cannot starve
-# the other endpoints because it is separate.
-MAILBOX_FETCH_RATE_CAPACITY = 120     # burst fetches
-MAILBOX_FETCH_RATE_REFILL_PER_SEC = 30.0  # sustained fetches/second
+# bucket. Phase-7 pentest 2026-09-16 F-P7-2: it is keyed PER AUTHENTICATED USER
+# and charged after `current_user` (it was per host, charged before the session
+# check — one shared bucket anyone with no account could drain). One account
+# polls every 6 s per session and holds at most MAX_SESSIONS_PER_ACCOUNT
+# sessions, so ~1/s sustained with a burst of 30 is ample.
+MAILBOX_FETCH_RATE_CAPACITY = 30          # burst fetches per user
+MAILBOX_FETCH_RATE_REFILL_PER_SEC = 1.0   # sustained fetches/second per user
 
 # --- Web-of-trust vouches --------------------------------------------------
 # A vouch is a dual-signed public statement "voucher has verified target's
@@ -352,12 +492,22 @@ MAX_VOUCHES_RETURNED = 50       # per lookup response
 # bundle by username AND token (the shareable handle is `username#token`), so
 # guessing a username without the token yields an indistinguishable 404 — the
 # username namespace is not enumerable. 18 bytes = 24 base64url chars (~144
-# bits), far beyond brute force under the lookup rate limit below.
+# bits), far beyond brute force under the /api rate limit.
 LOOKUP_TOKEN_BYTES = 18
 
 # The public bundle lookup is the one endpoint whose existence answer is
-# security-relevant, so it gets its own, stricter per-host token bucket on top
-# of the shared /api limiter. Behind Tor this collapses to a single global
-# throttle (see KeyedRateLimiter), which is the meaningful control there.
+# security-relevant, so it gets its own, stricter bucket on top of the shared
+# /api limiter. Phase-7 pentest 2026-09-16 F-P7-3: it is charged AFTER the token
+# gate and keyed on the TARGET handle (per authenticated voucher for POST
+# /vouch) — it used to be per host, charged before the gate, i.e. one global
+# bucket behind Tor that eleven garbage lookups drained. Guessing tokens is
+# therefore bounded by the shared /api limiter (5/s relay-wide), which at 144
+# bits is still far beyond brute force. See accounts._charge_lookup.
 LOOKUP_RATE_CAPACITY = 10        # burst allowance (lookups)
 LOOKUP_RATE_REFILL_PER_SEC = 0.5 # sustained lookups/second
+
+# POST /vouch per-host ceiling (6604d9e review L-3): accounts are free, so the
+# per-voucher bucket alone scales with throwaway accounts. Charged after the
+# session check, so a caller with no session cannot drain it.
+VOUCH_HOST_RATE_CAPACITY = 30
+VOUCH_HOST_RATE_REFILL_PER_SEC = 1.0
