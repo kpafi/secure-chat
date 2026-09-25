@@ -42,7 +42,7 @@ globalThis.fetch = async () => new Response("{}", { status: 404 });
 
 const dom = installDom(join(HERE, "index.html"));
 dom.body.appendChild(dom.el("tabbar"));
-dom.seedAlgRadios(["DHKE", "AES256", "RSA", "PQKEM", "OTP"], "DHKE");
+dom.seedAlgRadios(["DHKE", "AES256", "PQKEM", "OTP"], "DHKE");
 dom.seedNavItems(["live", "chats", "users", "profile"]);
 dom.seedChild("scrChat", "div", "topbar");
 for (const id of ["usersLocked", "chatsLocked"]) dom.seedChild(id, "p", "hint");

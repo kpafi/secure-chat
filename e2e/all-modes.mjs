@@ -6,9 +6,9 @@
 //     SECURE_CHAT_E2E_URL=http://<addr>.onion node e2e/all-modes.mjs
 //
 // The other e2e runs each pin one flow (admission, async chat, dead ends) and
-// all of them happen to use the default mode. Nothing drove DHKE, AES256, RSA,
+// all of them happen to use the default mode. Nothing drove DHKE, AES256,
 // PQKEM and OTP through a real pair of browsers, so a mode could rot without a
-// single test noticing. This walks all five: pick the mode, open a room, get
+// single test noticing. This walks all four (RSA was removed in package 4): pick the mode, open a room, get
 // approved, clear whatever gate that mode raises, and send a message BOTH ways
 // asserting the exact text arrives.
 //
@@ -28,7 +28,7 @@ const SLOW = PROXY ? 3 : 1;
 const T = (ms) => ms * SLOW;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const MODES = ["DHKE", "AES256", "RSA", "PQKEM", "OTP"];
+const MODES = ["DHKE", "AES256", "PQKEM", "OTP"]; // RSA removed in package 4
 const SHARED_PASS = cfg.chatPassphrase;
 const PAD_XFER_PASS = "e2e pad transfer passphrase — test only";
 const PAD_LOCAL_PASS = "e2e pad at-rest passphrase — test only";
@@ -262,7 +262,7 @@ async function runMode(mode, alice, bob) {
   await Promise.all([settle(alice.page), settle(bob.page)]);
 
   const gated = await alice.page.evaluate(() => !document.querySelector("#verify").hidden);
-  const authenticated = ["DHKE", "RSA", "PQKEM"].includes(mode);
+  const authenticated = ["DHKE", "PQKEM"].includes(mode);
   check(`${mode}: ${authenticated ? "raises" : "does not raise"} a safety-number gate`,
     gated === authenticated, gated ? "safety number shown" : "unlocked directly");
 

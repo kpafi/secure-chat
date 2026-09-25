@@ -57,7 +57,7 @@ const HERE = new URL("./", import.meta.url);
 
     // Every negotiated cipher mode must fail to become ready, and must refuse
     // to encrypt. `ready` staying false is what app.js gates on.
-    for (const alg of ["AES256", "DHKE", "RSA", "PQKEM"]) {
+    for (const alg of ["AES256", "DHKE", "PQKEM"]) {
       const c = crypto_.makeCipher(alg, "a".repeat(64), { passphrase: "x" });
       await assert.rejects(async () => {
         await c.init();

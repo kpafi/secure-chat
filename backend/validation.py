@@ -59,6 +59,12 @@ class Algorithm(str, Enum):
     never branch on this for any crypto decision because it does no crypto.
     """
 
+    # RSA was removed from the client in package 4 (F-CRYPTO-009) but stays
+    # ACCEPTED here on purpose. The relay never branches on `alg`, so keeping it
+    # costs nothing; removing it would turn every frame of a peer still running
+    # an old client in RSA mode into a relay error, and the new client would
+    # never see the RSA-tagged frame it answers with one clear "the other side
+    # uses RSA mode" line and a clean close. Drop it once no old build is left.
     rsa = "RSA"
     aes256 = "AES256"
     dhke = "DHKE"

@@ -7,10 +7,11 @@ holds keys, never decrypts, and never stores or logs message content.
 
 > **Status (v0.3.1):** relay + web client deployed on clearnet and as a
 > **Tor v3 onion service**; Android app and iOS app (sideloaded) ship the same
-> client. Five encryption modes for the live room (DHKE, AES-256, RSA, PQKEM,
-> OTP), plus persistent one-to-one chats and an optional public-key directory.
-> The DHKE / RSA / PQKEM handshakes are **authenticated** with long-term
-> identity keys (Ed25519 + ML-DSA-65) and an in-person safety-number check.
+> client. Four encryption modes for the live room (DHKE, AES-256, PQKEM, OTP;
+> RSA was removed in package 4 — see below), plus persistent one-to-one chats
+> and an optional public-key directory. The DHKE / PQKEM handshakes are
+> **authenticated** with long-term identity keys (Ed25519 + ML-DSA-65) and an
+> in-person safety-number check.
 
 ## Contents of this repository
 | path | what |
@@ -123,12 +124,11 @@ Two rules that are easy to get wrong and expensive to get wrong:
 | Mode    | Key agreement                       | Message cipher      | Notes                                       |
 |---------|-------------------------------------|---------------------|---------------------------------------------|
 | DHKE    | ephemeral ECDH P-256                | ratcheted AES-256-GCM | **identity-authenticated**, **forward-secret** |
-| RSA     | RSA-OAEP-2048 key transport         | ratcheted AES-256-GCM | **identity-authenticated**, **forward-secret** |
 | PQKEM   | **hybrid ECDH P-256 + ML-KEM-768**  | ratcheted AES-256-GCM | post-quantum; **identity-authenticated**, **forward-secret** |
 | AES256  | PBKDF2 from a shared passphrase + session nonces | ratcheted AES-256-GCM | no key exchange → not relay-MITM-able; forward secrecy limited (below) |
 | OTP     | pre-shared pad, exchanged in person | **XOR one-time pad** + one-time HMAC-SHA-256 tag | information-theoretic *confidentiality*; no key exchange → not relay-MITM-able |
 
-**The ratchet.** DHKE, RSA, PQKEM and AES256 frame their messages through the
+**The ratchet.** DHKE, PQKEM and AES256 frame their messages through the
 same forward-secret ratchet: two direction-separated one-way HMAC-SHA-256
 chains, a one-time AES-256-GCM key per message (`msgKey = HMAC(chain, 0x01)`,
 `chain' = HMAC(chain, 0x02)`, consumed keys deleted), and strictly increasing
@@ -136,9 +136,8 @@ sequence numbers. Forged frames fail AEAD authentication, direction separation
 rejects reflection, sequence numbers plus one-time keys reject replay. What
 differs per mode is only where the chains' root comes from.
 
-**DHKE / RSA / PQKEM.** The root comes from an ephemeral key exchange: ECDH
-(DHKE), an RSA-OAEP-wrapped random 32-byte secret (RSA), or *both* ECDH and
-ML-KEM-768 via HKDF (PQKEM — confidential unless an attacker breaks **both**,
+**DHKE / PQKEM.** The root comes from an ephemeral key exchange: ECDH
+(DHKE), or *both* ECDH and ML-KEM-768 via HKDF (PQKEM — confidential unless an attacker breaks **both**,
 which defeats "harvest now, decrypt later"). Handshake material (ephemeral
 private keys, KEM secret, raw shared secrets) is erased once traffic starts, so
 state captured at time T decrypts nothing from before T and never another
@@ -157,7 +156,16 @@ never sent to the server.
 nonce from each peer, so frames from an earlier session never authenticate in a
 new one. Honest limit: the passphrase is a long-term secret, so someone who
 learns it and recorded the ciphertext can derive every session's keys. For real
-forward secrecy use DHKE, PQKEM, or RSA.
+forward secrecy use DHKE or PQKEM.
+
+**RSA (removed).** Earlier versions offered RSA-OAEP-2048 key transport. It let
+the side that offered its RSA key decide the whole session's secrecy, and a
+deliberately weak key (a modulus with a small factor) passes every check a
+client can afford (F-CRYPTO-009), so the mode was removed rather than patched.
+A contact still on an old version who picks RSA gets one clear line — "the
+other side uses RSA mode, which this version no longer supports" — and the
+connection closes; both of you then pick DHKE or Post-quantum. The relay still
+accepts the `RSA` tag (it never reads it), so that line can be shown at all.
 
 **OTP.** A large random pad is generated on one device and carried to the other
 **in person** (a passphrase-encrypted file moved over Bluetooth / USB / QR /
@@ -247,7 +255,7 @@ Client → server, one JSON envelope per frame (unknown fields rejected):
 | type    | enum   | `join` \| `leave` \| `key` \| `msg` \| `knock` \| `admit` \| `deny` |
 | room    | string | exactly 64 lowercase hex chars (256-bit id) |
 | payload | string | base64; required for `key` / `msg` / `knock`, forbidden otherwise |
-| alg     | enum?  | advisory: `RSA`, `AES256`, `DHKE`, `PQKEM`, `OTP` (server ignores) |
+| alg     | enum?  | advisory: `AES256`, `DHKE`, `PQKEM`, `OTP` (server ignores); `RSA` still accepted from old clients |
 | jid     | string?| only on `admit` / `deny`: the server-issued id of a waiting peer |
 
 `knock` is a waiting peer's self-introduction (opaque, forwarded to the owner);

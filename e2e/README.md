@@ -14,7 +14,7 @@ node e2e/room-admission.mjs     #            — live room join approval
 node e2e/no-dead-ends.mjs       #            — every failure path says something
 node e2e/hostile-relay.mjs      #            — a relay cannot demote the room creator
 node e2e/contact-profile.mjs    #            — a saved user's short profile (sheet)
-node e2e/all-modes.mjs          #            — all five encryption modes, both directions
+node e2e/all-modes.mjs          #            — all four encryption modes, both directions
 node e2e/screenshots.mjs <dir>  #            — every screen at phone + desktop size, for design review
 node e2e/durable-crash.mjs      #            — SIGKILL after an OTP send; the pad must not reopen at a spent offset (~2 min)
 ```

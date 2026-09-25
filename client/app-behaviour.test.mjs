@@ -72,7 +72,7 @@ const dom = installDom(join(HERE, "index.html"));
 // document.querySelectorAll(".navitem") finds them), the chat top bar, and the
 // one <p> in each locked pane that app.js rewrites.
 dom.body.appendChild(dom.el("tabbar"));
-dom.seedAlgRadios(["DHKE", "AES256", "RSA", "PQKEM", "OTP"], "DHKE");
+dom.seedAlgRadios(["DHKE", "AES256", "PQKEM", "OTP"], "DHKE");
 dom.seedNavItems(["live", "chats", "users", "profile"]);
 dom.seedChild("scrChat", "div", "topbar");
 for (const id of ["usersLocked", "chatsLocked"]) dom.seedChild(id, "p", "hint");
@@ -380,6 +380,37 @@ const me = relay.registered;
 assert.ok(me && me.ecdh && me.mlkem, "fixture: our public bundle was published (and captured)");
 const myBundle = { ed: me.ed, mldsa: me.mldsa, ecdh: me.ecdh, mlkem: me.mlkem };
 
+// ---- package 4, owner decision 1: RSA mode is removed --------------------------
+// A contact still on an old build that picked RSA tags every frame alg:"RSA".
+// They get ONE clear, kept line and a clean close — never a flood (F-P7-7:
+// phase7-local refused every RSA-tagged frame with a line each), never a crash.
+{
+  const html = readFileSync(join(HERE, "index.html"), "utf8");
+  assert.ok(!/value="RSA"/.test(html) && /value="DHKE"/.test(html) && /value="PQKEM"/.test(html),
+    "decision 1: the mode picker no longer offers RSA");
+  for (const role of ["owner", "guest"]) {
+    await nav("live");
+    const ws = await connect("DHKE");
+    if (role === "guest") await ws.deliver({ type: "pending" });
+    await ws.deliver({ type: "joined", role });
+    const before = count(/uses RSA mode/);
+    // control: a key frame in another live mode is not this refusal
+    await ws.deliver({ type: "key", room: ROOM, alg: "PQKEM", payload: pack({ hello: true, n: freshNonce(), reply: true }) });
+    assert.strictEqual(count(/uses RSA mode/), before, "control: a PQKEM-tagged frame is not the RSA refusal");
+    for (let i = 0; i < 200; i++) {
+      ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "RSA", payload: pack({ hello: true, n: freshNonce(), reply: i % 2 === 0 }) }) });
+    }
+    for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 5));
+    const rsaLines = lines().filter((l) => /the other side uses RSA mode, which this version no longer supports/.test(l));
+    assert.strictEqual(rsaLines.length - before, 1, `decision 1 (${role}): an RSA peer gets exactly one line (got ${rsaLines.length - before})`);
+    assert.doesNotMatch(rsaLines[rsaLines.length - 1], /×/, "...said once, not 200 times folded into a count");
+    assert.strictEqual(ws.readyState, 3, "...and the connection is closed cleanly");
+    assert.match(dom.el("roomHint").textContent, /uses RSA mode.*pick DHKE or Post-quantum/,
+      "...and the room screen says what to do");
+  }
+  console.log("OK  decision 1: RSA is not offered; an RSA peer gets ONE latched line and a clean close, 200 frames or not (executed)");
+}
+
 // ---- item 4 (F-PROTO-003): our own key frame, reflected ------------------------
 // Guest side (the owner side is refused earlier: nobody was admitted). Before
 // the fix the reflection verified — the transcript folds both nonces, so our
@@ -438,20 +469,20 @@ const SAFE_HINT = /^[\x20-\x7e\u2014\u2013\u2026\u00d7\u2713\u201c\u201d\u2018\u
 // ---- fix round, finding 2: relay bytes cannot reach a hint through e.message --
 // A SyntaxError echoes up to ~20 characters of its source. Two routes: (a) a
 // key frame whose payload is not JSON (unpackKey — now a fixed sentence), and
-// (b) a signed RSA handshake whose `pub` is not JSON, which the CIPHER parses
+// (b) a signed PQKEM handshake whose `pub` is not JSON, which the CIPHER parses
 // (crypto.js unpackMsg) — covered only by the sink, hint(), which now cleans
 // whatever it is given.
 {
-  const { ws, nonces } = await guestAwaitingHandshake("RSA");
+  const { ws, nonces } = await guestAwaitingHandshake("PQKEM");
   const evil = Buffer.from("\u202e{\u2028", "utf8").toString("base64");
-  ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "RSA", payload: evil }) });
+  ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "PQKEM", payload: evil }) });
   await until(() => /Key exchange failed/.test(dom.el("hint").textContent), "the key-frame refusal");
   assert.strictEqual(dom.el("hint").textContent, "Key exchange failed: malformed key frame",
     "finding 2 (a): a key frame that is not JSON is refused with a fixed sentence");
   const peer = await Identity.generate();
   const pub = Buffer.from("\u202e{\u2028x", "utf8").toString("base64");
   const sig = await signHandshake(peer, ROOM, nonces, pub);
-  ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "RSA", payload: pack({ pub, reply: false, idb: peer.publicBundle(), sig }) }) });
+  ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "PQKEM", payload: pack({ pub, reply: false, idb: peer.publicBundle(), sig }) }) });
   await until(() => /Key exchange failed: (?!malformed key frame)/.test(dom.el("hint").textContent), "the cipher's refusal");
   const h = dom.el("hint").textContent;
   assert.ok(SAFE_HINT.test(h), `finding 2 (b): the cipher's parse error of relay bytes reaches the hint cleaned: ${JSON.stringify(h)}`);

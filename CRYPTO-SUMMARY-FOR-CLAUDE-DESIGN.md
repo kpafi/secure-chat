@@ -69,8 +69,8 @@ solving exactly one problem:
  │ L3  IDENTITY         long-term dual keypair Ed25519 + ML-DSA-65  │  who signed this?
  │     (identity.js)    signs the handshake; pinned after verify    │
  ├──────────────────────────────────────────────────────────────────┤
- │ L2  SESSION KEY      one of 4 modes creates a fresh root secret  │  how do we agree
- │     (crypto.js)      AES256 | DHKE | RSA | PQKEM                 │  on a secret?
+ │ L2  SESSION KEY      one of 3 modes creates a fresh root secret  │  how do we agree
+ │     (crypto.js)      AES256 | DHKE | PQKEM   (RSA: removed)      │  on a secret?
  ├──────────────────────────────────────────────────────────────────┤
  │ L1  MESSAGE RATCHET  shared RatchetChannel: per-direction HMAC   │  per-message keys,
  │     (crypto.js)      chains → one-time AES-256-GCM keys          │  forward secrecy,
@@ -99,7 +99,7 @@ into one ratchet box (L1) — literally four pipes merging into one machine.
    │  ◀─────────────────────────│◀───────────── hello{n=Nb}   │
    │        (first-write-wins; own nonce reflected back ⇒ rejected)
    │                            │                             │
-   │  PHASE 2 — signed handshake (DHKE / RSA / PQKEM):        │
+   │  PHASE 2 — signed handshake (DHKE / PQKEM):              │
    │  { ephemeral pub, identity bundle,                       │
    │    dual-sig over  DOMAIN‖room‖fold(Na,Nb)‖pub }  ───────▶│
    │  ◀───────  same, signed by Bob  ──────────────────────── │
@@ -177,23 +177,28 @@ two parallel belts labeled with the two directions.
 
 ---
 
-## 6. The four session-key modes (what differs, what's shared)
+## 6. The three ratcheted session-key modes (what differs, what's shared)
 
-| | **AES256** | **DHKE** | **RSA** | **PQKEM** |
-|---|---|---|---|---|
-| Root secret from | shared passphrase: PBKDF2-SHA256, **600k iters**, salt = room id | ephemeral **ECDH P-256** exchange | per-session **RSA-OAEP-2048** transports a random 32-byte root | hybrid: **ECDH P-256 + ML-KEM-768** secrets combined |
-| Key material on the wire | **none** (only the plaintext hello nonces) | signed ephemeral pubkey | signed pubkey + wrapped root | signed ECDH pub + KEM key/ciphertext |
-| Identity + safety number | not used (passphrase = the out-of-band trust) | required | required | required |
-| Cross-session forward secrecy | ✗ — passphrase is a long-term secret: whoever learns it + recorded traffic can re-derive **every** session (inherent to passphrase-only; stated honestly in the code) | ✓ (ephemeral keypair per session) | ✓ (RSA keypair is per-session) | ✓ (all key material per-session) |
-| In-session forward secrecy (ratchet) | ✓ | ✓ | ✓ | ✓ |
-| Secret-erasure moment | passphrase dropped at derive; HKDF base erased once chains exist | ECDH private key dropped the moment chains exist | **"seal"** on first real message: root secrets zeroed + RSA private key dropped | **"seal"** on first real message: ECDH priv, KEM secret key, raw secrets all erased |
-| Quantum resistance | n/a (symmetric) | ✗ | ✗ | ✓ — attacker must break **both** ECDH *and* ML-KEM ("harvest-now-decrypt-later" resistant) |
+(OTP, the fourth live mode, has no ratchet — see its own section. RSA-OAEP-2048
+key transport was **removed** in package 4, F-CRYPTO-009: the offerer's RSA key
+alone decided the session's secrecy, and a deliberately weak modulus passes
+every check a client can afford.)
+
+| | **AES256** | **DHKE** | **PQKEM** |
+|---|---|---|---|
+| Root secret from | shared passphrase: PBKDF2-SHA256, **600k iters**, salt = room id | ephemeral **ECDH P-256** exchange | hybrid: **ECDH P-256 + ML-KEM-768** secrets combined |
+| Key material on the wire | **none** (only the plaintext hello nonces) | signed ephemeral pubkey | signed ECDH pub + KEM key/ciphertext |
+| Identity + safety number | not used (passphrase = the out-of-band trust) | required | required |
+| Cross-session forward secrecy | ✗ — passphrase is a long-term secret: whoever learns it + recorded traffic can re-derive **every** session (inherent to passphrase-only; stated honestly in the code) | ✓ (ephemeral keypair per session) | ✓ (all key material per-session) |
+| In-session forward secrecy (ratchet) | ✓ | ✓ | ✓ |
+| Secret-erasure moment | passphrase dropped at derive; HKDF base erased once chains exist | ECDH private key dropped the moment chains exist | **"seal"** on first real message: ECDH priv, KEM secret key, raw secrets all erased |
+| Quantum resistance | n/a (symmetric) | ✗ | ✓ — attacker must break **both** ECDH *and* ML-KEM ("harvest-now-decrypt-later" resistant) |
 
 Shared subtleties worth showing:
 - **AES256 replay fix:** chains are keyed by passphrase **plus both fresh
   session nonces**, so a ciphertext captured in an earlier session of the same
   room+passphrase can never authenticate in this one.
-- **Join-order race (RSA & PQKEM):** both peers may "offer" simultaneously.
+- **Join-order race (PQKEM):** both peers may "offer" simultaneously.
   Solution: fold *all* established root secrets into HKDF, sorted by a hash
   tag — both sides feed HKDF identical input whether one or two secrets were
   exchanged, no role negotiation needed. Derivation is idempotent (replayed
@@ -278,10 +283,10 @@ closing summary graphic.
 - Primitives: WebCrypto (`crypto.subtle`) + audited @noble/post-quantum lib;
   **no hand-rolled primitives** — the project only composes them.
 - Numbers that matter: PBKDF2 = 600,000 iterations (OWASP 2023); nonces =
-  32 bytes; GCM IV = 96-bit random; ratchet skip cap = 1024; RSA = OAEP-2048;
+  32 bytes; GCM IV = 96-bit random; ratchet skip cap = 64;
   curves = P-256; PQ = ML-KEM-768 (FIPS 203) & ML-DSA-65 (Dilithium).
-- Message frame versions: `aes-msg/v2`, `dhke-msg/v2`, `rsa-msg/v2`,
-  `pqkem-msg/v2`; handshake transcript `secure-chat/handshake/v2`.
+- Message frame versions: `aes-msg/v2`, `dhke-msg/v2`, `pqkem-msg/v2`
+  (`rsa-msg/v2` retired with the RSA mode); handshake transcript `secure-chat/handshake/v2`.
 - OTP mode is deferred (would require in-person pad exchange).
 - The Android app is a thin WebView shell bundling this exact web client
   (do not present it as a separate implementation).

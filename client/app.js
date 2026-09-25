@@ -6,7 +6,7 @@
 // interpreted as markup.
 //
 // SECURITY — authenticated key exchange (closes the MITM gap):
-//   For the handshake modes (DHKE / RSA) the ephemeral/public key is signed by
+//   For the handshake modes (DHKE / PQKEM) the ephemeral/public key is signed by
 //   a long-term IDENTITY (Ed25519 + ML-DSA-65, see identity.js). The peer
 //   verifies that dual signature against the identity bundle that arrived, then
 //   the user confirms a SAFETY NUMBER in person. A relay that swaps the
@@ -18,7 +18,7 @@
 //   up by username and pre-pin their bundle. It is a convenience, not a trust
 //   root (it shares the relay's origin), so the in-person check still governs.
 
-import { makeCipher, isAscii, bufToB64, b64ToBuf } from "./crypto.js";
+import { makeCipher, isAscii, bufToB64, b64ToBuf, REMOVED_ALGS } from "./crypto.js";
 import { Identity, canonicalPublicBundle } from "./identity.js";
 import {
   signHandshake, verifyHandshake, freshNonce, isValidNonce, signKnock, verifyKnock,
@@ -191,6 +191,7 @@ let wasPending = false;    // we sat in the approval queue (M-2, guest side)
 // honest relay sends them once per connection are SAID once per connection.
 let saidTurnedAway = false;
 let saidDenied = false;
+let saidRemovedAlg = false; // package 4: "the other side uses RSA" is said once per connection
 // Pentest 2026-08-07 F-PROTO-001: the one fact about room ownership the relay
 // does NOT get to supply. `roomRole` above is whatever the relay answers to
 // `join`, and a hostile relay can answer the room's CREATOR with `pending` —
@@ -700,7 +701,9 @@ function wsUrl() {
 }
 
 function algNeedsIdentity(alg) {
-  return alg === "DHKE" || alg === "RSA" || alg === "PQKEM";
+  // RSA was here until package 4 (F-CRYPTO-009, see the tombstone in
+  // crypto.js): index.html no longer offers it and makeCipher refuses it.
+  return alg === "DHKE" || alg === "PQKEM";
 }
 
 // The encryption picker is a radio-card group (one input per mode); exactly one
@@ -2641,7 +2644,7 @@ function stopMailboxPolling() {
 // ---- connection lifecycle -------------------------------------------------
 
 // Pentest 2026-07-26 P-19: connect() awaits a directory fetch, a pad unlock
-// (600k PBKDF2) and RSA keygen before it disabled the button, so a double-click
+// (600k PBKDF2) and a keypair generation before it disabled the button, so a double-click
 // ran two overlapping connects that fought over ws/cipher/otpRecord/
 // otpLockRelease — the second call's releaseOtpLock() dropped the lock the first
 // had just taken, and both opened sockets into a room capped at two members,
@@ -2776,6 +2779,7 @@ async function connectInner() {
   wasPending = false;
   saidTurnedAway = false;
   saidDenied = false;
+  saidRemovedAlg = false;
   keyConfirm.reset();
   knockQueue = [];
   hideAdmitPrompt();
@@ -3133,8 +3137,8 @@ function admittedSomeone() {
 }
 
 // Produce + sign the next handshake payload. Computed fresh each call (not
-// cached): for PQKEM and RSA the initial "offer" and the "answer" are different
-// payloads (RSA's answer transports the wrapped root secret), and each must
+// cached): for PQKEM the initial "offer" and the "answer" are different
+// payloads (the answer carries the KEM encapsulation), and each must
 // carry its own signature. For DHKE the payload is idempotent, so re-signing
 // the reply is just a negligible extra signature. The signature covers both
 // per-connection nonces, so it is only meaningful once the hello exchange
@@ -3178,7 +3182,7 @@ function sendSignedKey(room, reply, sock = ws, live = () => true) {
 // Pentest 2026-07-29 M-5. The exchange above was right, but it assumed the
 // chains it confirms never change afterwards. They can: `_derive` REPLACES
 // `this.chan` (and so both confirmation tags) whenever its input signature
-// changes, in PQKEM and RSA alike. Two consequences, both of which this block
+// changes (PQKEM; the removed RSA mode did too). Two consequences, both of which this block
 // now handles explicitly:
 //
 //  1. THE ATTACK. A relay replays one genuine hello and delays one genuine
@@ -3458,6 +3462,28 @@ async function handleMessage(room, raw, sock) {
     }
 
     case "key": {
+      // Package 4, owner decision 1 (F-CRYPTO-009): RSA mode is removed. A
+      // contact still running an old build in RSA mode tags every frame
+      // alg:"RSA"; its key material is undecodable here, so without this the
+      // user got a generic "Key exchange failed" and a session that never
+      // starts. Say what is actually wrong, ONCE, and close cleanly.
+      //
+      // Deliberately NOT phase7-local's pre-switch refusal of every RSA-tagged
+      // frame (F-P7-7: a relay could flood the transcript with them): only a
+      // `key` frame is judged, the line is latched, and closeWs() retires the
+      // socket, so every frame queued behind this one is dropped at dispatch.
+      // The tag is advisory and relay-writable — the worst a relay does with it
+      // is close a session it could have dropped anyway — and it never selects
+      // a cipher: the mode is this page's own choice, frozen in `sessionAlg`.
+      if (typeof m.alg === "string" && m.alg !== sessionAlg &&
+          Object.prototype.hasOwnProperty.call(REMOVED_ALGS, m.alg)) {
+        if (saidRemovedAlg) break;
+        saidRemovedAlg = true;
+        addLine("sys", "", `[the other side uses ${m.alg} mode, which this version no longer supports — refusing]`, true);
+        closeWs(`The other side uses ${m.alg} mode, which this version no longer supports. ` +
+          "Both of you: pick DHKE or Post-quantum under Security options, then connect again.", sock);
+        return;
+      }
       try {
         const p = unpackKey(m.payload);
 
@@ -3615,8 +3641,8 @@ async function handleMessage(room, raw, sock) {
         // in — decoupling the verified identity from the live channel key. So:
         // pin the identity on first accept; hard-refuse any later frame whose
         // identity differs, and close the connection (that is a MITM attempt).
-        // (F-PROTO-003: the pin stays BEFORE cipher.onPeerKey on purpose. RSA's
-        // onPeerKey locks the peer key first-write-wins and can still throw
+        // (F-PROTO-003: the pin stays BEFORE cipher.onPeerKey on purpose. A
+        // cipher's onPeerKey may lock the peer key first-write-wins and still throw
         // afterwards — pinning only on success would leave the cipher keyed to
         // identity X with nothing pinned, and let identity Y's next frame pin Y.
         // The reflection is refused above instead, before anything is pinned.)
@@ -4377,14 +4403,13 @@ els.copyCode.addEventListener("click", async () => {
 const ALG_LABELS = {
   DHKE: "DHKE (recommended)",
   AES256: "AES-256 with a shared passphrase",
-  RSA: "RSA",
   PQKEM: "post-quantum (ML-KEM-768)",
   OTP: "one-time pad",
 };
 function syncAlgUI() {
   const alg = algValue();
   els.passRow.hidden = alg !== "AES256";
-  els.contactRow.hidden = !algNeedsIdentity(alg); // lookup only aids DHKE/RSA
+  els.contactRow.hidden = !algNeedsIdentity(alg); // lookup only aids DHKE/PQKEM
   els.otpPanel.hidden = alg !== "OTP";
   els.algSummary.textContent = "Security options — currently: " + (ALG_LABELS[alg] || alg);
   // A non-default choice needs the panel to stay open, or the setting becomes

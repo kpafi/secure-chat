@@ -5,7 +5,7 @@
 //
 // This complements identity.test.mjs (which proves MITM rejection at the
 // protocol layer) by proving the wired protocol actually CONVERGES through the
-// real relay for DHKE and RSA.
+// real relay for DHKE and PQKEM.
 //
 // Requires the server running:  cd backend && ./run.sh
 // Run:                          node client/auth.integration.test.mjs
@@ -44,7 +44,7 @@ function makePeer(name, room, alg, identity, peerPinnedBundle, onText) {
   let helloAnswered = false;
   let admitted = null; // the identity this peer let into the room (owner side)
 
-  // Computed fresh each call (no caching): PQKEM's and RSA's offer and answer
+  // Computed fresh each call (no caching): PQKEM's offer and answer
   // are different payloads and each needs its own signature.
   async function mine() {
     const pub = await cipher.handshakePayload();
@@ -253,7 +253,6 @@ async function testCrossSessionReplayLive() {
 }
 
 await testAlg("DHKE");
-await testAlg("RSA");
 await testAlg("PQKEM");
 await testCrossSessionReplayLive();
 console.log("\nAll authenticated-handshake integration checks passed.");

@@ -104,7 +104,7 @@ The bundled web client is **generated at build time** from `../client` by the
 - **Real phone (2026-09-21/22):** APK built and installed; the pad-floor
   harness passed 33/33 against the real AndroidKeyStore; `FLAG_SECURE`
   verified; unlock and login against the deployed relay observed.
-- The handshake modes (DHKE / RSA / PQKEM) and every other mode are covered in
+- The handshake modes (DHKE / PQKEM) and every other mode are covered in
   real browsers by `e2e/all-modes.mjs`, which drives the same client code.
 - **Owed on the phone (package 3b, durable storage):** (1) the v0.3.x → 0.4.0
   upgrade with data kept: contacts and chats open intact and have moved to
