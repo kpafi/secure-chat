@@ -1590,6 +1590,67 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
   console.log("OK  decision 2: a guest sees and decides the seated identity (deny: closed, nothing pinned; approve: pinned, a second identity refused); in-person-verified + pinned contacts auto-approve (executed)");
 }
 
+// ==== package 4, F-PROTO-004 (Low): a full knock queue keeps the expected peer ====
+// The queue is capped at 16 and used to drop the NEWEST knock when full — the
+// one knock this session was aimed at included. The owner named kim#tok; a
+// flood fills the queue first. Kim's knock must still be asked about (in place
+// of the oldest non-expected entry that is not on screen); any other extra
+// knock is still dropped.
+{
+  const kim = await Identity.generate();
+  const kb = kim.publicBundle();
+  relay.users.set("kim", { ed: kb.ed, mldsa: kb.mldsa, ecdh: kb.ecdh, mlkem: kb.mlkem });
+  dom.el("contact").value = "kim#tok";
+  try {
+    await nav("live");
+    const ws = await connect("DHKE");
+    await ws.deliver({ type: "joined", role: "owner" });
+    const flood = [];
+    for (let i = 0; i < 16; i++) flood.push(await Identity.generate());
+    const knock = async (who, i) => ws.deliver({ type: "knock", room: ROOM, jid: i.toString(16).padStart(16, "0"),
+      payload: pack({ idb: who.publicBundle(), sig: await signKnock(who, ROOM) }) });
+    for (let i = 0; i < 16; i++) await knock(flood[i], 0x100 + i);
+    const extra = await Identity.generate();
+    // Beyond the cap a stranger costs no signature verify (the L-1 property).
+    const subtle = crypto.subtle, origVerify = subtle.verify;
+    let verifies = 0;
+    subtle.verify = function (...a) { verifies++; return origVerify.apply(this, a); };
+    try {
+      await knock(extra, 0x200);   // a 17th stranger: still dropped
+      await settle(5);
+    } finally {
+      subtle.verify = origVerify;
+    }
+    assert.strictEqual(verifies, 0, "F-PROTO-004: a knock beyond the cap that is not the expected peer is dropped before any verify");
+    // Kim's keys claimed with a signature that does not verify: not kept either.
+    await ws.deliver({ type: "knock", room: ROOM, jid: "0000000000000250",
+      payload: pack({ idb: kb, sig: await signKnock(extra, ROOM) }) });
+    await knock(kim, 0x300);     // the expected peer: kept
+    await settle(10);
+    const fpOf = async (who) => Identity.fingerprintOf(who.publicBundle());
+    const [fpHead, fpKim, fpExtra] = [await fpOf(flood[0]), await fpOf(kim), await fpOf(extra)];
+    await until(() => dom.el("admitFingerprint").textContent.length > 20, "the knock prompt");
+    assert.strictEqual(dom.el("admitFingerprint").textContent, fpHead, "F-PROTO-004: the knock on screen is not the one evicted");
+    const seen = [];
+    for (let i = 0; i < 20 && !dom.el("admit").hidden; i++) {
+      const fp = dom.el("admitFingerprint").textContent;
+      seen.push(fp);
+      await dom.el("admitNo").click();
+      // the next knock is drawn after a digest: wait for it (or for the sheet to go)
+      await until(() => dom.el("admit").hidden || (dom.el("admitFingerprint").textContent !== fp &&
+        dom.el("admitFingerprint").textContent.length > 20), "the next knock to be drawn");
+    }
+    assert.ok(seen.includes(fpKim), "F-PROTO-004: the expected peer's knock is kept when the queue is full");
+    assert.ok(!seen.includes(fpExtra), "...while any other knock beyond the cap is still dropped");
+    assert.ok(!seen.includes(""), "...and a forged claim of kim's key (bad signature, shown without a fingerprint) did not take a place");
+    assert.strictEqual(seen.length, 16, `...and the queue stays at its cap (asked about ${seen.length})`);
+    await dom.el("disconnect").click();
+  } finally {
+    dom.el("contact").value = "";
+  }
+  console.log("OK  F-PROTO-004: a full knock queue keeps the expected peer's knock (evicting the oldest other one), drops the rest (executed)");
+}
+
 // ==== package 4, owner decision 3: contacts + chats live in ONE tab ================
 // Node has real Web Locks; the test plays the OTHER tab of the same browser by
 // requesting the same lock. Before: nothing held the stores to one tab — a

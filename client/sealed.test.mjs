@@ -139,4 +139,26 @@ console.log("OK  legacy identity blob upgrades; v3 blob round-trips enc keys");
   console.log("OK  items 7-8: open() refuses a sender bundle that is non-canonical, wrong-sized, not a point, or half a pair");
 }
 
+// ---- package 4, F-CRYPTO-005 (Info): the ephemeral ECDH key is non-extractable --
+{
+  const subtle = crypto.subtle;
+  const orig = subtle.generateKey;
+  const made = [];
+  subtle.generateKey = function (alg, extractable, usages) {
+    if (alg && alg.name === "ECDH") made.push({ extractable, usages });
+    return orig.call(this, alg, extractable, usages);
+  };
+  let env3;
+  try {
+    env3 = await seal(alice, bobPub, "ephemeral key check");
+  } finally {
+    subtle.generateKey = orig;
+  }
+  assert.strictEqual(made.length, 1, "fixture: seal() makes exactly one ephemeral ECDH key");
+  assert.strictEqual(made[0].extractable, false, "F-CRYPTO-005: the ephemeral ECDH private key is generated non-extractable");
+  assert.deepStrictEqual(made[0].usages, ["deriveBits"], "...for deriveBits only");
+  assert.strictEqual((await open(bob, env3)).msg, "ephemeral key check", "control: the envelope still opens");
+  console.log("OK  F-CRYPTO-005: seal()'s ephemeral ECDH key is non-extractable, deriveBits only");
+}
+
 console.log("\nAll sealed-envelope checks passed.");

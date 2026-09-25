@@ -3078,12 +3078,25 @@ async function queueKnock(m, live = () => true) {
   //
   // Note the cap sits BEFORE the two signature verifies below, so a flood costs
   // the owner a regex and an array scan, not the expensive part.
-  if (knockQueue.length >= MAX_KNOCK_QUEUE) return;
+  //
+  // Package 4, F-PROTO-004 (Low): "drop the newest" also dropped the ONE knock
+  // this session was aimed at — a flood that filled the queue first kept the
+  // expected contact out for as long as it kept refilling. So when the queue is
+  // full, a knock whose claimed bundle equals `expectedPeerBundle` still goes on
+  // (a cheap key comparison, still before the verifies), and once its signature
+  // verifies it takes the place of the OLDEST entry that is not the expected
+  // peer and not the one on screen. Any other knock is still dropped.
   let p;
   try {
     p = unpackKey(m.payload);
   } catch {
     return;
+  }
+  const full = knockQueue.length >= MAX_KNOCK_QUEUE;
+  if (full) {
+    let claimed = null;
+    try { claimed = p && p.idb ? canonicalBundle(p.idb) : null; } catch { claimed = null; }
+    if (!expectedPeerBundle || !claimed || !sameBundle(expectedPeerBundle, claimed)) return;
   }
   let entry = { jid: m.jid, bundle: null, anon: true };
   if (p && p.idb && p.sig) {
@@ -3103,6 +3116,14 @@ async function queueKnock(m, live = () => true) {
     const ok = idb ? await verifyKnock(idb, sessionRoom, p.sig).catch(() => false) : false;
     if (!live()) return; // L-2: the knock was for a session that has been replaced
     entry = { jid: m.jid, bundle: ok ? idb : null, anon: false, unproven: !ok };
+  }
+  if (knockQueue.length >= MAX_KNOCK_QUEUE) {
+    // F-PROTO-004: only a VERIFIED knock of the expected peer gets this far.
+    const expected = (k) => !!k.bundle && !!expectedPeerBundle && sameBundle(k.bundle, expectedPeerBundle);
+    if (!expected(entry)) return;
+    const victim = knockQueue.findIndex((k, i) => i > 0 && !expected(k));
+    if (victim < 0) return;
+    knockQueue.splice(victim, 1);
   }
   knockQueue.push(entry);
   await showNextKnock();
