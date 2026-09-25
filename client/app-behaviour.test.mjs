@@ -644,6 +644,9 @@ const pinFor = () => contacts.getPin("room:" + ROOM);
 function sameKeyPin(pin, b) { return !!pin && pin.ed === b.ed && pin.mldsa === b.mldsa; }
 
 // ---- M-1, the Low variant: no unlock for a pinned peer after the close ----------
+// (This binds enterVerification's POST-DIGEST generation check — the close
+// lands while the digest runs. The later check after getPin is dead defence:
+// getPin is synchronous behind its await, so nothing can land between them.)
 {
   const bob = await Identity.generate();
   // pin Bob legitimately first
@@ -665,7 +668,7 @@ function sameKeyPin(pin, b) { return !!pin && pin.ed === b.ed && pin.mldsa === b
   assert.ok(!lines().slice(lines0).some((l) => /matches your saved pin|secure channel established/.test(l)),
     "M-1 (Low): a pinned peer's session is not unlocked after its connection closed");
   assert.strictEqual(dom.el("text").disabled, true, "...and sending stays disabled");
-  console.log("OK  fix round 3 M-1 (Low): no unlockMessaging() for a connection that closed during the check (executed)");
+  console.log("OK  fix round 3 M-1 (Low): no unlockMessaging() for a connection that closed during the digest — the post-digest check (executed)");
 }
 
 // ---- M-1: connectInner itself clears the gate (a second connect with a gate up) --
@@ -709,6 +712,70 @@ function sameKeyPin(pin, b) { return !!pin && pin.ed === b.ed && pin.mldsa === b
   assert.ok(!sameKeyPin(pinFor(), dave.publicBundle()), "M-1: a click after the close pins nothing");
   assert.ok(lines().slice(lines0).some((l) => /did not belong to this connection — nothing was pinned/.test(l)), "M-1: ...and says so");
   console.log("OK  fix round 3 M-1: 'It matches' for a closed connection pins nothing (executed)");
+}
+
+// ==== final round (review of 85208fb) ============================================
+// R4-A (Low): AES256 — the peer's confirm tag handled AFTER a relay close used
+// to finish the session: onclose reset keyConfirm, the queued tag matched the
+// unchanged cipher.confirmation again, and finishSession enabled Send and wrote
+// "Ready. Messages are end-to-end encrypted." over the room screen's close
+// reason. finishSession now refuses a connection that is not open.
+{
+  const { ws, nonces } = await guestAwaitingHandshake("AES256");
+  await drain(ws);
+  const myTag = ws.sent.map((f) => (f.type === "key" ? unpack(f.payload) : null)).find((p) => p && typeof p.confirm === "string");
+  assert.ok(myTag, "fixture: our confirm tag went out");
+  let pc = null;
+  for (const [a, b] of [[nonces[1], nonces[0]], [nonces[0], nonces[1]]]) {
+    const c = makeCipher("AES256", ROOM, { passphrase: PASS });
+    await c.init();
+    await c.setNonces(a, b);
+    if (c.confirmation.theirs === myTag.confirm) { pc = c; break; }
+  }
+  assert.ok(pc, "fixture: the test holds the peer's side of the session");
+  await ws.deliver({ type: "error", reason: "approval timeout" }); // the relay parks why…
+  ws.close(); // …and hangs up; the peer's confirm frame is still queued behind it
+  await settle(5);
+  const reason = dom.el("roomHint").textContent;
+  assert.match(reason, /did not let you in within the time limit/, "fixture: the room screen says why the connection closed");
+  ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "AES256", payload: pack({ confirm: pc.confirmation.mine }) }) });
+  await settle();
+  assert.strictEqual(dom.el("roomHint").textContent, reason, "R4-1: a late confirm tag does not overwrite the close reason");
+  assert.strictEqual(dom.el("text").disabled, true, "R4-1: ...and does not enable sending on a closed connection");
+  console.log("OK  final round R4-1: an AES256 confirm tag handled after the relay's close finishes nothing (executed)");
+}
+
+// R4-B: the same late confirm in a handshake mode draws no gate. finishSession
+// defers to enterVerification here, whose own open-connection check at entry is
+// what stops it (it was unbound: the digest-time check never sees this case).
+{
+  const bobB = await Identity.generate();
+  const { ws, pc } = await handshakeToConfirm(bobB);
+  ws.close(); // the relay hangs up first…
+  ws.onmessage({ data: JSON.stringify(confirmFrame(pc)) }); // …then the queued confirm is handled
+  await settle();
+  assert.strictEqual(dom.el("verify").hidden, true, "R4-B: no gate is drawn for a connection that is already closed");
+  assert.notStrictEqual(dom.el("safetyNumber").textContent, await Identity.safetyNumber(myBundle, bobB.publicBundle()),
+    "R4-B: ...and no safety number is written");
+  console.log("OK  final round R4-B: a confirm handled after the close draws no gate (executed)");
+}
+
+// Info: "It matches" is single-shot — a double click pins once and unlocks once.
+{
+  const erin = await Identity.generate();
+  const { ws, pc } = await handshakeToConfirm(erin);
+  await ws.deliver(confirmFrame(pc));
+  await until(() => !dom.el("verify").hidden, "Erin's gate");
+  const lines0 = lines().length;
+  await Promise.all([dom.el("verifyOk").click(), dom.el("verifyOk").click()]);
+  await settle(20);
+  const after = lines().slice(lines0);
+  assert.strictEqual(after.filter((l) => /contact verified and pinned/.test(l)).length, 1, `a double click pins once: ${JSON.stringify(after)}`);
+  assert.strictEqual(after.filter((l) => /secure channel established/.test(l)).length, 1, "...and unlocks once");
+  assert.ok(!after.some((l) => /nothing was pinned/.test(l)), "...and the second click says nothing");
+  assert.ok(sameKeyPin(pinFor(), erin.publicBundle()), "control: Erin is pinned");
+  await dom.el("disconnect").click();
+  console.log("OK  final round Info: 'It matches' is single-shot (executed)");
 }
 
 // ---- Info: a handler still in flight at a relay close starts no key confirmation --

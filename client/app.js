@@ -3215,8 +3215,14 @@ async function finishSession(room) {
     // read-only stop, never "It matches") unless the user is somewhere else.
     if (!els.verify.hidden && (document.activeElement === document.body ||
         els.scrChat.contains(document.activeElement))) els.safetyNumber.focus();
-    return;
+    return; // (enterVerification checks for an open connection itself)
   }
+  // Final round (review of 85208fb, R4-1): AES256 / OTP unlock right here. A
+  // peer's confirm tag still queued when the relay hung up used to reach this
+  // after onclose — keyConfirm is reset there, but the tag matched the
+  // unchanged cipher.confirmation again — and "Ready. Messages are end-to-end
+  // encrypted." replaced the room screen's close reason, with Send enabled.
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
   verified = true;
   enableSend(true);
   if (cipher.usesNonces) {
@@ -3477,7 +3483,11 @@ async function handleMessage(room, raw, sock) {
           // relay can hammer — see MAX_PEER_CONFIRMS.
           currentRoom = room;
           await keyConfirm.onPeerTag(p.confirm, cipher.confirmation);
-          break; // (keyConfirm is reset by onclose and connectInner, so a stale finish is inert)
+          // (onclose resets keyConfirm, but a tag handled after the close can
+          // still match the unchanged cipher.confirmation and finish: the
+          // unlock paths — finishSession, enterVerification — each refuse a
+          // connection that is no longer open.)
+          break;
         }
 
         // Phase 2 — signed handshake. AES256 exchanges no key material, so a
@@ -3791,6 +3801,10 @@ async function onVerifyOk() {
   // M-1: pin exactly the bundle the gate on screen was drawn for, in the same
   // live connection, and only while it is still this connection's peer.
   // Anything else is refused out loud — never pinned.
+  // Final round (Info): single-shot. A second click while the first is still
+  // writing the pin does nothing (not a second pin, not a refusal line), and
+  // the gate is consumed before the first await.
+  if (verifyOkBusy) return;
   const g = gateFor;
   if (!g || g.gen !== gateGen || !ws || ws.readyState !== WebSocket.OPEN || !currentPinKey ||
       !peerBundle || !sameBundle(g.bundle, peerBundle)) {
@@ -3801,6 +3815,16 @@ async function onVerifyOk() {
     return;
   }
   const verifiedPeer = g.bundle;
+  gateFor = null;
+  verifyOkBusy = true;
+  try {
+    await pinVerifiedPeer(g, verifiedPeer);
+  } finally {
+    verifyOkBusy = false;
+  }
+}
+let verifyOkBusy = false;
+async function pinVerifiedPeer(g, verifiedPeer) {
   // P-02: savePin now rejects when the store is locked. The user's in-person
   // check still holds for THIS session, so messaging is allowed — but say
   // plainly that it was not remembered, or they would expect a change warning
@@ -3824,7 +3848,6 @@ async function onVerifyOk() {
     }).catch(() => { /* contact mirroring must never block messaging */ });
   }
   if (g.gen !== gateGen) return; // closed while the pin was being written: no unlock for a dead connection
-  gateFor = null;
   addLine("sys", "", "contact verified and pinned", true);
   unlockMessaging();
 }
