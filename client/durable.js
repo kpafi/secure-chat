@@ -256,7 +256,11 @@ export function storeSlot({ blobKey, genKey, marker }) {
         cache = { blob: back[blobKey], witness: back[genKey] };
         return cache;
       }
-      cache = legacy;
+      // Review round 1 (Low): nothing in IndexedDB, nothing to migrate, but
+      // the marker says a store WAS moved there — emptied storage (eviction,
+      // a deletion). Reported so the store refuses loudly (DELETED adoption)
+      // instead of starting a fresh, pin-less one.
+      cache = { ...legacy, lost: lsGet(marker) !== null };
       return cache;
     }
     // IndexedDB holds the store. A localStorage copy can only be what an
@@ -271,11 +275,24 @@ export function storeSlot({ blobKey, genKey, marker }) {
   // Preload at module load, so hasStore() can answer synchronously. Until it
   // settles, known() says TRUE: "unknown" must read as "a store exists" (the
   // loud pins-unreadable path in app.js), never as a clean first run.
-  const ready = read().then(() => {}, () => {}).finally(() => { pending = false; });
+  // Review round 1 (Low): a preload that FAILED is still "unknown", so known()
+  // keeps answering true until a later read succeeds.
+  let failed = false;
+  const ready = read().then(() => { failed = false; }, () => { failed = true; }).finally(() => { pending = false; });
 
   return {
     ready,
-    read: async () => { await ready; return read(); },
+    read: async () => {
+      await ready;
+      try {
+        const r = await read();
+        failed = false;
+        return r;
+      } catch (e) {
+        failed = true;
+        throw e;
+      }
+    },
     async readWitness() {
       await ready;
       if (mode === "ls" || !available()) return lsGet(genKey);
@@ -285,6 +302,7 @@ export function storeSlot({ blobKey, genKey, marker }) {
     durable: () => mode === "idb",
     async write(blob, witness) {
       await ready;
+      if (mode === null) throw new Error("the durable database could not be read — reload and try again");
       if (mode !== "idb") {
         ls().setItem(blobKey, blob);
         ls().setItem(genKey, witness);
@@ -302,7 +320,7 @@ export function storeSlot({ blobKey, genKey, marker }) {
       if (available()) await write({ [blobKey]: null, [genKey]: null });
     },
     known() {
-      return pending || cache.blob !== null || cache.witness !== null ||
+      return pending || failed || cache.blob !== null || cache.witness !== null ||
         lsGet(marker) !== null || lsGet(blobKey) !== null || lsGet(genKey) !== null;
     },
   };

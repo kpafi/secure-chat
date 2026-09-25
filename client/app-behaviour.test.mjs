@@ -371,6 +371,7 @@ await until(() => relay.registered && dom.el("idHint").textContent, "the automat
 
 // The chat store is planted garbage: clear it and unlock from the Chats view.
 fakeIdb.removeItem("sc.chats.v1"); // 3b: the planted store was migrated into IndexedDB at startup
+localStorage.removeItem("sc.chats.idb.v1"); // …with its moved-marker (else an emptied store is a loud DELETED)
 await nav("chats");
 dom.el("chatsUnlockPass").value = PASS;
 await dom.el("chatsUnlock").click();

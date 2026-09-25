@@ -162,6 +162,10 @@ async function sealDurable(id, key, v) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const plain = encU.encode(JSON.stringify({
     d: DUR_DOMAIN, padId: id, send: v.send, recv: v.recv, exported: !!v.exported,
+    // Review round 1: the pad's geometry, so a blob whose role / region size
+    // disagree (an archived v1 blob kept them outside its AEAD) is refused
+    // rather than healed onto the wrong half of the pad.
+    role: v.role, regionSize: v.regionSize,
   }));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain));
   return JSON.stringify({
@@ -175,7 +179,7 @@ function writeDurable(id, key, v) {
     const next = {
       send: maxOf(prev.send, v.send), recv: maxOf(prev.recv, v.recv), exported: !!(prev.exported || v.exported),
     };
-    await durable.put(durKey(id), await sealDurable(id, key, next));
+    await durable.put(durKey(id), await sealDurable(id, key, { ...next, role: v.role, regionSize: v.regionSize }));
     durHigh.set(id, next);
   };
   const run = (durQueue.get(id) || Promise.resolve()).then(job, job);
@@ -209,10 +213,11 @@ async function readDurable(id, key) {
     const w = JSON.parse(decU.decode(plain));
     plain.fill(0);
     if (w.d !== DUR_DOMAIN || w.padId !== id || !isInt(w.send) || !isInt(w.recv) ||
-        w.send < 0 || w.recv < 0 || typeof w.exported !== "boolean") {
+        w.send < 0 || w.recv < 0 || typeof w.exported !== "boolean" ||
+        (w.role !== 0 && w.role !== 1) || !isInt(w.regionSize) || w.regionSize <= 0) {
       return "corrupt";
     }
-    return { send: w.send, recv: w.recv, exported: w.exported };
+    return { send: w.send, recv: w.recv, exported: w.exported, role: w.role, regionSize: w.regionSize };
   } catch {
     return "corrupt";
   }
@@ -687,7 +692,9 @@ async function writePadBlob(record, key, salt, iters) {
   // Package 3b: the durable record, and only once it is ON DISK the native
   // floors. Every caller awaits this function before it transmits, displays or
   // hands out a file, so those now wait for the disk too.
-  await writeDurable(record.padId, key, { send: wm.send, recv: wm.recv, exported: !!record.exported });
+  await writeDurable(record.padId, key, {
+    send: wm.send, recv: wm.recv, exported: !!record.exported, role: record.role, regionSize: record.regionSize,
+  });
   // AFTER the blob, never before: a floor ahead of the blob it protects reads
   // as a rollback on the next unlock (the A4 F-A1 brick). Behind is harmless —
   // the blob's own hwSend/hwRecv are the higher input to unlockPad's max().
@@ -936,6 +943,16 @@ export async function unlockPad(padId, passphrase, opts = {}) {
     send: maxOf(sendOffset, inner.hwSend | 0, outerWm ? outerWm.send : 0, dur ? dur.send : 0),
     recv: maxOf(recvHighWater, inner.hwRecv | 0, outerWm ? outerWm.recv : 0, dur ? dur.recv : 0),
   };
+  // Review round 1 (HIGH, pentest-new-code): never heal a v1 blob. Its
+  // `role` / `regionSize` sit OUTSIDE the AEAD and the upgrade re-seals under
+  // the same key, so an archived v1 copy decrypts beside the current records;
+  // healing it opened the pad with the attacker's outer role — sending from
+  // the peer's half, a two-time pad. Pre-3b this state was refused ("blob
+  // below its records"), and for v1 it still is. (The durable record's sealed
+  // geometry, checked below, binds every other blob shape.)
+  if (legacy && (sendOffset < data.send || recvHighWater < data.recv)) {
+    throw new Error("pad state was rolled back (consumed key material) — refusing to use it; exchange a fresh pad");
+  }
   if (data.send < maxOf(readLegacyHW(padId), native > NATIVE_ABSENT ? native : 0)) {
     throw new Error("pad state was rolled back (consumed key material) — refusing to use it; exchange a fresh pad");
   }
@@ -1025,6 +1042,12 @@ export async function unlockPad(padId, passphrase, opts = {}) {
   const bytes = unb64(inner.bytes);
   if (bytes.length !== 2 * regionSize) {
     throw new Error("stored pad is internally inconsistent — refusing to use it");
+  }
+  // Review round 1: the blob's geometry must be the one the durable record
+  // sealed. A mismatch is not a crash artefact (role and size never change),
+  // it is a substituted or tampered blob.
+  if (dur && (dur.role !== role || dur.regionSize !== regionSize)) {
+    throw new Error("stored pad does not match its durable progress record (role or size) — refusing to use it; exchange a fresh pad");
   }
   if (wm.send > regionSize || wm.recv > regionSize) {
     throw new Error("this pad's progress records point past its end — refusing to use it; exchange a fresh pad");

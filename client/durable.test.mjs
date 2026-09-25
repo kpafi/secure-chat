@@ -287,6 +287,61 @@ const durKey = (id) => "sc.otp.dur.v1." + id;
   console.log("OK  3b: the durable record is sealed under the pad key; forged or substituted records are refused");
 }
 
+// E2. Review round 1 (HIGH, traced by pentest-new-code): the heal must never
+// apply to state that is not authenticated. A pre-P-01 (v1) blob kept `role`
+// and `regionSize` OUTSIDE its AEAD and is re-sealed under the same key when
+// upgraded, so an archived v1 copy still decrypts next to the pad's current
+// watermark and durable record. Pre-3b "blob below record" refused it; the
+// first 3b cut healed it — with the attacker's outer `role`, i.e. sending from
+// the PEER's region: a two-time pad. Now (a) a v1 blob is never healed, and
+// (b) the durable record carries role + regionSize, so ANY blob shape whose
+// geometry disagrees with it is refused.
+{
+  mem.clear(); freshIdb();
+  const A = await fresh("otp.js", "e2");
+  const pad = await A.generatePad({ label: "v1-role", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const pristine = pad.bytes.slice();
+  const at = await A.saveNewPad(pad, PASS);
+  pad.sendOffset = 500;
+  await A.savePadProgress(pad, at);
+  // The archived v1 blob: inner = {bytes, sendOffset, recvHighWater} only,
+  // everything else outside — and the attacker flips `role`.
+  const cur = JSON.parse(mem.get("sc.otp.pad.v1." + pad.padId));
+  const b64s = (u) => Buffer.from(u).toString("base64");
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const inner = new TextEncoder().encode(JSON.stringify({ bytes: b64s(pristine), sendOffset: 0, recvHighWater: 0 }));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, at.key, inner));
+  const v1 = (role) => JSON.stringify({ kdf: cur.kdf, iv: b64s(iv), ct: b64s(ct), padId: pad.padId, label: "x", regionSize: pad.regionSize, role });
+  mem.set("sc.otp.pad.v1." + pad.padId, v1(1));
+  const B = await fresh("otp.js", "e2-r");
+  await assert.rejects(B.unlockPad(pad.padId, PASS, { adoptLegacy: true }), /rolled back|role|does not match/,
+    "review r1: an archived v1 blob with its unauthenticated role flipped is refused, never healed");
+  // …and with the role left alone it is still not healed (v1 geometry is not
+  // authenticated): the pre-3b refusal.
+  mem.set("sc.otp.pad.v1." + pad.padId, v1(0));
+  await assert.rejects((await fresh("otp.js", "e2-r0")).unlockPad(pad.padId, PASS, { adoptLegacy: true }), /rolled back/,
+    "review r1: a v1 blob below its records is refused as before 3b (no heal on unauthenticated geometry)");
+  // (b) The durable record's geometry binds even without the v1 rule: a v3
+  // blob re-sealed with a flipped role (needs the key — models any future
+  // path to a wrong-geometry blob) is refused.
+  const dur = JSON.parse(fake.getItem(durKey(pad.padId)));
+  const durPlain = JSON.parse(new TextDecoder().decode(await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: Buffer.from(dur.iv, "base64") }, at.key, Buffer.from(dur.ct, "base64"))));
+  assert.deepStrictEqual([durPlain.role, durPlain.regionSize], [0, pad.regionSize],
+    "review r1: the durable record seals the pad's role and region size");
+  mem.set("sc.otp.pad.v1." + pad.padId, JSON.stringify(cur)); // the real v3 blob back
+  const v3 = JSON.parse(new TextDecoder().decode(await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: Buffer.from(cur.iv, "base64") }, at.key, Buffer.from(cur.ct, "base64"))));
+  v3.role = 1;
+  const iv3 = crypto.getRandomValues(new Uint8Array(12));
+  const ct3 = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv3 }, at.key,
+    new TextEncoder().encode(JSON.stringify(v3))));
+  mem.set("sc.otp.pad.v1." + pad.padId, JSON.stringify({ ...cur, iv: b64s(iv3), ct: b64s(ct3) }));
+  await assert.rejects((await fresh("otp.js", "e2-v3")).unlockPad(pad.padId, PASS), /does not match its durable progress record/,
+    "review r1: a blob whose role disagrees with the durable record is refused");
+  console.log("OK  review r1: an archived v1 blob (unauthenticated role) is never healed; the durable record binds the geometry");
+}
+
 // ============================================================================
 // F. `exported` survives the crash too
 // ============================================================================
@@ -423,7 +478,15 @@ console.log("OK  3b: v0.3.1 contact + chat stores migrate to IndexedDB verbatim,
   await blocker; await C.ready; await H.ready;
   assert.strictEqual(C.hasStore(), false, "…and FALSE once it has, when there really is no store");
   assert.strictEqual(H.hasStore(), false);
-  console.log("OK  3b: hasStore() cannot answer 'no store' before the IndexedDB preload");
+  // Review round 1 (Low): a preload that FAILED is still unknown, not "no store".
+  mem.clear(); freshIdb();
+  globalThis.indexedDB = { open: () => { throw new Error("IndexedDB broken"); } };
+  const Cf = await fresh("contacts.js", "h3-fail");
+  await Cf.ready;
+  assert.strictEqual(Cf.hasStore(), true,
+    "review r1: a FAILED IndexedDB preload leaves hasStore() true (unknown), not 'no store'");
+  fake.install();
+  console.log("OK  3b: hasStore() cannot answer 'no store' before (or after a failed) IndexedDB preload");
 }
 
 // H4: the floor is advanced only after the store's durable write; a kill in
@@ -513,7 +576,22 @@ console.log("OK  3b: v0.3.1 contact + chat stores migrate to IndexedDB verbatim,
   assert.ok(!fake.getItem("sc.contacts.v1") && !fake.getItem("sc.contacts.gen.v1") && !mem.has("sc.contacts.idb.v1"),
     "3b: wipe() deletes the store from IndexedDB, with its marker");
   assert.strictEqual(C.hasStore(), false);
-  console.log("OK  3b: wipe() clears IndexedDB");
+  // Review round 1 (Low): IndexedDB emptied (eviction / deletion) while the
+  // marker survives — a loud DELETED refusal, not a fresh pin-less store.
+  await C.unlock("id pass");
+  C.lock();
+  fake.clear();
+  await assert.rejects(C.unlock("id pass"), (e) => e.code === "DELETED_CONTACTS_ADOPTION",
+    "review r1: an emptied IndexedDB beside the moved-marker is a loud DELETED refusal (contacts)");
+  const H = await fresh("chats.js", "h6");
+  await H.unlock("id pass");
+  H.lock();
+  fake.clear();
+  await assert.rejects(H.unlock("id pass"), (e) => e.code === "DELETED_CHATS_ADOPTION",
+    "review r1: …and for the chat store");
+  assert.deepStrictEqual(await H.unlock("id pass", { adoptDeleted: true }), { created: true }, "…with the explicit override");
+  H.lock();
+  console.log("OK  3b: wipe() clears IndexedDB; an emptied IndexedDB with the marker left refuses loudly");
 }
 
 console.log("\nAll durable-storage checks passed.");

@@ -193,9 +193,9 @@ export async function unlock(passphrase, opts = {}) {
     lock();
     throw new Error("the device-protected record for your chat history is damaged or forged — refusing to open it");
   }
-  let raw, rawWitness;
+  let raw, rawWitness, lost = false;
   try {
-    ({ blob: raw, witness: rawWitness } = await slot.read());
+    ({ blob: raw, witness: rawWitness, lost = false } = await slot.read());
   } catch (e) {
     lock();
     throw e;
@@ -205,7 +205,7 @@ export async function unlock(passphrase, opts = {}) {
     // Package 3: `floor > 0` — a floor of 0 is a slot persist() armed for a
     // first save that never completed; it is not evidence of a store (see
     // contacts.js, same branch).
-    if (w !== null || floor > 0) {
+    if (w !== null || floor > 0 || lost) { // `lost`: see contacts.js (review round 1)
       // A store existed here (witness, or on Android the floor) and is gone:
       // the replay ring and negotiated modes with it. Explicit choice, never a
       // silent fresh start — the same rule as the contact store.
@@ -213,7 +213,7 @@ export async function unlock(passphrase, opts = {}) {
       if (!opts.adoptDeleted) {
         const gen = w && !w.corrupt ? w.gen : floor;
         throw adoptionError(
-          `your chat history (generation ${gen}) has been DELETED from this device — refusing to start over ` +
+          `your chat history${gen > 0 ? ` (generation ${gen})` : ""} has been DELETED from this device — refusing to start over ` +
           "silently, because already-delivered messages could then be replayed and per-chat encryption " +
           "settings are gone. If you did not Forget this identity yourself, treat this device as tampered.",
           "DELETED_CHATS_ADOPTION",

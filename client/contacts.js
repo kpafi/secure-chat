@@ -172,9 +172,9 @@ export async function unlock(passphrase, opts = {}) {
   // Package 3b: the store and its witness live in IndexedDB (durable.js
   // storeSlot), read together — and migrated there from localStorage on the
   // first read after the upgrade.
-  let raw, rawWitness;
+  let raw, rawWitness, lost = false;
   try {
-    ({ blob: raw, witness: rawWitness } = await slot.read());
+    ({ blob: raw, witness: rawWitness, lost = false } = await slot.read());
   } catch (e) {
     lock();
     throw e;
@@ -198,11 +198,13 @@ export async function unlock(passphrase, opts = {}) {
     // app died) — every completed save leaves generation >= 1 on the floor.
     // Reading 0 as "a store was deleted" turned a failed first save into a
     // false DELETED alarm, and into a no-override refusal on the legacy path.
-    if (floor > 0) {
+    // Review round 1 (Low): or the marker says the store had moved to
+    // IndexedDB and IndexedDB is now empty (evicted or deleted).
+    if (floor > 0 || lost) {
       expectedStore = true;
       if (!opts.adoptDeleted) {
         throw adoptionError(
-          `your saved contacts (generation ${floor}) have been DELETED from this device — refusing to ` +
+          `your saved contacts${floor > 0 ? ` (generation ${floor})` : ""} have been DELETED from this device — refusing to ` +
           "start over with an empty store, because that would silently turn off key-change warnings. " +
           "If you did not Forget this identity yourself, treat every contact as unverified.",
           "DELETED_CONTACTS_ADOPTION",
