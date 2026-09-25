@@ -276,6 +276,13 @@ async def _sqlite_busy(request: Request, exc: sqlite3.DatabaseError) -> Response
     # a DatabaseError) is a 500 plus ONE log line carrying only sqlite's error
     # NAME (no path, no query, no request data — I2), at most once per name per
     # minute so a failing disk cannot become a log flood.
+    # Round-3 Info c: only OperationalError and DatabaseError PROPER are the
+    # environment failing (lock, disk, I/O, corruption). ProgrammingError,
+    # IntegrityError, InterfaceError, DataError, NotSupportedError are bugs in
+    # OUR code; they must stay loud — re-raised to the default handler (500 +
+    # traceback, and they fail the tests that hit them).
+    if type(exc) not in (sqlite3.OperationalError, sqlite3.DatabaseError):
+        raise exc
     name = _sqlite_error_name(exc)
     if name.startswith(_SQLITE_CONTENTION):
         return Response(status_code=503, content="busy", media_type="text/plain")

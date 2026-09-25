@@ -274,13 +274,12 @@ def test_mailbox_budget_is_bytes_and_evicts_from_the_heaviest_inbox(monkeypatch)
     _clear_mailbox()
 
 
-def test_mailbox_row_cap_evicts_instead_of_503(monkeypatch):
-    """Master's shape: the row cap was a relay-wide 503 "mailbox storage full".
-    It now bounds the table and evicts to fit (heaviest other inbox, newest
-    envelope). Ties are broken AWAY from the recipient: the index hands back
+def test_mailbox_full_budget_evicts_instead_of_503(monkeypatch):
+    """Master's shape: a full mailbox was a relay-wide 503 "mailbox storage
+    full". It now evicts to fit (heaviest other inbox, newest envelope). Ties are broken AWAY from the recipient: the index hands back
     equal weights in rowid order, so both directions are exercised — in one of
     them the recipient comes back first and must not be refused."""
-    monkeypatch.setattr(config, "MAX_MAILBOX_TOTAL", 2)
+    monkeypatch.setattr(config, "MAX_MAILBOX_TOTAL_BYTES", 2 * config.MIN_ENVELOPE_BYTES)
     for k, (first, second) in enumerate((("a", "b"), ("b", "a"))):
         _clear_mailbox()
         users = {x: _register(f"f1-rows{k}{x}") for x in "ab"}
@@ -290,7 +289,7 @@ def test_mailbox_row_cap_evicts_instead_of_503(monkeypatch):
                                json={"envelope": _env(fill=fill)}).status_code
 
         assert post(users[second], "c") == 200
-        assert post(users[first], "x") == 200      # table full (2 rows), the two inboxes tie;
+        assert post(users[first], "x") == 200      # budget full (2 envelopes), the two inboxes tie;
         # the recipient's counter row is the NEWER one, which a descending
         # index scan returns first among equal weights.
         assert post(users[first], "z") == 200, "a recipient tied for heaviest must not be refused"
@@ -455,11 +454,16 @@ def test_request_path_never_scans_the_mailbox_table(monkeypatch):
 
 
 def _counters_match():
+    """Counters == real sums of the per-row CHARGE (round-3 M-1), and every
+    row's size is its real length and its charge is at least that."""
     with accounts._db() as conn:
-        real = conn.execute("SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(envelope AS BLOB))), 0) FROM mailbox").fetchone()
+        bad = conn.execute("SELECT COUNT(*) FROM mailbox WHERE size != LENGTH(CAST(envelope AS BLOB)) "
+                           "OR charge < size").fetchone()[0]
+        assert bad == 0, f"{bad} rows with a wrong size or a charge below their size"
+        real = conn.execute("SELECT COUNT(*), COALESCE(SUM(charge), 0) FROM mailbox").fetchone()
         kept = conn.execute("SELECT rows, bytes FROM mailbox_totals WHERE id = 1").fetchone()
         real_inbox = {r[0]: (r[1], r[2]) for r in conn.execute(
-            "SELECT recipient, COUNT(*), SUM(LENGTH(CAST(envelope AS BLOB))) FROM mailbox GROUP BY recipient")}
+            "SELECT recipient, COUNT(*), SUM(charge) FROM mailbox GROUP BY recipient")}
         kept_inbox = {r[0]: (r[1], r[2]) for r in conn.execute("SELECT recipient, rows, bytes FROM mailbox_inbox")}
     assert tuple(kept) == tuple(real), f"totals drifted: kept {tuple(kept)} vs real {tuple(real)}"
     assert kept_inbox == real_inbox, f"per-inbox counters drifted: {kept_inbox} vs {real_inbox}"
@@ -765,9 +769,12 @@ def test_R3_migration_from_a_pre_size_schema_and_after_a_crash(tmp_path):
         for _ in range(2):
             subprocess.run([sys.executable, "-c", code], cwd=backend, env=env, check=True)
         c = sqlite3.connect(db)
-        real = c.execute("SELECT COUNT(*), SUM(LENGTH(CAST(envelope AS BLOB))) FROM mailbox").fetchone()
+        floor = -(-config.MAX_MAILBOX_TOTAL_BYTES // config.MAX_MAILBOX_TOTAL)
+        real = c.execute("SELECT COUNT(*), SUM(MAX(LENGTH(CAST(envelope AS BLOB)), ?)) FROM mailbox",
+                         (floor,)).fetchone()
         assert c.execute("SELECT rows, bytes FROM mailbox_totals").fetchone() == real, case
-        assert c.execute("SELECT COUNT(*) FROM mailbox WHERE size != LENGTH(CAST(envelope AS BLOB))").fetchone()[0] == 0, case
+        assert c.execute("SELECT COUNT(*) FROM mailbox WHERE size != LENGTH(CAST(envelope AS BLOB)) "
+                         "OR charge != MAX(size, ?)", (floor,)).fetchone()[0] == 0, case
         c.close()
 
 
@@ -858,3 +865,209 @@ def test_delete_rows_decrements_only_what_was_actually_deleted():
     _counters_match()
     _clear_mailbox()
 
+
+# ---- Round-3 review: M-1 row cap vs byte budget, Info a/b/c/d/e -------------
+
+def _plant(conn, recipient, n, size, created=None):
+    created = created or int(time.time())
+    conn.executemany("INSERT INTO mailbox (recipient, envelope, created_at, size) VALUES (?,?,?,?)",
+                     [(recipient, "Z" * size, created, size)] * n)
+
+
+def test_ROWCAP_minimum_size_filler_cannot_make_a_63KB_inbox_the_heaviest(monkeypatch):
+    """Round-3 M-1, the reviewer's scenario with the SHIPPED constants. The row
+    cap (100 000) used to be a second "budget full" trigger: 500 accounts x 200
+    x 256 B filled it at 25.6 MB, every inbox over 51 200 B was then "the
+    heaviest", mail to it was refused and any post elsewhere evicted its
+    newest envelope. Rows are now charged at least budget/row-cap, so that
+    filler weighs a full byte budget and its own inboxes are the heaviest."""
+    _clear_mailbox()
+    monkeypatch.setattr(mailbox._post_limiter, "_refill", 0.0)
+    victim = _register("rc-victim")
+    sender_to = _register("rc-x")
+
+    def post(u, n, fill):
+        mailbox._post_limiter._buckets.clear()
+        return client.post(f"/api/mailbox/{u['username']}", params={"t": u["token"]},
+                           json={"envelope": _env(n, fill)}).status_code
+
+    assert post(victim, 3000, "O") == 200      # honest, old
+    assert post(victim, 60000, "N") == 200     # honest, a photo — victim now 63 000 B
+    with accounts._db() as conn:               # == 100 000 POSTs of 256 B to 500 own inboxes
+        for i in range(500):
+            _plant(conn, f"rc-att{i:03d}", 200, 256)
+        conn.execute("DELETE FROM mailbox WHERE recipient LIKE 'rc-att%' AND id IN "
+                     "(SELECT id FROM mailbox WHERE recipient LIKE 'rc-att%' LIMIT 2)")  # 100 000 rows total
+        mailbox._rebuild_counters(conn)
+        rows, charged = mailbox._totals(conn)
+    assert rows == config.MAX_MAILBOX_TOTAL
+    assert charged >= config.MAX_MAILBOX_TOTAL_BYTES, "the filler must weigh a full byte budget"
+    r_victim = post(victim, 2000, "V")         # honest mail to the victim
+    r_other = post(sender_to, 300, "x")        # anyone posts anywhere else
+    got = client.get("/api/mailbox", headers=_auth(_login(victim))).json()["messages"]
+    kinds = [m["envelope"][0] for m in got]
+    _counters_match()
+    _clear_mailbox()
+    assert (r_victim, r_other) == (200, 200), (r_victim, r_other)
+    assert kinds == ["O", "N", "V"], kinds
+
+
+def test_row_cap_cannot_fill_before_the_byte_budget():
+    """The invariant M-1 rests on: with every row charged at least the floor,
+    MAX_MAILBOX_TOTAL rows always weigh at least the whole byte budget."""
+    assert config.MAX_MAILBOX_TOTAL * mailbox._row_charge(config.MIN_ENVELOPE_BYTES) >= config.MAX_MAILBOX_TOTAL_BYTES
+    assert mailbox._row_charge(config.MAX_ENVELOPE_BYTES) == config.MAX_ENVELOPE_BYTES
+    assert 2048 < mailbox._row_charge(1) < 4096  # ~2.6 KiB at the shipped numbers
+
+
+def test_noroom_after_partial_eviction_rolls_back(monkeypatch):
+    """(Reviewer round 3.) Evictions made while looking for room are undone
+    when the post is refused in the end: the 429 leaves every inbox as it was."""
+    _clear_mailbox()
+    n = config.MIN_ENVELOPE_BYTES
+    monkeypatch.setattr(config, "MAX_MAILBOX_PER_RECIPIENT_BYTES", 64 * n)
+    monkeypatch.setattr(config, "MAX_MAILBOX_TOTAL_BYTES", 20 * n)
+    monkeypatch.setattr(mailbox._post_limiter, "_refill", 0.0)
+    r = _register("nr-r")
+    o = _register("nr-o")
+
+    def post(u, size):
+        mailbox._post_limiter._buckets.clear()
+        return client.post(f"/api/mailbox/{u['username']}", params={"t": u["token"]},
+                           json={"envelope": _env(size)}).status_code
+    for _ in range(11):
+        assert post(o, n) == 200          # O = 11n
+    for _ in range(9):
+        assert post(r, n) == 200          # R = 9n, budget 20n full
+    code = post(r, 6 * n)                 # evicts O, O (tie away from R), then R heaviest -> 429
+    with accounts._db() as conn:
+        inb = dict((a, b) for a, b in conn.execute("SELECT recipient, bytes FROM mailbox_inbox"))
+    _counters_match()
+    _clear_mailbox()
+    assert code == 429 and inb["nr-o"] == 11 * n, (code, inb)
+
+
+def test_startup_refuses_an_sqlite_without_returning(monkeypatch):
+    """Round-3 Info a: DELETE ... RETURNING needs sqlite >= 3.35; refuse to
+    start loudly instead of failing on the first delete."""
+    import sqlite3
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 34, 1))
+    with pytest.raises(RuntimeError, match="too old"):
+        mailbox.init_db()
+
+
+def test_startup_repair_reads_the_index_not_the_bodies(monkeypatch):
+    """Round-3 Info b: the size/charge repair on every start used to scan every
+    envelope body. It finds the rows to fix through the covering age index."""
+    import re
+    seen = []
+
+    def traced_db():
+        conn = accounts._db()
+        conn.set_trace_callback(seen.append)
+        return conn
+
+    monkeypatch.setattr(mailbox, "_db", traced_db)
+    mailbox.init_db()
+    repairs = [q for q in seen if q.lstrip().upper().startswith("UPDATE MAILBOX SET")]
+    assert len(repairs) == 2, repairs
+    with accounts._db() as conn:
+        for q in repairs:
+            plan = [r[3] for r in conn.execute("EXPLAIN QUERY PLAN " + q)]
+            # A full pass over the (small) covering index is the point; a pass
+            # over the TABLE reads every envelope body.
+            assert not any(re.fullmatch(r"SCAN mailbox\s*", line) for line in plan), (q, plan)
+            assert any("COVERING INDEX idx_mailbox_age" in line for line in plan), (q, plan)
+
+
+@pytest.mark.parametrize("err", ["IntegrityError", "ProgrammingError"])
+def test_programming_errors_are_not_swallowed(monkeypatch, err):
+    """Round-3 Info c: the DatabaseError handler also caught IntegrityError /
+    ProgrammingError — bugs in our code — and turned them into a quiet 500.
+    They propagate to the default handler (and so fail any test that hits
+    them)."""
+    import sqlite3
+    bob = _register(f"ic-{err.lower()}")
+    tok = _login(bob)
+
+    def buggy():
+        raise getattr(sqlite3, err)("a bug")
+
+    monkeypatch.setattr(mailbox, "_db", buggy)
+    with pytest.raises(getattr(sqlite3, err)):
+        client.get("/api/mailbox", headers=_auth(tok))
+
+
+def test_begin_write_refuses_to_join_an_open_transaction():
+    """Round-3 Info d: _begin_write used to skip BEGIN IMMEDIATE silently if a
+    transaction was already open — possibly a deferred one that had read
+    without the lock (R1 again)."""
+    with accounts._db() as conn:
+        conn.execute("UPDATE mailbox_totals SET rows = rows WHERE id = 1")  # opens a deferred txn
+        assert conn.in_transaction
+        with pytest.raises(RuntimeError, match="already open"):
+            mailbox._begin_write(conn)
+
+
+def test_prune_of_more_rows_than_sqlite_can_bind_at_once(monkeypatch):
+    """Round-3 Info e (the surviving mutant): one statement may bind at most
+    SQLITE_LIMIT_VARIABLE_NUMBER parameters — 32 766 in a default sqlite
+    build, 250 000 in this venv's — and a prune after downtime can exceed it.
+    _delete_rows chunks its ids. The limit is lowered on the connection so the
+    test binds whatever the local build's default is."""
+    import sqlite3
+    _clear_mailbox()
+    bob = _register("ie-prune")
+    tok = _login(bob)
+    old = int(time.time()) - config.MAILBOX_TTL_SEC - 5
+    with accounts._db() as conn:
+        _plant(conn, "ie-filler", 1500, 256, created=old)
+        mailbox._rebuild_counters(conn)
+
+    def limited_db():
+        conn = accounts._db()
+        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        return conn
+
+    monkeypatch.setattr(mailbox, "_db", limited_db)
+    r = client.get("/api/mailbox", headers=_auth(tok))
+    assert r.status_code == 200, r.text
+    with accounts._db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM mailbox WHERE recipient = 'ie-filler'").fetchone()[0] == 0
+    _counters_match()
+    _clear_mailbox()
+
+
+def test_ROWCAP_scaled_through_the_api(monkeypatch):
+    """Round-3 M-1 again, but every filler envelope goes through POST (so
+    through _insert's charge, not the startup repair): with a 20-row cap and
+    a 20-row-floor budget, 20 minimum-size filler posts (4 accounts at a
+    5-row inbox cap) used to fill the ROW cap at 5 KB and make a 6 KB inbox
+    the heaviest. Charged per row, the same filler weighs the whole byte
+    budget, and the victim's mail survives and keeps arriving."""
+    _clear_mailbox()
+    monkeypatch.setattr(config, "MAX_MAILBOX_TOTAL", 20)
+    monkeypatch.setattr(config, "MAX_MAILBOX_TOTAL_BYTES", 20 * 2048)   # row floor 2048
+    monkeypatch.setattr(config, "MAX_MAILBOX_PER_RECIPIENT", 5)
+    monkeypatch.setattr(mailbox._post_limiter, "_refill", 0.0)
+    victim = _register("rcs-victim")
+    other = _register("rcs-x")
+    atts = [_register(f"rcs-att{i}") for i in range(4)]
+
+    def post(u, n, fill):
+        mailbox._post_limiter._buckets.clear()
+        return client.post(f"/api/mailbox/{u['username']}", params={"t": u["token"]},
+                           json={"envelope": _env(n, fill)}).status_code
+
+    assert post(victim, 3000, "O") == 200
+    assert post(victim, 3000, "N") == 200              # victim: 6 000 B queued
+    for i in range(20):                                   # minimum-size filler, inbox by inbox
+        assert post(atts[i // 5], 256, "Z") == 200
+    r_victim = post(victim, 2000, "V")
+    r_other = post(other, 256, "x")
+    got = client.get("/api/mailbox", headers=_auth(_login(victim))).json()["messages"]
+    kinds = [m["envelope"][0] for m in got]
+    _counters_match()
+    _clear_mailbox()
+    assert (r_victim, r_other) == (200, 200), (r_victim, r_other)
+    assert kinds == ["O", "N", "V"], kinds

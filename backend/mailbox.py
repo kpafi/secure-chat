@@ -27,6 +27,7 @@ from __future__ import annotations
 import hmac
 import re
 import secrets
+import sqlite3
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -99,7 +100,45 @@ def _post_rate_limit(recipient: str) -> None:
         raise HTTPException(status_code=429, detail="rate limited")
 
 
+# `DELETE ... RETURNING` (what the counter decrements are derived from, see
+# _delete_rows) needs sqlite >= 3.35. Refuse to start loudly rather than fail
+# on the first delete (round-3 Info a; the production box has 3.46.1).
+_MIN_SQLITE = (3, 35, 0)
+
+
+def _require_sqlite() -> None:
+    if sqlite3.sqlite_version_info < _MIN_SQLITE:
+        raise RuntimeError(
+            f"sqlite {sqlite3.sqlite_version} is too old: the mailbox needs >= "
+            f"{'.'.join(map(str, _MIN_SQLITE))} (DELETE ... RETURNING)"
+        )
+
+
+def _row_floor() -> int:
+    """The least any row is charged: MAX_MAILBOX_TOTAL_BYTES / MAX_MAILBOX_TOTAL,
+    rounded up, so the ROW cap can never fill before the BYTE budget does."""
+    return -(-config.MAX_MAILBOX_TOTAL_BYTES // config.MAX_MAILBOX_TOTAL)
+
+
+def _row_charge(size: int) -> int:
+    """What one envelope costs the global budget, the per-inbox share and the
+    heaviest-inbox ranking.
+
+    Round-3 review M-1: the row cap (MAX_MAILBOX_TOTAL) was a second "budget
+    full" trigger while victims were ranked by BYTES. 500 accounts x 200
+    minimum envelopes (256 B) filled the row cap at only 25.6 MB, and from
+    then on every inbox over 51 200 B was "the heaviest" — reaching a 63 KB
+    inbox cost 500 accounts, not the ~4 000 the byte budget implies. Charging
+    every row at least the per-row share of the byte budget (~2.6 KiB at the
+    shipped numbers) makes the two budgets one: the byte budget always fills
+    first, the row cap stays as a backstop only, and a minimum-size filler
+    weighs what a row of the table really costs. A real sealed envelope is
+    ~1.5-3 KB, so honest mail is charged at or near its size."""
+    return max(size, _row_floor())
+
+
 def init_db() -> None:
+    _require_sqlite()
     with _db() as conn:
         conn.execute(
             """
@@ -122,20 +161,22 @@ def init_db() -> None:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(mailbox)")}
         if "size" not in cols:
             conn.execute("ALTER TABLE mailbox ADD COLUMN size INTEGER NOT NULL DEFAULT 0")
-        # Re-review R3: the ALTER commits on its own, so a crash between it and
-        # the backfill used to leave size = 0 forever (the rebuild below then
-        # faithfully summed zeros, and those rows were invisible to every
-        # budget). No real envelope is 0 bytes (MIN_ENVELOPE_BYTES), so
-        # repairing `size = 0` on EVERY start is exact and idempotent.
-        conn.execute("UPDATE mailbox SET size = LENGTH(CAST(envelope AS BLOB)) WHERE size = 0")
-        # Covering indexes, so the per-inbox, eviction and prune paths read the
-        # sizes from the index and never touch the (up to 64 KiB) row bodies.
+        # Round-3 review M-1: what a row COSTS the budgets, max(size, the row
+        # floor) — see _row_charge. Stored per row so a decrement always takes
+        # back exactly what the insert charged, whatever the config says now.
+        if "charge" not in cols:
+            conn.execute("ALTER TABLE mailbox ADD COLUMN charge INTEGER NOT NULL DEFAULT 0")
+        # Indexes first, so the startup repair in _rebuild_counters can find
+        # the rows it has to fix from an index instead of reading every
+        # envelope body (round-3 Info b: 0.003 s vs 0.058 s measured).
         conn.execute("DROP INDEX IF EXISTS idx_mailbox_recipient")
         conn.execute("DROP INDEX IF EXISTS idx_mailbox_created")
+        conn.execute("DROP INDEX IF EXISTS idx_mailbox_expiry")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_inbox ON mailbox(recipient, id, size)")
         # The TTL prune is `created_at < ?` on every POST and GET; without an
-        # index it scanned the whole table under the write lock (§9 L-2).
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_expiry ON mailbox(created_at, recipient, size)")
+        # index it scanned the whole table under the write lock (§9 L-2). It
+        # also covers size and charge for the startup repair.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_age ON mailbox(created_at, size, charge)")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS mailbox_totals (
@@ -162,31 +203,50 @@ def init_db() -> None:
 
 
 def _rebuild_counters(conn) -> None:
-    """Recompute both counter tables from the mailbox table (startup only —
-    this is the one full scan, and it is deliberately off the request path)."""
+    """Repair per-row sizes and charges, then recompute both counter tables
+    from the mailbox table (startup only — off the request path).
+
+    Re-review R3: the ALTER that adds a column commits on its own, so a crash
+    before a backfill used to leave size = 0 forever and the rebuild summed
+    zeros. No real envelope is 0 bytes (MIN_ENVELOPE_BYTES) and no charge is
+    below the row floor, so repairing `size = 0` and `charge < max(size,
+    floor)` on EVERY start is exact and idempotent. Both are found through the
+    covering age index, not by reading envelope bodies (round-3 Info b)."""
+    floor = _row_floor()
+    conn.execute(
+        "UPDATE mailbox SET size = LENGTH(CAST(envelope AS BLOB)) "
+        "WHERE id IN (SELECT id FROM mailbox INDEXED BY idx_mailbox_age WHERE size = 0)"
+    )
+    conn.execute(
+        "UPDATE mailbox SET charge = MAX(size, ?) "
+        "WHERE id IN (SELECT id FROM mailbox INDEXED BY idx_mailbox_age WHERE charge < MAX(size, ?))",
+        (floor, floor),
+    )
     conn.execute("DELETE FROM mailbox_totals")
     conn.execute(
-        "INSERT INTO mailbox_totals (id, rows, bytes) SELECT 1, COUNT(*), COALESCE(SUM(size), 0) FROM mailbox"
+        "INSERT INTO mailbox_totals (id, rows, bytes) SELECT 1, COUNT(*), COALESCE(SUM(charge), 0) FROM mailbox"
     )
     conn.execute("DELETE FROM mailbox_inbox")
     conn.execute(
         "INSERT INTO mailbox_inbox (recipient, rows, bytes) "
-        "SELECT recipient, COUNT(*), SUM(size) FROM mailbox GROUP BY recipient"
+        "SELECT recipient, COUNT(*), SUM(charge) FROM mailbox GROUP BY recipient"
     )
 
 
 def _insert(conn, recipient: str, envelope: str) -> None:
-    """INSERT one envelope and bump both counters, in the caller's transaction."""
+    """INSERT one envelope and bump both counters by its CHARGE, in the
+    caller's transaction."""
     size = len(envelope.encode("ascii"))
+    charge = _row_charge(size)
     conn.execute(
-        "INSERT INTO mailbox (recipient, envelope, created_at, size) VALUES (?,?,?,?)",
-        (recipient, envelope, int(time.time()), size),
+        "INSERT INTO mailbox (recipient, envelope, created_at, size, charge) VALUES (?,?,?,?,?)",
+        (recipient, envelope, int(time.time()), size, charge),
     )
-    conn.execute("UPDATE mailbox_totals SET rows = rows + 1, bytes = bytes + ? WHERE id = 1", (size,))
+    conn.execute("UPDATE mailbox_totals SET rows = rows + 1, bytes = bytes + ? WHERE id = 1", (charge,))
     conn.execute(
         "INSERT INTO mailbox_inbox (recipient, rows, bytes) VALUES (?, 1, ?) "
         "ON CONFLICT(recipient) DO UPDATE SET rows = rows + 1, bytes = bytes + excluded.bytes",
-        (recipient, size),
+        (recipient, charge),
     )
 
 
@@ -205,8 +265,11 @@ def _begin_write(conn) -> None:
     the update. (It also serialises two overlapping fetches of one inbox,
     which used to be able to return the same envelopes twice.)
     """
-    if not conn.in_transaction:
-        conn.execute("BEGIN IMMEDIATE")
+    # Round-3 Info d: never "join" a transaction someone already opened — a
+    # deferred one may have read without the lock, which is the R1 bug again.
+    if conn.in_transaction:
+        raise RuntimeError("_begin_write: a transaction is already open")
+    conn.execute("BEGIN IMMEDIATE")
 
 
 def _delete_rows(conn, ids) -> None:
@@ -220,16 +283,18 @@ def _delete_rows(conn, ids) -> None:
     the caller believed."""
     ids = list(ids)
     per: dict[str, list[int]] = {}
+    # Chunked: one statement may bind at most SQLITE_MAX_VARIABLE_NUMBER
+    # (32 766) parameters, and a prune after downtime can exceed that.
     for i in range(0, len(ids), 500):
         chunk = ids[i:i + 500]
         gone = conn.execute(
-            "DELETE FROM mailbox WHERE id IN (%s) RETURNING recipient, size" % ",".join("?" * len(chunk)),
+            "DELETE FROM mailbox WHERE id IN (%s) RETURNING recipient, charge" % ",".join("?" * len(chunk)),
             chunk,
         ).fetchall()
-        for recipient, size in gone:
+        for recipient, charge in gone:
             agg = per.setdefault(recipient, [0, 0])
             agg[0] += 1
-            agg[1] += size
+            agg[1] += charge
     if not per:
         return
     total_rows = sum(a[0] for a in per.values())
@@ -249,7 +314,7 @@ def _prune(conn) -> None:
     (`_begin_write`), so the victim list cannot be stale."""
     cutoff = int(time.time()) - config.MAILBOX_TTL_SEC
     ids = [r[0] for r in conn.execute(
-        "SELECT id FROM mailbox INDEXED BY idx_mailbox_expiry WHERE created_at < ?", (cutoff,)
+        "SELECT id FROM mailbox INDEXED BY idx_mailbox_age WHERE created_at < ?", (cutoff,)
     ).fetchall()]
     _delete_rows(conn, ids)
 
@@ -263,7 +328,7 @@ class _NoRoom(Exception):
     """The budget is full and the recipient's own inbox is the heaviest."""
 
 
-def _evict_to_fit(conn, recipient: str, incoming: int) -> None:
+def _evict_to_fit(conn, recipient: str, incoming: int) -> None:  # incoming = the new row's CHARGE
     """When the server-wide budget is full, evict the NEWEST envelope of the
     HEAVIEST inbox other than the recipient's, one at a time and only until
     the incoming envelope fits. If the recipient's own inbox is the heaviest,
@@ -276,28 +341,37 @@ def _evict_to_fit(conn, recipient: str, incoming: int) -> None:
     showed a HANDLE HOLDER could pad the victim's inbox to the per-inbox cap,
     keep ~budget/cap own inboxes just under it (~65 accounts, ~2 minutes) and
     have the victim's OLDEST envelope — the honest mail queued before the
-    padding — evicted next.
+    padding — evicted next. Weights are CHARGES (_row_charge), so the row cap
+    can no longer make a light inbox "the heaviest" (round-3 M-1).
 
-    Why NEWEST of the heaviest. The relay cannot tell padding from honest
-    mail (sealed sender), so the order is the only lever. Padding normally
-    arrives AFTER the mail it is meant to displace, and newest-first evicts
-    the padding and leaves everything queued before it. The reverse order —
-    padding first, honest mail later — is the worst case, and it degrades
-    loudly where it can: an inbox padded to its cap refuses the new mail with
-    429 "recipient inbox full" (per-inbox cap), and while the recipient's own
-    inbox is the heaviest and the budget is full, new mail to it is refused
-    rather than evicting anything (so a sender learns, and retries).
+    Why NEWEST of the heaviest. The relay cannot tell padding from mail under
+    sealed sender, so the eviction order is the only lever it has. Newest-
+    first means that mail queued before a flood or before padding is the last
+    thing an inbox loses; where it can, the relay degrades LOUDLY instead: an
+    inbox at its per-inbox cap refuses new mail with 429, and while the
+    recipient's own inbox is the heaviest under a full budget, new mail to it
+    is refused (429) rather than evicting anything.
 
-    Residual, stated precisely:
-      * a handle holder who pads FIRST, leaving room under the per-inbox cap,
-        and then fills the budget from other accounts can have mail that
-        arrived AFTER the padding evicted silently (its sender got 200). Mail
-        queued BEFORE the padding survives until every newer envelope of that
-        inbox (the padding) is gone;
-      * without the handle, an inbox is reached only when it is the heaviest
-        one left, i.e. after the attacker holds the whole budget in inboxes no
-        heavier than it: ~MAX_MAILBOX_TOTAL_BYTES / (its queued bytes)
-        accounts;
+    Residual, stated precisely (round-3 M-2 — it is continuous, not one-off):
+      * a HANDLE HOLDER can suppress a victim's incoming mail CONTINUOUSLY, for
+        as long as the victim is offline: pad the victim's inbox so it is the
+        heaviest but leave room under the per-inbox cap, keep the budget full
+        with lighter inboxes of their own (~MAX_MAILBOX_TOTAL_BYTES /
+        MAX_MAILBOX_PER_RECIPIENT_BYTES + 1 accounts, ~65), then loop: fetch
+        some of their own filler to open space, honest mail to the victim
+        lands (its sender sees 200), post filler again, and the overflow evicts
+        the victim's NEWEST envelope — that honest mail. The running cost is
+        flat. Mail queued BEFORE the padding survives until all newer mail in
+        that inbox is gone. The relay cannot distinguish padding from mail
+        under sealed sender, so this is inherent to a bounded, shared store;
+        the victim sees it (their inbox is full of undecryptable junk) once
+        they come online and fetch;
+      * WITHOUT the handle, an inbox is reached only once it is the heaviest
+        left, i.e. after the attacker holds the whole budget in inboxes
+        charged no more than it: ~MAX_MAILBOX_TOTAL_BYTES / (its charged
+        bytes) accounts — ~4 300 for a 63 KB inbox, ~29 000 for 9 KiB, and
+        never fewer than MAX_MAILBOX_TOTAL / MAX_MAILBOX_PER_RECIPIENT = 500
+        (a full inbox of minimum-size filler is charged 200 x ~2.6 KiB);
       * an honest inbox that is simply the heaviest (someone offline receiving
         a lot) loses its newest mail first, and while it is the heaviest new
         mail to it is refused (429) under a full budget.
@@ -370,11 +444,12 @@ def post_mail(recipient: str, req: PostReq, t: str = Query(default="", max_lengt
             "SELECT rows, bytes FROM mailbox_inbox WHERE recipient = ?", (recipient,)
         ).fetchone()
         count, inbox_bytes = (inbox[0], inbox[1]) if inbox else (0, 0)
+        charge = _row_charge(len(req.envelope))
         if (count >= config.MAX_MAILBOX_PER_RECIPIENT
-                or inbox_bytes + len(req.envelope) > config.MAX_MAILBOX_PER_RECIPIENT_BYTES):
+                or inbox_bytes + charge > config.MAX_MAILBOX_PER_RECIPIENT_BYTES):
             raise HTTPException(status_code=429, detail="recipient inbox full")
         try:
-            _evict_to_fit(conn, recipient, len(req.envelope))
+            _evict_to_fit(conn, recipient, charge)
         except _NoRoom:
             # Loud, not silent: the budget is full and this inbox is the
             # heaviest, so the NEW envelope is refused rather than evicting

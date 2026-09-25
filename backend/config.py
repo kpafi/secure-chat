@@ -399,16 +399,29 @@ MAX_MAILBOX_PER_RECIPIENT = 200       # queued envelopes per inbox
 #     accounts silently delete everyone's mail (fix review F1); heaviest-OLDEST
 #     let a handle holder pad a victim to the cap and, with ~65 accounts in ~2
 #     minutes, evict the honest mail queued before the padding (re-review R2).
-#     RESIDUAL, stated precisely — the relay cannot tell padding from honest
-#     mail under sealed sender, so only the order can be chosen:
-#       - a HANDLE HOLDER who pads FIRST (leaving room under the per-inbox cap)
-#         and then fills the budget from ~budget/cap + 1 other accounts can have
-#         mail that arrives AFTER the padding evicted silently (its sender saw
-#         200). Mail queued BEFORE the padding is evicted only after all of the
-#         padding is. Padding to the cap instead makes new mail a loud 429;
+#     Every row is CHARGED at least MAX_MAILBOX_TOTAL_BYTES / MAX_MAILBOX_TOTAL
+#     (~2.6 KiB) against the byte budget, the per-inbox share and the
+#     heaviest-inbox ranking (mailbox._row_charge; round-3 review M-1: the row
+#     cap used to fill first at 25.6 MB of minimum-size filler, making every
+#     inbox over 51 200 B "the heaviest" for 500 accounts). The byte budget now
+#     always fills first; the row cap is a backstop only.
+#     RESIDUAL, stated precisely — the relay cannot distinguish padding from
+#     mail under sealed sender, so only the eviction order can be chosen:
+#       - a HANDLE HOLDER can suppress a victim's new mail CONTINUOUSLY, for as
+#         long as the victim is offline (round-3 M-2): pad the victim's inbox
+#         so it is the heaviest but leave room, keep the budget full with
+#         lighter inboxes of their own (~MAX_MAILBOX_TOTAL_BYTES /
+#         MAX_MAILBOX_PER_RECIPIENT_BYTES + 1 = ~65 accounts), then loop —
+#         fetch some of their own filler to open space, honest mail to the
+#         victim lands (its sender sees 200), post filler again and the
+#         overflow evicts the victim's NEWEST envelope, i.e. that mail. Flat
+#         running cost. Mail queued BEFORE the padding survives until all newer
+#         mail in that inbox is gone. Padding to the cap instead makes new mail
+#         a loud 429;
 #       - WITHOUT the handle, an inbox is reached only when it is the heaviest
-#         left: ~MAX_MAILBOX_TOTAL_BYTES / (its queued bytes) accounts (e.g.
-#         ~30 000 for 9 KiB queued);
+#         left: ~MAX_MAILBOX_TOTAL_BYTES / (its CHARGED bytes) accounts — ~4 300
+#         for a 63 KB inbox, ~29 000 for 9 KiB — and never fewer than
+#         MAX_MAILBOX_TOTAL / MAX_MAILBOX_PER_RECIPIENT = 500;
 #       - an honest inbox that is simply the heaviest (someone offline receiving
 #         a lot) loses its newest mail first and, while the budget is full, has
 #         new mail refused with 429.
