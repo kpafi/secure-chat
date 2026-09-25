@@ -591,6 +591,19 @@ export function getPin(key) {
 // sufficiently verified once the peer presents encryption keys.
 export async function savePin(key, bundle) {
   if (!pins) throw new Error("contact store is locked");
+  // Fix round 2 (review L, poc7): a user: pin replaced by a DIFFERENT signing
+  // identity (Bob's new phone, verified in person) supersedes the old one, and
+  // so do the room: pins made under it. They used to stay live: revocation
+  // later only ever saw the new keys (record and user: pin both hold K2), so
+  // after Remove the old device's K1 was still auto-accepted in that room.
+  // Revoked here, at the moment the old identity is superseded — the simpler
+  // of the two options (no per-contact key history to keep): a revoked pin
+  // only means "ask again in person", never a lockout.
+  const prev = key.startsWith("user:") ? pins[key] : null;
+  if (prev && prev.ed && prev.mldsa &&
+      !(sameKeyBytes(prev.ed, bundle.ed) && sameKeyBytes(prev.mldsa, bundle.mldsa))) {
+    revokeRoomPins([prev]);
+  }
   pins[key] = {
     ed: bundle.ed, mldsa: bundle.mldsa,
     ecdh: bundle.ecdh ?? null, mlkem: bundle.mlkem ?? null,
@@ -757,6 +770,11 @@ function revokePin(username, keys = null) {
   const pin = pins && pins[pinKeyFor(username)];
   const sets = [keys, pin].filter((s) => s && s.ed && s.mldsa);
   if (pin) pin.revoked = true;
+  revokeRoomPins(sets);
+}
+
+// Mark every room: pin whose signing keys match one of `sets` as revoked.
+function revokeRoomPins(sets) {
   if (!pins || sets.length === 0) return;
   for (const k of Object.keys(pins)) {
     if (!k.startsWith("room:")) continue;

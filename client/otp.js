@@ -253,6 +253,24 @@ function randomId() {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+// "The rollback record for this pad is missing" — and what the user can do.
+//
+// Fix round 2 (review L): the re-import advice is only true where the import
+// can actually tell whether the pad was used, i.e. where a native floor exists
+// (padWasUsed consults it first, and nothing in the JS context can delete it).
+// In a plain browser padWasUsed sees only the three deletable localStorage
+// markers — the very keys whose absence produced this refusal — so following
+// the advice after an attack reopened a used pad at offset 0: a two-time pad.
+function missingRecordError() {
+  const lead = "the rollback record for this pad is missing — refusing to use the pad, because pad reuse could no longer be detected. ";
+  return new Error(nativeFloor
+    ? lead + "If this pad has never sent or received a message here (e.g. the app was closed while it was first being saved), " +
+      "Forget it and import the same file again — the import checks this device's protected record of whether it was used; " +
+      "otherwise exchange a fresh pad."
+    : lead + "In a browser a re-import cannot verify whether this pad was already used, so do not re-import it: " +
+      "exchange a fresh pad in person.");
+}
+
 // ---- generation ------------------------------------------------------------
 
 // Generate a fresh pristine pad. The generator is always role 0.
@@ -497,6 +515,10 @@ async function writePadBlob(record, key, salt, iters) {
     // one-line localStorage write. It is authenticated state now; the index
     // keeps a copy purely so the pad list can render without the passphrase.
     exported: !!record.exported,
+    // Fix round 2 (Info): "exported" was INFERRED (unverifiable history),
+    // not recorded by an export on this device — kept so the re-export
+    // warning can say so honestly after the next save latches the flag.
+    exportedInferred: !!record.exportedInferred,
     // Pentest 2026-07-29 H-1: "a floor was in force when this blob was written."
     //
     // Deleting the native floor record used to be SILENT even though the file
@@ -688,10 +710,7 @@ export async function unlockPad(padId, passphrase, opts = {}) {
   // record was deleted: the H-3 PoC, and the v2-shaped variant it used to escape
   // through. Unlike `usedKey`, this evidence is not deletable from JS.
   if (native > NATIVE_ABSENT && outerWm === null) {
-    throw new Error(
-      "the rollback record for this pad is missing — refusing to use the pad, because pad reuse could no longer be detected. " +
-        "If this pad has never sent or received a message here (e.g. the app was closed while it was first being saved), Forget it and import the same file again — the import checks whether it was used; otherwise exchange a fresh pad.",
-    );
+    throw missingRecordError();
   }
   // …and the converse (2026-07-29 H-1): a blob written WHILE a floor was in
   // force, with the floor now gone. Removing `clear()` from the bridge closed
@@ -741,10 +760,7 @@ export async function unlockPad(padId, passphrase, opts = {}) {
     // A pad that has demonstrably run on this device but can no longer produce
     // its watermark FAILS CLOSED. (No record AND no evidence = a pad written
     // before this fix, adopted below.)
-    throw new Error(
-      "the rollback record for this pad is missing — refusing to use the pad, because pad reuse could no longer be detected. " +
-        "If this pad has never sent or received a message here (e.g. the app was closed while it was first being saved), Forget it and import the same file again — the import checks whether it was used; otherwise exchange a fresh pad.",
-    );
+    throw missingRecordError();
   }
   // max(outer, inner, legacy, native): each is a floor this device is known to
   // have passed, so the highest of them is the truth.
@@ -892,6 +908,13 @@ export async function unlockPad(padId, passphrase, opts = {}) {
     exported: nativeExported >= 1 ||
       (native > NATIVE_ABSENT && nativeExported === NATIVE_ABSENT) ||
       (inner.exported !== undefined ? !!inner.exported : true),
+    // Fix round 2 (Info): true when that TRUE comes only from missing
+    // evidence (the slot or the in-AEAD flag absent), not from an export
+    // recorded on this device. Only the wording of the re-export warning
+    // depends on it; the confirm stays.
+    exportedInferred: inner.exportedInferred === true ||
+      (nativeExported < 1 && inner.exported !== true &&
+        (inner.exported === undefined || (native > NATIVE_ABSENT && nativeExported === NATIVE_ABSENT))),
   };
   const atRest = { key, salt, iters };
   // Rewrite a genuine legacy blob in the v2 (fully authenticated) format
@@ -926,6 +949,7 @@ export async function unlockPad(padId, passphrase, opts = {}) {
 // a render cache for the pad list (which has no passphrase to hand).
 export async function markExported(record, atRest) {
   record.exported = true;
+  record.exportedInferred = false; // a real export on this device, from here on
   // F-ATREST-002: recorded natively FIRST, so a crash between the two writes
   // leaves the stronger record in place, not the weaker one. Package 3: and
   // CHECKED — this latch is the only record of the export a snapshot restore

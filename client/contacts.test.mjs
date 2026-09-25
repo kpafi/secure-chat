@@ -626,6 +626,39 @@ console.log("OK  item 17: Unverify / Remove revoke every room: pin under the con
 }
 console.log("OK  fix round 1: revocation follows the verified keys (user: pin) and decoded bytes");
 
+// ---- fix round 2 (review L, poc7): a re-verification under NEW keys supersedes
+// the room: pins of the OLD ones. Bob verified with K1 (user:bob, room:R); his
+// phone is replaced (K2) and re-verified in person, which overwrites user:bob;
+// a later Remove only ever sees K2 — so room:R (K1) stayed live and the old
+// phone's holder was auto-accepted in that room.
+{
+  localStorage.clear();
+  await contacts.unlock(PASS);
+  const K1 = { ed: "RURCMQ==", mldsa: "TUxCMQ==", ecdh: "RUMx", mlkem: "TUsx" };
+  const K2 = { ed: "RVZJTA==", mldsa: "TUxFVg==", ecdh: "RUMy", mlkem: "TUsy" };
+  const R = "room:" + "7".repeat(64);
+  const R2 = "room:" + "8".repeat(64);
+  await contacts.upsert({ username: "bob", ...K1, verified: true });
+  await contacts.savePin(contacts.pinKeyFor("bob"), K1);
+  await contacts.savePin(R, K1);
+  await contacts.savePin(R2, K2);                    // an unrelated room pin already under K2
+  await contacts.upsert({ username: "bob", ...K2, verified: true });
+  await contacts.savePin(contacts.pinKeyFor("bob"), K2);
+  assert.strictEqual(contacts.getPin(R).revoked, true,
+    "fix round 2: re-pinning user:bob to a different identity revokes room: pins of the superseded keys");
+  assert.strictEqual(contacts.getPin(R2).revoked, undefined, "…not those of the new keys");
+  await contacts.remove("bob");
+  assert.strictEqual(contacts.getPin(R).revoked, true, "poc7: after Remove the K1 room pin is (still) revoked");
+  // Re-saving the SAME identity (enc keys updated) supersedes nothing.
+  const R3 = "room:" + "9".repeat(64);
+  await contacts.upsert({ username: "cat", ed: "Q0FU", mldsa: "Q01M", verified: true });
+  await contacts.savePin(contacts.pinKeyFor("cat"), { ed: "Q0FU", mldsa: "Q01M" });
+  await contacts.savePin(R3, { ed: "Q0FU", mldsa: "Q01M" });
+  await contacts.savePin(contacts.pinKeyFor("cat"), { ed: "Q0FU", mldsa: "Q01M", ecdh: "RUNE", mlkem: "S0VN" });
+  assert.strictEqual(contacts.getPin(R3).revoked, undefined, "same signing identity: its room pins stay");
+}
+console.log("OK  fix round 2: a re-verification under new keys revokes the old keys' room: pins");
+
 // ---- Pentest 2026-08-07 F-ATREST-003/004: the native floor, where it exists --
 // A second module instance captures the bridge at load, exactly as on the
 // device (the app injects it at document-start, before any module runs).
@@ -743,6 +776,7 @@ console.log("OK  F-ATREST-003/004: on device the contact store fails closed; bro
   localStorage.clear();
   const disk = new Map();
   let failCommit = null; // (id, value) => true: that commit() returns false
+  let full = false;      // fix round 2: the record cap answers FULL (-5) for new ids
   const kotlinModel = () => {
     const mem = new Map(disk);
     let latched = false;
@@ -752,6 +786,7 @@ console.log("OK  F-ATREST-003/004: on device the contact store fails closed; bro
         if (v < 0 || v > 0x7fffffff) return -4;
         if (latched) return -3;
         const cur = mem.has(id) ? mem.get(id) : -1;
+        if (full && cur === -1) return -5; // PadFloor.FULL (record cap)
         const next = cur === -1 ? v : (v > cur ? v : cur);
         if (next === cur) return cur;
         mem.set(id, next);
@@ -841,6 +876,19 @@ console.log("OK  F-ATREST-003/004: on device the contact store fails closed; bro
     "7b: a store must refuse to advance past the floor's ceiling, loudly");
   assert.strictEqual(localStorage.getItem("sc.contacts.v1"), null, "7b: …before anything is written");
   assert.strictEqual(disk.get("contacts:" + ID2), 0x7fffffff);
+
+  // (4) Fix round 2: the record cap (FULL, -5) fails the first save closed,
+  // with its own reason, and nothing is sealed.
+  localStorage.clear();
+  full = true;
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinModel();
+  const c4 = await import("./contacts.js?p3r2=full");
+  await assert.rejects(c4.unlock(PASS, { floorId: "f".repeat(64) }),
+    (e) => e.code === "FLOOR_WRITE_FAILED" && /store is full/.test(e.message),
+    "fix round 2: a full floor store fails the contact store's save with the 'full' reason");
+  assert.strictEqual(localStorage.getItem("sc.contacts.v1"), null, "…and nothing is written");
+  assert.ok(!c4.isUnlocked());
+  full = false;
   delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
   localStorage.clear();
 }

@@ -4038,7 +4038,13 @@ async function ensureUnlocked(padId) {
     // attack the victim is looking at a pad they have used for months, and
     // "no usage record" is the sentence that should stop them.
     if (e.code !== "LEGACY_PAD_ADOPTION") throw e;
-    const warn = e.suspicious
+    // Fix round 2 (Info): the receive-record variant says what is actually
+    // missing, and what the right answer almost always is.
+    const warn = e.recvRecord
+      ? "WARNING: this pad's receive record is missing, although this device has a " +
+        "protected record of the pad itself — a strong sign it was deleted. Unless you " +
+        "used this pad with a development build from before v0.1.0, do NOT adopt it.\n\n"
+      : e.suspicious
       ? "WARNING: this device HAS used one-time pads under the current version, " +
         "so this pad having no usage record is a strong sign its rollback " +
         "protection was tampered with.\n\n"
@@ -4198,7 +4204,13 @@ async function otpExport() {
     // causes key reuse. Warn once and require a second click to confirm.
     if (record.exported && pendingReexportId !== id) {
       pendingReexportId = id;
-      otpStatusMsg("This pad was already exported. A pad must be imported on only ONE device — re-exporting risks catastrophic key reuse. Click Export again to confirm you know what you are doing.", true);
+      // Fix round 2 (Info): when "exported" is only INFERRED (a pad from before
+      // v0.3.2 whose export history cannot be verified), say that — telling an
+      // honest never-exported pad it "was already exported" teaches users to
+      // click through the one warning that matters. The confirm stays.
+      otpStatusMsg(record.exportedInferred
+        ? "This pad's export history can't be verified on this device (it predates the current version). If you have already given it to someone, exporting it again would reuse key material. Click Export again to confirm it has not been exported before."
+        : "This pad was already exported. A pad must be imported on only ONE device — re-exporting risks catastrophic key reuse. Click Export again to confirm you know what you are doing.", true);
       return;
     }
     pendingReexportId = null;

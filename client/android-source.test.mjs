@@ -352,6 +352,12 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
     "the COMMIT_FAILED latch is only ever SET (never reset) for the life of the process");
   assert.strictEqual(constOf("FULL"), `${NATIVE_FULL}L`, "FULL matches nativefloor.js");
   assert.strictEqual(constOf("MAX_RECORDS"), "4096", "record cap as on iOS (PadFloor.maxRecords)");
+  // Fix round 2 (coverage M6): the id-length bound must admit every id the
+  // client uses — `contacts:`/`chats:` + 64 hex (73 chars) is the longest. A
+  // smaller value would make every contact/chat save on the device fail.
+  const longest = Math.max(("contacts:" + "f".repeat(64)).length, ("exported:" + "f".repeat(32)).length);
+  assert.strictEqual(constOf("MAX_ID_LENGTH"), "96", "PadFloor.MAX_ID_LENGTH is pinned");
+  assert.ok(96 >= longest, `MAX_ID_LENGTH (96) admits the longest client id (${longest})`);
   ok("ROUND-3 F-4 / 7b: PadFloor.bump reports COMMIT_FAILED (latched) and INVALID; constants match nativefloor.js");
 }
 

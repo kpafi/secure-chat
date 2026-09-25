@@ -1099,6 +1099,7 @@ function kotlinFloor(disk, ctl = {}) {
       // floor — no error, the old value comes back). No latch, so every slot's
       // check is exercised on its own rather than masked by a later one.
       if (ctl.freeze && ctl.freeze(id) && cur !== -1) return cur;
+      if (ctl.full && cur === -1) return -5;               // PadFloor.FULL: record cap reached
       const next = cur === -1 ? v : (v > cur ? v : cur);
       if (next === cur) return cur;
       mem.set(id, next);
@@ -1217,6 +1218,13 @@ console.log("OK  item 13: deleting the recv: or exported: slot is refused on dev
   const o4 = await import("./otp.js?p3r1=older-c");
   const uc = await o4.unlockPad(c.padId, PASS);
   assert.strictEqual(uc.record.exported, true, "control: an unverifiable exported flag is TRUE (conservative)");
+  assert.strictEqual(uc.record.exportedInferred, true, "fix round 2: …and marked as INFERRED, for the warning's wording");
+  await o4.savePadProgress(uc.record, uc.atRest);          // the save latches exported:1 …
+  const uc2 = await o4.unlockPad(c.padId, PASS);
+  assert.strictEqual(uc2.record.exportedInferred, true, "fix round 2: …but it stays 'inferred' across saves (sealed in the AEAD)");
+  await o4.markExported(uc2.record, uc2.atRest);             // a REAL export here
+  assert.strictEqual((await o4.unlockPad(c.padId, PASS)).record.exportedInferred, false,
+    "fix round 2: a recorded export is not 'inferred'");
   assert.strictEqual(uc.record.sendOffset, 0, "control: …and the pad opens");
 
   // J1 gap: `exported > 0` alone is evidence of use in padWasUsed — the file of
@@ -1440,5 +1448,54 @@ console.log("OK  F-P7-A3: knownUsedHere uses no writable global");
   }
 }
 console.log("OK  F-CRYPTO-012: 64 KiB, 256 KiB and 1 MiB pads all generate (chunked CSPRNG)");
+
+// --- fix round 2 ----------------------------------------------------------------
+// (1) FULL (-5, the PadFloor record cap) fails a first save closed: nothing written.
+{
+  const disk = new Map();
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinFloor(disk, { full: true });
+  const o = await import("./otp.js?p3r2=full");
+  const p = await o.generatePad({ label: "full", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  await assert.rejects(o.saveNewPad(p, PASS),
+    (e) => e.code === "FLOOR_WRITE_FAILED" && /store is full/.test(e.message),
+    "fix round 2: a full floor store fails the save with the 'full' reason");
+  assert.strictEqual(localStorage.getItem("sc.otp.pad.v1." + p.padId), null, "…and nothing is written");
+  assert.strictEqual(o.padMeta(p.padId), null);
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+}
+// (2) The "rollback record missing" advice. Re-import is only offered where the
+// import can really tell prior use (a native floor). In a browser padWasUsed
+// sees only the deletable markers the attacker removed (poc6: two-time pad).
+{
+  const XFER = "xfer-r2";
+  const gen = await otp.generatePad({ label: "r2-browser", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const file = await otp.exportPad(gen, XFER);
+  const imp = await otp.importPad(file, XFER);
+  const at = await otp.saveNewPad(imp, PASS);
+  imp.sendOffset = 500;
+  await otp.savePadProgress(imp, at);
+  for (const k of ["wm", "used", "hw"]) localStorage.removeItem(`sc.otp.${k}.v1.${imp.padId}`);
+  const e = await otp.unlockPad(imp.padId, PASS).then(() => null, (x) => x);
+  assert.ok(e && /rollback record for this pad is missing/.test(e.message), "fixture: refused");
+  assert.doesNotMatch(e.message, /import the same file again/,
+    "fix round 2: in a browser the refusal must NOT advise re-importing (the import cannot verify use there)");
+  assert.match(e.message, /cannot verify whether this pad was already used/, "…it says why, and to exchange a fresh pad");
+  // Native: a first save killed between blob and watermark — the advice holds.
+  const disk = new Map();
+  globalThis.__SECURE_CHAT_PAD_FLOOR__ = kotlinFloor(disk);
+  const o = await import("./otp.js?p3r2=advice-native");
+  const gen2 = await otp.generatePad({ label: "r2-native", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const file2 = await otp.exportPad(gen2, XFER);
+  const imp2 = await o.importPad(file2, XFER);
+  await o.saveNewPad(imp2, PASS);
+  localStorage.removeItem("sc.otp.wm.v1." + imp2.padId);
+  const e2 = await o.unlockPad(imp2.padId, PASS).then(() => null, (x) => x);
+  assert.ok(e2 && /import the same file again/.test(e2.message), "fix round 2: with a native floor the re-import advice stays");
+  o.forgetPad(imp2.padId);
+  for (const k of ["used", "hw"]) localStorage.removeItem(`sc.otp.${k}.v1.${imp2.padId}`);
+  await o.importPad(file2, XFER); // …and it is true: nothing was used, the floor says 0
+  delete globalThis.__SECURE_CHAT_PAD_FLOOR__;
+}
+console.log("OK  fix round 2: FULL fails closed; re-import advice only where a floor can verify it");
 
 console.log("\nAll OTP rollback checks passed.");

@@ -64,6 +64,20 @@ let downloads = 0;
 const realObjectURL = URL.createObjectURL;
 URL.createObjectURL = (b) => { downloads++; return realObjectURL.call(URL, b); };
 
+// A native floor, as in the Android app (fix round 2: the consent and warning
+// wordings below exist only where a floor exists). Monotone, and deletable by
+// the test the way a file-level attacker deletes a prefs entry.
+const floors = new Map();
+globalThis.__SECURE_CHAT_PAD_FLOOR__ = Object.freeze({
+  read: (id) => (floors.has(id) ? floors.get(id) : -1),
+  bump: (id, v) => {
+    const cur = floors.has(id) ? floors.get(id) : -1;
+    const n = cur === -1 ? v : (v > cur ? v : cur);
+    floors.set(id, n);
+    return n;
+  },
+});
+
 await import("./app.js");
 const otp = await import("./otp.js"); // the same module instance app.js uses
 
@@ -196,6 +210,69 @@ async function otpConnect(padId = pad.padId) {
   const ws3 = await otpConnect();
   assert.ok(ws3 && ws3.readyState === 1, "control: once released, the pad opens here");
   console.log("OK  F-CRYPTO-014: the pad lock is Web Locks only — no lease fallback, refused with a reason (executed)");
+}
+
+// ---- fix round 2: the consent and warning wordings -----------------------------
+// Re-seal a pad's inner record (the test knows the pad passphrase) — to model a
+// blob written by an older build.
+async function resealPad(padId, mutate) {
+  const k = "sc.otp.pad.v1." + padId;
+  const o = JSON.parse(localStorage.getItem(k));
+  const u8 = (s) => Uint8Array.from(Buffer.from(s, "base64"));
+  const b64s = (u) => Buffer.from(u).toString("base64");
+  const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(PAD_PASS), "PBKDF2", false, ["deriveKey"]);
+  const key = await crypto.subtle.deriveKey({ name: "PBKDF2", salt: u8(o.kdf.salt), iterations: o.kdf.iters, hash: "SHA-256" },
+    base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+  const inner = JSON.parse(new TextDecoder().decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv: u8(o.iv) }, key, u8(o.ct))));
+  mutate(inner);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(JSON.stringify(inner))));
+  localStorage.setItem(k, JSON.stringify({ ...o, iv: b64s(iv), ct: b64s(ct) }));
+}
+{
+  // (a) The receive-record consent: the pad's send slot exists, its recv: slot
+  // is gone. The prompt must say THAT, and that the answer is almost always no.
+  const r = await otp.generatePad({ label: "recv-gone", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  await otp.saveNewPad(r, PAD_PASS);
+  await resealPad(r.padId, (inner) => { delete inner.derivedFloors; }); // an older blob copy
+  floors.delete("recv:" + r.padId);
+  const asked = [];
+  const realConfirm = globalThis.confirm;
+  globalThis.confirm = (m) => { asked.push(String(m)); return false; };
+  try {
+    const ws = await otpConnect(r.padId);
+    assert.strictEqual(ws, null, "declining the consent opens nothing");
+  } finally {
+    globalThis.confirm = realConfirm;
+  }
+  assert.strictEqual(asked.length, 1, "fixture: the adoption consent was asked");
+  assert.match(asked[0], /^WARNING: this pad's receive record is missing/,
+    "fix round 2: the receive-side prompt names what is missing (not 'no usage record')");
+  assert.match(asked[0], /do NOT adopt/, "…and says the right answer is almost always no");
+  assert.match(asked[0], /never\s+received a message on this device/,
+    "…and asks about RECEIVING, not about sending (e.recvRecord drives the wording)");
+  assert.ok(anyHint(/Pad not adopted/), "…and declining is reported");
+  console.log("OK  fix round 2: the receive-record consent says what is missing and not to adopt (executed)");
+}
+{
+  // (b) "exported" only INFERRED (an older pad, exported: slot missing): the
+  // re-export warning says the history can't be verified — still one confirm.
+  const x = await otp.generatePad({ label: "inferred", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  await otp.saveNewPad(x, PAD_PASS);
+  await resealPad(x.padId, (inner) => { delete inner.derivedFloors; });
+  floors.delete("exported:" + x.padId);
+  dom.el("otpSelect").value = x.padId;
+  dom.el("otpPass").value = PAD_PASS;
+  dom.el("otpXferPass").value = "transfer passphrase";
+  const d0 = downloads;
+  await dom.el("otpExport").click();
+  assert.match(dom.el("otpStatus").textContent, /export history can't be verified/,
+    "fix round 2: an INFERRED export is worded as unverifiable history, not 'already exported'");
+  assert.doesNotMatch(dom.el("otpStatus").textContent, /catastrophic/);
+  assert.strictEqual(downloads, d0, "…and the first click still hands out nothing (the confirm stays)");
+  await dom.el("otpExport").click();
+  assert.strictEqual(downloads, d0 + 1, "the confirming click exports");
+  console.log("OK  fix round 2: an inferred export gets the 'history can't be verified' warning (executed)");
 }
 
 console.log("\nAll app.js OTP-path checks passed.");
