@@ -14,6 +14,16 @@
 #
 # Run from the repo root, on a checkout of v0.3.1:
 #   bash deploy/deploy-2026-09-24-v0.3.1.sh
+#
+# TEMPLATE FOR THE NEXT RELEASE. This is the newest deploy script, so the next
+# one is a copy of it. Revised on 2026-09-25 (package 5), AFTER it ran: step 1
+# now rsyncs with the shared lists deploy/ship-excludes.txt (the one ship list,
+# F-P7-18) and deploy/rsync-excludes.txt (the box-only lines, accounts.db
+# first), and step 2 leaves the code root-owned instead of chown'ing it to the
+# service user. The script exactly as it ran is `git show 890080a:<this file>`.
+# A v0.3.1 checkout has no shared lists, so step 1 now refuses to run there.
+# backend/tests/test_ship_list.py holds every non-historical deploy-*.sh to
+# the shared lists and to root ownership.
 set -euo pipefail
 
 BOX=root@138.199.144.35
@@ -32,16 +42,23 @@ ssh "$BOX" "systemctl stop secure-chat \
   && ls -la /root/accounts.db.bak-$STAMP \
   && python3 -c \"import sqlite3;print('    accounts before:',sqlite3.connect('file:/var/lib/secure-chat/accounts.db?mode=ro',uri=True).execute('select count(*) from accounts').fetchone()[0])\""
 
-echo "==> 1. code (NEVER without the accounts.db excludes)"
+echo "==> 1. code (NEVER without the accounts.db excludes in deploy/rsync-excludes.txt)"
+test -f deploy/ship-excludes.txt && test -f deploy/rsync-excludes.txt || { echo "no shared exclude lists"; exit 1; }
 rsync -az --itemize-changes \
-  --exclude node_modules --exclude 'package*.json' --exclude '*.test.mjs' \
-  --exclude __pycache__ --exclude '.venv' --exclude '.pytest_cache' \
-  --exclude 'accounts.db*' --exclude '*.db' --exclude '*.db-shm' --exclude '*.db-wal' \
-  --exclude 'tests' \
+  --exclude-from deploy/ship-excludes.txt \
+  --exclude-from deploy/rsync-excludes.txt \
   backend client "$BOX":/opt/secure-chat/
 
-echo "==> 2. restart"
-ssh "$BOX" 'chown -R securechat:securechat /opt/secure-chat/backend \
+echo "==> 2. ownership, then restart"
+# Code is root:root, dirs 0755 / files 0644 (executables keep their x bit):
+# the service user reads its code and never owns it. The ONLY thing it writes
+# is the accounts DB (+ -wal/-shm) in /var/lib/secure-chat, which systemd's
+# StateDirectory= creates and owns for it. rsync -a as root would otherwise
+# carry the dev box's uid over. The venv is code too: root-owned, its modes
+# left as pip made them.
+ssh "$BOX" 'chown -R root:root /opt/secure-chat/backend /opt/secure-chat/client /opt/secure-chat/venv \
+  && chmod -R u=rwX,go=rX /opt/secure-chat/backend /opt/secure-chat/client \
+  && find /opt/secure-chat -user securechat | wc -l | sed "s/^/    files under \/opt\/secure-chat owned by securechat (want 0): /" \
   && systemctl start secure-chat \
   && sleep 2 \
   && systemctl is-active secure-chat'

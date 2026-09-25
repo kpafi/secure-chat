@@ -21,6 +21,7 @@ Threat-model notes (see PROGRESS.md for the full list):
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import logging
 import os
@@ -194,11 +195,22 @@ app.include_router(mailbox.router)
 # Development/tooling files that live in the client dir but must never be
 # served to the public (L-02). StaticFiles would otherwise expose them; this
 # guard 404s them regardless of what is on disk (defense in depth alongside the
-# deploy excludes). Exact paths + a suffix rule for test modules.
-_BLOCKED_BASENAMES = {"package.json", "package-lock.json"}
-# Whole subtrees that must never be reachable, matched on normalized path
-# segments (not string prefixes).
-_BLOCKED_SEGMENTS = {"node_modules"}
+# deploy excludes).
+#
+# Phase-7 pentest F-P7-18: THE SAME LIST as deploy/ship-excludes.txt, which the
+# deploy rsync, the APK's Gradle sync and the iOS bundle's sync-web.sh read.
+# The relay cannot read it (deploy/ is not on the box), so it is repeated here
+# and backend/tests/test_ship_list.py holds the two equal. Semantics are
+# rsync's for a slash-free pattern: it matches ANY path segment, so a matching
+# directory blocks everything below it. `client/vendor/README.md` used to be
+# served because only package*.json, *.test.mjs, node_modules and dotfile
+# BASENAMES were refused (a file inside a dot-directory was served too).
+_DEV_ONLY_PATTERNS = ("*.test.mjs", "package*.json", "node_modules", ".*", "README.md")
+
+
+def _normalized_path(path: str) -> str:
+    """Collapse "//", "/./" and any "/x/../" the way the static mount will."""
+    return posixpath.normpath("/" + path.strip("/"))
 
 
 def _is_blocked_static(path: str) -> bool:
@@ -215,17 +227,12 @@ def _is_blocked_static(path: str) -> bool:
     copies are all caught, and the control no longer depends on the deploy-time
     excludes being right.
     """
-    # Collapse "//", "/./" and any "/x/../" the way the static mount will.
-    normalized = posixpath.normpath("/" + path.strip("/"))
-    segments = [s for s in normalized.split("/") if s]
-    if any(s in _BLOCKED_SEGMENTS for s in segments):
-        return True
-    basename = segments[-1] if segments else ""
-    # Dotfiles (.package-lock.json, .env, .git*) are never client assets.
-    return (
-        basename in _BLOCKED_BASENAMES
-        or basename.startswith(".")
-        or basename.endswith(".test.mjs")
+    segments = [s for s in _normalized_path(path).split("/") if s]
+    # Every segment, not just the basename: /node_modules/x.js, /.git/config
+    # and /vendor/README.md alike. Dotfiles (.package-lock.json, .env, .git*)
+    # are never client assets.
+    return any(
+        fnmatch.fnmatchcase(seg, pat) for seg in segments for pat in _DEV_ONLY_PATTERNS
     )
 
 
@@ -322,7 +329,12 @@ async def security_headers(request: Request, call_next):
     # Host header, which can desync it from the routed path and bypass this
     # gate (GHSA-86qp-5c8j-p5mr). scope["path"] is what routing actually uses.
     path = request.scope["path"]
-    api = path.startswith("/api/")
+    # Package-5 review (Medium): decide "/api" on the NORMALIZED path, the
+    # same one StaticFiles resolves. On the raw path, `/api/../package.json`
+    # (or `/api/%2e%2e/vendor/README.md`, which uvicorn decodes to the same)
+    # counted as /api, skipped the gate, matched no route and fell through to
+    # the static mount, which normalized it and served the dev file.
+    api = _normalized_path(path).startswith("/api/")
     # Phase-7 pentest 2026-09-16 F-P7-16: the gate is for the static mount only.
     # Run on every path, it made legal usernames (a leading ".", a ".test.mjs"
     # suffix) register fine and then 404 on every /api/users lookup,

@@ -23,6 +23,44 @@ Check it after any change:
 ss -ltnp | grep 8000        # must show 127.0.0.1:8000, never 0.0.0.0 or *
 ```
 
+## The unit's sandbox
+
+`secure-chat.service` has two tiers. The first (`NoNewPrivileges`,
+`ProtectSystem=strict`, the 0700 `StateDirectory`, `ProtectHome`, `PrivateTmp`,
+`PrivateDevices`) keeps the relay from writing anywhere but its database. The
+second (pentest F-RELAY-010, added for 0.4.0) fences what a compromised relay
+process could still do: sockets only `AF_UNIX`/`AF_INET`/`AF_INET6`, IP traffic
+only to and from localhost (`IPAddressDeny=any` + `IPAddressAllow=localhost`;
+the relay makes **no** outbound connection), a `@system-service` syscall
+allow-list minus `@privileged @resources` with `EPERM` for the rest,
+`MemoryDenyWriteExecute`, an empty capability bounding set, the `Protect*`
+kernel/clock/hostname/proc switches, `RestrictNamespaces/Realtime/SUIDSGID`,
+`LockPersonality`, `RemoveIPC` and `UMask=0077`. `systemd-analyze security
+--offline=yes deploy/secure-chat.service` (systemd 261): **7.7 EXPOSED before,
+1.1 OK after**. Each line is pinned by `backend/tests/test_service_unit.py`.
+
+Measured, not assumed: the backend suite and the three client integration
+suites against a real uvicorn pass under the same properties via
+`systemd-run --user` on the dev box. `ProtectProc=` could not be exercised
+that way (a user manager ignores it); `PrivateUsers=` is left out on purpose
+(see the comment in the unit).
+
+**Installing a changed unit** (the rsync never copies it):
+
+```bash
+install -m 0644 -o root -g root deploy/secure-chat.service /etc/systemd/system/secure-chat.service
+systemd-analyze verify /etc/systemd/system/secure-chat.service
+systemctl daemon-reload && systemctl restart secure-chat && systemctl is-active secure-chat
+systemd-analyze security secure-chat | tail -1      # want ~1.1 OK
+curl -s http://127.0.0.1:8000/healthz
+```
+
+If it does not come up, `journalctl -u secure-chat -n 50` names the failing
+line; rolling back is copying the previous unit from git and repeating the
+daemon-reload. **MailDigest on the same box is unaffected**: it runs in Docker
+under its own units, and nothing here touches `docker.service`, Caddy's unit
+or any other service. `IPAddressDeny=` applies to this unit's cgroup only.
+
 ## Two front ends, one process
 
 Caddy and Tor both proxy to the *same* `127.0.0.1:8000`. That is deliberate:
@@ -182,6 +220,81 @@ of the web client".
 public clearnet site on the same host, so anyone who knows both can correlate
 them, and the clearnet site remains an attack surface into the same box. A
 location-anonymous deployment needs a host with no clearnet service on it.
+
+## What ships: one list
+
+`client/` leaves the repository four ways: the relay serves it, the deploy
+script rsyncs it to the box, Gradle copies it into the APK, and
+`ios/scripts/sync-web.sh` copies it into the iOS bundle. Which files are
+development-only (tests, package manifests, `node_modules`, dotfiles,
+`README.md`) is decided by **`ship-excludes.txt`** alone: the deploy rsync,
+Gradle and `sync-web.sh` read it, and the relay repeats it as
+`main._DEV_ONLY_PATTERNS` (it cannot read `deploy/`, which is not on the box).
+A pattern matches any path component, and a matching directory goes whole.
+`backend/tests/test_ship_list.py` runs the deploy rsync and `sync-web.sh` into a
+temp dir, fetches one real file per pattern from the relay, and checks the
+Gradle task's `**/<p>` + `**/<p>/**` translation; all four must ship the same
+set. (Pentest F-P7-18: before this, `vendor/README.md` shipped everywhere and
+`vendor/lean-qr/package.json` sat in the APK.) `manifest.webmanifest` and
+`icons/` ship everywhere on purpose: `index.html` links both.
+
+`rsync-excludes.txt` holds what only the box needs kept out (the accounts DB
+and its `-wal`/`-shm`, caches, `tests`). Every deploy script uses both files
+with `--exclude-from` and no inline `--exclude`; the newest
+`deploy-*.sh` is the template the next one is copied from.
+
+The rsync has no `--delete`, so a dev file already on the box stays there
+until removed by hand; the relay 404s it regardless. At a release, check the
+APK too:
+
+```bash
+unzip -l android/app/build/outputs/apk/*/app-*.apk | grep assets/web/ \
+  | grep -E 'README|package.*\.json|\.test\.mjs|node_modules|/\.'   # want nothing
+```
+
+## Code ownership on the box
+
+`/opt/secure-chat/{backend,client}` are `root:root`, directories 0755 and
+files 0644: the service user reads its code and never owns it. The relay
+writes exactly one thing, the accounts DB with its `-wal`/`-shm`, in
+`/var/lib/secure-chat`, which systemd creates and owns for it
+(`StateDirectory=`, mode 0700). Deploys up to 0.3.1 ran
+`chown -R securechat:securechat /opt/secure-chat/backend`; that was harmless
+under `ProtectSystem=strict` (the code tree is read-only to the service either
+way) but it let the service user own its own source outside the sandbox. From
+the next deploy on, step 2 of the deploy script does `chown -R root:root` on
+backend/, client/ and the venv (whose owner was never recorded here),
+`chmod -R u=rwX,go=rX` on backend/ and client/ (the venv keeps pip's modes),
+and counts what under `/opt/secure-chat` is still owned by `securechat`
+(want 0).
+
+## Pending on the box (repo ahead of the live setup since 2026-09-25)
+
+Package 5 changed only repository files. The next deploy (0.4.0) must, on the
+box, in this order:
+
+1. Copy the next deploy script from the newest `deploy-*.sh` (it already uses
+   `ship-excludes.txt` + `rsync-excludes.txt` and root ownership); run it from
+   a checkout that has both lists.
+2. Remove the dev file the old rsync left behind (no `--delete`):
+   `rm -f /opt/secure-chat/client/vendor/README.md` (the new relay 404s it
+   anyway).
+3. Ownership: the script's step 2 (`chown -R root:root` on backend/,
+   client/ and venv/, `chmod -R u=rwX,go=rX` on backend/ and client/); its
+   count of files still owned by `securechat` must say 0.
+4. Unit: `install -m 0644 -o root -g root deploy/secure-chat.service
+   /etc/systemd/system/`, `systemd-analyze verify`, `systemctl daemon-reload`,
+   `systemctl restart secure-chat`, `systemd-analyze security secure-chat`
+   (want about 1.1), healthz, and a login + a sealed message from a phone
+   (the sandbox's first run on the real box; see "The unit's sandbox").
+5. Caddy: `cp deploy/Caddyfile /etc/caddy/Caddyfile` (it includes the `/ios/`
+   block; see "iOS app downloads" if that is not wanted yet), `caddy validate
+   --config /etc/caddy/Caddyfile`, `systemctl reload caddy`. After some traffic,
+   `journalctl -u caddy --since -10min` must hold no client IP (with the
+   default logger discarded it should hold nothing but ACME lines). Note the
+   trade-off: Caddy's own runtime messages no longer reach journald either
+   (a failed `caddy reload` still prints its error to the terminal and keeps
+   the old config); `caddy validate` before every reload is the check.
 
 ## iOS app downloads (SideStore / AltStore)
 

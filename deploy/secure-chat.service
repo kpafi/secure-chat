@@ -49,6 +49,53 @@ StateDirectoryMode=0700
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
+#
+# Second tier (pentest F-RELAY-010, package 5). What the relay does, which is
+# all these allow: listen on 127.0.0.1:8000 for Caddy and Tor, read its code
+# and the client tree, read and write ONE sqlite file under StateDirectory. It
+# makes no outbound connection at all (no HTTP client, no DNS, no SMTP — grep
+# backend/*.py), so the network is fenced to loopback in both directions.
+# Measured with systemd-run on the dev box (systemd 261, Python 3.13): the
+# backend suite (256 tests) and the three client integration suites against a
+# real uvicorn (uvloop + httptools + websockets) pass with every line below.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# A syscall outside the set fails with EPERM instead of killing the process:
+# a surprise in a library update degrades one request, not the whole relay.
+SystemCallErrorNumber=EPERM
+# MemoryDenyWriteExecute: CPython 3.13 has no JIT by default, and nothing here
+# uses cffi's ABI-mode ffi.callback() (the one cffi feature that needs W+X
+# memory; cryptography 49 is Rust + out-of-line cffi, uvloop/httptools are
+# plain C). Measured: under MDWE ffi.callback() raises MemoryError while
+# Ed25519, ML-DSA-65 and the full relay work. If a future dependency needs
+# W+X, it fails loudly at that call — do not "fix" it by dropping this line
+# without knowing which call it was.
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+# The accounts DB and its -wal/-shm are created 0600, not 0644 (belt and
+# braces under StateDirectoryMode=0700).
+UMask=0077
+# DELIBERATELY ABSENT: PrivateUsers=yes. It would add little here (the process
+# already runs unprivileged with an empty capability set) and it changes how
+# /opt/secure-chat/venv's owner appears inside the service; that has not been
+# measured on the box, and a unit that fails to start is an outage.
 
 [Install]
 WantedBy=multi-user.target
