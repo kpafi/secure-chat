@@ -236,20 +236,47 @@ _SQLITE_LOG_WINDOW_SEC = 60.0
 _sqlite_logged_at: dict[str, float] = {}
 
 
-@app.exception_handler(sqlite3.OperationalError)
-async def _sqlite_busy(request: Request, exc: sqlite3.OperationalError) -> Response:
+# Primary result codes (low byte of the extended code) for lock contention.
+_SQLITE_BUSY_CODES = (5, 6)  # SQLITE_BUSY, SQLITE_LOCKED
+_SQLITE_BUSY_TEXT = ("database is locked", "database table is locked")
+
+
+def _sqlite_error_name(exc: sqlite3.Error) -> str:
+    """sqlite's own name for the error, robust to where it came from.
+
+    `sqlite_errorname` / `sqlite_errorcode` exist since Python 3.11 and are
+    only set on errors sqlite itself raised (the production venv is 3.13.5;
+    re-review Info a). Fall back to the numeric code, then to the two fixed
+    lock-contention messages, so contention is never misread as a fault."""
+    name = getattr(exc, "sqlite_errorname", None)
+    if name:
+        return name
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int) and (code & 0xFF) in _SQLITE_BUSY_CODES:
+        return "SQLITE_BUSY" if (code & 0xFF) == 5 else "SQLITE_LOCKED"
+    if any(t in str(exc) for t in _SQLITE_BUSY_TEXT):
+        return "SQLITE_BUSY"
+    return "SQLITE_UNKNOWN"
+
+
+# Registered for sqlite3.DatabaseError, the parent of OperationalError: a
+# malformed database (SQLITE_CORRUPT / SQLITE_NOTADB) raises DatabaseError
+# itself, which used to reach Starlette's default 500 with a traceback in the
+# journal (re-review Info b). Every sqlite failure now takes this path.
+@app.exception_handler(sqlite3.DatabaseError)
+async def _sqlite_busy(request: Request, exc: sqlite3.DatabaseError) -> Response:
     # §9 L-2 (ported from phase7-local 6604d9e): "database is locked" under
     # load used to escape as a 500 with a traceback in the journal (I2). A bare
     # 503 says "try again" and writes nothing.
     #
     # Fix review F4: that mapping swallowed EVERY OperationalError — disk full,
-    # I/O error, a malformed database, a missing table — as the same silent
-    # "busy", so a relay that had lost its storage looked, to its operator,
-    # like a quiet one. Only lock contention is silent now. Anything else is a
-    # 500 plus ONE log line carrying only sqlite's error NAME (no path, no
-    # query, no request data — I2), at most once per name per minute so a
-    # failing disk cannot become a log flood.
-    name = getattr(exc, "sqlite_errorname", None) or "SQLITE_UNKNOWN"
+    # I/O error, a missing table — as the same silent "busy", so a relay that
+    # had lost its storage looked, to its operator, like a quiet one. Only lock
+    # contention is silent now. Anything else (including a malformed database,
+    # a DatabaseError) is a 500 plus ONE log line carrying only sqlite's error
+    # NAME (no path, no query, no request data — I2), at most once per name per
+    # minute so a failing disk cannot become a log flood.
+    name = _sqlite_error_name(exc)
     if name.startswith(_SQLITE_CONTENTION):
         return Response(status_code=503, content="busy", media_type="text/plain")
     now = asyncio.get_running_loop().time()

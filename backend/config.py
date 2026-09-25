@@ -391,19 +391,30 @@ MAX_MAILBOX_PER_RECIPIENT = 200       # queued envelopes per inbox
 #   * each inbox has a hard BYTE share beside its row cap (429, the owner can
 #     fetch);
 #   * the server-wide budget is BYTES, the row cap only bounds table size, and
-#     when either is full queued mail is EVICTED instead of refusing new mail —
-#     from the HEAVIEST inbox first, its oldest envelope, only as much as the
-#     new envelope needs (fix review F1: evicting the globally oldest rows let
-#     80 throwaway accounts flooding their own inboxes silently delete every
-#     victim's queued mail). A flood therefore mostly evicts the flooders' own
-#     full inboxes. RESIDUAL, stated honestly: an inbox is reached once it is
-#     the heaviest one left, so an attacker who spreads the whole budget over
-#     inboxes no bigger than the victim's — about
-#     MAX_MAILBOX_TOTAL_BYTES / (victim's queued bytes) accounts, e.g. ~30 000
-#     for 9 KiB of queued mail — can still evict it; and an HONEST inbox that is
-#     simply the heaviest (someone offline receiving a lot) loses its oldest
-#     mail first under pressure. Totals are maintained counters (mailbox.py
-#     mailbox_totals / mailbox_inbox), never a table scan on the request path.
+#     when either is full queued mail is EVICTED instead of refusing new mail:
+#     the NEWEST envelope of the HEAVIEST inbox other than the recipient's, one
+#     at a time and only until the new envelope fits; if the recipient's own
+#     inbox is the heaviest, the NEW envelope is refused (429) instead. History
+#     and reasoning in mailbox._evict_to_fit: globally-oldest let 80 throwaway
+#     accounts silently delete everyone's mail (fix review F1); heaviest-OLDEST
+#     let a handle holder pad a victim to the cap and, with ~65 accounts in ~2
+#     minutes, evict the honest mail queued before the padding (re-review R2).
+#     RESIDUAL, stated precisely — the relay cannot tell padding from honest
+#     mail under sealed sender, so only the order can be chosen:
+#       - a HANDLE HOLDER who pads FIRST (leaving room under the per-inbox cap)
+#         and then fills the budget from ~budget/cap + 1 other accounts can have
+#         mail that arrives AFTER the padding evicted silently (its sender saw
+#         200). Mail queued BEFORE the padding is evicted only after all of the
+#         padding is. Padding to the cap instead makes new mail a loud 429;
+#       - WITHOUT the handle, an inbox is reached only when it is the heaviest
+#         left: ~MAX_MAILBOX_TOTAL_BYTES / (its queued bytes) accounts (e.g.
+#         ~30 000 for 9 KiB queued);
+#       - an honest inbox that is simply the heaviest (someone offline receiving
+#         a lot) loses its newest mail first and, while the budget is full, has
+#         new mail refused with 429.
+#     Totals are maintained counters (mailbox_totals / mailbox_inbox), updated
+#     from what each DELETE ... RETURNING actually removed, under a write lock
+#     taken before any read (re-review R1) — never a table scan on requests.
 MIN_ENVELOPE_BYTES = 256
 MAX_MAILBOX_TOTAL = 100_000                        # rows server-wide (evict-oldest)
 MAX_MAILBOX_TOTAL_BYTES = 256 * 1024 * 1024        # queued bytes server-wide (evict-oldest)

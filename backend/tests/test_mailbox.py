@@ -244,10 +244,10 @@ def _clear_mailbox():
 
 def test_mailbox_budget_is_bytes_and_evicts_from_the_heaviest_inbox(monkeypatch):
     """F-RELAY-008 / F-P7-1: the server-wide budget is BYTES, and when it is
-    full queued mail is evicted — from the HEAVIEST inbox, oldest first (fix
-    review F1) — instead of a relay-wide 503 "storage full" (which ~500
-    throwaway accounts could hold for the whole 14-day TTL). The per-inbox
-    share stays a hard 429 — the recipient can fetch."""
+    full queued mail is evicted — the NEWEST envelope of the HEAVIEST other
+    inbox (fix review F1, re-review R2) — instead of a relay-wide 503 "storage
+    full" (which ~500 throwaway accounts could hold for the whole 14-day TTL).
+    The per-inbox share stays a hard 429 — the recipient can fetch."""
     _clear_mailbox()
     n = config.MIN_ENVELOPE_BYTES
     monkeypatch.setattr(config, "MAX_MAILBOX_TOTAL_BYTES", 3 * n)
@@ -264,27 +264,65 @@ def test_mailbox_budget_is_bytes_and_evicts_from_the_heaviest_inbox(monkeypatch)
     r = post(bob, "3")
     assert r.status_code == 429 and "inbox full" in r.text, r.text  # bob's share (2n) is hard
     assert post(alice, "a").status_code == 200                      # 3n total: full
-    assert post(alice, "b").status_code == 200                      # bob is heaviest: his oldest ("1") goes
+    assert post(alice, "b").status_code == 200                      # bob is heaviest: his NEWEST ("2") goes
     with accounts._db() as conn:
         rows = [(r["recipient"], r["envelope"][0])
                 for r in conn.execute("SELECT recipient, envelope FROM mailbox ORDER BY id").fetchall()]
-    assert rows == [("f1-bob", "2"), ("f1-alice", "a"), ("f1-alice", "b")], rows
+    assert rows == [("f1-bob", "1"), ("f1-alice", "a"), ("f1-alice", "b")], rows
     got = client.get("/api/mailbox", headers=_auth(_login(alice))).json()["messages"]
     assert [m["envelope"][0] for m in got] == ["a", "b"], "new mail was delivered under a full budget"
     _clear_mailbox()
 
 
-def test_mailbox_row_cap_evicts_oldest_instead_of_503(monkeypatch):
+def test_mailbox_row_cap_evicts_instead_of_503(monkeypatch):
     """Master's shape: the row cap was a relay-wide 503 "mailbox storage full".
-    It now bounds the table and evicts the oldest row to fit."""
-    _clear_mailbox()
+    It now bounds the table and evicts to fit (heaviest other inbox, newest
+    envelope). Ties are broken AWAY from the recipient: the index hands back
+    equal weights in rowid order, so both directions are exercised — in one of
+    them the recipient comes back first and must not be refused."""
     monkeypatch.setattr(config, "MAX_MAILBOX_TOTAL", 2)
-    bob = _register("f1-rows")
-    for fill in "xyz":
-        r = client.post("/api/mailbox/f1-rows", params={"t": bob["token"]}, json={"envelope": _env(fill=fill)})
-        assert r.status_code == 200, r.text
+    for k, (first, second) in enumerate((("a", "b"), ("b", "a"))):
+        _clear_mailbox()
+        users = {x: _register(f"f1-rows{k}{x}") for x in "ab"}
+
+        def post(u, fill):
+            return client.post(f"/api/mailbox/{u['username']}", params={"t": u["token"]},
+                               json={"envelope": _env(fill=fill)}).status_code
+
+        assert post(users[second], "c") == 200
+        assert post(users[first], "x") == 200      # table full (2 rows), the two inboxes tie;
+        # the recipient's counter row is the NEWER one, which a descending
+        # index scan returns first among equal weights.
+        assert post(users[first], "z") == 200, "a recipient tied for heaviest must not be refused"
+        got = client.get("/api/mailbox", headers=_auth(_login(users[first]))).json()["messages"]
+        assert [m["envelope"][0] for m in got] == ["x", "z"], got
+        assert client.get("/api/mailbox", headers=_auth(_login(users[second]))).json()["messages"] == []
+    _clear_mailbox()
+
+
+def test_full_budget_refuses_new_mail_to_the_heaviest_inbox_loudly(monkeypatch):
+    """Re-review R2, the reverse order: when the budget is full and the
+    recipient's OWN inbox is the heaviest, the NEW envelope is refused with a
+    429 the sender sees, rather than silently evicting older mail."""
+    _clear_mailbox()
+    n = config.MIN_ENVELOPE_BYTES
+    monkeypatch.setattr(config, "MAX_MAILBOX_TOTAL_BYTES", 3 * n)
+    monkeypatch.setattr(mailbox._post_limiter, "_refill", 0.0)
+    bob = _register("r2-heavy")
+    alice = _register("r2-light")
+
+    def post(u, fill):
+        return client.post(f"/api/mailbox/{u['username']}", params={"t": u["token"]},
+                           json={"envelope": _env(n, fill)})
+
+    assert post(bob, "1").status_code == 200
+    assert post(bob, "2").status_code == 200
+    assert post(alice, "a").status_code == 200           # full; bob (2n) is the heaviest
+    r = post(bob, "3")
+    assert r.status_code == 429 and "inbox full" in r.text, r.text
     got = client.get("/api/mailbox", headers=_auth(_login(bob))).json()["messages"]
-    assert [m["envelope"][0] for m in got] == ["y", "z"], got
+    assert [m["envelope"][0] for m in got] == ["1", "2"], "nothing already queued was evicted"
+    _clear_mailbox()
 
 
 # ---- §9 L-2 / master-only: POST throttling, prune placement, sqlite busy -----
@@ -566,3 +604,257 @@ def test_per_inbox_cap_holds_under_concurrent_posts(monkeypatch):
             n = conn.execute("SELECT COUNT(*) FROM mailbox WHERE recipient = 'race-bob'").fetchone()[0]
         assert n <= 3, f"per-inbox cap overshot under concurrency: {n} rows, codes {codes}"
         _clear_mailbox()
+
+
+# ---- Re-review R1 / R1b / R2 (reviewer's binding tests, folded in) -----------
+
+def _real_bytes():
+    with accounts._db() as conn:
+        return conn.execute("SELECT COALESCE(SUM(LENGTH(CAST(envelope AS BLOB))),0) FROM mailbox").fetchone()[0]
+
+
+def _plant_expired(recipient, count, size):
+    with accounts._db() as conn:
+        old = int(time.time()) - config.MAILBOX_TTL_SEC - 5
+        for _ in range(count):
+            conn.execute("INSERT INTO mailbox (recipient, envelope, created_at, size) VALUES (?,?,?,?)",
+                         (recipient, _env(size), old, size))
+        mailbox._rebuild_counters(conn)
+
+
+def test_R1_concurrent_prunes_do_not_double_count_expired_rows():
+    """Re-review R1 (HIGH): _prune SELECTed the expired rows OUTSIDE any write
+    transaction, so N concurrent requests all saw the same victims and each
+    subtracted them from the counters (live: 20 GETs -> (-1140, -74 MB))."""
+    import concurrent.futures as cf
+    _clear_mailbox()
+    att = _register("r1-att")
+    tok = _login(att)
+    _plant_expired("r1-att", 20, 4096)
+    with cf.ThreadPoolExecutor(max_workers=12) as ex:   # the attacker's OWN session; fetch burst is 30
+        codes = list(ex.map(lambda _: client.get("/api/mailbox", headers=_auth(tok)).status_code, range(12)))
+    assert set(codes) == {200}, codes
+    _counters_match()
+    _clear_mailbox()
+
+
+def test_R1_counters_match_after_a_mixed_concurrent_burst(monkeypatch):
+    """Concurrent POSTs and fetches over freshly expired rows: whatever the
+    interleaving, the counters equal the real sums afterwards."""
+    import concurrent.futures as cf
+    _clear_mailbox()
+    monkeypatch.setattr(mailbox._post_limiter, "_refill", 0.0)
+    users = [_register(f"r1-mix{i}") for i in range(6)]
+    toks = [_login(u) for u in users]
+    _plant_expired("r1-mix0", 30, 2048)
+
+    def work(i):
+        u = users[i % 6]
+        if i % 2:
+            return client.get("/api/mailbox", headers=_auth(toks[i % 6])).status_code
+        return client.post(f"/api/mailbox/{u['username']}", params={"t": u["token"]},
+                           json={"envelope": _env(700)}).status_code
+
+    with cf.ThreadPoolExecutor(max_workers=16) as ex:
+        codes = list(ex.map(work, range(48)))
+    assert set(codes) <= {200, 429}, codes
+    _counters_match()
+    _clear_mailbox()
+
+
+def test_R1b_drift_cannot_lift_the_global_budget(monkeypatch):
+    """Consequence of R1: after one burst of concurrent fetches over an expired
+    full budget the counters sat far below reality, and the relay accepted a
+    multiple of MAX_MAILBOX_TOTAL_BYTES (live: 10x) with no evictions."""
+    import concurrent.futures as cf
+    _clear_mailbox()
+    n = 4096
+    budget = 40 * n
+    monkeypatch.setattr(config, "MAX_MAILBOX_TOTAL_BYTES", budget)
+    monkeypatch.setattr(config, "MAX_MAILBOX_PER_RECIPIENT_BYTES", 1_000_000)
+    monkeypatch.setattr(mailbox._post_limiter, "_refill", 0.0)
+    att = _register("r1b-att")
+    tok = _login(att)
+    _plant_expired("r1b-att", 40, n)  # a full budget, planted 14 days ago, now expired
+    with cf.ThreadPoolExecutor(max_workers=12) as ex:
+        list(ex.map(lambda _: client.get("/api/mailbox", headers=_auth(tok)).status_code, range(12)))
+    sinks = [_register(f"r1b-s{i}") for i in range(4)]
+    for i in range(4 * 100):
+        mailbox._post_limiter._buckets.clear()
+        s_ = sinks[i % 4]
+        client.post(f"/api/mailbox/{s_['username']}", params={"t": s_["token"]}, json={"envelope": _env(n)})
+    real = _real_bytes()
+    assert real <= budget, f"budget {budget} B, queued {real} B ({real / budget:.1f}x)"
+    _counters_match()
+    _clear_mailbox()
+
+
+def test_R2_handle_holder_cannot_evict_mail_queued_before_the_padding(monkeypatch):
+    """Re-review R2 (Medium): anyone holding the victim's handle pads the
+    victim's inbox to the per-inbox cap, then keeps budget/cap + 1 own inboxes
+    just under the cap, which made the victim the heaviest inbox and evicted
+    its OLDEST envelope — the honest mail queued before the padding (~65
+    accounts, ~2 minutes at production sizes). Newest-first evicts the
+    padding instead."""
+    _clear_mailbox()
+    n = config.MIN_ENVELOPE_BYTES
+    cap = 8 * n
+    monkeypatch.setattr(config, "MAX_MAILBOX_PER_RECIPIENT_BYTES", cap)
+    monkeypatch.setattr(config, "MAX_MAILBOX_TOTAL_BYTES", 8 * cap)      # 8 "full inboxes" of budget
+    monkeypatch.setattr(mailbox._post_limiter, "_refill", 0.0)
+    victim = _register("r2-victim")
+    atts = [_register(f"r2-att{i}") for i in range(10)]
+
+    def post(u, fill):
+        mailbox._post_limiter._buckets.clear()
+        return client.post(f"/api/mailbox/{u['username']}", params={"t": u["token"]},
+                           json={"envelope": _env(n, fill)}).status_code
+
+    assert post(victim, "H") == 200                         # honest mail, queued while victim is offline
+    for _ in range(7):
+        assert post(victim, "P") == 200                     # attacker (has the handle) pads to the cap
+    for a in atts[:8]:                                      # 8 attacker inboxes at cap - 1 envelope
+        for _ in range(7):
+            post(a, "Z")
+    codes = [post(atts[9], "Z") for _ in range(3)]          # budget now full; flood a fresh inbox
+    assert 200 in codes, f"precondition: the flood was accepted (so something was evicted): {codes}"
+    got = client.get("/api/mailbox", headers=_auth(_login(victim))).json()["messages"]
+    assert "H" in [m["envelope"][0] for m in got], "the victim's honest mail was evicted"
+    _counters_match()
+    _clear_mailbox()
+
+
+# ---- Re-review R3: an interrupted migration must not leave size = 0 ----------
+
+def test_R3_interrupted_size_migration_is_repaired_on_start():
+    """The ALTER TABLE ... ADD COLUMN size commits on its own; a crash before
+    the backfill left size = 0 forever, invisible to every budget."""
+    _clear_mailbox()
+    with accounts._db() as conn:
+        for i in range(5):
+            conn.execute("INSERT INTO mailbox (recipient, envelope, created_at, size) VALUES (?,?,?,0)",
+                         (f"r3-u{i % 2}", _env(300 + i), int(time.time())))
+    mailbox.init_db()  # the next start
+    with accounts._db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM mailbox WHERE size = 0").fetchone()[0] == 0
+    _counters_match()
+    _clear_mailbox()
+
+
+def test_R3_migration_from_a_pre_size_schema_and_after_a_crash(tmp_path):
+    """migr.py, as a test: an old-schema DB, and one where the ALTER ran but
+    the backfill did not, both come up with exact sizes and counters, twice."""
+    import sqlite3
+    import subprocess
+    import sys
+    backend = str(Path(__file__).resolve().parents[1])
+    for case in ("old_schema", "crash_after_alter"):
+        db = str(tmp_path / f"{case}.db")
+        c = sqlite3.connect(db)
+        c.execute("CREATE TABLE mailbox (id INTEGER PRIMARY KEY AUTOINCREMENT, recipient TEXT NOT NULL, "
+                  "envelope TEXT NOT NULL, created_at INTEGER NOT NULL)")
+        for i in range(50):
+            c.execute("INSERT INTO mailbox (recipient, envelope, created_at) VALUES (?,?,?)",
+                      (f"u{i % 5}", "E" * (300 + i), int(time.time())))
+        if case == "crash_after_alter":
+            c.execute("ALTER TABLE mailbox ADD COLUMN size INTEGER NOT NULL DEFAULT 0")
+        c.commit()
+        c.close()
+        code = "import accounts, mailbox; accounts.init_db(); mailbox.init_db()"
+        env = dict(os.environ, SECURE_CHAT_DB=db)
+        for _ in range(2):
+            subprocess.run([sys.executable, "-c", code], cwd=backend, env=env, check=True)
+        c = sqlite3.connect(db)
+        real = c.execute("SELECT COUNT(*), SUM(LENGTH(CAST(envelope AS BLOB))) FROM mailbox").fetchone()
+        assert c.execute("SELECT rows, bytes FROM mailbox_totals").fetchone() == real, case
+        assert c.execute("SELECT COUNT(*) FROM mailbox WHERE size != LENGTH(CAST(envelope AS BLOB))").fetchone()[0] == 0, case
+        c.close()
+
+
+# ---- Re-review Info a/b: busy detection and DatabaseError --------------------
+
+def test_a_real_sqlite_busy_is_a_silent_503(monkeypatch, caplog):
+    """Info a: the F4 tests set sqlite_errorname by hand. This one makes sqlite
+    raise a REAL SQLITE_BUSY (another connection holds the write lock,
+    busy_timeout 0) and checks the handler recognises it."""
+    import sqlite3
+    bob = _register("ia-busy")
+    tok = _login(bob)
+
+    def impatient_db():
+        conn = accounts._db()
+        conn.execute("PRAGMA busy_timeout=0")
+        return conn
+
+    monkeypatch.setattr(mailbox, "_db", impatient_db)
+    blocker = sqlite3.connect(config.DB_PATH)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        with caplog.at_level(logging.DEBUG):
+            r = client.get("/api/mailbox", headers=_auth(tok))
+    finally:
+        blocker.rollback()
+        blocker.close()
+    assert (r.status_code, r.text) == (503, "busy"), (r.status_code, r.text)
+    assert not [rec for rec in caplog.records if rec.levelno >= logging.WARNING], caplog.text
+
+
+@pytest.mark.parametrize("attrs", [{}, {"sqlite_errorcode": 5}, {"sqlite_errorcode": 517}])
+def test_busy_is_recognised_without_sqlite_errorname(monkeypatch, caplog, attrs):
+    """Info a: without `sqlite_errorname` (older Python, or a hand-raised
+    error) contention is still recognised — by code, then by message."""
+    import sqlite3
+    bob = _register(f"ia-noname{attrs.get('sqlite_errorcode', 0)}")
+    tok = _login(bob)
+
+    def locked():
+        exc = sqlite3.OperationalError("database is locked" if not attrs else "whatever")
+        for k, v in attrs.items():
+            setattr(exc, k, v)
+        raise exc
+
+    monkeypatch.setattr(mailbox, "_db", locked)
+    with caplog.at_level(logging.DEBUG):
+        r = client.get("/api/mailbox", headers=_auth(tok))
+    assert (r.status_code, r.text) == (503, "busy"), (r.status_code, r.text)
+    assert not [rec for rec in caplog.records if rec.levelno >= logging.WARNING], caplog.text
+
+
+def test_malformed_database_is_a_500_with_one_name_only_log_line(monkeypatch, caplog):
+    """Info b: a malformed database raises sqlite3.DatabaseError (not
+    OperationalError), which bypassed the handler: Starlette's default 500
+    with a traceback in the journal. Same treatment as any other fault now."""
+    import sqlite3
+    import main
+    monkeypatch.setattr(main, "_sqlite_logged_at", {})
+    bob = _register("ib-corrupt")
+    tok = _login(bob)
+
+    def corrupt():
+        exc = sqlite3.DatabaseError("database disk image is malformed")
+        exc.sqlite_errorname = "SQLITE_CORRUPT"
+        raise exc
+
+    monkeypatch.setattr(mailbox, "_db", corrupt)
+    with caplog.at_level(logging.DEBUG):
+        codes = [client.get("/api/mailbox", headers=_auth(tok)).status_code for _ in range(2)]
+    assert codes == [500, 500], codes
+    lines = [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.WARNING]
+    assert lines == ["sqlite error SQLITE_CORRUPT"], lines
+    assert not any(rec.exc_info for rec in caplog.records), "no traceback"
+
+
+def test_delete_rows_decrements_only_what_was_actually_deleted():
+    """Re-review R1, second layer: the decrement follows `DELETE ... RETURNING`,
+    so deleting an id that is already gone (or an unknown one) changes no
+    counter, whatever the caller believed."""
+    _clear_mailbox()
+    bob = _register("r1-ret")
+    assert client.post("/api/mailbox/r1-ret", params={"t": bob["token"]}, json={"envelope": _env()}).status_code == 200
+    with accounts._db() as conn:
+        rid = conn.execute("SELECT id FROM mailbox WHERE recipient = 'r1-ret'").fetchone()[0]
+        mailbox._delete_rows(conn, [rid, rid, 10**9])
+        mailbox._delete_rows(conn, [rid])
+    _counters_match()
+    _clear_mailbox()
+
