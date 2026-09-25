@@ -18,7 +18,22 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   logger discarded, systemd second-tier sandboxing — exposure 7.7 → 1.1, one
   ship list for relay/rsync/APK/iOS, code root-owned on deploy). The 0.4.0
   deploy has extra steps on the box: `deploy/README.md`, "Pending on the box".
-- **Next:** package 3 (at-rest + Android, in review), package 4 (RSA removal, guest-side
+- **Merged, NOT deployed (2026-09-25):** package 3 (at-rest + Android): OTP
+  derived floor slots armed and checked (item 13, incl. older blob copies),
+  every native-floor write checked + Kotlin COMMIT_FAILED latch, floor 0 no
+  longer evidence of use, inner-keyed gates (F-P7-5, F-ATREST-006), room:
+  pins revoked on Unverify/Remove and when a user: pin is superseded,
+  persist-before-display, latch-before-download, Web Locks or no OTP,
+  chunked pad RNG, int32 ceiling + PadFloor record cap, FLAG_SECURE on every
+  dialog window, console off logcat in release, taskAffinity, Kotlin
+  source-anchor test. On-device checks owed: android/README.md.
+- **Open HIGH (pre-existing), next = package 3b:** Chromium localStorage can
+  stay off disk ~1 min after setItem → a crash can reopen an OTP pad at an
+  old offset (two-time pad); on Android the native floor can end up ahead of
+  the data (bricked store). Owner decisions: OTP heals forward to a durable
+  record; contacts + chats move to IndexedDB (strict durability), floor
+  advanced only after the durable write.
+- **Next:** package 3b (durable storage), package 4 (RSA removal, guest-side
   approval, chats single tab, F-ATREST-008). Then release 0.4.0 (APK first if the wire
   contract changes), deploy, phone APK, archive `phase7-local`.
 - **Relay deployed:** still 0.3.1 (`v0.3.1`).
