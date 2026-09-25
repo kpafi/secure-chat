@@ -296,6 +296,17 @@ secret and make a new one per conversation.
 (no length padding yet). This is the minimal routing metadata a relay cannot
 avoid.
 
+**The identity blob (F-ATREST-008, package 4).** The identity's saved copy
+carries a generation inside its encryption. A copy without encryption keys is
+never given new ones silently any more: the app asks, says what it costs, and
+Cancel changes nothing. On Android the generation is held to a native floor
+(the same Keystore-backed record as the pads' and stores'), so an older copy put
+back is refused outright — including a keyless one, which a device that has used
+the identity with keys never asks about. The floor is raised only after the
+blob is stored, so a crash in between cannot lock you out. In a plain browser
+there is no floor: an older copy of the SAME keys is not detectable there, and
+for a keyless one the question is the control.
+
 **One tab for contacts and chats (package 4).** Like a one-time pad, your
 contacts and chats are open in one tab or window of a browser at a time. A
 second tab says so and offers **Use here**, which moves them: the first tab

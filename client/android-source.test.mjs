@@ -355,7 +355,8 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
   // Fix round 2 (coverage M6): the id-length bound must admit every id the
   // client uses — `contacts:`/`chats:` + 64 hex (73 chars) is the longest. A
   // smaller value would make every contact/chat save on the device fail.
-  const longest = Math.max(("contacts:" + "f".repeat(64)).length, ("exported:" + "f".repeat(32)).length);
+  const longest = Math.max(("contacts:" + "f".repeat(64)).length, ("identity:" + "f".repeat(64)).length,
+    ("exported:" + "f".repeat(32)).length);
   assert.strictEqual(constOf("MAX_ID_LENGTH"), "96", "PadFloor.MAX_ID_LENGTH is pinned");
   assert.ok(96 >= longest, `MAX_ID_LENGTH (96) admits the longest client id (${longest})`);
   ok("ROUND-3 F-4 / 7b: PadFloor.bump reports COMMIT_FAILED (latched) and INVALID; constants match nativefloor.js");

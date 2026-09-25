@@ -8,7 +8,7 @@
 //
 // Run: node identity.test.mjs   (server not required)
 import assert from "node:assert";
-import { Identity, b64, concat } from "./identity.js";
+import { Identity, b64, concat, checkIdentityGeneration, raiseIdentityFloor, identityFloorId } from "./identity.js";
 import { signHandshake, verifyHandshake, freshNonce, signKnock, verifyKnock } from "./auth.js";
 import { makeCipher, bufToB64 } from "./crypto.js";
 
@@ -130,13 +130,67 @@ async function testLegacyBlobImport() {
   );
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain));
   const legacy = JSON.stringify({ v: 1, salt: b64(salt), iv: b64(iv), ct: b64(ct) }); // no `iters`
-  const back = await Identity.import(legacy, "pp");
+  // Package 4 (F-ATREST-008): the upgrade is ASKED, never assumed. Without
+  // the user's confirmation a keyless blob is refused (legacy wording) — the
+  // old code added new keys here silently and app.js persisted them.
+  await assert.rejects(Identity.import(legacy, "pp"),
+    (e) => e.code === "IDENTITY_NEEDS_NEW_KEYS" && e.legacy === true && e.storedGen === 0 && e.edPubRaw.length === 32,
+    "a keyless legacy blob is refused until the user confirms");
+  const back = await Identity.import(legacy, "pp", { allowNewEncryptionKeys: true });
+  assert.strictEqual(back.gen, 1, "the confirmed upgrade is a new generation (0 -> 1)");
+  assert.strictEqual(back.storedGen, 0, "...and the stored blob's generation is kept for the floor check");
   // The SIGNING identity must survive unchanged; the import also upgrades the
   // blob with fresh encryption keys (bundle v2), so compare only ed/mldsa.
   assert.strictEqual(back.publicBundle().ed, id.publicBundle().ed, "legacy v:1 blob imports via 310k fallback (ed)");
   assert.strictEqual(back.publicBundle().mldsa, id.publicBundle().mldsa, "legacy v:1 blob imports via 310k fallback (mldsa)");
   assert.ok(back.upgraded && back.publicBundle().ecdh, "legacy blob is upgraded with encryption keys");
   console.log("OK  legacy (v:1, 310k) identity backup still imports");
+}
+
+// ---- package 4 (F-ATREST-008): the identity blob's generation + native floor ----
+async function testIdentityGenerationFloor() {
+  const pass = "gen pass";
+  const id = await Identity.generate();
+  assert.strictEqual(id.gen, 1, "a new identity is generation 1");
+  const back = await Identity.import(await id.export(pass), pass);
+  assert.strictEqual(back.gen, 1, "the generation travels inside the encrypted blob");
+  // A v3 blob WITHOUT keys (what a restored/edited copy looks like) is the loud variant.
+  const keyless = new Identity({ edPriv: id._edPriv, edPubRaw: id.edPubRaw, mldsaSecret: id._mldsaSecret, mldsaPub: id.mldsaPub });
+  keyless.gen = 1;
+  await assert.rejects(Identity.import(await keyless.export(pass), pass),
+    (e) => e.code === "IDENTITY_NEEDS_NEW_KEYS" && e.legacy === false && /NO encryption keys/.test(e.message),
+    "a v3 blob without encryption keys is refused, never silently re-keyed");
+  // A fake native floor (monotone, like PadFloor.kt).
+  const rec = new Map();
+  const floor = {
+    read: (k) => (rec.has(k) ? rec.get(k) : -1),
+    bump: (k, v) => { const c = rec.has(k) ? rec.get(k) : -1; const n = Math.max(c, v); rec.set(k, n); return n; },
+  };
+  const key = await identityFloorId(id.edPubRaw);
+  assert.match(key, /^identity:[0-9a-f]{64}$/, "floor id: identity:<sha256 hex> (73 chars, within PadFloor's 96)");
+  assert.strictEqual(await checkIdentityGeneration(id.edPubRaw, 1, true, null), null, "no floor (browser): nothing to check");
+  assert.strictEqual(await checkIdentityGeneration(id.edPubRaw, 1, true, floor), key, "absent floor: allowed, raise afterwards");
+  raiseIdentityFloor(floor, key, 1);
+  assert.strictEqual(rec.get(key), 1, "raised to the stored generation");
+  assert.strictEqual(await checkIdentityGeneration(id.edPubRaw, 1, true, floor), key, "same generation: allowed");
+  assert.strictEqual(await checkIdentityGeneration(id.edPubRaw, 2, true, floor), key, "newer generation: allowed");
+  await assert.rejects(checkIdentityGeneration(id.edPubRaw, 0, true, floor), (e) => e.code === "IDENTITY_ROLLBACK",
+    "an OLDER generation than the floor is a rollback");
+  await assert.rejects(checkIdentityGeneration(id.edPubRaw, 5, false, floor), (e) => e.code === "IDENTITY_ROLLBACK",
+    "a keyless blob on a device that used this identity with keys is a rollback, whatever its generation");
+  await assert.rejects(checkIdentityGeneration(id.edPubRaw, 1, true, { read: () => -2, bump: () => -2 }), (e) => e.code === "IDENTITY_FLOOR",
+    "a damaged floor refuses");
+  await assert.rejects(checkIdentityGeneration(id.edPubRaw, 1, true, { read: () => -3, bump: () => -3 }), (e) => e.code === "IDENTITY_FLOOR",
+    "an unexpected negative answer is not 'absent'");
+  await assert.rejects(checkIdentityGeneration(id.edPubRaw, 1, true, { broken: true, read: () => 1, bump: () => 1 }), (e) => e.code === "IDENTITY_FLOOR",
+    "a broken bridge refuses");
+  assert.throws(() => raiseIdentityFloor({ read: () => 0, bump: () => -3 }, key, 2), (e) => e.code === "FLOOR_WRITE_FAILED",
+    "a floor write that did not land is loud");
+  // a crafted generation inside the AEAD is refused
+  const odd = await Identity.generate();
+  odd.gen = 1.5;
+  await assert.rejects(Identity.import(await odd.export(pass), pass), /malformed generation/);
+  console.log("OK  F-ATREST-008: keyless blobs are never silently re-keyed; generation + native floor refuse an older copy");
 }
 
 async function testMitmDefeated() {
@@ -334,6 +388,7 @@ await testImportRefusesMismatchedKeypairs();
 await testFingerprints();
 await testExportImport();
 await testLegacyBlobImport();
+await testIdentityGenerationFloor();
 await testMitmDefeated();
 await testCrossSessionReplayDefeated();
 console.log("\nAll identity / authenticated-handshake checks passed.");

@@ -5,7 +5,7 @@ import Security
 /// Monotonic, tamper-evident floors for the at-rest stores — the iOS port of
 /// `android/app/src/main/java/org/securechat/app/PadFloor.kt`. Read that file
 /// first: the threat model, the namespace (`<padId>`, `recv:`, `exported:`,
-/// `contacts:`, `chats:`) and the H-1 "no lowering operation, no deletion"
+/// `contacts:`, `chats:`, `identity:`) and the H-1 "no lowering operation, no deletion"
 /// rule are the same, and deliberately so.
 ///
 /// STORAGE, and how it differs from Android:

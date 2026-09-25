@@ -69,9 +69,18 @@ URL.createObjectURL = (b) => { downloads++; return realObjectURL.call(URL, b); }
 // wordings below exist only where a floor exists). Monotone, and deletable by
 // the test the way a file-level attacker deletes a prefs entry.
 const floors = new Map();
+// Package 4 (F-ATREST-008): identity-floor bumps are recorded with the identity
+// blob stored AT THAT MOMENT (the floor must follow the stored blob, never lead
+// it), and one can be made to fail the way a failed commit() does.
+const identityBumps = [];
+let failIdentityBumps = 0;
 globalThis.__SECURE_CHAT_PAD_FLOOR__ = Object.freeze({
   read: (id) => (floors.has(id) ? floors.get(id) : -1),
   bump: (id, v) => {
+    if (id.startsWith("identity:")) {
+      identityBumps.push({ id, v, blob: store.get("sc.identity.v1") });
+      if (failIdentityBumps > 0) { failIdentityBumps--; return -3; }
+    }
     const cur = floors.has(id) ? floors.get(id) : -1;
     const n = cur === -1 ? v : (v > cur ? v : cur);
     floors.set(id, n);
@@ -325,6 +334,105 @@ async function resealPad(padId, mutate) {
   await settle(10);
   assert.strictEqual(downloads, d0 + 1, "…and is handed out once it has");
   console.log("OK  3b: OTP transmit, display and export wait for the durable (IndexedDB) write (executed)");
+}
+
+// ==== package 4 (F-ATREST-008): the identity blob is never silently re-keyed =====
+// …and on a device with a native floor, an older copy is refused. Before: a
+// blob without encryption keys was given NEW ones on unlock and app.js stored
+// them — a restored older copy (one setItem) silently re-keyed the identity.
+{
+  const { Identity, identityFloorId, b64 } = await import("./identity.js");
+  const PASS = "identity passphrase for the tests";
+  const stored = () => store.get("sc.identity.v1");
+  const ED = async () => (await Identity.import(stored(), PASS)).edPubRaw;
+  const unlock = async () => {
+    dom.el("idPass").value = PASS;
+    await dom.el("idUnlock").click();
+    await settle(20);
+  };
+  // A keyless copy of an identity: `legacy` = the pre-v3 envelope (v:1).
+  const keylessBlob = async (id, legacy, gen = 0) => {
+    const k = new Identity({ edPriv: id._edPriv, edPubRaw: id.edPubRaw, mldsaSecret: id._mldsaSecret, mldsaPub: id.mldsaPub });
+    k.gen = gen;
+    const blob = JSON.parse(await k.export(PASS));
+    if (legacy) blob.v = 1;
+    return JSON.stringify(blob);
+  };
+  let asked = [];
+  let answer = false;
+  globalThis.confirm = (q) => { asked.push(q); return answer; };
+
+  // (1) create: the floor follows the stored blob (generation 1).
+  dom.el("idPass").value = PASS;
+  await dom.el("idCreate").click();
+  await settle(40);
+  const keyA = await identityFloorId(await ED());
+  assert.strictEqual(floors.get(keyA), 1, "F-ATREST-008: a new identity raises its floor to generation 1");
+  const bumpA = identityBumps.find((b) => b.id === keyA);
+  assert.ok(bumpA && bumpA.blob && JSON.parse(bumpA.blob).v === 3, "...AFTER the blob was stored (never a floor ahead of the only copy)");
+  const blobA = stored();
+  const idA = await Identity.import(blobA, PASS);
+
+  // (2) Android: an older KEYLESS copy of this identity is put back. Refused
+  //     before anyone is asked; nothing re-keyed, nothing stored.
+  for (const legacy of [true, false]) {
+    const planted = await keylessBlob(idA, legacy);
+    store.set("sc.identity.v1", planted);
+    asked = [];
+    await unlock();
+    assert.strictEqual(asked.length, 0, `F-ATREST-008 (${legacy ? "legacy" : "v3"} envelope): a device that used this identity WITH keys does not even ask`);
+    assert.match(dom.el("idStatus").textContent, /Not unlocked: .*old copy has been put back/, "...it refuses, saying why");
+    assert.strictEqual(stored(), planted, "...and the stored copy was NOT upgraded with new keys");
+  }
+  // an older WITH-keys generation below the floor is refused too
+  floors.set(keyA, 3);
+  store.set("sc.identity.v1", blobA); // generation 1 < floor 3
+  await unlock();
+  assert.match(dom.el("idStatus").textContent, /Not unlocked: .*OLDER than one this device has already used/, "F-ATREST-008: a generation below the floor is refused");
+  floors.set(keyA, 1);
+
+  // (3) a keyless blob of an identity this device never saw (the browser case,
+  //     or a genuine first upgrade): the user is ASKED; Cancel changes nothing.
+  const idB = await Identity.generate();
+  const legacyB = await keylessBlob(idB, true);
+  const keyB = await identityFloorId(idB.edPubRaw);
+  store.set("sc.identity.v1", legacyB);
+  asked = []; answer = false;
+  await unlock();
+  assert.strictEqual(asked.length, 1, "F-ATREST-008: a keyless blob is never re-keyed without asking");
+  assert.match(asked[0], /old version of the app.*ALREADY used this identity with a newer version.*Cancel/s, "...the legacy question warns about a restored copy");
+  assert.strictEqual(stored(), legacyB, "...Cancel stores nothing");
+  assert.ok(!floors.has(keyB), "...and raises no floor");
+  assert.match(dom.el("idStatus").textContent, /Not unlocked/, "...and says it did not unlock");
+  // a v3 envelope without keys asks the LOUD question
+  store.set("sc.identity.v1", await keylessBlob(idB, false));
+  asked = [];
+  await unlock();
+  assert.match(asked[0] || "", /WARNING: your saved identity has NO encryption keys/, "F-ATREST-008: a v3 blob without keys gets the loud question");
+  // (4) confirmed: keys added once, stored, generation +1, floor raised after.
+  store.set("sc.identity.v1", legacyB);
+  asked = []; answer = true;
+  const bumps0 = identityBumps.length;
+  await unlock();
+  const up = await Identity.import(stored(), PASS);
+  assert.ok(up.publicBundle().ecdh && up.gen === 1 && !up.upgraded, "F-ATREST-008: confirmed — the new keys are stored once, as generation 1");
+  assert.ok(lines().some((l) => /new encryption keys were created for your identity — you confirmed it/.test(l)), "...and the transcript says so");
+  const bumpB = identityBumps.slice(bumps0).find((b) => b.id === keyB);
+  assert.ok(bumpB && bumpB.v === 1 && bumpB.blob === stored(), "...the floor was raised to 1 AFTER the upgraded blob was stored");
+  // (5) a crash/failed write between storing and raising: the blob is safe,
+  //     the next unlock catches the floor up (no brick).
+  const idC = await Identity.generate();
+  store.set("sc.identity.v1", await idC.export(PASS));
+  const keyC = await identityFloorId(idC.edPubRaw);
+  failIdentityBumps = 1;
+  await unlock();
+  assert.ok(!floors.has(keyC) && lines().some((l) => /rollback record for your identity could not be updated/.test(l)),
+    "F-ATREST-008: a failed floor write is said, and the identity still unlocks");
+  await unlock();
+  assert.strictEqual(floors.get(keyC), 1, "...and the next unlock raises the floor");
+  globalThis.confirm = () => true;
+  void b64;
+  console.log("OK  F-ATREST-008: a keyless identity blob is never silently re-keyed; an older copy is refused on a floored device; the floor follows the stored blob (executed)");
 }
 
 console.log("\nAll app.js OTP-path checks passed.");

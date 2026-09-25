@@ -116,3 +116,17 @@ The bundled web client is **generated at build time** from `../client` by the
   (the re-export warning appears). The node suite simulates all three
   (`client/durable.test.mjs`) and `e2e/durable-crash.mjs` proves (2) in desktop
   Chromium; neither runs the Android WebView.
+- **Owed on the phone (package 4, owner decisions):** (1) upgrade with data
+  kept: the existing identity unlocks WITHOUT the "no encryption keys"
+  question (it has them), and the native floor gains an `identity:<hash>`
+  record at generation 0; (2) the mode picker shows four modes, no RSA; (3) as
+  the GUEST of a live room (DHKE), the owner's key appears on the admission
+  sheet ("Is this who you are expecting?", Continue / Refuse) on the phone
+  layout, above the tab bar, with the same 500 ms tap guard; Refuse returns to
+  the room screen with the reason, Continue reaches the safety number; (4) with
+  a contact verified in person on the phone (the pin written by "It matches"),
+  joining their room shows no prompt and the transcript line "approved without
+  asking"; (5) mixed versions: the 0.3.x APK as owner and the new client as
+  guest, and the reverse, still connect (only the new guest is asked). The
+  node suite and e2e cover all of it in desktop Chromium; none runs the
+  Android WebView.

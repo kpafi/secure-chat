@@ -19,7 +19,10 @@
 //   root (it shares the relay's origin), so the in-person check still governs.
 
 import { makeCipher, isAscii, bufToB64, b64ToBuf, REMOVED_ALGS } from "./crypto.js";
-import { Identity, canonicalPublicBundle } from "./identity.js";
+import {
+  Identity, canonicalPublicBundle, checkIdentityGeneration, raiseIdentityFloor, identityFloorId,
+} from "./identity.js";
+import { captureNativeFloor } from "./nativefloor.js";
 import {
   signHandshake, verifyHandshake, freshNonce, isValidNonce, signKnock, verifyKnock,
   unb64,
@@ -160,6 +163,9 @@ function promptSecret(message) {
 // localStorage keys. Private keys live only inside the passphrase-encrypted
 // identity blob; pins hold peers' PUBLIC bundles only.
 const LS_IDENTITY = "sc.identity.v1";
+// Package 4 (F-ATREST-008): the identity blob's native floor (Android; null in
+// a plain browser). See checkIdentityGeneration in identity.js.
+const identityFloor = captureNativeFloor();
 const LS_PINS = "sc.pins.v1";
 const LS_USERNAME = "sc.username.v1";
 const LS_LOOKUP_TOKEN = "sc.lookuptoken.v1"; // our directory lookup token
@@ -813,6 +819,8 @@ async function createIdentity() {
     identity = await Identity.generate();
     const blob = await identity.export(pass);
     localStorage.setItem(LS_IDENTITY, blob);
+    // F-ATREST-008: the floor follows the stored blob, never leads it.
+    await raiseIdentityFloorSaid(identity);
     await unlockContacts(pass, { expectStore: false }); // contact store shares the identity passphrase
     els.idPass.value = "";
     await showIdentityUnlocked();
@@ -826,22 +834,78 @@ async function createIdentity() {
 // the per-view unlock rows (Profile / Users / Chats), so a new tab opened from
 // an invite link can unlock where the user actually is instead of sending them
 // back to the Live room. Returns null on success, or an error message.
+// Package 4 (F-ATREST-008): the two questions a keyless identity blob raises.
+// The legacy one is the genuine one-time upgrade — but a restored OLD copy
+// looks exactly like it in a browser (the envelope's version is outside the
+// encryption), so it says what to do if this identity was used before.
+const NEW_KEYS_LEGACY_Q =
+  "This identity was saved by an old version of the app and has no encryption keys yet.\n\n" +
+  "Create them now? Your fingerprint does not change, but contacts will see new encryption keys.\n\n" +
+  "If you have ALREADY used this identity with a newer version of the app, press Cancel: " +
+  "an old copy has been put back, and new keys would make your mail unreadable.";
+const NEW_KEYS_MISSING_Q =
+  "WARNING: your saved identity has NO encryption keys, although this app always saves them. " +
+  "An older or edited copy has probably replaced it.\n\n" +
+  "Continuing creates NEW encryption keys: mail sealed to your old keys can no longer be opened, " +
+  "and every contact will see your keys change.\n\n" +
+  "Press Cancel and restore your newest backup unless you know exactly why this happened.";
+
+// Raise the identity floor to the STORED blob's generation. A failure leaves
+// the blob safe (it is already stored) and the next unlock catches up — said,
+// not swallowed.
+async function raiseIdentityFloorSaid(id) {
+  if (!identityFloor) return;
+  try {
+    raiseIdentityFloor(identityFloor, await identityFloorId(id.edPubRaw), id.gen);
+  } catch (e) {
+    addLine("sys", "", "[the device's rollback record for your identity could not be updated — it will be retried at the next unlock]", true);
+  }
+}
+
 async function unlockWithPassphrase(pass) {
   const blob = localStorage.getItem(LS_IDENTITY);
   if (!blob) return "Nothing to unlock — create an identity in the Live room first.";
   if (!pass) return "Enter your identity passphrase to unlock.";
   try {
-    identity = await Identity.import(blob, pass);
-    if (identity.upgraded) {
-      // Pre-v3 blob: encryption keys were just added — persist them so the
-      // upgrade happens exactly once, then re-publish the bundle below.
-      localStorage.setItem(LS_IDENTITY, await identity.export(pass));
+    let imported;
+    try {
+      imported = await Identity.import(blob, pass);
+    } catch (e) {
+      if (e.code !== "IDENTITY_NEEDS_NEW_KEYS") throw e;
+      // F-ATREST-008: never re-key silently. On Android a device that has used
+      // this identity refuses outright (checkIdentityGeneration); otherwise the
+      // user decides, told what it costs.
+      await checkIdentityGeneration(e.edPubRaw, e.storedGen, false, identityFloor);
+      if (!confirm(e.legacy ? NEW_KEYS_LEGACY_Q : NEW_KEYS_MISSING_Q)) {
+        identity = null;
+        addLine("sys", "", "[identity NOT unlocked — its saved copy has no encryption keys and you chose not to create new ones]", true);
+        return "Not unlocked: " + e.message + ". Restore your newest identity backup, or unlock again and confirm new keys.";
+      }
+      imported = await Identity.import(blob, pass, { allowNewEncryptionKeys: true });
     }
+    // Refused BEFORE anything is stored or unlocked: a copy older than the one
+    // this device has used (Android).
+    await checkIdentityGeneration(imported.edPubRaw, imported.storedGen, !imported.upgraded, identityFloor);
+    identity = imported;
+    if (identity.upgraded) {
+      // Encryption keys were just added, with the user's consent — persist
+      // them (generation +1) so it happens exactly once, then raise the floor
+      // and re-publish the bundle below.
+      localStorage.setItem(LS_IDENTITY, await identity.export(pass));
+      addLine("sys", "", "[new encryption keys were created for your identity — you confirmed it]", true);
+    }
+    await raiseIdentityFloorSaid(identity);
     await unlockContacts(pass, { expectStore: true }); // contact store shares the identity passphrase
     await showIdentityUnlocked();
     return null;
   } catch (e) {
     identity = null;
+    // The package-4 refusals say what happened; everything else keeps the
+    // one sentence that does not help a guesser.
+    if (e && (e.code === "IDENTITY_ROLLBACK" || e.code === "IDENTITY_FLOOR")) {
+      addLine("sys", "", "[identity NOT unlocked — " + e.message + "]", true);
+      return "Not unlocked: " + e.message;
+    }
     return "Wrong passphrase or corrupted identity.";
   }
 }

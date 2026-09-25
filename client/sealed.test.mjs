@@ -88,7 +88,10 @@ const legacy = new Identity({
   mldsaSecret: alice._mldsaSecret, mldsaPub: alice.mldsaPub,
 });
 const legacyBlob = await legacy.export(pass);
-const reimported = await Identity.import(legacyBlob, pass);
+// Package 4 (F-ATREST-008): never silently — a keyless blob is refused until
+// the user confirms new keys (a v3 envelope without keys is the loud variant).
+await assert.rejects(Identity.import(legacyBlob, pass), (e) => e.code === "IDENTITY_NEEDS_NEW_KEYS" && e.legacy === false);
+const reimported = await Identity.import(legacyBlob, pass, { allowNewEncryptionKeys: true });
 assert.ok(reimported.upgraded, "legacy blob triggers upgrade");
 assert.ok(reimported.publicBundle().ecdh, "upgraded identity has encryption keys");
 const reimportedV3 = await Identity.import(blobV3, pass);
