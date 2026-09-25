@@ -3,21 +3,69 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ CURRENT STATE (2026-09-24 evening)
+## ⮕ CURRENT STATE (2026-09-25) — fixing the old pentest findings on master
 
-- **`master` = `v0.3.1`** (`55c11b4`): 0.3.0 + the iOS app (PRs #2, #3) + the
-  docs refresh + `fix/contact-remove-row` + `android-ondevice-2026-09-21`
-  (formatDetail). Release notes: `deploy/release-2026-09-24-v0.3.1.md`.
-- **Relay DEPLOYED 0.3.1** at 19:13 with `deploy/deploy-2026-09-24-v0.3.1.sh`
-  from a detached `v0.3.1`: backup `/root/accounts.db.bak-2026-09-24-1913`,
-  accounts 31 = 31, every check green (public `/healthz` 0.3.1, formatDetail
-  and the centred Remove served, iOS-origin preflight 200 / foreign 400,
-  `worker-src 'none'`, TRUSTED_PROXIES unset, loopback only).
-- **Not on the box:** the Caddyfile's `/ios/` block (needs a published IPA).
-- **Phone:** still the debug APK from `e811219` (0.3.0, versionCode 3); a
-  0.3.1 rebuild is optional (the old APK works against this relay).
-- **Local `master` (`a4e5063`, Phase 7) is still diverged** from `origin/master`
-  — never `git pull` it; deploy from a detached tag checkout.
+- **Goal (owner, 2026-09-24):** every still-open pentest finding fixed on `master`,
+  then GitHub holds only `master` (+ `ci/ios-shots`, which iOS CI recreates).
+  The old unpushed Phase 1–7 line is preserved as branch `phase7-local`
+  (`a4e5063`); its fixes are ported package by package, then it is archived as a
+  tag and deleted. Local `master` = `origin/master` since 2026-09-24.
+- **Owner decisions (2026-09-24):** RSA mode → remove. Guest side → also asks
+  for approval. Chats in several tabs → only one active tab (like OTP pads).
+  Safety-number format (F-P7-21 / F-CRYPTO-013) → unchanged, documented only.
+- **Merged, NOT deployed:** package 1 (relay availability + mailbox) and
+  package 2 (web client vs a hostile relay) — see the next entry.
+- **Next:** package 3 (at-rest + Android), package 4 (RSA removal, guest-side
+  approval, chats single tab, F-ATREST-008), package 5 (ops: Caddy global log,
+  systemd hardening, one ship list). Then release 0.4.0 (APK first if the wire
+  contract changes), deploy, phone APK, archive `phase7-local`.
+- **Relay deployed:** still 0.3.1 (`v0.3.1`).
+- The full itemised 2026-08-07 list (all 47, incl. 18 Low / 15 Info) lives
+  outside the repo at `~/secure-chat-pentest/state/findings/INDEX.md`.
+
+## (2026-09-25, packages 1 + 2 merged: relay findings and client-vs-hostile-relay)
+
+**Package 1 — `fix/relay-findings` (backend).** item 15 ML-DSA verify
+serialised (dilithium_py's SHAKE fallback is not thread-safe: 71/160 valid
+signatures rejected under 8 threads); F-P7-2/F-P7-3 per-subject buckets charged
+after their gates; register/challenge/verify on their own router outside the
+shared /api bucket; item 19 host bucket first, per-name refill 2.0 (reach 10);
+mailbox POST per-host ceiling, prune after the gate, busy_timeout, 503 only for
+BUSY/LOCKED, `DatabaseError` → 500 + one name-only log line; mailbox storage as
+per-row charge (≥ budget/row-cap) with running totals (DELETE … RETURNING under
+BEGIN IMMEDIATE), 256 MiB byte budget, evict the newest envelope of the heaviest
+OTHER inbox, recipient-heaviest → loud 429; 8 KiB minimum envelope (the
+smallest real sealed envelope is ~13.6 KB); F-P7-10/11/12/13/15/16/25/26,
+F-P7-A4, §9 I-2, COOP + CORP (off /api), 4 unused vendored @noble files
+deleted, sqlite connections closed, CORS allows DELETE (apps could not unvouch).
+Four pentest-new-code rounds: round 2 found a HIGH in the fix (counter drift
+under concurrent prunes → budgets off, disk fillable), fixed with RETURNING +
+lock-first; rounds 3–4 nothing above Medium. Accepted residual, stated in
+config.py: a holder of the victim's handle with ~65 accounts can keep evicting
+the victim's newly arriving mail while the victim is offline (the relay cannot
+tell padding from mail under sealed sender); without the handle it costs
+~256 MiB / min(inbox bytes, 4 MiB) accounts. Migration of the v0.3.1 DB schema
+verified in 8 scenarios (incl. crashes mid-migration and rollback+upgrade).
+
+**Package 2 — `fix/client-hostile-relay` (client).** transcript-line forgery
+closed (formatDetail and addLine clean text; every hint/status sink
+sanitised; parse failures give fixed sentences); #log bounded (500, narration
+folding, keep-marked record lines, 3-tier eviction; joined/denied/turned-away
+latched and role-guarded); frames of an app-closed or superseded socket
+dropped, session re-checked after every await; own identity refused as peer;
+F-P7-19; sealed receive path ASCII rule, canonical + size-checked sender keys;
+frame/body/batch caps (worst-case JSON escaping); per-view hints; setVouches
+requires its keys; crypto controls pinned (F-P7-A1/A6); app.js now EXECUTED in
+`npm test` (dom-stub + app-behaviour). Four review rounds: round 1 found a
+Medium the fix introduced (mail lost to the body cap), round 3 a pre-existing
+Medium: a verification gate drawn after a relay close survived into the next
+session and "It matches" pinned the new session's (MITM) peer — reproduced in
+Firefox; fixed by gateGen + gateFor binding (pin only the bundle on screen, same
+open connection). Nothing above Low left.
+
+**Checked on the merged tree:** backend 256, `npm test` green, ios dist green,
+the three integration tests, e2e hostile-relay, room-admission, two-user-flow,
+no-dead-ends, all-modes 32/32, contact-profile 64/64.
 
 ## (2026-09-24, 0.3.0 deployed + the Remove-row fix — merged and released in 0.3.1)
 
