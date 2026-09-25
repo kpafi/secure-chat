@@ -13,11 +13,13 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
 - **Owner decisions (2026-09-24):** RSA mode → remove. Guest side → also asks
   for approval. Chats in several tabs → only one active tab (like OTP pads).
   Safety-number format (F-P7-21 / F-CRYPTO-013) → unchanged, documented only.
-- **Merged, NOT deployed:** package 1 (relay availability + mailbox) and
-  package 2 (web client vs a hostile relay) — see the next entry.
-- **Next:** package 3 (at-rest + Android), package 4 (RSA removal, guest-side
-  approval, chats single tab, F-ATREST-008), package 5 (ops: Caddy global log,
-  systemd hardening, one ship list). Then release 0.4.0 (APK first if the wire
+- **Merged, NOT deployed:** package 1 (relay availability + mailbox),
+  package 2 (web client vs a hostile relay), package 5 (ops: Caddy default
+  logger discarded, systemd second-tier sandboxing — exposure 7.7 → 1.1, one
+  ship list for relay/rsync/APK/iOS, code root-owned on deploy). The 0.4.0
+  deploy has extra steps on the box: `deploy/README.md`, "Pending on the box".
+- **Next:** package 3 (at-rest + Android, in review), package 4 (RSA removal, guest-side
+  approval, chats single tab, F-ATREST-008). Then release 0.4.0 (APK first if the wire
   contract changes), deploy, phone APK, archive `phase7-local`.
 - **Relay deployed:** still 0.3.1 (`v0.3.1`).
 - The full itemised 2026-08-07 list (all 47, incl. 18 Low / 15 Info) lives
