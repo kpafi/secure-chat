@@ -1,0 +1,22 @@
+# The ONE ship list for the web client (Phase-7 pentest F-P7-18).
+#
+# Development files in client/ that NO channel ships. Read as-is by
+#   - the deploy script's rsync to the box   (--exclude-from, rsync syntax)
+#   - android/app/build.gradle.kts           (each line as **/<p> and **/<p>/**)
+#   - ios/scripts/sync-web.sh                (--exclude-from)
+# and mirrored by the relay's static gate (backend/main.py _DEV_ONLY_PATTERNS),
+# which cannot read this file because deploy/ is not on the box.
+# backend/tests/test_ship_list.py holds all four to this list.
+#
+# Rules: one pattern per line, no '/' in a pattern (it matches any path
+# component, at any depth; a matching directory is excluded whole). Lines
+# starting with '#' or ';' and blank lines are ignored (rsync's rules).
+#
+# Deliberately SHIPPED everywhere: manifest.webmanifest and icons/ (index.html
+# links both; the apps do not use the manifest, but leaving it out would only
+# turn the link into a 404 and fork the list), and vendor/lean-qr/LICENSE.
+*.test.mjs
+package*.json
+node_modules
+.*
+README.md

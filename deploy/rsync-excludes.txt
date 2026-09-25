@@ -1,0 +1,19 @@
+# Box-only rsync excludes: what the deploy's rsync of backend/ + client/ must
+# never copy on top of the box, beyond the ship list (ship-excludes.txt).
+# Every deploy script uses BOTH:
+#   rsync ... --exclude-from deploy/ship-excludes.txt \
+#             --exclude-from deploy/rsync-excludes.txt backend client BOX:/opt/secure-chat/
+# backend/tests/test_ship_list.py pins that and the database lines below.
+#
+# NEVER drop the database lines: a dev accounts.db copied over the live one
+# (or its -wal/-shm) destroys the directory and every sealed mailbox.
+accounts.db*
+*.db
+*.db-shm
+*.db-wal
+# Local caches and environments (the box has its own venv at /opt/secure-chat/venv).
+__pycache__
+.venv
+.pytest_cache
+# The relay does not need its tests on the box.
+tests

@@ -21,6 +21,7 @@ Threat-model notes (see PROGRESS.md for the full list):
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import logging
 import os
@@ -194,11 +195,17 @@ app.include_router(mailbox.router)
 # Development/tooling files that live in the client dir but must never be
 # served to the public (L-02). StaticFiles would otherwise expose them; this
 # guard 404s them regardless of what is on disk (defense in depth alongside the
-# deploy excludes). Exact paths + a suffix rule for test modules.
-_BLOCKED_BASENAMES = {"package.json", "package-lock.json"}
-# Whole subtrees that must never be reachable, matched on normalized path
-# segments (not string prefixes).
-_BLOCKED_SEGMENTS = {"node_modules"}
+# deploy excludes).
+#
+# Phase-7 pentest F-P7-18: THE SAME LIST as deploy/ship-excludes.txt, which the
+# deploy rsync, the APK's Gradle sync and the iOS bundle's sync-web.sh read.
+# The relay cannot read it (deploy/ is not on the box), so it is repeated here
+# and backend/tests/test_ship_list.py holds the two equal. Semantics are
+# rsync's for a slash-free pattern: it matches ANY path segment, so a matching
+# directory blocks everything below it. `client/vendor/README.md` used to be
+# served because only package*.json, *.test.mjs, node_modules and dotfile
+# BASENAMES were refused (a file inside a dot-directory was served too).
+_DEV_ONLY_PATTERNS = ("*.test.mjs", "package*.json", "node_modules", ".*", "README.md")
 
 
 def _is_blocked_static(path: str) -> bool:
@@ -218,14 +225,11 @@ def _is_blocked_static(path: str) -> bool:
     # Collapse "//", "/./" and any "/x/../" the way the static mount will.
     normalized = posixpath.normpath("/" + path.strip("/"))
     segments = [s for s in normalized.split("/") if s]
-    if any(s in _BLOCKED_SEGMENTS for s in segments):
-        return True
-    basename = segments[-1] if segments else ""
-    # Dotfiles (.package-lock.json, .env, .git*) are never client assets.
-    return (
-        basename in _BLOCKED_BASENAMES
-        or basename.startswith(".")
-        or basename.endswith(".test.mjs")
+    # Every segment, not just the basename: /node_modules/x.js, /.git/config
+    # and /vendor/README.md alike. Dotfiles (.package-lock.json, .env, .git*)
+    # are never client assets.
+    return any(
+        fnmatch.fnmatchcase(seg, pat) for seg in segments for pat in _DEV_ONLY_PATTERNS
     )
 
 

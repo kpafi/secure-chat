@@ -79,9 +79,23 @@ android {
 // reachable at https://secure-chat.internal/... `Sync` mirrors the source
 // exactly, deleting stale files, so the bundle cannot drift from the reviewed
 // client. (Safe here: the destination holds nothing but this task's output.)
+//
+// Phase-7 pentest F-P7-18: the excludes come from deploy/ship-excludes.txt, the
+// ONE list the relay, the deploy rsync and the iOS bundle also use
+// (backend/tests/test_ship_list.py holds them equal). They used to be a
+// hand-kept list of Ant patterns such as "package*.json", which Ant matches at
+// the ROOT of the copy only: vendor/lean-qr/package.json and vendor/README.md
+// shipped in the APK. Each entry is applied as **/<p> (the file or directory
+// at any depth) and **/<p>/** (everything under a matching directory), which
+// is rsync's meaning of a slash-free pattern.
+val shipExcludesFile = rootProject.file("../deploy/ship-excludes.txt")
+val shipExcludes = shipExcludesFile.readLines()
+    .map { it.trim() }
+    .filter { it.isNotEmpty() && !it.startsWith("#") && !it.startsWith(";") }
 val syncWebClient = tasks.register<Sync>("syncWebClient") {
+    inputs.file(shipExcludesFile)
     from(rootProject.file("../client")) {
-        exclude("*.test.mjs", "*.integration.test.mjs", "package*.json", "node_modules")
+        shipExcludes.forEach { exclude("**/$it", "**/$it/**") }
     }
     into(layout.projectDirectory.dir("src/main/assets/web"))
 }

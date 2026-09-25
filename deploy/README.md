@@ -221,6 +221,37 @@ public clearnet site on the same host, so anyone who knows both can correlate
 them, and the clearnet site remains an attack surface into the same box. A
 location-anonymous deployment needs a host with no clearnet service on it.
 
+## What ships: one list
+
+`client/` leaves the repository four ways: the relay serves it, the deploy
+script rsyncs it to the box, Gradle copies it into the APK, and
+`ios/scripts/sync-web.sh` copies it into the iOS bundle. Which files are
+development-only (tests, package manifests, `node_modules`, dotfiles,
+`README.md`) is decided by **`ship-excludes.txt`** alone: the deploy rsync,
+Gradle and `sync-web.sh` read it, and the relay repeats it as
+`main._DEV_ONLY_PATTERNS` (it cannot read `deploy/`, which is not on the box).
+A pattern matches any path component, and a matching directory goes whole.
+`backend/tests/test_ship_list.py` runs the deploy rsync and `sync-web.sh` into a
+temp dir, fetches one real file per pattern from the relay, and checks the
+Gradle task's `**/<p>` + `**/<p>/**` translation; all four must ship the same
+set. (Pentest F-P7-18: before this, `vendor/README.md` shipped everywhere and
+`vendor/lean-qr/package.json` sat in the APK.) `manifest.webmanifest` and
+`icons/` ship everywhere on purpose: `index.html` links both.
+
+`rsync-excludes.txt` holds what only the box needs kept out (the accounts DB
+and its `-wal`/`-shm`, caches, `tests`). Every deploy script uses both files
+with `--exclude-from` and no inline `--exclude`; the newest
+`deploy-*.sh` is the template the next one is copied from.
+
+The rsync has no `--delete`, so a dev file already on the box stays there
+until removed by hand; the relay 404s it regardless. At a release, check the
+APK too:
+
+```bash
+unzip -l android/app/build/outputs/apk/*/app-*.apk | grep assets/web/ \
+  | grep -E 'README|package.*\.json|\.test\.mjs|node_modules|/\.'   # want nothing
+```
+
 ## iOS app downloads (SideStore / AltStore)
 
 > **Not yet on the box.** The `/ios/` block in `Caddyfile` was added with the
