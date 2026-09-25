@@ -35,11 +35,13 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   durable record in IndexedDB (strict durability; native floor and legacy
   watermark only refuse, never heal); **contacts + chats moved to IndexedDB**
   (strict, store+witness in one transaction), native floor advanced only after
-  the durable write. Three review rounds (round 1 HIGH: heal on a v1 blob's
+  the durable write. Four review rounds (round 1 HIGH: heal on a v1 blob's
   unauthenticated role → fixed, geometry now sealed; round 2 Lows: overlapping
   saves could arm the floor ahead of data → persist serialized; old-version tab
   / downgrade → witness mirrored in localStorage, conflicts settled by
-  authenticated generation). Real-Chromium SIGKILL test `e2e/durable-crash.mjs`
+  authenticated generation; round 3 Lows: saves beside an old tab's copy
+  refused (STALE), a localStorage copy authenticated — domain, generation,
+  salt — before it may replace the store, adoption reported). Real-Chromium SIGKILL test `e2e/durable-crash.mjs`
   fails on 0786d47, passes on 3b. **Release notes 0.4.0 must say:** first start
   moves contacts/chats to IndexedDB; **downgrading afterwards is not supported**
   (an older client refuses loudly); **reload every open tab after updating**;

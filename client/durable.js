@@ -225,6 +225,10 @@ export function del(key) {
 export function storeSlot({ blobKey, genKey, marker }) {
   let pending = true;
   let mode = null;           // "idb" | "ls"
+  // Review round 3 (info): bumped by wipe(). A save that was in flight across
+  // a Forget must not put the marker / witness mirror back afterwards (that
+  // read as a false "DELETED" on the next unlock).
+  let epoch = 0;
   let cache = { blob: null, witness: null };
   const ls = () => globalThis.localStorage;
   const lsGet = (k) => ls().getItem(k);
@@ -302,7 +306,13 @@ export function storeSlot({ blobKey, genKey, marker }) {
   // generation the new code commits (STALE instead of a lost update).
   function mirror(witness) {
     if (witness === null || witness === undefined) return;
-    if (lsGet(genKey) !== witness) ls().setItem(genKey, witness);
+    // Review round 3 (info): best effort. The mirror is a hint for older
+    // clients; a failure (quota) after IndexedDB committed must not turn a
+    // committed save into a "failed" one (the next save then reported a
+    // false STALE). read() re-mirrors on every load.
+    try {
+      if (lsGet(genKey) !== witness) ls().setItem(genKey, witness);
+    } catch { /* the store itself is saved; the mirror catches up on the next read */ }
   }
 
   // Preload at module load, so hasStore() can answer synchronously. Until it
@@ -333,6 +343,12 @@ export function storeSlot({ blobKey, genKey, marker }) {
     },
     // True when the last read went to IndexedDB (writes are durable there).
     durable: () => mode === "idb",
+    // Review round 3 (F1): a blob in localStorage beside the IndexedDB store —
+    // written by a tab still running the previous version after this one read
+    // the store. A save now would commit over it and its witness would outrank
+    // ours at the next unlock; the caller refuses the save (STALE) instead, and
+    // the next unlock settles the conflict with the passphrase.
+    foreignCopy: () => mode === "idb" && lsGet(blobKey) !== null,
     // Review round 2 (L-2): settle a conflict read() reported. `adopt` = the
     // localStorage copy is the newer authenticated generation (the caller
     // checked, with the passphrase): it becomes the IndexedDB store. Otherwise
@@ -352,13 +368,16 @@ export function storeSlot({ blobKey, genKey, marker }) {
         ls().setItem(blobKey, blob);
         ls().setItem(genKey, witness);
       } else {
+        const e = epoch;
         await write({ [blobKey]: blob, [genKey]: witness });
-        if (lsGet(marker) === null) ls().setItem(marker, "1");
+        if (e !== epoch) return; // wiped meanwhile (review round 3): leave it wiped
+        try { if (lsGet(marker) === null) ls().setItem(marker, "1"); } catch { /* best effort, as mirror() */ }
         mirror(witness);
       }
       cache = { blob, witness };
     },
     async wipe() {
+      epoch += 1;
       cache = { blob: null, witness: null };
       ls().removeItem(blobKey);
       ls().removeItem(genKey);

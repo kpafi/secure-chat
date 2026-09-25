@@ -837,5 +837,247 @@ if (r2("i6")) {
   console.log("OK  review r2 I-6: an unused durable record stranded under an old key is replaced, a used one refused");
 }
 
+// ============================================================================
+// R3. Review round 3 (pentest of f9711e7)
+// ============================================================================
+
+// F1: the REVERSE two-tab order. The old (v0.3.1) tab writes first — its CAS
+// sees the mirrored witness N and puts blob+witness N+1 in localStorage; the
+// new tab then saves (Remove bob) against IndexedDB alone and its mirror()
+// overwrote the old tab's witness; the old tab wrote again (N+2, no STALE);
+// the next unlock ADOPTED the old tab's copy — the Remove (pin revocation)
+// silently undone. Now a new-code save next to a localStorage blob is refused
+// (STALE) and the conflict is settled at unlock — with a notice on adoption.
+if (r2("r3f1")) {
+  const PASSX = "identity passphrase r3";
+  const bob = { username: "bob", token: "t", ed: "RUQx", mldsa: "TUwx", ecdh: "RUMx", mlkem: "TUsx", verified: true };
+  mem.clear(); freshIdb();
+  const oldTab = await V031C("r3f1");
+  await oldTab.unlock(PASSX);
+  await oldTab.upsert(bob);
+  await oldTab.savePin("user:bob", bob);
+  const newTab = await fresh("contacts.js", "r3f1-new");
+  await newTab.unlock(PASSX);
+  await oldTab.upsert({ username: "carol", token: "t2", ed: "RUQy", mldsa: "TUwy" }); // old tab first
+  await assert.rejects(newTab.remove("bob"), (e) => e.code === "STALE",
+    "review r3 F1: a save beside a localStorage blob an old-version tab wrote is refused (STALE), not committed over it");
+  const reload = await fresh("contacts.js", "r3f1-reload");
+  const r = await reload.unlock(PASSX);
+  assert.strictEqual(r.conflictAdopted, true, "review r3 F1: adopting an old tab's copy is reported (conflictAdopted)");
+  assert.ok(reload.get("carol"), "…the old tab's newer copy is the store");
+  reload.lock();
+  // Chats: the same, and the adoption of a newer old-tab chat store is covered
+  // (round-3 coverage gap M3b).
+  mem.clear(); freshIdb();
+  const oldH = await V031H("r3f1c");
+  await oldH.unlock(PASSX);
+  await oldH.append("bob", { dir: "in", text: "one", ts: 1, id: "e1" });
+  const newH = await fresh("chats.js", "r3f1c-new");
+  await newH.unlock(PASSX);
+  await oldH.append("bob", { dir: "in", text: "two", ts: 2, id: "e2" });
+  await assert.rejects(newH.append("bob", { dir: "out", text: "mine", ts: 3, id: null }), (e) => e.code === "STALE",
+    "review r3 F1 (chats): a save beside an old tab's localStorage blob is refused (STALE)");
+  const rh = await fresh("chats.js", "r3f1c-reload");
+  assert.deepStrictEqual(await rh.unlock(PASSX), { created: false, conflictAdopted: true },
+    "review r3 (M3b): a newer old-tab chat store is adopted, and that is reported");
+  assert.deepStrictEqual(rh.get("bob").messages.map((m) => m.text), ["one", "two"]);
+  rh.lock();
+  console.log("OK  review r3 F1: new-code saves beside an old tab's copy are refused (STALE); adoption is reported (contacts + chats)");
+}
+
+// F2: a localStorage-ONLY plant. Adoption was decided on the two witnesses
+// alone and wrote the planted blob into IndexedDB unauthenticated: an earlier
+// incarnation's pair (Forget + re-create) brought back bob's OLD pin (alarm
+// inverted); a garbage blob overwrote the good store before the refusal (raw
+// atob error). Now the blob must decrypt, carry the store's domain tag and the
+// witness's generation, and share the IndexedDB store's salt — else it is
+// dropped (reported), and IndexedDB is never touched first.
+if (r2("r3f2")) {
+  const PASSX = "identity passphrase r3 plant";
+  mem.clear(); freshIdb();
+  const a = await fresh("contacts.js", "r3f2-a");
+  await a.unlock(PASSX);
+  await a.upsert({ username: "bob", ed: "RUQtT0xE", mldsa: "TUwtT0xE", verified: true });
+  await a.savePin("user:bob", { ed: "RUQtT0xE", mldsa: "TUwtT0xE" });
+  for (let i = 0; i < 5; i++) await a.upsert({ username: "x" + i, ed: "RUQ" + i, mldsa: "TUw" + i });
+  const snapBlob = fake.getItem("sc.contacts.v1"), snapWit = fake.getItem("sc.contacts.gen.v1");
+  await a.wipe();
+  const b = await fresh("contacts.js", "r3f2-b");
+  await b.unlock(PASSX);
+  await b.savePin("user:bob", { ed: "RUQtTkVX", mldsa: "TUwtTkVX" });
+  b.lock();
+  const good = fake.getItem("sc.contacts.v1");
+  mem.set("sc.contacts.v1", snapBlob); mem.set("sc.contacts.gen.v1", snapWit);
+  const r1 = await fresh("contacts.js", "r3f2-r1");
+  const res = await r1.unlock(PASSX);
+  assert.strictEqual(r1.getPin("user:bob").ed, "RUQtTkVX",
+    "review r3 F2: an earlier incarnation's blob+witness planted in localStorage is NOT adopted (the current pin stands)");
+  assert.strictEqual(res.conflictDropped, true, "…it is dropped, and reported");
+  assert.strictEqual(fake.getItem("sc.contacts.v1"), good, "…and IndexedDB is untouched");
+  r1.lock();
+  // Garbage blob + a genuine higher witness: dropped, IndexedDB untouched,
+  // no raw decoder error.
+  mem.set("sc.contacts.v1", "{\"v\":4,\"garbage\":1}"); mem.set("sc.contacts.gen.v1", snapWit);
+  const r2m = await fresh("contacts.js", "r3f2-r2");
+  const res2 = await r2m.unlock(PASSX);
+  assert.strictEqual(res2.conflictDropped, true, "review r3 F2: a garbage localStorage blob is dropped, not adopted");
+  assert.strictEqual(fake.getItem("sc.contacts.v1"), good, "review r3 F2: …and the good IndexedDB store is never overwritten");
+  r2m.lock();
+  // Same store (same salt), a genuine higher witness, but a blob of ANOTHER
+  // generation beside it (a mismatched pair): dropped too.
+  mem.clear(); freshIdb();
+  const c = await fresh("contacts.js", "r3f2-c");
+  await c.unlock(PASSX);
+  const b0 = fake.getItem("sc.contacts.v1");                         // gen g
+  await c.upsert({ username: "q1", ed: "RUQq", mldsa: "TUwq" });    // g+1
+  const sIdb1 = new Map(fake.mem);
+  await c.upsert({ username: "q2", ed: "RUQr", mldsa: "TUwr" });    // g+2
+  const w2 = fake.getItem("sc.contacts.gen.v1");
+  c.lock();
+  freshIdb(); for (const [k, v] of sIdb1) fake.mem.set(k, v);       // IndexedDB at g+1
+  mem.set("sc.contacts.v1", b0); mem.set("sc.contacts.gen.v1", w2);  // blob g, witness g+2
+  const r3m = await fresh("contacts.js", "r3f2-r3");
+  assert.strictEqual((await r3m.unlock(PASSX)).conflictDropped, true,
+    "review r3 F2: a localStorage blob whose generation is not its witness's is dropped (not adopted on the witness alone)");
+  assert.ok(r3m.get("q1"), "…the IndexedDB store stands");
+  assert.strictEqual(fake.getItem("sc.contacts.v1"), sIdb1.get("sc.contacts.v1"), "…untouched");
+  r3m.lock();
+  // The witness record itself planted as the "blob" (same key, same salt, its
+  // own gen matches): only the domain tag tells it apart — dropped.
+  mem.set("sc.contacts.v1", w2); mem.set("sc.contacts.gen.v1", w2);
+  const r4m = await fresh("contacts.js", "r3f2-r4");
+  assert.strictEqual((await r4m.unlock(PASSX)).conflictDropped, true,
+    "review r3 F2: a record that is not a contact store (the witness, by domain tag) is never adopted as one");
+  assert.strictEqual(fake.getItem("sc.contacts.v1"), sIdb1.get("sc.contacts.v1"));
+  r4m.lock();
+  console.log("OK  review r3 F2: a planted localStorage copy is authenticated (domain, generation, salt) before adoption; IndexedDB untouched otherwise");
+}
+
+// Coverage (round 3): an EQUAL-generation localStorage copy is not adopted
+// (M3: `>` → `>=`).
+if (r2("r3cov")) {
+  const PASSX = "identity passphrase r3 cov";
+  mem.clear(); freshIdb();
+  const c = await fresh("contacts.js", "r3cov");
+  await c.unlock(PASSX);
+  await c.upsert({ username: "base", ed: "RUQb", mldsa: "TUwb" });
+  const sIdb = new Map(fake.mem);
+  await c.upsert({ username: "fromB", ed: "RUQc", mldsa: "TUwc" });
+  const blobB = fake.getItem("sc.contacts.v1"), witB = fake.getItem("sc.contacts.gen.v1");
+  c.lock();
+  freshIdb(); for (const [k, v] of sIdb) fake.mem.set(k, v);
+  const c2 = await fresh("contacts.js", "r3cov-2");
+  await c2.unlock(PASSX);
+  await c2.upsert({ username: "fromC", ed: "RUQd", mldsa: "TUwd" });
+  c2.lock();
+  mem.set("sc.contacts.v1", blobB); mem.set("sc.contacts.gen.v1", witB);
+  const r = await fresh("contacts.js", "r3cov-r");
+  assert.strictEqual((await r.unlock(PASSX)).conflictDropped, true,
+    "review r3 (M3): a localStorage copy at the SAME generation is dropped, not adopted");
+  assert.ok(r.get("fromC") && !r.get("fromB"), "…the IndexedDB store stands");
+  r.lock();
+
+  // M8: a save still in flight when the store is locked must not touch the
+  // floor (floorKey is gone) or revive the counter.
+  mem.clear(); floors.clear(); freshIdb();
+  const ID = "7".repeat(64);
+  const L = await withFloor("contacts.js", "r3cov-lock");
+  await L.unlock("id pass", { floorId: ID });
+  const before = [...floors.keys()].sort();
+  fake.hold();
+  const p = L.upsert({ username: "late", ed: "RUQl", mldsa: "TUwl" });
+  p.catch(() => {});
+  await settle(30);
+  L.lock();
+  fake.release();
+  await p.catch(() => {});
+  assert.deepStrictEqual([...floors.keys()].sort(), before,
+    "review r3 (M8): a save that completes after lock() does not bump any floor (no floor under a null id)");
+  console.log("OK  review r3 coverage: equal-generation copies are dropped; a save finishing after lock() touches no floor");
+}
+
+// I-6 coverage (M5b/M5c): the stranded-record replacement also requires a
+// zero watermark and an un-exported blob.
+if (r2("r3i6")) {
+  const enc8 = new TextEncoder();
+  const b64s = (u) => Buffer.from(u).toString("base64");
+  const u8 = (s) => Uint8Array.from(Buffer.from(s, "base64"));
+  const setup = async (tag) => {
+    mem.clear(); freshIdb();
+    const A = await fresh("otp.js", tag);
+    const src = await A.generatePad({ label: "i6b", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    const file = await A.exportPad(src, "xfer");
+    mem.clear();
+    await A.saveNewPad(await A.importPad(file, "xfer"), "first pass");
+    mem.clear();
+    const B = await fresh("otp.js", tag + "-b");
+    const imp = await B.importPad(file, "xfer");
+    fake.failWrites((k) => k.startsWith("sc.otp.dur."));
+    await assert.rejects(B.saveNewPad(imp, "second pass"));
+    fake.failWrites(null);
+    const outer = JSON.parse(mem.get("sc.otp.pad.v1." + src.padId));
+    const base = await crypto.subtle.importKey("raw", enc8.encode("second pass"), "PBKDF2", false, ["deriveKey"]);
+    const key = await crypto.subtle.deriveKey({ name: "PBKDF2", salt: u8(outer.kdf.salt), iterations: outer.kdf.iters, hash: "SHA-256" },
+      base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+    return { src, key, outer };
+  };
+  // (a) a watermark sealed under the new key that says the pad was used.
+  {
+    const { src, key } = await setup("r3i6a");
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key,
+      enc8.encode(JSON.stringify({ d: "secure-chat/otp-watermark/v1", padId: src.padId, send: 0, recv: 64 }))));
+    mem.set("sc.otp.wm.v1." + src.padId, JSON.stringify({ iv: b64s(iv), ct: b64s(ct) }));
+    await assert.rejects((await fresh("otp.js", "r3i6a-u")).unlockPad(src.padId, "second pass"), /damaged or forged/,
+      "review r3 (M5b): a stranded record is not replaced when the watermark says the pad was used");
+  }
+  // (b) the blob says exported.
+  {
+    const { src, key, outer } = await setup("r3i6b");
+    const inner = JSON.parse(new TextDecoder().decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv: u8(outer.iv) }, key, u8(outer.ct))));
+    inner.exported = true;
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc8.encode(JSON.stringify(inner))));
+    mem.set("sc.otp.pad.v1." + src.padId, JSON.stringify({ ...outer, iv: b64s(iv), ct: b64s(ct) }));
+    await assert.rejects((await fresh("otp.js", "r3i6b-u")).unlockPad(src.padId, "second pass"), /damaged or forged/,
+      "review r3 (M5c): a stranded record is not replaced when the blob says the pad was exported");
+  }
+  console.log("OK  review r3 coverage: the I-6 replacement also needs a zero watermark and an un-exported blob");
+}
+
+// Infos (round 3): (a) a Forget during an in-flight save must not put the
+// marker / witness mirror back after wipe(); (b) a failing mirror write
+// (quota) after the IndexedDB commit must not fail the committed save.
+if (r2("r3info")) {
+  mem.clear(); freshIdb();
+  const C = await fresh("contacts.js", "r3info");
+  await C.unlock("id pass");
+  fake.hold();
+  const p = C.upsert({ username: "late", ed: "RUQl", mldsa: "TUwl" });
+  p.catch(() => {});
+  await settle(30);
+  const w = C.wipe();
+  fake.release();
+  await p.catch(() => {}); await w;
+  assert.ok(!mem.has("sc.contacts.idb.v1") && !mem.has("sc.contacts.gen.v1"),
+    "review r3 info: a save in flight across wipe() does not put the marker or the witness mirror back");
+  assert.strictEqual(C.hasStore(), false, "…so the next unlock is a clean first run, not a false DELETED");
+
+  mem.clear(); freshIdb();
+  const D = await fresh("contacts.js", "r3info-q");
+  await D.unlock("id pass");
+  const realSet = globalThis.localStorage.setItem;
+  globalThis.localStorage.setItem = (k, v) => { if (k === "sc.contacts.gen.v1") throw new Error("QuotaExceededError"); return realSet(k, v); };
+  try {
+    await D.upsert({ username: "q", ed: "RUQq", mldsa: "TUwq" });
+  } finally {
+    globalThis.localStorage.setItem = realSet;
+  }
+  await D.upsert({ username: "q2", ed: "RUQr", mldsa: "TUwr" }); // no false STALE
+  assert.ok(D.get("q") && D.get("q2"), "review r3 info: a failed mirror write does not fail the committed save or the next one");
+  D.lock();
+  console.log("OK  review r3 info: wipe() during a save stays wiped; a mirror write failure is not a failed save");
+}
+
 console.log("\nAll durable-storage checks passed.");
 process.exit(0);

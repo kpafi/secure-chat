@@ -185,6 +185,23 @@ export function hasStore() {
 }
 
 // Same options as contacts.unlock: `floorId`, `adoptLegacy`, `adoptDeleted`.
+// Review round 3 (F2): see the conflict note in unlock(). Never throws.
+async function conflictIsNewerCopy(passphrase, conflict, idbBlob, idbWitness) {
+  try {
+    const wl = conflict.witness ? await readWitness(passphrase, conflict.witness) : null;
+    const wi = idbWitness ? await readWitness(passphrase, idbWitness) : null;
+    if (!wl || wl.corrupt || !wi || wi.corrupt || !(wl.gen > wi.gen)) return false;
+    const cb = JSON.parse(conflict.blob);
+    const ib = JSON.parse(idbBlob);
+    if (!cb || !ib || typeof cb.salt !== "string" || cb.salt !== ib.salt) return false;
+    const key = await deriveKey(passphrase, unb64(cb.salt), cb.iters || KDF_ITERS);
+    const plain = JSON.parse(dec.decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(cb.iv) }, key, unb64(cb.ct))));
+    return !!plain && typeof plain === "object" && plain.d === CHATS_DOMAIN && plain.gen === wl.gen;
+  } catch {
+    return false;
+  }
+}
+
 export async function unlock(passphrase, opts = {}) {
   if (!passphrase) throw new Error("passphrase required to unlock the chat store");
   floorKey = opts.floorId ? "chats:" + opts.floorId : null;
@@ -200,18 +217,28 @@ export async function unlock(passphrase, opts = {}) {
     lock();
     throw e;
   }
-  // Review round 2 (L-2), as in contacts.js: a copy written to localStorage by a tab still running
-  // the previous version. The higher AUTHENTICATED generation wins — both
-  // witnesses are checked under this passphrase, so an attacker can replay an
-  // old copy (dropped: lower generation) but not forge a newer one. Equal or
-  // lower is dropped, and said.
+  // Review round 2 (L-2), hardened in round 3 (F2): a blob in localStorage
+  // beside the IndexedDB store — normally what a tab still running the previous
+  // version wrote after the migration. It is adopted ONLY when it is provably
+  // the newer state of THIS store: its witness decrypts under this passphrase
+  // at a higher generation than IndexedDB's, the blob itself decrypts, carries
+  // the store's domain tag and exactly that generation, and has the same salt
+  // as the IndexedDB store (a genuine old-tab save re-uses it; a Forget +
+  // re-create, i.e. an earlier incarnation, has another). Adoption used to be
+  // decided on the witnesses alone and wrote the blob into IndexedDB before
+  // anything authenticated it: two setItem calls brought back an earlier
+  // incarnation's pins (alarm inverted), a garbage blob overwrote the good
+  // store. Anything else is DROPPED (reported), and IndexedDB is not touched.
   let conflictDropped = false;
+  let conflictAdopted = false;
   if (conflict) {
-    const wl = conflict.witness ? await readWitness(passphrase, conflict.witness) : null;
-    const wi = rawWitness ? await readWitness(passphrase, rawWitness) : null;
-    const adopt = !!(wl && !wl.corrupt && wi && !wi.corrupt && wl.gen > wi.gen);
+    const adopt = await conflictIsNewerCopy(passphrase, conflict, raw, rawWitness);
     await slot.resolve(conflict, adopt);
-    if (adopt) { raw = conflict.blob; rawWitness = conflict.witness; } else conflictDropped = true;
+    if (adopt) {
+      raw = conflict.blob; rawWitness = conflict.witness; conflictAdopted = true;
+    } else {
+      conflictDropped = true;
+    }
   }
   if (!raw) {
     const w = await readWitness(passphrase, rawWitness);
@@ -337,6 +364,7 @@ export async function unlock(passphrase, opts = {}) {
   if (!tagged) dirty = true; // upgraded in place so adoption happens once
   if (floorKey && nativeFloor && slot.durable() && data.nativeFloor !== true) dirty = true;
   if (dirty) await persist();
+  if (conflictAdopted) return { created: false, conflictAdopted: true };
   return conflictDropped ? { created: false, conflictDropped: true } : { created: false };
 }
 
@@ -382,6 +410,17 @@ function persist() {
 
 async function persistNow() {
   if (!dataKey) throw new Error("chat store is locked");
+  // Review round 3 (F1): see contacts.js — an older-version tab wrote the store
+  // to localStorage since we read it; refuse rather than race it.
+  if (slot.foreignCopy()) {
+    lock();
+    const err = new Error(
+      "your chat history was changed by an older version of the app in another tab — this page is out of date. " +
+      "Close the other tab, then reload.",
+    );
+    err.code = "STALE";
+    throw err;
+  }
   // Number past whatever the witness holds (another tab may have written): the
   // store must never end up BEHIND its own witness, or the next unlock reads
   // an honest concurrent write as a rollback. Deliberately not a refusal — see
