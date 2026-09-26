@@ -22,8 +22,8 @@ android {
         applicationId = "org.securechat.app"
         minSdk = 26      // Android 8.0 — WebView supports the crypto + asset loader we need
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.3.1"
+        versionCode = 5
+        versionName = "0.4.0"
     }
 
     buildFeatures {
