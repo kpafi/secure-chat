@@ -94,6 +94,23 @@ def test_ios_importmap_hash_matches():
     )
 
 
+def test_ios_csp_has_no_frames_and_no_workers():
+    """Package 6 fix round (F-ANDROID-002 parity): the iOS shell stamps its own
+    CSP; like Android's and the relay's it must say frame-src, child-src and
+    worker-src 'none' explicitly. Checked on the Swift source (the XCTest in
+    RelayUrlsTests runs in CI only), inside `static func csp`, code lines only."""
+    if not _WEB_SHELL.exists():
+        import pytest
+
+        pytest.skip("ios/ module not present")
+    swift = _WEB_SHELL.read_text(encoding="utf-8")
+    start = swift.index("static func csp(")
+    body = swift[start:swift.index("\n    }", start)]
+    code = "\n".join(line for line in body.splitlines() if not line.strip().startswith("//"))
+    for directive in ("worker-src 'none'; ", "frame-src 'none'; ", "child-src 'none'; "):
+        assert '"' + directive + '"' in code, f"WebShell.csp must carry {directive!r}"
+
+
 def test_ios_origin_matches_relay_allow_list():
     if not _WEB_SHELL.exists():
         import pytest

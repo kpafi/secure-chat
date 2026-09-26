@@ -422,6 +422,7 @@ class MainActivity : AppCompatActivity() {
             "style-src 'self'; " +
             "connect-src 'self' $connect; " +
             "img-src 'self' data:; " +
+            "worker-src 'none'; " +
             "frame-src 'none'; " +
             "child-src 'none'; " +
             "base-uri 'none'; " +

@@ -52,6 +52,11 @@ enum WebShell {
             "style-src 'self'; " +
             "connect-src 'self' \(connect); " +
             "img-src 'self' data:; " +
+            // Package 6 fix round (F-ANDROID-002 parity): no frames, no workers,
+            // spelled out rather than left to the default-src fallback.
+            "worker-src 'none'; " +
+            "frame-src 'none'; " +
+            "child-src 'none'; " +
             "base-uri 'none'; " +
             "form-action 'none'; " +
             "frame-ancestors 'none'"
