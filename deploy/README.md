@@ -56,8 +56,9 @@ curl -s http://127.0.0.1:8000/healthz
 ```
 
 If it does not come up, `journalctl -u secure-chat -n 50` names the failing
-line; rolling back is copying the previous unit from git and repeating the
-daemon-reload. **MailDigest on the same box is unaffected**: it runs in Docker
+line; rolling back is copying the previous unit back and repeating the
+daemon-reload (the 0.4.0 deploy script keeps the live unit in its backup
+directory and does this by itself). **MailDigest on the same box is unaffected**: it runs in Docker
 under its own units, and nothing here touches `docker.service`, Caddy's unit
 or any other service. `IPAddressDeny=` applies to this unit's cgroup only.
 
@@ -243,8 +244,14 @@ and its `-wal`/`-shm`, caches, `tests`). Every deploy script uses both files
 with `--exclude-from` and no inline `--exclude`; the newest
 `deploy-*.sh` is the template the next one is copied from.
 
-The rsync has no `--delete`, so a dev file already on the box stays there
-until removed by hand; the relay 404s it regardless. At a release, check the
+The rsync has no `--delete`, on purpose: a deletion pass skips EXCLUDED
+files, so it would not remove a dev file the ship list now excludes (like
+`vendor/README.md`); `--delete-excluded` would, but it would also delete
+whatever matches `accounts.db*` / `*.db` under backend/ on the box; and a
+wrong source path with `--delete` empties the tree. A stale file on the box is
+removed by name in the deploy script instead (0.4.0: step 1b, which also
+lists any other file on the box that the release does not ship); the relay
+404s dev files regardless. At a release, check the
 APK too:
 
 ```bash
@@ -268,39 +275,55 @@ backend/, client/ and the venv (whose owner was never recorded here),
 and counts what under `/opt/secure-chat` is still owned by `securechat`
 (want 0).
 
-## Pending on the box (repo ahead of the live setup since 2026-09-25)
+## Done by `deploy-2026-09-26-v0.4.0.sh` (was "Pending on the box")
 
-Package 5 changed only repository files. The next deploy (0.4.0) must, on the
-box, in this order:
+Package 5 changed only repository files; the box catches up with the 0.4.0
+deploy, whose script does each of the steps below. **Not run yet** — the relay
+stays 0.3.1 until the owner runs it.
 
-1. Copy the next deploy script from the newest `deploy-*.sh` (it already uses
-   `ship-excludes.txt` + `rsync-excludes.txt` and root ownership); run it from
-   a checkout that has both lists.
-2. Remove the dev file the old rsync left behind (no `--delete`):
-   `rm -f /opt/secure-chat/client/vendor/README.md` (the new relay 404s it
-   anyway).
-3. Ownership: the script's step 2 (`chown -R root:root` on backend/,
-   client/ and venv/, `chmod -R u=rwX,go=rX` on backend/ and client/); its
-   count of files still owned by `securechat` must say 0.
-4. Unit: `install -m 0644 -o root -g root deploy/secure-chat.service
-   /etc/systemd/system/`, `systemd-analyze verify`, `systemctl daemon-reload`,
-   `systemctl restart secure-chat`, `systemd-analyze security secure-chat`
-   (want about 1.1), healthz, and a login + a sealed message from a phone
-   (the sandbox's first run on the real box; see "The unit's sandbox").
-5. Caddy: `cp deploy/Caddyfile /etc/caddy/Caddyfile` (it includes the `/ios/`
-   block; see "iOS app downloads" if that is not wanted yet), `caddy validate
-   --config /etc/caddy/Caddyfile`, `systemctl reload caddy`. After some traffic,
-   `journalctl -u caddy --since -10min` must hold no client IP (with the
-   default logger discarded it should hold nothing but ACME lines). Note the
+1. The script is a copy of the previous template: rsync with
+   `ship-excludes.txt` + `rsync-excludes.txt` and root ownership. Its
+   preflight refuses a checkout without both lists, with uncommitted or
+   untracked files under backend/ client/ deploy/, or without the 0.4.0
+   markers.
+2. Removes the dev files the old rsync left behind (no `--delete`, see "What
+   ships: one list"), by name: `client/vendor/README.md` (the new relay 404s
+   it anyway) and the four `@noble` modules deleted from `vendor/` in package
+   1. Anything else on the box that 0.4.0 does not ship is listed, not deleted.
+3. Ownership: step 2 (`chown -R root:root` on backend/, client/ and venv/,
+   `chmod -R u=rwX,go=rX` on backend/ and client/); its count of files still
+   owned by `securechat` must say 0.
+4. Unit: backs up the live unit, runs `systemd-analyze verify` on the staged
+   file, `install -m 0644 -o root -g root`, `daemon-reload`, start, and waits
+   for `/healthz` 0.4.0 with no restart in between. If the relay does not come
+   up it prints `journalctl -u secure-chat -n 50`, **puts the previous unit
+   back and starts the relay again by itself** (and restores the previous code
+   if even that fails), then exits non-zero. `systemd-analyze security
+   secure-chat` is printed in step 5 (want about 1.1). A login + a sealed
+   message from a phone stays a manual check (the sandbox's first run on the
+   real box; see "The unit's sandbox").
+5. Caddy: backs up `/etc/caddy/Caddyfile`, runs `caddy validate` on the staged
+   copy **before** installing it and again in place, then `systemctl reload
+   caddy`; a failed validate or reload restores the backup. The `/ios/` block
+   goes live with it and answers 404 until an IPA is published (see "iOS app
+   downloads"). After some traffic, `journalctl -u caddy --since <reload>`
+   must hold no client IP (with the default logger discarded it should hold
+   nothing but ACME lines); the script prints the exact command. Note the
    trade-off: Caddy's own runtime messages no longer reach journald either
    (a failed `caddy reload` still prints its error to the terminal and keeps
    the old config); `caddy validate` before every reload is the check.
 
+Backups: every run keeps the accounts DB (taken with the relay stopped), the
+live unit, the live Caddyfile and a tarball of the code as it ran in
+`/root/secure-chat-0.4.0-<stamp>/` (0700); the first run's directory is also
+linked as `/root/secure-chat-pre-0.4.0`, the state a full rollback returns to
+(`deploy/release-2026-09-26-v0.4.0.md`, "Rollback").
+
 ## iOS app downloads (SideStore / AltStore)
 
-> **Not yet on the box.** The `/ios/` block in `Caddyfile` was added with the
-> iOS distribution and has not been deployed; until it is, the file in this
-> directory is ahead of the live one.
+> **Goes live with the 0.4.0 deploy.** The `/ios/` block in `Caddyfile` is
+> installed by `deploy-2026-09-26-v0.4.0.sh`; until an IPA is published,
+> `/srv/secure-chat-ios` does not exist and every `/ios/` URL answers 404.
 
 The relay's clearnet host also serves the iOS download bundle, as static files,
 under `https://<host>/ios/`. The repository is private, so GitHub release
