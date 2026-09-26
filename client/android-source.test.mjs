@@ -269,10 +269,16 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
     '"style-src \'self\'; " +',
     '"connect-src \'self\' $connect; " +',
     '"img-src \'self\' data:; " +',
+    '"frame-src \'none\'; " +',
+    '"child-src \'none\'; " +',
     '"base-uri \'none\'; " +',
     '"form-action \'none\'; " +',
     '"frame-ancestors \'none\'"',
   ], "F-P7-A5: the CSP body is pinned line for line (connect-src = 'self' + the configured relay only)");
+  // Package 6, F-ANDROID-002: the one bridge is exposed to EVERY frame of the
+  // WebView — so no frame may load. Explicit, not only via default-src.
+  assert.ok(csp.includes('"frame-src \'none\'; " +') && csp.includes('"child-src \'none\'; " +'),
+    "F-ANDROID-002: the app CSP must say frame-src 'none' and child-src 'none' explicitly");
   ok("F-P7-A5: file/content access off, one bridge, debug-only devtools, CSP pinned");
 }
 

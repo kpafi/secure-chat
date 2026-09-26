@@ -373,6 +373,13 @@ async def security_headers(request: Request, call_next):
         # outlives the fix. It does NOT stop a compromised relay, which writes
         # its own headers. The client uses no workers (pentest dist-1 F3/2 L1).
         "worker-src 'none'; "
+        # No frames (package 6, F-ANDROID-002): default-src 'none' already
+        # covers frame-src/child-src, but only as a fallback — a later edit to
+        # default-src would silently open them. The client embeds nothing, and
+        # the Android shell's JS bridge is exposed to EVERY frame of its
+        # WebView, so "no frames" is an invariant, spelled out on both sides.
+        "frame-src 'none'; "
+        "child-src 'none'; "
         "base-uri 'none'; "
         "form-action 'none'; "
         "frame-ancestors 'none'"
