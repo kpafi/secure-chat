@@ -6175,7 +6175,13 @@ function syncAlgUI() {
   // invisible the moment the user looks away.
   if (alg !== "DHKE") els.algDetails.open = true;
 }
-els.algCards.addEventListener("change", syncAlgUI); // radio changes bubble here
+els.algCards.addEventListener("change", () => { // radio changes bubble here
+  syncAlgUI();
+  // A refusal about the mode just left ("…needs your identity") no longer
+  // applies — and, sticky at the bottom of the step, it could sit over
+  // Connect for the mode just chosen (the OTP panel is shorter than it was).
+  if (els.roomHint.classList.contains("err")) { els.roomHint.textContent = ""; els.roomHint.className = "hint"; }
+});
 // Phase 2b fix round: a filled "Expecting…" value never hides in the collapsed
 // row. Opened when it holds a value; never closed under the user's typing.
 if (els.contact.value) els.expectRow.open = true;
