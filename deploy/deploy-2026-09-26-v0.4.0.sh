@@ -30,6 +30,10 @@
 # one is a copy of it. backend/tests/test_ship_list.py holds every
 # non-historical deploy-*.sh to the shared lists and to root ownership.
 set -euo pipefail
+# Deploy of 2026-09-26: the first run stopped in 1b because `comm` ran under
+# the caller's locale (de_DE) while the lists were sorted with LC_ALL=C; the
+# re-run under LC_ALL=C went through. Pin it for every command.
+export LC_ALL=C
 
 BOX=root@138.199.144.35
 HOST=138-199-144-35.sslip.io
@@ -175,7 +179,8 @@ echo "==> 2. ownership"
 # StateDirectory= creates and owns for it. rsync -a as root would otherwise
 # carry the dev box's uid over. The venv is code too: root-owned, its modes
 # left as pip made them.
-ssh "$BOX" 'chown -R root:root /opt/secure-chat/backend /opt/secure-chat/client /opt/secure-chat/venv \
+ssh "$BOX" 'chown root:root /opt/secure-chat && chmod 755 /opt/secure-chat \
+  && chown -R root:root /opt/secure-chat/backend /opt/secure-chat/client /opt/secure-chat/venv \
   && chmod -R u=rwX,go=rX /opt/secure-chat/backend /opt/secure-chat/client \
   && find /opt/secure-chat -user securechat | wc -l | sed "s/^/    files under \/opt\/secure-chat owned by securechat (want 0): /"'
 

@@ -3,7 +3,29 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ CURRENT STATE (2026-09-26) — release 0.4.0 prepared on `release-0.4.0`, NOT deployed
+## ⮕ CURRENT STATE (2026-09-26) — release 0.4.0 merged, tagged and DEPLOYED; phone APK still owed
+
+- **Deployed 2026-09-26 ~22:13** from a detached `v0.4.0` (merge `94218b8`)
+  with `deploy/deploy-2026-09-26-v0.4.0.sh`. First run stopped in step 1b
+  (`comm` under the de_DE locale vs lists sorted with LC_ALL=C; relay briefly
+  stopped, code already copied); re-run under `LC_ALL=C` went through. All
+  checks ok except one: `/opt/secure-chat` itself was still owned by
+  securechat (the script chowned only the subdirs) — fixed by hand
+  (`chown root:root`, 755), and both fixes are now in the script. Result:
+  healthz 0.4.0 (also public), accounts 31 = 31, sandboxed unit active,
+  `systemd-analyze security` 1.1 OK, new Caddyfile live, TRUSTED_PROXIES
+  unset, loopback only, MailDigest/kiosk containers untouched. Backups:
+  `/root/secure-chat-pre-0.4.0` (first run) and
+  `/root/secure-chat-0.4.0-2026-09-26-221305`. Left on the box, not shipped,
+  decide by hand: `/opt/secure-chat/backend/.venv` (60 MB, June, unused — the
+  unit runs `/opt/secure-chat/venv`) and `/opt/secure-chat/backend/tests`.
+- **Phone:** the 0.4.0 debug APK (versionCode 5) is built
+  (`~/secure-chat-apk/secure-chat-0.4.0-debug.apk`) but NOT installed — the
+  phone was not connected. Then: login + a sealed message (release notes
+  step 6 / §5 on-device checks).
+- **GitHub:** only `master` (+ `ci/ios-shots`). The old Phase 1–7 line is
+  archived as tag `archive/phase7-local` (a4e5063); the branch is deleted.
+
 
 - **Release 0.4.0 (2026-09-26), branch `release-0.4.0` off `master` 6a512f7,
   not merged, not pushed, not tagged, not deployed.** Three commits:
@@ -34,9 +56,6 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   - step 5's relay checks against a scratch relay on 8071 all passed;
   - DB 0.3.1 → 0.4.0 → 0.3.1 → 0.4.0: counters exact.
 
-  **Next, on the owner's word:** merge + tag `v0.4.0`, run the script from a
-  detached checkout of the tag, then the phone APK (assembleDebug, `install
-  -r`) and the on-device checks (release notes §5), archive `phase7-local`.
 - **Goal (owner, 2026-09-24):** every still-open pentest finding fixed on `master`,
   then GitHub holds only `master` (+ `ci/ios-shots`, which iOS CI recreates).
   The old unpushed Phase 1–7 line is preserved as branch `phase7-local`
