@@ -194,7 +194,37 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
     15/15, no-dead-ends 17/17, all-modes 28/28, contact-profile 67/67,
     durable-crash passed
 
-  **Owed:** a re-review of round 3, merge on the owner's word.
+  **Round 4 (2026-09-26, independent OTP sweep of 92efe63):** round 3
+  confirmed. One more MEDIUM, pre-existing and browser only: the same pad
+  file imported in two tabs gave a two-time pad (no pad lock; saveNewPad
+  checked "used?" only before its KDF; a new-key write discarded the other
+  tab's records). Fixed in `c272817` by enforcing a GENERAL invariant rather
+  than one more point fix:
+
+  > every writer of a pad's storage holds that pad's session lock, and every
+  > decision taken before a KDF is re-checked after it, right before the
+  > write.
+
+  - Import, Generate and Forget go through `withPadLock`.
+  - saveNewPad re-checks after its KDF.
+  - writePadBlob refuses to overwrite another key's records (only a
+    module-private FRESH_SAVE token may).
+  - Saves never start after a close; all in-flight saves hold the lock.
+  - A reconnect waits for the previous session's save; a stale cached key is
+    dropped.
+
+  The per-writer audit table is in the commit message. A real two-tab
+  Chromium check of this finding (not committed) reports "B refused, no
+  rewind". The round-3 browser PoC still reports "no reuse".
+
+  Re-checked:
+  - backend 302, `npm test` (all files), ios dist
+  - gradle + 12 unit tests
+  - e2e on 8061: hostile-relay 24/24, room-admission 49/49, two-user-flow
+    15/15, no-dead-ends 17/17, all-modes 28/28, contact-profile 67/67,
+    durable-crash passed
+
+  **Owed:** a re-review of round 4, merge on the owner's word.
 - **Next:** merge package 6, then release 0.4.0 (no wire change beyond the
   additive `?by=`; release notes: IndexedDB migration, no downgrade, reload
   open tabs, OTP needs IndexedDB, RSA removed, guest approval, one active
