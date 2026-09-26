@@ -120,7 +120,30 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   get the old answer). **Release notes 0.4.0 add:** the gap line; "vouch not
   re-checked"; weak-passphrase warnings. iOS WebShell.swift's CSP should get
   the same two frame directives (iOS branch, not touched here).
-  **Owed:** review of the branch (pentest-new-code), merge on the owner's word.
+  **Fix round (2026-09-26, two reviews: no Critical/High in the branch):**
+  MEDIUM, pre-existing on master — one OTP pad could be EXPORTED TWICE
+  (double click / click during the KDF / another tab's stale unlock cache →
+  two files of one pad, a two-time pad): now a synchronous in-flight latch,
+  a per-pad Web Lock around the export (no Web Locks → no export), and a
+  fresh authenticated re-read (otp.unlockPad with the cached key) under the
+  lock; app-otp.test.mjs's page-reload imports are fenced (any click after a
+  reload throws). Low — the gap notice subtracted every pre-gate frame, so
+  injected junk hid real drops: AES256/OTP now hold/subtract nothing (and say
+  "before the secure channel was ready"); DHKE/PQKEM hold ≤ 64 pre-gate frames
+  and subtract only those that AUTHENTICATE on a scratch walk
+  (countAuthentic) — closes the documented masking residual; hold reset per
+  connection (bound). iOS CSP parity: worker/frame/child-src 'none' on iOS
+  (and worker-src on Android), pinned via test_csp_hash.py + XCTest.
+  Passphrase screen: no-letters, repeated-block and short-word+digits rules.
+  README corrections: window is "64 or more", a hostile relay can keep a
+  retracted but validly signed vouch (no time in the signature — known
+  limit), the gap notice needs a later frame, about:blank/srcdoc frames.
+  Mutants per item in the fix-round commits (ae0c6a2, 216e3e1, b54ce8b,
+  e699fe2, 79209eb). Re-checked: backend 302, npm test (all files), ios
+  dist, gradle + 12 unit tests, e2e on 8061 — hostile-relay 24/24,
+  room-admission 49/49, two-user-flow 15/15, no-dead-ends 17/17, all-modes
+  28/28, contact-profile 67/67, durable-crash passed.
+  **Owed:** a re-review of the fix round, merge on the owner's word.
 - **Next:** merge package 6, then release 0.4.0 (no wire change beyond the
   additive `?by=`; release notes: IndexedDB migration, no downgrade, reload
   open tabs, OTP needs IndexedDB, RSA removed, guest approval, one active
