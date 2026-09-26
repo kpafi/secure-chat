@@ -52,7 +52,7 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   (an older client refuses loudly); **reload every open tab after updating**;
   OTP needs IndexedDB (refused in private modes without it). On-device checks
   owed: android/README.md ("Owed on the phone (package 3b …)") + iOS twin.
-- **Package 4 on branch `fix/owner-decisions`, NOT merged (2026-09-25):** the
+- **Package 4 merged, NOT deployed (2026-09-26; three review rounds, nothing above Info left):** the
   four owner decisions. (1) **RSA removed** (F-CRYPTO-009, moots F-CRYPTO-007):
   implementation deleted, makeCipher refuses it by name, picker has four modes;
   an old client in RSA mode gets ONE latched line + a clean close (not
@@ -94,9 +94,11 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   "Use here" (an invite link opened while the app is open in another tab
   needs it too); an identity saved without encryption keys now asks before
   new ones are made.
-- **Next:** review + merge package 4. Then release 0.4.0 (APK first if the wire
-  contract changes — package 4 does not change it), deploy, phone APK, archive
-  `phase7-local`.
+- **Next:** package 6 (sweep of the remaining Low/Info findings + a "Known
+  limits" section in README.md). Then release 0.4.0 (no wire change; release
+  notes: IndexedDB migration, no downgrade, reload open tabs, OTP needs
+  IndexedDB, RSA removed, guest approval, one active tab), deploy incl.
+  deploy/README.md "Pending on the box", phone APK, archive `phase7-local`.
 - **Relay deployed:** still 0.3.1 (`v0.3.1`).
 - The full itemised 2026-08-07 list (all 47, incl. 18 Low / 15 Info) lives
   outside the repo at `~/secure-chat-pentest/state/findings/INDEX.md`.
