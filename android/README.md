@@ -72,8 +72,10 @@ in the client first. Verify on a device by backgrounding the app and opening
 recents (blank card), and with `adb shell screencap` (refused or black).
 
 ## The pad-floor bridge and frames (F-ANDROID-002)
-The native OTP/store floor is reached through ONE `addJavascriptInterface`
-bridge, `SecureChatPadFloor`. Android exposes such a bridge to **every frame**
+The native OTP/store floor is reached through an `addJavascriptInterface`
+bridge, `SecureChatPadFloor` (since the OTP transfer sheets there is a second
+one, `SecureChatFiles`, below; everything in this section holds for both).
+Android exposes such a bridge to **every frame**
 of the WebView, of any origin — so the bridge is only as narrow as the set of
 frames the WebView can ever load. The app loads no framed content, and since
 package 6 that is a pinned invariant rather than an accident: the CSP stamped
@@ -97,6 +99,68 @@ before the next statement runs). Moving to it means reworking every floor call
 site into an async round trip with its own failure and ordering cases, a
 larger change than the risk it removes while no framed content loads. Revisit if the
 app ever needs a frame.
+
+## Pad files: Share, Save to device, Import (OTP transfer sheets)
+Before this, Import did nothing on the phone (a WebView ignores
+`<input type=file>` unless the `WebChromeClient` implements
+`onShowFileChooser`) and Export handed out nothing (a WebView drops
+`<a download>` on a `blob:` URL) — after the pad had been latched as exported.
+Spec: `design/research/reviews/otp-transfer-brief.md` 5, 6, 9. Code:
+`PadFiles.kt` (validation, the bridge) and `MainActivity` (the intents).
+
+- **Export** goes through a second bridge, `SecureChatFiles`, captured in the
+  same document-start script as the pad floor and republished frozen as
+  `window.__SECURE_CHAT_FILES__ = {share, save}` (bound methods,
+  non-writable, non-configurable; `verifyRelayConfig` refuses to run without
+  it). `share(name, text)` / `save(name, text)` answer at once with a request
+  id, `"busy"` or `"invalid"`; the outcome (`shared` / `saved` / `cancelled` /
+  `error`) comes back through `window.__SECURE_CHAT_FILES_RESULT__(id,
+  outcome)`, evaluated by the shell from our own hex id and a constant.
+- **Validated natively**, whatever the page checked: the name must be exactly
+  `secure-chat-pad-YYYY-MM-DD-HHMM.json` (ASCII digits — on Android `\d` is
+  ICU's, which admits any Unicode digit), the text at most 4 MiB and exactly
+  the envelope `exportPad()` writes (`client/android-source.test.mjs` runs the
+  real `exportPad()` against the Kotlin pattern). One request at a time.
+- **What page script can do with it** (any script in the page reaches it):
+  ask for the system share sheet or save dialog for one timestamp-named,
+  pad-envelope-shaped file. Nothing leaves app-private storage until the user
+  picks a target in system UI. It cannot choose a path, a name, a type or an
+  intent extra, and it cannot read any file. It can spam: one request at a
+  time, and each needs the user to tap through a system screen. A page that
+  passes a huge string can exhaust memory (the bridge copies arguments before
+  any check) — denial of service by a party that already runs the page.
+- **Share** writes the one file to `cacheDir/pad-share/` and hands it out via a
+  non-exported `FileProvider` whose paths xml admits that directory only,
+  `ACTION_SEND` `application/json`, a read grant to the chosen target only.
+  *What "shared" means:* the chooser's activity result is `RESULT_CANCELED`
+  whether or not a target was picked, so the shell uses the chooser's
+  `IntentSender` (`EXTRA_CHOSEN_COMPONENT`): a target picked = `shared`; none
+  by the time the chooser returns (+1.5 s, the two signals travel separately)
+  = `cancelled`. Whether the file reached the other phone Android cannot tell
+  an app; the UI says "File shared", not "handed over". The file is deleted on
+  `cancelled`/`error`; after `shared` it stays until the next share or the
+  next start (Bluetooth reads it from a background service after its activity
+  has closed), and every start empties the directory first.
+- **Save** is `ACTION_CREATE_DOCUMENT` (`application/json`, the name
+  suggested); `saved` only after the bytes are written and the stream closed.
+- **Import**: `onShowFileChooser` → `ACTION_OPEN_DOCUMENT`,
+  `CATEGORY_OPENABLE`, `*/*` (Quick Share and Bluetooth often deliver a .json
+  as `application/octet-stream`), one document, no persisted permission. The
+  WebView's callback is answered exactly once (`null` on cancel). This works
+  with `allowContentAccess = false`: that setting governs `content://` URLs the
+  *page* loads; the chooser's pick reaches the page as an upload the WebView
+  reads itself under the one-document grant (the Import check below confirms
+  it on the device).
+- **No cloud roots (design critic r2, N-M1):** Save and Import both put
+  `EXTRA_LOCAL_ONLY`, so DocumentsUI lists local roots only, not Google Drive.
+  A pad file on a server is protected only by the transfer passphrase,
+  guessable offline for as long as the copy exists. **This is a hint**: an OEM
+  picker may ignore it, which is why the UI says "File saved", never "saved to
+  this device".
+- No new permission; no new dialog of ours (the close confirm is the page's
+  `confirm()`, through `secureShow`). The share sheet, save dialog and picker
+  are other apps' windows, which `FLAG_SECURE` does not cover; they show only
+  the neutral file name.
 
 ## SafeBrowsing is off (F-P7-24)
 `AndroidManifest.xml` sets `android.webkit.WebView.EnableSafeBrowsing` to
@@ -167,3 +231,27 @@ The bundled web client is **generated at build time** from `../client` by the
   guest, and the reverse, still connect (only the new guest is asked). The
   node suite and e2e cover all of it in desktop Chromium; none runs the
   Android WebView.
+- **Owed on the phone (OTP transfer sheets, pad files):** the Robolectric
+  tests drive the intents, not real system UI. (1) **Share…**: the chooser
+  opens; Quick Share to the second phone delivers
+  `secure-chat-pad-YYYY-MM-DD-HHMM.json` there and the sheet says "File
+  shared"; backing out of the chooser without a pick says "Not shared." within
+  ~2 s. **Check whether Bluetooth is offered at all** — AOSP Bluetooth's share
+  filter lists specific MIME types and may not include `application/json`; if
+  it is missing, that is a decision (share as `text/plain` or `*/*`), not a
+  bug to paper over. Also check the Quick Share button of the Android 14
+  sharesheet reports "File shared" (it must fire the chosen-target callback;
+  if it says "Not shared." after a real send, note the device and build).
+  (2) **Save to device**: the save dialog shows no Google Drive / cloud roots
+  (`EXTRA_LOCAL_ONLY`; if the OEM picker lists them anyway, note it); saving
+  into Downloads says "File saved" and the file in Files is the JSON envelope;
+  cancelling says "Not saved.". (3) **Import**: "Choose pad file…" opens the
+  system picker (no cloud roots), the file received by Quick Share (often
+  `application/octet-stream`) is selectable and imports; cancelling changes
+  nothing, and a second tap opens the picker again. (4) While the file is
+  ready, the close confirm is black in a screen recording (`secureShow`).
+  (5) Debug build: after a share, `adb shell run-as org.securechat.app ls
+  cache/pad-share` lists the one file; after a force-stop and restart it is
+  empty. (6) Android Back closes an open sheet (the client pushes a history
+  entry; `onBackPressed` calls `webview.goBack()` while `canGoBack()`)
+  instead of leaving the app, and does not dismiss a working sheet.
