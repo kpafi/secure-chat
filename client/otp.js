@@ -509,7 +509,13 @@ export async function importPad(fileText, passphrase) {
   }
   if (file.fmt !== "secure-chat-otp-pad" || file.v !== 1) throw new Error("unrecognized pad file format");
   if (!file.kdf || typeof file.kdf !== "object") throw new Error("unrecognized pad file format");
-  const key = await deriveKey(passphrase, unb64(file.kdf.salt), file.kdf.iters || KDF_ITERS);
+  // Android pentest (F7 lead, pre-existing): the file chose its own iteration
+  // count (anything deriveKey allows, up to 5M — or none, read as 600k), so a
+  // crafted file held the import sheet in its un-closable working state for
+  // as long as that KDF took. Every exportPad has written exactly KDF_ITERS
+  // since the format existed: anything else is refused BEFORE any KDF runs.
+  if (file.kdf.iters !== KDF_ITERS) throw new Error("this pad file asks for unsupported encryption settings");
+  const key = await deriveKey(passphrase, unb64(file.kdf.salt), KDF_ITERS);
   let plain;
   try {
     plain = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(file.iv) }, key, unb64(file.ct)));

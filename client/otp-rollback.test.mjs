@@ -1572,17 +1572,19 @@ console.log("OK  fix round 2: FULL fails closed; re-import advice only where a f
 {
   const XFER2 = "m9 transfer passphrase";
   // A pad file built by hand, so the test controls recipientRole (exportPad
-  // itself can no longer write 0). 100k iterations: the KDF floor importPad accepts.
-  const sealFile = async (plainObj, pass) => {
+  // itself can no longer write 0) and the iteration count (600k is the only
+  // one importPad accepts).
+  const sealFile = async (plainObj, pass, iters = 600000, claim = iters) => {
     const salt = crypto.getRandomValues(new Uint8Array(16));
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(pass), "PBKDF2", false, ["deriveKey"]);
-    const key = await crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" },
+    const key = await crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: iters, hash: "SHA-256" },
       base, { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
     const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key,
       new TextEncoder().encode(JSON.stringify(plainObj))));
     const b = (u) => Buffer.from(u).toString("base64");
-    return JSON.stringify({ fmt: "secure-chat-otp-pad", v: 1, kdf: { salt: b(salt), iters: 100000 }, iv: b(iv), ct: b(ct) });
+    const kdf = claim === undefined ? { salt: b(salt) } : { salt: b(salt), iters: claim };
+    return JSON.stringify({ fmt: "secure-chat-otp-pad", v: 1, kdf, iv: b(iv), ct: b(ct) });
   };
   const maker = await otp.generatePad({ label: "m9-maker", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
   const plainFor = (role) => ({
@@ -1610,7 +1612,21 @@ console.log("OK  fix round 2: FULL fails closed; re-import advice only where a f
   const good = await otp.importPad(await sealFile(plainFor(1), XFER2), XFER2);
   assert.strictEqual(good.role, 1, "control: the hand-built file with recipientRole 1 imports (the refusal is about the role, not the build)");
   good.bytes.fill(0); received.bytes.fill(0);
+
+  // Android pentest F7 lead: the file does not choose the KDF cost. A file
+  // sealed (validly) under 100k iterations, one claiming 5M, and one naming
+  // none are all refused before any KDF runs — the 5M one fast, not after 5M.
+  const SETTINGS = "this pad file asks for unsupported encryption settings";
+  await assert.rejects(otp.importPad(await sealFile(plainFor(1), XFER2, 100000), XFER2),
+    (e) => e.message === SETTINGS, "F7: a file sealed under 100k iterations is refused (it would import otherwise)");
+  const t0 = Date.now();
+  await assert.rejects(otp.importPad(await sealFile(plainFor(1), XFER2, 100000, 5000000), XFER2),
+    (e) => e.message === SETTINGS, "F7: a file asking for 5M iterations is refused");
+  assert.ok(Date.now() - t0 < 1500, `F7: …before running them (${Date.now() - t0} ms)`);
+  await assert.rejects(otp.importPad(await sealFile(plainFor(1), XFER2, 100000, undefined), XFER2),
+    (e) => e.message === SETTINGS, "F7: a file naming no iteration count is refused (no silent default)");
 }
 console.log("OK  M9: exportPad refuses a received pad; importPad refuses recipientRole 0 (exact sentences)");
+console.log("OK  F7: importPad accepts only the 600k iterations every export writes — refused before any KDF");
 
 console.log("\nAll OTP rollback checks passed.");
