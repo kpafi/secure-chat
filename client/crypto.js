@@ -169,6 +169,10 @@ class RatchetChannel {
     this.recvChain = recvChain;
     this.sendSeq = 0;
     this.recvSeq = 0;
+    // F-CRYPTO-001: how many frames the LAST authenticated frame stepped over
+    // (0 = it was the next one). Read by the app right after decrypt() —
+    // handleMessage is FIFO-serialized, so no other decrypt runs in between.
+    this.lastSkipped = 0;
     // Key confirmation (M-5). `mine` is what we send the peer; `theirs` is what
     // we require back. Computed once, from the chain heads as they are at
     // creation, and only the 32-byte tags are retained — the heads themselves
@@ -228,6 +232,11 @@ class RatchetChannel {
     );
     this.recvChain = step.chain; // commit: skipped/used keys are unrecoverable
     this.recvSeq = m.n;
+    // F-CRYPTO-001: the skipped keys are gone either way (forward secrecy);
+    // what must not be silent is THAT frames were skipped. Recorded only
+    // here, after the AEAD authenticated this frame, so a forged frame can
+    // never report a gap: only a genuine peer frame reveals one.
+    this.lastSkipped = steps - 1;
     return this._finish(pt);
   }
   _finish(pt) {
@@ -340,7 +349,8 @@ class AesPassphrase {
   async decrypt(b64) {
     if (!this.chan) throw new Error("session nonces not exchanged yet");
     return this.chan.decrypt(b64);
-  }
+  }  // F-CRYPTO-001: frames the last decrypted frame stepped over (see RatchetChannel).
+  get lastSkipped() { return this.chan ? this.chan.lastSkipped : 0; }
 }
 
 // ---- DHKE: ephemeral ECDH (P-256) -> forward-secret symmetric ratchet ------
@@ -441,7 +451,8 @@ class Dhke {
   async decrypt(b64) {
     if (!this.chan) throw new Error("handshake not complete");
     return this.chan.decrypt(b64);
-  }
+  }  // F-CRYPTO-001: frames the last decrypted frame stepped over (see RatchetChannel).
+  get lastSkipped() { return this.chan ? this.chan.lastSkipped : 0; }
 }
 
 // ---- shared byte helpers (DHKE + PQKEM) ------------------------------------
@@ -654,7 +665,8 @@ class Pqkem {
     const pt = await this.chan.decrypt(b64);
     if (!this.sealed) this._seal();
     return pt;
-  }
+  }  // F-CRYPTO-001: frames the last decrypted frame stepped over (see RatchetChannel).
+  get lastSkipped() { return this.chan ? this.chan.lastSkipped : 0; }
 }
 
 // ---- OTP: pre-shared one-time pad (true XOR) --------------------------------
@@ -730,6 +742,11 @@ class OtpPad {
     this.regionSize = pad.regionSize;
     this.sendOffset = pad.sendOffset;       // our position in our send region
     this.recvHighWater = pad.recvHighWater; // highest consumed offset in the peer's region
+    // F-CRYPTO-001: -1 when the last authenticated frame started past the
+    // highwater — pad bytes between were sent and never reached us. A pad
+    // frame carries a byte offset, not a message number, so the count is
+    // unknown; 0 when nothing was stepped over.
+    this.lastSkipped = 0;
     this._q = new CallQueue();
   }
   get needsHandshake() { return false; } // the pad is the shared secret; nothing crosses the wire
@@ -838,6 +855,7 @@ class OtpPad {
     // Consume through this frame, including any skipped gap (dropped/rejected
     // frames), zeroing it for forward secrecy. Gap bytes are unusable anyway
     // once the highwater passes them.
+    this.lastSkipped = p.o > this.recvHighWater ? -1 : 0;
     this.pad.fill(0, base + this.recvHighWater, abs + need);
     this.recvHighWater = p.o + need;
     return text;

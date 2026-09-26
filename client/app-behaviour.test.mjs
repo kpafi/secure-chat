@@ -1838,6 +1838,88 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
   console.log("OK  decision 3: contacts+chats live in one tab — a second tab does not open them; Use here takes over and the other tab locks and says why; no Web Locks falls back to 3b (executed)");
 }
 
+// ==== package 6, F-CRYPTO-001 (Low): a skipped gap is said, once per gap ==========
+// The ratchet fast-forwards over frames that never arrived and destroys their
+// keys; that used to be silent, so a relay dropping messages left no trace.
+// (a) AES256: every gap an authenticated frame steps over is one line just
+//     above it, with the count; no gap, no line; a forged frame far ahead is
+//     not a gap (it fails authentication and says "undecryptable").
+// (b) DHKE: frames WE dropped unread before our gate passed are not blamed on
+//     the relay — only a gap beyond them is.
+{
+  const GAP = /never arrived — the relay may have dropped them/;
+  const gapLines = () => lines().filter((l) => GAP.test(l));
+  const ONE = /^\[1 message from your contact never arrived — the relay may have dropped them\]( \(×\d+\))?$/;
+  // The eviction block above leaves 500 record lines; at the cap a new
+  // conversation line is the first thing evicted. Start from an empty log.
+  dom.el("log").textContent = "";
+  // The relay's `error` frame (drain) is not queued behind a decrypt, so the
+  // shown line itself is what is waited for.
+  const deliverMsg = async (ws, alg, pc, text) => {
+    await ws.deliver({ type: "msg", room: ROOM, alg, payload: await pc.encrypt(text) });
+    await until(() => said(new RegExp("^peer" + text + "$")), "the peer line " + text);
+  };
+  await nav("live");
+  const ws = await connect("AES256");
+  await ws.deliver({ type: "joined", role: "owner" });
+  const hello = ws.sent.map((f) => (f.type === "key" ? unpack(f.payload) : null)).find((p) => p && p.hello);
+  const peer = makeCipher("AES256", ROOM, { passphrase: PASS });
+  await peer.init();
+  const peerNonce = freshNonce();
+  await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: pack({ hello: true, n: peerNonce, reply: true }) });
+  await peer.setNonces(peerNonce, hello.n);
+  await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: pack({ confirm: peer.confirmation.mine }) });
+  assert.strictEqual(dom.el("text").disabled, false, "fixture: the AES256 session is confirmed");
+  const before = gapLines().length;
+  await deliverMsg(ws, "AES256", peer, "gap-m1");
+  assert.ok(said(/^peergap-m1$/) && gapLines().length === before, "control: an in-order frame shows no gap line ");
+  await peer.encrypt("gap-lost-2");
+  await peer.encrypt("gap-lost-3");
+  await deliverMsg(ws, "AES256", peer, "gap-m4");
+  const L = lines();
+  const at = L.indexOf("peergap-m4");
+  assert.ok(at > 0, "control: the frame after the gap is shown");
+  assert.strictEqual(L[at - 1], "[2 messages from your contact never arrived — the relay may have dropped them]",
+    "F-CRYPTO-001: a frame that stepped over 2 earlier ones says so, with the count, just above it");
+  await deliverMsg(ws, "AES256", peer, "gap-m5");
+  assert.ok(gapLines().length === before + 1 && !GAP.test(lines()[lines().indexOf("peergap-m5") - 1]),
+    "F-CRYPTO-001: one line per gap — the next in-order frame adds none");
+  await ws.deliver(junk(9100)); // n far ahead, fails authentication
+  await until(() => /undecryptable message/.test(lines()[lines().length - 1]), "the forged frame's narration");
+  assert.strictEqual(gapLines().length, before + 1, "a forged frame is never a gap (it does not authenticate)");
+  await peer.encrypt("gap-lost-6");
+  await deliverMsg(ws, "AES256", peer, "gap-m7");
+  assert.match(lines()[lines().indexOf("peergap-m7") - 1], ONE,
+    "...and a later gap of one says 1");
+  await dom.el("disconnect").click();
+
+  // (b) the peer passes its gate first and writes; we drop two frames unread.
+  const fay = await Identity.generate();
+  const { ws: w2, pc } = await handshakeToConfirm(fay);
+  await w2.deliver(confirmFrame(pc));
+  await until(() => !dom.el("verify").hidden, "Fay's gate");
+  const g0 = gapLines().length;
+  await w2.deliver({ type: "msg", room: ROOM, alg: "DHKE", payload: await pc.encrypt("early-1") });
+  await w2.deliver({ type: "msg", room: ROOM, alg: "DHKE", payload: await pc.encrypt("early-2") });
+  await settle(10);
+  assert.ok(!said(/^peerearly-/), "fixture: frames before our gate are dropped unread");
+  await dom.el("verifyOk").click();
+  await until(() => dom.el("text").disabled === false, "Fay's session to unlock");
+  await deliverMsg(w2, "DHKE", pc, "after-3");
+  assert.ok(said(/^peerafter-3$/), "control: the first frame after our gate is shown");
+  // (position, not only count: a narration that is already in the log folds
+  // and MOVES instead of adding a line)
+  assert.ok(gapLines().length === g0 && !GAP.test(lines()[lines().indexOf("peerafter-3") - 1]),
+    "F-CRYPTO-001: frames WE dropped before verifying are not reported as lost by the relay");
+  await pc.encrypt("after-lost-4");
+  await deliverMsg(w2, "DHKE", pc, "after-5");
+  // (a narration: the same sentence folds by membership and moves here, ×n)
+  assert.match(lines()[lines().indexOf("peerafter-5") - 1], ONE,
+    "...but a gap after that is ");
+  await dom.el("disconnect").click();
+  console.log("OK  F-CRYPTO-001: a skipped gap shows one line with its count; our own pre-verification drops are not blamed on the relay (executed)");
+}
+
 // ==== final round, Info-4: Forget while the stores are opening is not "another tab" ====
 // The L-2 re-check locked the stores and said "opened in another tab" whenever
 // the lock this unlock took was no longer held — also when THIS tab let it go

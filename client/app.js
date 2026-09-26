@@ -203,6 +203,11 @@ let otpAtRest = null;      // cached at-rest key {key,salt,iters} for cheap re-s
 let otpLockRelease = null; // releases this pad's exclusive same-origin lock
 let joined = false;
 let verified = false; // in-person gate passed; gates RECEIVING as well as sending
+// F-CRYPTO-001: peer frames this connection dropped UNREAD because the gate
+// was still up. The peer's side can pass its gate first and send; those frames
+// never reach the cipher, so the next frame we do decrypt steps over them. They
+// are ours, not the relay's — the gap notice subtracts them (see `case "msg"`).
+let droppedBeforeVerify = 0;
 // Pentest 2026-07-26 P-19: the room id and algorithm this session actually
 // negotiated, captured once at connect(). The send path used to re-read
 // roomCode()/algValue() from the live DOM, so any later UI change would have
@@ -3122,6 +3127,7 @@ async function connectInner() {
   peerBundle = null;
   verified = false;
   els.chatVerified.hidden = true; // B2: nobody is verified on a new connection
+  droppedBeforeVerify = 0; // F-CRYPTO-001: a new connection, a new chain
   myNonce = freshNonce();
   peerNonce = null;
   helloAnswered = false;
@@ -4236,11 +4242,15 @@ async function handleMessage(room, raw, sock) {
       // sends before the user confirms the safety number would render as a
       // trusted "peer" line. Drop such frames — never decrypt or display them.
       if (!verified) {
+        droppedBeforeVerify += 1; // F-CRYPTO-001: a gap we caused, not the relay
         addLine("sys", "", "[message arrived before you verified the safety number — dropped]");
         break;
       }
       try {
         const text = await cipher.decrypt(m.payload);
+        // F-CRYPTO-001: read at once — msgChain serializes handleMessage, so
+        // this is the value for THIS frame.
+        const skipped = cipher.lastSkipped || 0;
         if (!live()) return;
         // P-04: recvHighWater must reach disk too — an unpersisted receive
         // watermark lets an already-delivered frame be replayed after a reload.
@@ -4261,6 +4271,25 @@ async function handleMessage(room, raw, sock) {
           return;
         }
         if (!live()) return;
+        // Pentest 2026-08-07 F-CRYPTO-001 (Low): the ratchet fast-forwards
+        // over a gap and destroys the skipped keys — correctly, for forward
+        // secrecy — but it used to do so SILENTLY, so a relay that dropped
+        // messages in flight left no trace. Now an authenticated frame that
+        // stepped over earlier ones says so once, just above it. Frames WE
+        // dropped unread before the gate passed are subtracted (the peer may
+        // verify first and write; that is not loss in flight). A relay cannot
+        // flood this: only a genuine peer frame carries a gap, so there is at
+        // most one notice per real message, and it is a narration (folds by
+        // membership, evicted before the record — package 2's addLine).
+        // A pad frame reports -1: bytes were skipped, the count is unknown.
+        if (skipped !== 0) {
+          const ours = Math.min(droppedBeforeVerify, skipped < 0 ? 0 : skipped);
+          droppedBeforeVerify = 0;
+          const lost = skipped < 0 ? -1 : skipped - ours;
+          if (lost !== 0) addLine("sys", "", gapNotice(lost));
+        } else {
+          droppedBeforeVerify = 0;
+        }
         addLine("peer", "peer", text);
       } catch {
         addLine("sys", "", "[undecryptable message — wrong key or tampered]");
@@ -4276,6 +4305,13 @@ async function handleMessage(room, raw, sock) {
       closeRelayReason = RELAY_FATAL.has(m.reason) ? m.reason : null;
       break;
   }
+}
+
+// F-CRYPTO-001: the gap notice. `lost` > 0 is a count; -1 is a pad gap of
+// unknown size.
+function gapNotice(lost) {
+  const what = lost < 0 ? "Earlier message(s)" : lost === 1 ? "1 message" : `${lost} messages`;
+  return `[${what} from your contact never arrived — the relay may have dropped them]`;
 }
 
 // The in-person verification gate. The dual signature is already verified at
