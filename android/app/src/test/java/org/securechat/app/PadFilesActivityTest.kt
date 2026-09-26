@@ -9,6 +9,7 @@ import android.webkit.WebChromeClient
 import android.webkit.WebView
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -150,9 +151,53 @@ class PadFilesActivityTest {
         assertNull(shadowOf(activity).nextStartedActivityForResult)
     }
 
+    // Pentest r1 F4: only another app's content:// document reaches the page.
+    @Test
+    fun pickerResultsThatAreNotAnotherAppsDocumentAreDropped() {
+        for (bad in listOf(
+            Uri.parse("file:///data/data/org.securechat.app/app_webview/Default/Local%20Storage/leveldb/000003.log"),
+            Uri.parse("content://${activity.packageName}.files/pad-share/0123456789abcdef/$name"),
+            Uri.parse("http://example.com/pad.json"),
+            // Another provider of OURS (merged in from androidx.startup): refused by
+            // package, not only by the FileProvider's authority.
+            Uri.parse("content://${activity.packageName}.androidx-startup/x"),
+        )) {
+            val cb = Recorder()
+            chooser(cb)
+            result(nextStarted(), Activity.RESULT_OK, Intent().setData(bad))
+            assertEquals("must not reach the page: $bad", listOf<List<Uri>?>(null), cb.answers)
+        }
+    }
+
     // --- Export: Share --------------------------------------------------------
 
     private fun shareDir() = File(activity.cacheDir, MainActivity.SHARE_DIR)
+
+    /** Every file under pad-share, as a path relative to it. */
+    private fun shared(): List<String> =
+        shareDir().walk().filter { it.isFile }.map { it.relativeTo(shareDir()).path }.sorted().toList()
+
+    private fun chosen(id: String, from: MainActivity = activity) {
+        from.sendBroadcast(
+            Intent("${from.packageName}.action.PAD_SHARE_CHOSEN").setPackage(from.packageName)
+                .putExtra("org.securechat.app.extra.PAD_FILE_REQUEST", id),
+        )
+        idle()
+    }
+
+    private fun sendOf(chooser: Intent) = chooser.getParcelableExtra(Intent.EXTRA_INTENT, Intent::class.java)!!
+    private fun streamOf(chooser: Intent) = sendOf(chooser).getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)!!
+
+    /** Share, pick a target, return: a completed "shared". Returns the chooser intent. */
+    private fun shareAndPick(t: String = text): Pair<String, Intent> {
+        val id = bridge.share(name, t)
+        idle()
+        val chooser = nextStarted()
+        chosen(id)
+        result(chooser, Activity.RESULT_CANCELED, null)
+        assertEquals(PadFilesBridge.resultScript(id, PadFileOutcome.SHARED), lastScript())
+        return id to chooser
+    }
 
     @Test
     fun shareHandsOneFileProviderUriToTheChooserWithAReadGrantOnly() {
@@ -170,9 +215,10 @@ class PadFilesActivityTest {
         assertTrue(send.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION != 0)
         assertEquals("no write grant", 0, send.flags and Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
         assertEquals(setOf(Intent.EXTRA_STREAM), send.extras!!.keySet())
-        val files = shareDir().listFiles()!!.toList()
-        assertEquals(listOf(name), files.map { it.name })
-        assertEquals(text, files[0].readText())
+        assertEquals("the URI is unique to the request (F1), the target sees the neutral name",
+            "/pad-share/$id/$name", uri.path)
+        assertEquals(listOf("$id/$name"), shared())
+        assertEquals(text, File(shareDir(), "$id/$name").readText())
         assertEquals(PadFilesBridge.BUSY, bridge.save(name, text))
         assertEquals(id, bridge.pending())
     }
@@ -187,7 +233,8 @@ class PadFilesActivityTest {
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(MainActivity.SHARE_GRACE_MS))
         assertEquals(PadFilesBridge.resultScript(id, PadFileOutcome.CANCELLED), lastScript())
         assertNull(bridge.pending())
-        assertTrue("nobody holds a grant: the file is deleted", shareDir().listFiles().isNullOrEmpty())
+        assertTrue("nobody holds a grant: the file is deleted", shared().isEmpty())
+        assertTrue("…and its request directory", shareDir().listFiles().isNullOrEmpty())
     }
 
     @Test
@@ -205,7 +252,7 @@ class PadFilesActivityTest {
         result(chooser, Activity.RESULT_CANCELED, null)      // what a chooser really returns
         assertEquals(PadFilesBridge.resultScript(id, PadFileOutcome.SHARED), lastScript())
         assertNull(bridge.pending())
-        assertEquals(listOf(name), shareDir().listFiles()!!.map { it.name })
+        assertEquals(listOf("$id/$name"), shared())
     }
 
     @Test
@@ -239,19 +286,82 @@ class PadFilesActivityTest {
         assertEquals(PadFilesBridge.resultScript(id, PadFileOutcome.CANCELLED), lastScript())
     }
 
+    // Pentest r1 F1: two shares with the same (minute-resolution) name used to
+    // hand out the SAME URI, so a grant still held on the first read the second.
     @Test
-    fun aNewShareClearsTheOldFileAndAStartClearsTheDirectory() {
-        val stale = File(shareDir().apply { mkdirs() }, "secure-chat-pad-2020-01-01-0000.json")
-        stale.writeText("old")
-        val id = bridge.share(name, text)
+    fun aSecondShareGetsItsOwnUriAndSupersedesTheFirst() {
+        val (idA, chA) = shareAndPick()
+        val uriA = streamOf(chA)
+        val textB = text.replace("q83vASNFZ4mrze8BI0VniQ+/", "BBBBBBBBBBBBBBBBBBBBBBBB")
+        val idB = bridge.share(name, textB)
         idle()
-        assertEquals(listOf(name), shareDir().listFiles()!!.map { it.name })
-        bridge.finish(id)
-        // A fresh start empties it before anything else runs.
-        File(shareDir(), "secure-chat-pad-2020-01-01-0000.json").writeText("old")
+        val uriB = streamOf(nextStarted())
+        assertNotEquals("a new URI per request", uriA, uriB)
+        assertEquals(name, uriB.lastPathSegment)
+        assertEquals("the first share's file is gone (revoked, then deleted)", listOf("$idB/$name"), shared())
+        assertFalse(File(shareDir(), idA).exists())
+    }
+
+    // Pentest r1 F2: a second instance of the activity, or a recreation, used
+    // to empty pad-share and so delete a file a lazy target had yet to read.
+    @Test
+    fun aNewInstanceKeepsARecentShareAndPurgesAnExpiredOne() {
+        val (id, _) = shareAndPick()
+        val old = File(shareDir(), "0123456789abcdef").apply { mkdirs() }
+        File(old, name).writeText(text)
+        old.setLastModified(System.currentTimeMillis() - MainActivity.SHARE_TTL_MS - 1000)
         Robolectric.buildActivity(MainActivity::class.java).setup()
         idle()
-        assertTrue(shareDir().listFiles().isNullOrEmpty())
+        assertEquals("the recent share survives, the expired one does not", listOf("$id/$name"), shared())
+    }
+
+    @Test
+    fun aSharedFileIsPurgedAfterItsLifetime() {
+        val (id, _) = shareAndPick()
+        assertEquals(listOf("$id/$name"), shared())
+        File(shareDir(), id).setLastModified(System.currentTimeMillis() - MainActivity.SHARE_TTL_MS)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(MainActivity.SHARE_TTL_MS + 1000))
+        assertTrue("no pad file lies around past SHARE_TTL_MS", shared().isEmpty())
+    }
+
+    // Pentest r1 F2 (second half) and F5: each share has its OWN chosen-target
+    // PendingIntent (a shared one had its request id rewritten by the next
+    // share in another instance), and it is immutable.
+    @Test
+    fun eachShareHasItsOwnImmutableChosenCallback() {
+        val idA = bridge.share(name, text)
+        idle()
+        nextStarted()
+        val other = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        idle()
+        val otherBridge = shadowOf(other.findViewById<WebView>(R.id.webview))
+            .getJavascriptInterface("SecureChatFiles") as PadFilesBridge
+        val idB = otherBridge.share(name, text)
+        idle()
+        val probe = Intent("${activity.packageName}.action.PAD_SHARE_CHOSEN").setPackage(activity.packageName)
+        val pis = (0..10_000).mapNotNull {
+            android.app.PendingIntent.getBroadcast(activity, it, probe,
+                android.app.PendingIntent.FLAG_NO_CREATE or android.app.PendingIntent.FLAG_IMMUTABLE or
+                    android.app.PendingIntent.FLAG_ONE_SHOT)
+        }
+        assertEquals("one PendingIntent per share, each carrying its own id", setOf(idA, idB),
+            pis.map { shadowOf(it).savedIntent.getStringExtra("org.securechat.app.extra.PAD_FILE_REQUEST") }.toSet())
+        for (pi in pis) {
+            assertTrue("immutable (F5)", shadowOf(pi).isImmutable)
+            assertTrue("one shot", shadowOf(pi).flags and android.app.PendingIntent.FLAG_ONE_SHOT != 0)
+        }
+    }
+
+    // Pentest r1 MH: a request that reaches a finishing activity is released,
+    // not started.
+    @Test
+    fun aRequestReachingAFinishingActivityStartsNothingAndFreesTheSlot() {
+        activity.finish()
+        assertEquals(16, bridge.share(name, text).length)
+        idle()
+        assertNull(shadowOf(activity).nextStartedActivityForResult)
+        assertNull("the slot is free again", bridge.pending())
+        assertTrue(shared().isEmpty())
     }
 
     // --- Export: Save ---------------------------------------------------------
@@ -316,5 +426,18 @@ class PadFilesActivityTest {
         idle()
         assertNull(shadowOf(activity).nextStartedActivityForResult)
         assertTrue(shareDir().listFiles().isNullOrEmpty())
+    }
+
+    // Pentest r1 F4: the save result is written only if it is another app's document.
+    @Test
+    fun aSaveResultThatIsNotAnotherAppsDocumentIsNotWritten() {
+        val victim = File(activity.filesDir, "victim.txt").apply { writeText("PRECIOUS") }
+        for (bad in listOf(Uri.fromFile(victim), Uri.parse("content://${activity.packageName}.files/pad-share/x/$name"))) {
+            val id = bridge.save(name, text)
+            idle()
+            result(nextStarted(), Activity.RESULT_OK, Intent().setData(bad))
+            assertEquals(PadFilesBridge.resultScript(id, PadFileOutcome.ERROR), awaitScript())
+        }
+        assertEquals("PRECIOUS", victim.readText())
     }
 }

@@ -9,9 +9,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.app.PendingIntent
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
-import android.provider.DocumentsContract
 import android.text.InputType
 import android.view.WindowManager
 import android.webkit.ConsoleMessage
@@ -38,6 +36,7 @@ import org.json.JSONObject
 import org.securechat.app.databinding.ActivityMainBinding
 import java.io.File
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 
 /**
@@ -90,8 +89,21 @@ class MainActivity : AppCompatActivity() {
          */
         const val SECRET_PROMPT_MARK = "[secure-chat:secret] "
 
-        /** Subdirectory of cacheDir holding the one pad file being shared. */
+        /**
+         * Subdirectory of cacheDir holding shared pad files, each in its own
+         * `<requestId>/` directory (pentest r1 F1: a URI unique per request).
+         */
         const val SHARE_DIR = "pad-share"
+
+        /**
+         * How long a shared pad file outlives its share (pentest r1 F2). Long
+         * enough for a target that reads lazily (Bluetooth sends from a
+         * background service after its screen has closed); short enough that
+         * no pad file lies around. Enforced at every start of the activity and
+         * by a timer after "shared"; a NEW share supersedes (revokes and
+         * deletes) every earlier one at once.
+         */
+        const val SHARE_TTL_MS = 10 * 60 * 1000L
 
         /**
          * How long to wait, after the share chooser has returned, for its
@@ -102,6 +114,15 @@ class MainActivity : AppCompatActivity() {
         const val SHARE_GRACE_MS = 1500L
 
         private const val EXTRA_REQUEST = "org.securechat.app.extra.PAD_FILE_REQUEST"
+
+        /**
+         * Pentest r1 F2: one chosen-target PendingIntent PER SHARE. They used
+         * to share requestCode 0 with FLAG_UPDATE_CURRENT, i.e. one
+         * PendingIntent for the whole app: a share in a second activity
+         * instance rewrote the request id inside the one the first instance's
+         * open chooser held. Process-wide, so two instances never collide.
+         */
+        private val shareRequestCodes = AtomicInteger()
     }
 
     // --- OTP pad files: export (share / save) and import (file chooser) -------
@@ -111,8 +132,8 @@ class MainActivity : AppCompatActivity() {
     /** The page-facing bridge; its one-request slot is released in [deliverPadFileResult]. */
     private val padFiles = PadFilesBridge { req -> runOnUiThread { startPadFileRequest(req) } }
 
-    /** The share in flight: its temp file, and what we have heard back so far. */
-    private class PendingShare(val id: String, val file: File) {
+    /** The share in flight: its directory, and what we have heard back so far. */
+    private class PendingShare(val id: String, val dir: File) {
         var chosen = false     // the chooser reported a target (EXTRA_CHOSEN_COMPONENT)
         var returned = false   // the chooser activity has returned to us
     }
@@ -197,10 +218,13 @@ class MainActivity : AppCompatActivity() {
             .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(this))
             .build()
 
-        // A pad file left in the share directory by an earlier run (a share
-        // whose target may still have been reading it when the app went away)
-        // is removed here, before anything else can run. See [clearShareDir].
-        clearShareDir()
+        // Pad files an earlier share left behind are revoked and deleted here,
+        // before anything else can run — but only those past SHARE_TTL_MS
+        // (pentest r1 F2). A second instance of this activity (another app can
+        // start it into its own task) or a recreation (dark mode, locale, font
+        // scale, a fold) must not delete a file just handed to a target that
+        // has not read it yet. See [purgeShares].
+        purgeShares(SHARE_TTL_MS)
         // NOT exported: only broadcasts from this app's own uid arrive, which
         // includes the PendingIntent the system chooser sends back on our behalf.
         ContextCompat.registerReceiver(
@@ -421,7 +445,9 @@ class MainActivity : AppCompatActivity() {
     private fun onFileChosen(uri: Uri?) {
         val callback = fileChooserCallback ?: return
         fileChooserCallback = null
-        callback.onReceiveValue(uri?.let { arrayOf(it) })
+        // Pentest r1 F4: only another app's content:// document reaches the
+        // page — never a file:// path, never one of our own providers.
+        callback.onReceiveValue(uri?.takeIf { isForeignDocument(it) }?.let { arrayOf(it) })
     }
 
     /** Main thread. Start the share or save the bridge has claimed the slot for. */
@@ -446,28 +472,38 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Share: one file in cacheDir/[SHARE_DIR], named as validated (no path can
-     * be formed from it — see PadFileRules.NAME), exposed through the
-     * FileProvider whose paths xml admits that directory ONLY, with a read
+     * Share: one file in cacheDir/[SHARE_DIR]/<requestId>/, named as validated
+     * (no path can be formed from it — see PadFileRules.NAME), exposed through
+     * the FileProvider whose paths xml admits that directory ONLY, with a read
      * grant that goes to the target the user picks and nowhere else.
      *
      * WHAT THE CHOOSER TELLS US, honestly: its activity result is useless —
      * RESULT_CANCELED whether the user backed out or picked a target (targets
      * such as Quick Share or Bluetooth set no result). The one real signal is
-     * the IntentSender passed to createChooser, which the system fires with
-     * EXTRA_CHOSEN_COMPONENT when a target is picked. So "shared" means "the
+     * the IntentSender passed to createChooser, which the system sends when a
+     * target is picked (with EXTRA_CHOSEN_COMPONENT filled in only if it is
+     * mutable; ours is not, and does not need it). So "shared" means "the
      * user picked a target"; whether the file then reached the other phone is
      * beyond what Android can tell an app, and the UI says "File shared", not
      * "handed over". No target by the time the chooser returns (plus
      * [SHARE_GRACE_MS]) is "cancelled".
      */
     private fun startShare(req: PadFileRequest) {
-        val dir = clearShareDir()
+        // Pentest r1 F1: a share SUPERSEDES every earlier one. Its URI grants
+        // are revoked and its file deleted now, before the new file exists.
+        val root = purgeShares(0)
+        // …and the new URI is unique to this request: content://…/pad-share/
+        // <requestId>/<name>. Android keys a grant by the URI, and the name is
+        // only minute-resolution, so a same-name file at the old path would be
+        // readable through any grant still held on it. The target sees only
+        // the last segment (FileProvider's display name): the neutral name.
+        val dir = File(root, req.id)
         if (!dir.isDirectory && !dir.mkdirs()) throw IOException("cannot create the share directory")
         val file = File(dir, req.name)
-        if (file.parentFile != dir) throw IOException("share file escapes its directory")
+        if (file.parentFile != dir || dir.parentFile != root) throw IOException("share file escapes its directory")
+        padShare = PendingShare(req.id, dir)
         file.writeText(req.text, Charsets.UTF_8)
-        val uri = FileProvider.getUriForFile(this, "$packageName.files", file)
+        val uri = FileProvider.getUriForFile(this, filesAuthority, file)
         val send = Intent(Intent.ACTION_SEND).apply {
             type = "application/json"
             putExtra(Intent.EXTRA_STREAM, uri)
@@ -476,16 +512,16 @@ class MainActivity : AppCompatActivity() {
             clipData = ClipData.newRawUri(req.name, uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        // Mutable, because the chooser fills in EXTRA_CHOSEN_COMPONENT; explicit
-        // (package set), as Android 14 requires of a mutable PendingIntent. Only
-        // the system chooser ever holds it, and the receiver is not exported.
+        // Pentest r1 F5: IMMUTABLE. The chooser fills EXTRA_CHOSEN_COMPONENT
+        // into a mutable PendingIntent only; an immutable one is still SENT on
+        // a pick, with the fill-in dropped — and the pick is all we read. Our
+        // own request id rides in the intent itself. Explicit (package set),
+        // a fresh requestCode per share (F2), one shot.
         val chosen = PendingIntent.getBroadcast(
-            this, 0,
+            this, shareRequestCodes.incrementAndGet(),
             Intent(shareChosenAction).setPackage(packageName).putExtra(EXTRA_REQUEST, req.id),
-            PendingIntent.FLAG_UPDATE_CURRENT or
-                (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0),
+            PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE,
         )
-        padShare = PendingShare(req.id, file)
         shareLauncher.launch(Intent.createChooser(send, getString(R.string.share_pad_title), chosen.intentSender))
     }
 
@@ -496,59 +532,79 @@ class MainActivity : AppCompatActivity() {
             deliverPadFileResult(p.id, PadFileOutcome.SHARED)
             return
         }
-        binding.root.postDelayed({
-            if (padShare === p) deliverPadFileResult(p.id, PadFileOutcome.CANCELLED)
-        }, SHARE_GRACE_MS)
+        // No `padShare === p` test here: deliverPadFileResult answers a request
+        // at most once (the bridge's slot), which is what keeps a late timer
+        // from contradicting an earlier "shared".
+        binding.root.postDelayed({ deliverPadFileResult(p.id, PadFileOutcome.CANCELLED) }, SHARE_GRACE_MS)
     }
 
     /**
      * Save: the system save dialog (ACTION_CREATE_DOCUMENT, application/json,
-     * the validated name suggested) has created a document the user placed;
+     * the validated name suggested) has given us a document the user placed;
      * write the text to it off the main thread (a provider's stream can be
-     * slow, and EXTRA_LOCAL_ONLY is only a hint).
-     * "saved" only once the bytes are written AND the stream closed; a failed
-     * write removes the half-written document when the provider allows it.
+     * slow, and EXTRA_LOCAL_ONLY is only a hint). "saved" only once the bytes
+     * are written AND the stream closed.
+     *
+     * Pentest r1 F3. Opened "wt", not "w": when the user picks an EXISTING
+     * file and confirms the overwrite, DocumentsUI hands back that file, and
+     * whether "w" truncates is up to the provider — a longer old file would
+     * keep its tail after the envelope, "File saved" would be shown, and the
+     * import on the other phone would fail only after the pad was latched.
+     *
+     * NOTHING here deletes a document. The dialog may have returned a file the
+     * user already had, and from the URI alone we cannot tell "just created"
+     * from "chose to overwrite". So a failed write is reported as "error" and
+     * the (half-written) file is left where the user put it, and a result that
+     * arrives for a request this activity never made (the process died while
+     * the dialog was open, so the text is gone) is ignored: at worst an empty
+     * file is left behind, never someone's file removed.
      */
     private fun onSaveDocument(uri: Uri?) {
-        val req = padSave
-        if (req == null) {
-            // A result for a request this activity never made: the process died
-            // while the dialog was open and the page (and its text) are gone.
-            // Do not leave an empty pad file where the user put it.
-            if (uri != null) thread(name = "pad-save-orphan") { discardDocument(uri) }
-            return
-        }
+        val req = padSave ?: return
         if (uri == null) {
             deliverPadFileResult(req.id, PadFileOutcome.CANCELLED)
             return
         }
+        if (!isForeignDocument(uri)) {
+            deliverPadFileResult(req.id, PadFileOutcome.ERROR)
+            return
+        }
         thread(name = "pad-save") {
             val written = try {
-                val out = contentResolver.openOutputStream(uri, "w") ?: throw IOException("no output stream")
+                val out = contentResolver.openOutputStream(uri, "wt") ?: throw IOException("no output stream")
                 out.use { it.write(req.text.toByteArray(Charsets.UTF_8)); it.flush() }
                 true
             } catch (e: Exception) {
                 false
             }
-            if (!written) discardDocument(uri)
             runOnUiThread {
                 deliverPadFileResult(req.id, if (written) PadFileOutcome.SAVED else PadFileOutcome.ERROR)
             }
         }
     }
 
-    private fun discardDocument(uri: Uri) {
-        try {
-            DocumentsContract.deleteDocument(contentResolver, uri)
-        } catch (e: Exception) {
-            // Best effort: not every provider supports deletion.
-        }
+    /**
+     * Pentest r1 F4: a document URI from the picker or the save dialog is used
+     * only if it is a content:// URI served by ANOTHER app. Both intents are
+     * answered by the system's DocumentsUI, which only ever returns such URIs,
+     * so this refuses nothing legitimate; it keeps a file:// result (which
+     * ContentResolver would open directly, app-private files included) or one
+     * of our own providers (the pad-share FileProvider) from ever being read
+     * into the page or written over, whatever answered the intent.
+     */
+    private fun isForeignDocument(uri: Uri): Boolean {
+        if (uri.scheme != "content") return false
+        val authority = uri.authority ?: return false
+        if (authority == filesAuthority) return false
+        return packageManager.resolveContentProvider(authority, 0)?.packageName != packageName
     }
 
     /**
      * Report [outcome] for request [id] to the page and release the bridge's
-     * slot. Only the request in flight can be answered, and only once. The
-     * script is [PadFilesBridge.resultScript]: our hex id, a constant outcome.
+     * slot. Only the request in flight can be answered, and only once — every
+     * caller relies on that (the share grace timer does not check whether a
+     * result was already given). The script is [PadFilesBridge.resultScript]:
+     * our hex id, a constant outcome.
      */
     private fun deliverPadFileResult(id: String, outcome: String) {
         if (!padFiles.finish(id)) return
@@ -556,29 +612,65 @@ class MainActivity : AppCompatActivity() {
         padShare?.let {
             if (it.id == id) {
                 padShare = null
-                // Nobody was granted the file: remove it now. After "shared" it
-                // stays until the next share or the next start (clearShareDir).
-                if (outcome != PadFileOutcome.SHARED) it.file.delete()
+                if (outcome == PadFileOutcome.SHARED) {
+                    // The target holds a URI grant and may read later (Bluetooth
+                    // does, from a background service): keep the file for
+                    // SHARE_TTL_MS, then revoke and delete it.
+                    binding.root.postDelayed({ purgeShares(SHARE_TTL_MS) }, SHARE_TTL_MS + 1000)
+                } else {
+                    // Nobody was granted the file: revoke (belt and braces) and delete now.
+                    revokeAndDelete(it.dir)
+                }
             }
         }
         if (isDestroyed) return
         binding.webview.evaluateJavascript(PadFilesBridge.resultScript(id, outcome), null)
     }
 
+    private val filesAuthority by lazy { "$packageName.files" }
+
     /**
-     * Empty cacheDir/[SHARE_DIR] and return it. Called at every start and before
-     * every share. NOT when a share returns "shared": the target holds only a
-     * URI grant, and some (Bluetooth sends from a background service) open the
-     * file after their activity has finished, so deleting at that point would
-     * break the very transfer the user just started. The file is the
-     * transfer-passphrase-encrypted envelope, in app-private cache (never backed
-     * up: allowBackup=false and dataExtractionRules), and it lives at most until
-     * the next share or the next start of the app.
+     * Revoke and delete every share in cacheDir/[SHARE_DIR] whose directory is
+     * at least [minAgeMs] old (0 = all of them), and return the directory.
+     *
+     *  * 0 before every new share: a share supersedes all earlier ones (F1).
+     *  * [SHARE_TTL_MS] at every start of the activity and by the timer after
+     *    "shared" (F2): a file handed to a target outlives the share by that
+     *    long, not "until the next share or start", and a second instance or
+     *    a recreation no longer deletes a file a target has yet to read.
+     *
+     * The file is the transfer-passphrase-encrypted envelope, in app-private
+     * cache, never backed up (allowBackup=false, dataExtractionRules). A file
+     * left by a process that died stays until the next start or share.
      */
-    private fun clearShareDir(): File {
-        val dir = File(cacheDir, SHARE_DIR)
-        dir.listFiles()?.forEach { it.delete() }
-        return dir
+    private fun purgeShares(minAgeMs: Long): File {
+        val root = File(cacheDir, SHARE_DIR)
+        val now = System.currentTimeMillis()
+        root.listFiles()?.forEach { entry ->
+            if (minAgeMs == 0L || now - entry.lastModified() >= minAgeMs) revokeAndDelete(entry)
+        }
+        return root
+    }
+
+    /**
+     * Pentest r1 F1: every file is un-granted BEFORE it is deleted. Android
+     * keys a grant by URI and FileProvider serves whatever file sits at that
+     * path now, so deleting alone leaves the grant alive for whatever is
+     * written there next; revoking alone leaves the file. Revoking our own
+     * provider's URI removes it from every app that holds it (until then a
+     * grant can outlive the target's activity, and be passed on).
+     */
+    private fun revokeAndDelete(entry: File) {
+        entry.walkBottomUp().forEach { f ->
+            if (f.isFile) {
+                try {
+                    revokeUriPermission(FileProvider.getUriForFile(this, filesAuthority, f), Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                } catch (e: IllegalArgumentException) {
+                    // Outside the provider's paths: nothing can have been granted.
+                }
+            }
+            f.delete()
+        }
     }
 
     /**

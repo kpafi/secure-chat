@@ -448,8 +448,16 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
   assert.deepStrictEqual(kotlinFun(/^fun validText\(text: String\?\): Boolean \{$/, "validText", pfLines).slice(1, -1), [
     "if (text == null || text.length > MAX_BYTES) return false",
     "if (text.toByteArray(Charsets.UTF_8).size > MAX_BYTES) return false",
-    "return ENVELOPE.matches(text)",
+    "return isEnvelope(text)",
   ], "validText: null / over-length refused, UTF-8 bytes capped, then the WHOLE text must be the envelope");
+  // Pentest r1: no regex over the (up to 4 MiB) text — ICU on the device is not
+  // the engine the JVM tests run. The only regexes left are on the name and the id.
+  assert.deepStrictEqual(pfLines.filter((l) => /\bRegex\(/.test(l)), [
+    'val NAME = Regex("secure-chat-pad-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}\\\\.json")',
+    'private val ID = Regex("[0-9a-f]{16}")',
+  ], "PadFiles.kt: regexes only on the short name and id, never on the file text");
+  assert.ok(!/\.toRegex\(|Pattern\.|\.matches\(text\)/.test(pf), "…and no other route to a regex over the text");
+  assert.ok(pfLines.includes("fun isEnvelope(text: String): Boolean {"), "the envelope is checked by the linear scanner");
   assert.ok(pfLines.includes("fun valid(name: String?, text: String?): Boolean = validName(name) && validText(text)"),
     "valid() needs both");
   // (c) one request at a time; nothing starts before validation and the slot.
@@ -485,37 +493,55 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
     "binding.webview.evaluateJavascript(",
   ], `MainActivity evaluates only resultScript and the verifyRelayConfig probe — found ${JSON.stringify(evals)}`);
 
-  // (e) the envelope pattern holds the REAL exportPad() output (and the
-  // largest pad fits the cap) — so native and client cannot drift apart.
-  const envLine = pfLines.find((l) => l.startsWith('"""\\{"fmt":'));
-  assert.ok(envLine, "PadFileRules.ENVELOPE is a raw-string regex");
-  const envelope = new RegExp("^(?:" + envLine.slice(3, envLine.lastIndexOf('"""')) + ")$");
+  // (e) the envelope check and the REAL exportPad() output agree — the two
+  // ends are tied through a committed fixture. PadFilesTest (JVM) asserts the
+  // native check accepts the fixture; here the real exportPad(), on the
+  // largest pad size, must write the same skeleton as the fixture (same
+  // literals and key order, same salt/iv lengths, only ct's length differs)
+  // and fit the cap. Pentest r1 F7: the iteration count is pinned natively,
+  // and it must be otp.js's KDF_ITERS.
+  const otpSrc = await readFile(new URL("./otp.js", import.meta.url), "utf8");
+  const itersJs = /^const KDF_ITERS = (\d+);$/m.exec(otpSrc);
+  assert.ok(itersJs, "otp.js defines `const KDF_ITERS = <n>;`");
+  assert.ok(pfLines.includes(`const val KDF_ITERS = ${itersJs[1]}`),
+    `PadFileRules.KDF_ITERS must equal otp.js KDF_ITERS (${itersJs[1]})`);
+  assert.ok(pfLines.includes('private const val AFTER_SALT = "\\",\\"iters\\":$KDF_ITERS},\\"iv\\":\\""'),
+    "the native envelope requires exactly KDF_ITERS");
+  const fixture = await readFile(new URL("../android/app/src/test/resources/org/securechat/app/pad-export-fixture.json",
+    import.meta.url), "utf8");
+  const skeleton = (t) => t.replace(/"(salt|iv|ct)":"([A-Za-z0-9+/]*)(=*)"/g,
+    (_, k, b, p) => `"${k}":"<${k === "ct" ? (b.length + p.length) % 4 : b.length}+${p.length}>"`);
   const { exportPad, PAD_SIZES } = await import("./otp.js");
   const biggest = Math.max(...PAD_SIZES.map((p) => p.bytes));
   const bytes = new Uint8Array(biggest);
   for (let o = 0; o < biggest; o += 65536) crypto.getRandomValues(bytes.subarray(o, o + 65536));
-  const fileText = await exportPad({ padId: "ab".repeat(16), label: "Chess club é—\"</script>",
+  const fileText = await exportPad({ padId: "ab".repeat(16), label: "Chess club \u00e9\u2014\"</script>",
     regionSize: biggest / 2, role: 0, sendOffset: 0, recvHighWater: 0, bytes }, "transfer passphrase");
-  assert.match(fileText, envelope, "the real exportPad() output matches PadFileRules.ENVELOPE");
+  assert.strictEqual(skeleton(fileText), skeleton(fixture),
+    "the real exportPad() output has the fixture's skeleton (the fixture PadFilesTest accepts natively)");
+  assert.strictEqual(skeleton(fixture),
+    `{"fmt":"secure-chat-otp-pad","v":1,"kdf":{"salt":"<22+2>","iters":${itersJs[1]}},"iv":"<16+0>","ct":"<0+${/(=*)"}$/.exec(fixture)[1].length}>"}`,
+    "control: the skeleton really abstracts only the base64 contents");
   assert.ok(Buffer.byteLength(fileText, "utf8") <= 4 * 1024 * 1024,
     `the largest export (${Buffer.byteLength(fileText)} bytes) fits under MAX_BYTES`);
-  assert.doesNotMatch(fileText + "<html>", envelope, "control: the pattern is anchored");
-  assert.doesNotMatch(fileText.replace('"v":1', '"v":1,"x":1'), envelope, "control: no extra key");
 
   // (f) share: fixed type, one extra (our FileProvider URI), a READ grant only,
   // the file in cacheDir/pad-share under the validated name.
   const share = kotlinFun(/^private fun startShare\(req: PadFileRequest\) \{$/, "startShare");
   for (const must of [
-    "val dir = clearShareDir()",
+    "val root = purgeShares(0)",
+    "val dir = File(root, req.id)",
     "val file = File(dir, req.name)",
-    'if (file.parentFile != dir) throw IOException("share file escapes its directory")',
-    'val uri = FileProvider.getUriForFile(this, "$packageName.files", file)',
+    'if (file.parentFile != dir || dir.parentFile != root) throw IOException("share file escapes its directory")',
+    "val uri = FileProvider.getUriForFile(this, filesAuthority, file)",
     "val send = Intent(Intent.ACTION_SEND).apply {",
     'type = "application/json"',
     "putExtra(Intent.EXTRA_STREAM, uri)",
     "clipData = ClipData.newRawUri(req.name, uri)",
     "addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)",
+    "this, shareRequestCodes.incrementAndGet(),",
     "Intent(shareChosenAction).setPackage(packageName).putExtra(EXTRA_REQUEST, req.id),",
+    "PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE,",
     "shareLauncher.launch(Intent.createChooser(send, getString(R.string.share_pad_title), chosen.intentSender))",
   ]) assert.ok(share.includes(must), `startShare must contain \`${must}\``);
   assert.deepStrictEqual(share.join("\n").match(/putExtra\([^)]*\)/g),
@@ -523,13 +549,56 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
     "the share intent carries EXTRA_STREAM only (plus our own request id on the chooser callback)");
   assert.ok(!lines.some((l) => /FLAG_GRANT_(WRITE|PERSISTABLE|PREFIX)_URI_PERMISSION|takePersistableUriPermission/.test(l)),
     "no write, persistable or prefix URI grant anywhere");
-  assert.ok(kotlinFun(/^private fun clearShareDir\(\): File \{$/, "clearShareDir").includes("val dir = File(cacheDir, SHARE_DIR)"),
-    "the share dir is under cacheDir");
+  // Pentest r1 F2 / F5: one immutable, one-shot PendingIntent per share —
+  // never the app-wide requestCode-0 / UPDATE_CURRENT one, never mutable.
+  assert.ok(!lines.some((l) => /FLAG_MUTABLE|FLAG_UPDATE_CURRENT/.test(l)), "no mutable or updatable PendingIntent");
+  assert.ok(lines.includes("private val shareRequestCodes = AtomicInteger()"), "a process-wide requestCode counter");
+  // Pentest r1 F1 / F2: the temp files' life. Every share file is revoked
+  // before it is deleted, and nothing else deletes one.
+  assert.deepStrictEqual(kotlinFun(/^private fun purgeShares\(minAgeMs: Long\): File \{$/, "purgeShares").slice(1, -1), [
+    "val root = File(cacheDir, SHARE_DIR)",
+    "val now = System.currentTimeMillis()",
+    "root.listFiles()?.forEach { entry ->",
+    "if (minAgeMs == 0L || now - entry.lastModified() >= minAgeMs) revokeAndDelete(entry)",
+    "}",
+    "return root",
+  ], "purgeShares: under cacheDir; all (0) or only entries at least minAgeMs old; always through revokeAndDelete");
+  const rad = kotlinFun(/^private fun revokeAndDelete\(entry: File\) \{$/, "revokeAndDelete");
+  const revokeAt = rad.findIndex((l) => l.startsWith("revokeUriPermission(FileProvider.getUriForFile(this, filesAuthority, f), Intent.FLAG_GRANT_READ_URI_PERMISSION)"));
+  assert.ok(revokeAt > 0 && revokeAt < rad.indexOf("f.delete()"), "revokeAndDelete revokes the file's URI BEFORE deleting it");
+  assert.deepStrictEqual(lines.filter((l) => /\.delete\(\)|\.deleteRecursively\(|deleteDocument/.test(l)), ["f.delete()"],
+    "the only deletion in MainActivity is revokeAndDelete's (no DocumentsContract.deleteDocument: F3)");
   assert.ok(lines.includes('const val SHARE_DIR = "pad-share"'), "SHARE_DIR is pad-share");
+  assert.ok(lines.includes("const val SHARE_TTL_MS = 10 * 60 * 1000L"), "a shared file lives 10 minutes");
   const onCreate = kotlinFun(/^override fun onCreate\(/, "onCreate");
-  const clearAt = onCreate.indexOf("clearShareDir()");
+  const clearAt = onCreate.indexOf("purgeShares(SHARE_TTL_MS)");
   assert.ok(clearAt > 0 && clearAt < onCreate.indexOf("configureWebView()"),
-    "stale pad files are removed at every start, before the page can run");
+    "expired pad files are removed at every start, before the page can run — and only expired ones (F2)");
+  assert.ok(!onCreate.includes("purgeShares(0)"), "F2: a start never wipes a recent share");
+  // Every result is answered at most once, by the bridge's slot (pentest r1 MD).
+  const deliver = kotlinFun(/^private fun deliverPadFileResult\(id: String, outcome: String\) \{$/, "deliverPadFileResult");
+  assert.strictEqual(deliver[1], "if (!padFiles.finish(id)) return", "deliverPadFileResult answers only the request in flight, once");
+  assert.ok(deliver.includes("binding.root.postDelayed({ purgeShares(SHARE_TTL_MS) }, SHARE_TTL_MS + 1000)"),
+    "after \"shared\" the file is purged once its lifetime is over");
+  // Save (pentest r1 F3 / F4).
+  const save = kotlinFun(/^private fun onSaveDocument\(uri: Uri\?\) \{$/, "onSaveDocument");
+  assert.strictEqual(save[1], "val req = padSave ?: return", "a save result without a request is ignored (nothing deleted)");
+  assert.ok(save.includes('val out = contentResolver.openOutputStream(uri, "wt") ?: throw IOException("no output stream")'),
+    "the save stream is opened \"wt\" (truncate an overwritten file)");
+  const foreignAt = save.indexOf("if (!isForeignDocument(uri)) {");
+  assert.ok(foreignAt > 0 && foreignAt < save.findIndex((l) => l.startsWith("thread(")), "the save URI is checked before any write");
+  assert.deepStrictEqual(kotlinFun(/^private fun isForeignDocument\(uri: Uri\): Boolean \{$/, "isForeignDocument").slice(1, -1), [
+    'if (uri.scheme != "content") return false',
+    "val authority = uri.authority ?: return false",
+    "if (authority == filesAuthority) return false",
+    "return packageManager.resolveContentProvider(authority, 0)?.packageName != packageName",
+  ], "isForeignDocument: content:// only, never our FileProvider or any provider of ours");
+  assert.deepStrictEqual(kotlinFun(/^private fun startPadFileRequest\(req: PadFileRequest\) \{$/, "startPadFileRequest").slice(1, 5), [
+    "if (isFinishing || isDestroyed) {",
+    "padFiles.finish(req.id)",
+    "return",
+    "}",
+  ], "a request reaching a finishing activity starts nothing and frees the slot (pentest r1 MH)");
   assert.ok(callAt(onCreate, onCreate.findIndex((l) => l.startsWith("ContextCompat.registerReceiver(")), "registerReceiver(")
     .includes("ContextCompat.RECEIVER_NOT_EXPORTED"), "the chooser-callback receiver is NOT exported");
 
@@ -574,8 +643,8 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
   assert.deepStrictEqual(kotlinFun(/^private fun onFileChosen\(uri: Uri\?\) \{$/, "onFileChosen").slice(1, -1), [
     "val callback = fileChooserCallback ?: return",
     "fileChooserCallback = null",
-    "callback.onReceiveValue(uri?.let { arrayOf(it) })",
-  ], "onFileChosen hands the WebView the picked URI (or null) exactly once");
+    "callback.onReceiveValue(uri?.takeIf { isForeignDocument(it) }?.let { arrayOf(it) })",
+  ], "onFileChosen hands the WebView the picked URI (or null) exactly once — only another app's content:// (F4)");
   assert.ok(!lines.some((l) => /EXTRA_ALLOW_MULTIPLE|OpenMultipleDocuments|GetContent|ACTION_GET_CONTENT/.test(l)),
     "one document, through the SAF picker only");
 
@@ -594,7 +663,8 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
     ], `${launcher}: CATEGORY_OPENABLE and EXTRA_LOCAL_ONLY on the intent it launches`);
   }
   ok("pad files: exact name, 4 MiB, canonical envelope (= real exportPad), one at a time, fixed result script, " +
-    "share = read grant on cacheDir/pad-share only, save/import local-only + openable, onShowFileChooser answers once");
+    "share = read grant on a per-request URI, revoked before delete, 10-minute life; save \"wt\", no deletes; " +
+    "document URIs content:// of another app only; save/import local-only + openable; onShowFileChooser answers once");
 }
 
 console.log(`\nAll ${n} Android source checks passed.`);

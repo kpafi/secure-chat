@@ -45,20 +45,65 @@ object PadFileRules {
     val NAME = Regex("secure-chat-pad-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}\\.json")
 
     /**
-     * The pad-file envelope exactly as `exportPad()` in client/otp.js writes it
-     * with `JSON.stringify`: these five keys in this order, `v` 1, a numeric
-     * iteration count, and standard base64 (btoa) in every string. Stricter
-     * than "parses as JSON with these keys": a lenient parser (org.json takes
-     * single quotes, unquoted names, trailing garbage) would let the page put
-     * arbitrary bytes into a file the user then carries to another device.
-     * Matching the canonical text admits only strings that are valid JSON with
-     * exactly those keys, and nothing else. client/android-source.test.mjs
-     * runs the real `exportPad()` and holds its output to THIS pattern, so the
-     * two cannot drift apart unnoticed.
+     * The PBKDF2 iteration count `exportPad()` always writes: KDF_ITERS in
+     * client/otp.js (android-source.test.mjs holds the two equal). Pentest r1
+     * F7: the envelope used to admit any 1–9 digit count, so a page could hand
+     * out a file whose import runs a PBKDF2 of minutes (or of one round).
      */
-    val ENVELOPE = Regex(
-        """\{"fmt":"secure-chat-otp-pad","v":1,"kdf":\{"salt":"[A-Za-z0-9+/]+={0,2}","iters":[1-9][0-9]{0,8}\},"iv":"[A-Za-z0-9+/]+={0,2}","ct":"[A-Za-z0-9+/]+={0,2}"\}""",
-    )
+    const val KDF_ITERS = 600000
+
+    // The envelope exactly as `exportPad()` writes it with JSON.stringify:
+    // these literals, in this order, around three standard (btoa) base64 runs —
+    // salt (16 random bytes), iv (12 random bytes), ct.
+    private const val HEAD = "{\"fmt\":\"secure-chat-otp-pad\",\"v\":1,\"kdf\":{\"salt\":\""
+    private const val AFTER_SALT = "\",\"iters\":$KDF_ITERS},\"iv\":\""
+    private const val AFTER_IV = "\",\"ct\":\""
+    private const val TAIL = "\"}"
+    const val SALT_BYTES = 16
+    const val IV_BYTES = 12
+
+    /**
+     * Is [text] exactly the pad-file envelope? Stricter than "parses as JSON
+     * with these keys": a lenient parser (org.json takes single quotes,
+     * unquoted names, trailing garbage) would let the page put arbitrary bytes
+     * into a file the user then carries to another device. Matching the
+     * canonical text admits only strings that are valid JSON with exactly
+     * those keys, and nothing else.
+     *
+     * Pentest r1: a hand-written, single-pass scanner, NOT a regex. On Android
+     * java.util.regex is ICU, whose backtracking stack has a fixed limit, and
+     * the JVM unit tests run OpenJDK's engine instead — a 1.4 MB `ct` run that
+     * overflowed ICU would fail every real Share/Save while every test passed.
+     * This is O(n), allocation-free, and behaves the same on both.
+     * client/android-source.test.mjs holds the real `exportPad()` output to the
+     * same skeleton as the fixture PadFilesTest accepts, so client and native
+     * cannot drift apart unnoticed.
+     */
+    fun isEnvelope(text: String): Boolean {
+        var i = 0
+        fun literal(s: String): Boolean {
+            if (!text.startsWith(s, i)) return false
+            i += s.length
+            return true
+        }
+        // One base64 run as btoa writes it: alphabet characters, then at most
+        // two '=', a positive multiple of 4 in all; for a known byte count,
+        // exactly the length and padding btoa gives that many bytes.
+        fun base64(bytes: Int?): Boolean {
+            val start = i
+            while (i < text.length && isBase64Char(text[i])) i++
+            var pad = 0
+            while (pad < 2 && i < text.length && text[i] == '=') { i++; pad++ }
+            val n = i - start
+            if (n == 0 || n % 4 != 0) return false
+            return bytes == null || (n == 4 * ((bytes + 2) / 3) && pad == (3 - bytes % 3) % 3)
+        }
+        return literal(HEAD) && base64(SALT_BYTES) && literal(AFTER_SALT) && base64(IV_BYTES) &&
+            literal(AFTER_IV) && base64(null) && literal(TAIL) && i == text.length
+    }
+
+    private fun isBase64Char(c: Char): Boolean =
+        c in 'A'..'Z' || c in 'a'..'z' || c in '0'..'9' || c == '+' || c == '/'
 
     /**
      * 4 MiB, the same cap `importPad()` applies (audit 2026-07-18 L-01). The
@@ -73,7 +118,7 @@ object PadFileRules {
     fun validText(text: String?): Boolean {
         if (text == null || text.length > MAX_BYTES) return false
         if (text.toByteArray(Charsets.UTF_8).size > MAX_BYTES) return false
-        return ENVELOPE.matches(text)
+        return isEnvelope(text)
     }
 
     fun valid(name: String?, text: String?): Boolean = validName(name) && validText(text)

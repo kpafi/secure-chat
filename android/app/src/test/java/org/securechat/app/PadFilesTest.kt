@@ -84,11 +84,23 @@ class PadFilesTest {
             envelope(iters = "-1"),
             envelope(iters = "6e5"),
             envelope(iters = "1234567890"),                                      // > 9 digits
+            envelope(iters = "600001"),                                          // not KDF_ITERS (F7)
+            envelope(iters = "60000"),
+            envelope(iters = "1"),
+            envelope(iters = "6000000"),
+            envelope(salt = "AAECAwQFBgcICQoLDA0O"),                             // 20 chars: not 16 bytes
+            envelope(salt = "AAECAwQFBgcICQoLDA0ODw==AAAA"),                     // 28 chars
+            envelope(iv = "AAECAwQFBgcICQ=="),                                   // 16 chars, but 10 bytes
+            envelope(iv = "AAECAwQFBgcICQoLDA0O"),                               // 15 bytes
             envelope(ct = ""),                                                   // empty base64
             envelope(ct = "abc\\u0022"),                                         // JSON escape
             envelope(ct = "abc-_"),                                              // base64url, not btoa
             envelope(ct = "ab==c"),                                              // padding mid-string
             envelope(ct = "abc==="),                                             // three pad chars
+            envelope(ct = "AAAAA==="),                                           // three pad chars, 8 in all
+            envelope(ct = "a==="),
+            envelope(ct = "abcde"),                                              // not a multiple of 4
+            envelope(ct = "abc"),
             envelope(salt = "é"),                                                // non-ASCII
         )) {
             assertFalse("must refuse ${bad?.take(80)}", PadFileRules.validText(bad))
@@ -97,12 +109,39 @@ class PadFilesTest {
 
     @Test
     fun capsTheTextAtFourMiB() {
-        val over = PadFileRules.MAX_BYTES - envelope(ct = "").length + 1   // one byte over with ct filled
-        val fits = envelope(ct = "A".repeat(over - 1))
-        assertEquals(PadFileRules.MAX_BYTES, fits.length)
-        assertTrue("exactly 4 MiB is accepted", PadFileRules.validText(fits))
-        assertFalse("4 MiB + 1 is refused", PadFileRules.validText(envelope(ct = "A".repeat(over))))
+        // The longest valid ct (a multiple of 4) that fits, and the next one.
+        val room = PadFileRules.MAX_BYTES - envelope(ct = "").length
+        val fits = envelope(ct = "A".repeat(room - room % 4))
+        assertTrue(fits.length <= PadFileRules.MAX_BYTES && fits.length > PadFileRules.MAX_BYTES - 4)
+        assertTrue("a valid envelope up to 4 MiB is accepted", PadFileRules.validText(fits))
+        assertFalse("the next valid size, over 4 MiB, is refused by the cap",
+            PadFileRules.validText(envelope(ct = "A".repeat(room - room % 4 + 4))))
         assertEquals(4 * 1024 * 1024, PadFileRules.MAX_BYTES)
+    }
+
+    // Pentest r1: the check is a linear scan, not a regex (ICU's backtracking
+    // stack on the device is not what the JVM tests run). A worst case for a
+    // backtracking engine — a 4 MiB alphabet run that fails at the very end —
+    // is answered at once, and so is the largest real export.
+    @Test
+    fun theEnvelopeCheckIsLinearOnFourMiB() {
+        val room = PadFileRules.MAX_BYTES - envelope(ct = "").length
+        val run = "A".repeat(room - room % 4 - 4)
+        val t0 = System.nanoTime()
+        assertFalse(PadFileRules.validText(envelope(ct = run + "AAA!")))
+        assertFalse(PadFileRules.validText(envelope(ct = run + "AA=A")))
+        assertTrue(PadFileRules.validText(envelope(ct = run + "AA==")))
+        assertTrue("three 4 MiB scans in under 2 s", System.nanoTime() - t0 < 2_000_000_000L)
+    }
+
+    // The committed fixture is the real exportPad() output (client/otp.js);
+    // client/android-source.test.mjs checks that exportPad still writes the
+    // same skeleton, so this ties the native check to the client.
+    @Test
+    fun acceptsARealExportPadFile() {
+        val fixture = javaClass.getResource("pad-export-fixture.json")!!.readText()
+        assertTrue(PadFileRules.validText(fixture))
+        assertTrue(fixture.contains("\"iters\":${PadFileRules.KDF_ITERS}},"))
     }
 
     // --- the bridge: one request at a time, ids, the result script -----------
