@@ -554,9 +554,15 @@ export function passphraseWarning(pass) {
   if (/^(.)\1*$/su.test(p)) why = "it is one character repeated";
   else if (/^\d+$/.test(p)) why = "it is only digits";
   else if (isSequence(p)) why = "it is a simple sequence";
+  // Package 6 fix round (review Info): a date, a PIN with dashes, "1111…!".
+  else if (!/\p{L}/u.test(p)) why = "it has no letters, only digits and symbols";
+  // "passwordpassword", "abcabcabcabc": one short block, repeated.
+  else if (/^(.{2,}?)\1+$/su.test(p)) why = "it is one short block repeated";
   else if (COMMON_PASSPHRASE_WORDS.has(p.toLowerCase().replace(/[^a-z]/g, ""))) {
     why = "it is a common password with a few characters added";
   } else if ([...p].length < PASSPHRASE_MIN_CHARS) why = `it is shorter than ${PASSPHRASE_MIN_CHARS} characters`;
+  // "Summer2024!!": one short word padded with digits or symbols to the length.
+  else if (/^[^\p{L}\s]*\p{L}{1,8}[^\p{L}\s]*$/u.test(p)) why = "it is one short word with digits or symbols added";
   if (!why) return null;
   return `Weak passphrase: ${why}. Anyone who copies the encrypted data can try guesses offline, ` +
     `at their own pace — use ${PASSPHRASE_MIN_CHARS} or more characters, e.g. four or more random words. ` +

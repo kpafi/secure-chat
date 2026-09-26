@@ -406,6 +406,13 @@ await testCrossSessionReplayDefeated();
     "qwertyuiop2024": /common password/,
     "Pass Word 2024!!": /common password/, // split by spaces/digits, still the common word
     "hunter2": /shorter than 12/,
+    // package 6 fix round (review Info)
+    "111111111111!": /no letters/,
+    "1234-5678-90": /no letters/,
+    "2024-01-01!!": /no letters/,
+    "passwordpassword": /one short block repeated/,
+    "abcabcabcabc": /one short block repeated/,
+    "Summer2024!!": /one short word with digits or symbols added/,
     "elevenchars": /shorter than 12/,
   };
   for (const [p, why] of Object.entries(weak)) {
