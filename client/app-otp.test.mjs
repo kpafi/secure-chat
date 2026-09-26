@@ -755,6 +755,255 @@ async function otpConnect(padId = pad.padId) {
   console.log("OK  package 6 round 3: I1-I3 — no old frame on a new socket; the pad lock is released on every failed connect and only after an in-flight save (executed)");
 }
 
+// ==== package 6 round 4: every writer of a pad runs under its lock, re-checked after the slow step ====
+// Tab B is a separate otp.js instance throughout (its own caches), sharing
+// localStorage, the fake IndexedDB and Web Locks with this page.
+{
+  const st = dom.el("otpStatus");
+  const holdImportOf = (text) => {       // hold the next importKey of `text` (a PBKDF2 passphrase)
+    const subtle = crypto.subtle;
+    const real = subtle.importKey;
+    let gate;
+    const mayGo = new Promise((r) => { gate = r; });
+    const h = { entered: false, release: () => gate(), restore: () => { subtle.importKey = real; } };
+    subtle.importKey = function (fmt, raw, ...rest) {
+      if (fmt === "raw" && raw instanceof Uint8Array && new TextDecoder().decode(raw) === text) {
+        subtle.importKey = real;
+        h.entered = true;
+        return mayGo.then(() => real.call(this, fmt, raw, ...rest));
+      }
+      return real.call(this, fmt, raw, ...rest);
+    };
+    return h;
+  };
+  const waitFor = async (cond) => { for (let i = 0; i < 400 && !cond(); i++) await new Promise((r) => setTimeout(r, 5)); };
+  const sendTwo = async (label) => {
+    for (const t of [label + " one", label + " two"]) {
+      dom.el("text").value = t;
+      await dom.el("sendForm").dispatch("submit");
+      await settle(5);
+    }
+  };
+
+  // (1) F1: the same pad FILE imported in two tabs. Tab B's import sits in its
+  //     at-rest KDF while this page imports it, connects, sends and saves.
+  //     B must then refuse; a reload must open the pad at >= what was spent.
+  {
+    const foreign = await otp.generatePad({ label: "twice-imported", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    const file = await otp.exportPad(foreign, "transfer passphrase");
+    const recB = await otpB.importPad(file, "transfer passphrase");        // tab B decrypts the file…
+    const hB = holdImportOf("tab B pad passphrase");
+    const bSaving = otpB.saveNewPad(recB, "tab B pad passphrase").then(() => "saved", (e) => e.message);
+    await waitFor(() => hB.entered);                                       // …and sits in its KDF
+    assert.ok(hB.entered, "fixture: tab B's import is inside its KDF");
+    dom.el("otpXferPass").value = "transfer passphrase";
+    dom.el("otpPass").value = PAD_PASS;
+    dom.el("otpFile").files = [{ text: async () => file }];
+    await dom.el("otpFile").dispatch("change");
+    await settle(10);
+    assert.match(st.textContent, /^Imported \+ encrypted pad "twice-imported"/, "fixture: this page imported it: " + st.textContent);
+    const ws = await otpConnect(foreign.padId);
+    assert.ok(ws, "fixture: a session on the imported pad");
+    await sendTwo("twice");
+    const spent = (await otpB.unlockPad(foreign.padId, PAD_PASS)).record.sendOffset;
+    assert.ok(spent > 0, "fixture: pad bytes were spent and saved");
+    await dom.el("disconnect").click();
+    hB.release();
+    const outcome = await bSaving;
+    assert.match(String(outcome), /already been used/,
+      `round 4 F1: tab B's import, re-checked after its KDF, is refused (got ${outcome})`);
+    const otpR = await import("./otp.js?tab=R-" + foreign.padId);
+    const r = await otpR.unlockPad(foreign.padId, PAD_PASS);
+    assert.ok(r.record.sendOffset >= spent, `round 4 F1: a reload opens the pad at ${r.record.sendOffset} ≥ ${spent}`);
+  }
+
+  // (2) F1, the lock: this page imports a pad file while tab B holds the pad's
+  //     lock (its own import of the same file): refused, said why.
+  {
+    const foreign = await otp.generatePad({ label: "import-while-locked", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    const file = await otp.exportPad(foreign, "transfer passphrase");
+    let releaseB;
+    const gotB = await new Promise((res) => navigator.locks.request("sc.otp.lock.v1." + foreign.padId, { ifAvailable: true },
+      (l) => { res(!!l); return new Promise((r) => { releaseB = r; }); }));
+    assert.ok(gotB, "fixture: tab B holds the pad's lock");
+    dom.el("otpFile").files = [{ text: async () => file }];
+    await dom.el("otpFile").dispatch("change");
+    await settle(10);
+    releaseB();
+    assert.match(st.textContent, /This pad is in use/, "round 4: an import while the pad is locked elsewhere is refused: " + st.textContent);
+    assert.strictEqual(otp.padMeta(foreign.padId), null, "…and nothing of it was stored");
+  }
+
+  // (3) writePadBlob never silently replaces a record written under another
+  //     key: a save under a foreign key is refused and the pad stays readable.
+  {
+    const p = await otp.generatePad({ label: "foreign-key", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    const atRest = await otp.saveNewPad(p, PAD_PASS);
+    const u = await otpB.unlockPad(p.padId, PAD_PASS);
+    const otherKey = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+    await assert.rejects(otpB.savePadProgress(u.record, { ...atRest, key: otherKey }), /written under another key/,
+      "round 4: a save under another key does not overwrite this key's records");
+    assert.ok(await otp.unlockPad(p.padId, PAD_PASS), "…and the pad still opens with its own passphrase");
+  }
+
+  // (4) F2 (Info): a save that would START after a relay close is not made —
+  //     the receive is not shown, the send is not sent (no "me" line).
+  {
+    const p = await otp.generatePad({ label: "after-close", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    await otp.saveNewPad(p, PAD_PASS);
+    const peerPad = { bytes: p.bytes.slice(), role: 1, regionSize: p.regionSize, sendOffset: 0, recvHighWater: 0 };
+    const peerC = makeCipher("OTP", ROOM, { pad: peerPad });
+    const ws = await otpConnect(p.padId);
+    // receive: held inside its HMAC verify, the relay closes, then it completes
+    const subtle = crypto.subtle;
+    const realVerify = subtle.verify;
+    let gate;
+    const mayGo = new Promise((r) => { gate = r; });
+    let inside = false;
+    subtle.verify = function (...a) { subtle.verify = realVerify; inside = true; return mayGo.then(() => realVerify.apply(this, a)); };
+    const frame = await peerC.encrypt("after close");
+    ws.onmessage({ data: JSON.stringify({ type: "msg", room: ROOM, alg: "OTP", payload: frame }) });
+    await waitFor(() => inside);
+    ws.close();
+    await settle(5);
+    gate();
+    await settle(20);
+    assert.ok(!said(/after close$/), "round 4 F2: a frame whose save would start after the close is not shown");
+    assert.ok(said(/arrived as the connection closed — not shown/), "…and that is said");
+    assert.strictEqual((await otpB.unlockPad(p.padId, PAD_PASS)).record.recvHighWater, 0, "…and nothing was saved without the lock");
+    // send: held inside its encrypt (HMAC sign), the relay closes
+    const w2 = await otpConnect(p.padId);
+    const realSign = subtle.sign;
+    let gate2;
+    const mayGo2 = new Promise((r) => { gate2 = r; });
+    let inside2 = false;
+    subtle.sign = function (...a) { subtle.sign = realSign; inside2 = true; return mayGo2.then(() => realSign.apply(this, a)); };
+    dom.el("text").value = "never sent";
+    const sending = dom.el("sendForm").dispatch("submit");
+    await waitFor(() => inside2);
+    w2.close();
+    await settle(5);
+    gate2();
+    await sending;
+    await settle(10);
+    assert.strictEqual(w2.sent.filter((f) => f.type === "msg").length, 0, "round 4 F2: nothing is sent after the close");
+    assert.ok(!said(/^menever sent$/), "…no \"me\" line for it");
+    assert.match(dom.el("hint").textContent + dom.el("roomHint").textContent, /was NOT sent/, "…and it says so");
+    assert.strictEqual((await otpB.unlockPad(p.padId, PAD_PASS)).record.sendOffset, 0,
+      "…and no save was made once the session's lock was released");
+    // …and a save that started BEFORE the close completes (it holds the lock),
+    // but its frame is not sent on the closed socket, and there is no "me" line.
+    const w3 = await otpConnect(p.padId);
+    fakeIdb.hold();
+    dom.el("text").value = "saved but not sent";
+    const s3 = dom.el("sendForm").dispatch("submit");
+    await settle(10);
+    w3.close();
+    await settle(5);
+    fakeIdb.release();
+    await s3;
+    await settle(10);
+    assert.strictEqual(w3.sent.filter((f) => f.type === "msg").length, 0, "round 4 F2: a frame saved during the close is not sent");
+    assert.ok(!said(/^mesaved but not sent$/), "…and gets no \"me\" line");
+  }
+
+  // (5) F2: ALL saves in flight hold the lock, not only the latest one. Save A
+  //     (a send) is held at its blob encryption; save B (a receive) at the
+  //     durable write. The relay closes. B settles first: the lock is still
+  //     held until A settles too.
+  {
+    const lockFree = (id) => new Promise((res) => {
+      navigator.locks.request("sc.otp.lock.v1." + id, { ifAvailable: true }, (l) => { res(!!l); });
+    });
+    const p = await otp.generatePad({ label: "two-saves", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    await otp.saveNewPad(p, PAD_PASS);
+    const peerC = makeCipher("OTP", ROOM, { pad: { bytes: p.bytes.slice(), role: 1, regionSize: p.regionSize, sendOffset: 0, recvHighWater: 0 } });
+    const ws = await otpConnect(p.padId);
+    const subtle = crypto.subtle;
+    const realEnc = subtle.encrypt;
+    let gateA;
+    const mayGoA = new Promise((r) => { gateA = r; });
+    let insideA = false;
+    subtle.encrypt = function (...a) { subtle.encrypt = realEnc; insideA = true; return mayGoA.then(() => realEnc.apply(this, a)); };
+    dom.el("text").value = "save A";
+    const sendingA = dom.el("sendForm").dispatch("submit");
+    await waitFor(() => insideA);
+    assert.ok(insideA, "fixture: save A is held");
+    fakeIdb.hold();
+    ws.onmessage({ data: JSON.stringify({ type: "msg", room: ROOM, alg: "OTP", payload: await peerC.encrypt("save B") }) });
+    await settle(20);
+    ws.close();
+    await settle(5);
+    fakeIdb.release();                     // B settles
+    await settle(20);
+    assert.strictEqual(await lockFree(p.padId), false, "round 4 F2: with save A still in flight the pad lock is still held");
+    gateA();
+    await sendingA;
+    await settle(20);
+    assert.ok(await lockFree(p.padId), "…and released once every save settled");
+  }
+
+  // (5b) Forget is a writer too: refused while the pad is locked elsewhere.
+  {
+    const p = await otp.generatePad({ label: "forget-locked", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    await otp.saveNewPad(p, PAD_PASS);
+    let releaseB;
+    await new Promise((res) => navigator.locks.request("sc.otp.lock.v1." + p.padId, { ifAvailable: true },
+      (l) => { res(!!l); return new Promise((r) => { releaseB = r; }); }));
+    dom.el("otpSelect").value = p.padId;
+    await dom.el("otpForget").click();
+    await settle(5);
+    releaseB();
+    assert.ok(otp.padMeta(p.padId), "round 4: Forget does not delete a pad that is in use elsewhere");
+    assert.match(dom.el("otpStatus").textContent, /This pad is in use/, "…and says why");
+  }
+
+  // (6) F3: a reconnect while the previous session's save is still settling
+  //     waits for it (no "open in another tab" refusal).
+  {
+    const p = await otp.generatePad({ label: "reconnect-wait", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    await otp.saveNewPad(p, PAD_PASS);
+    const ws = await otpConnect(p.padId);
+    fakeIdb.hold();
+    dom.el("text").value = "slow save";
+    const sending = dom.el("sendForm").dispatch("submit");
+    await settle(10);
+    ws.close();
+    await settle(5);
+    const again = otpConnect(p.padId);
+    await settle(10);
+    assert.match(dom.el("status") ? dom.el("status").textContent : "", /finishing the previous session's save/,
+      "round 4 F3: the reconnect says it is waiting for the previous save");
+    fakeIdb.release();
+    await sending;
+    const w2 = await again;
+    assert.ok(w2, "round 4 F3: …and then connects (not refused as 'open in another tab')");
+    assert.ok(!anyHint(/open in another tab/), "…no other-tab wording");
+    await dom.el("disconnect").click();
+  }
+
+  // (7) F3: a cached key the pad no longer matches (it was saved again under a
+  //     new key elsewhere) is dropped, and the passphrase unlocks it again.
+  {
+    dom.el("otpPass").value = PAD_PASS;
+    dom.el("otpLabel").value = "rekeyed";
+    await dom.el("otpGenerate").click();
+    await settle(10);
+    const id = otp.listPads().find((m) => m.label === "rekeyed").padId;
+    // Elsewhere: the pristine pad is forgotten and saved again under a new key.
+    const u = await otpB.unlockPad(id, PAD_PASS);
+    otpB.forgetPad(id);
+    for (const k of ["sc.otp.wm.v1.", "sc.otp.used.v1.", "sc.otp.hw.v1."]) localStorage.removeItem(k + id);
+    fakeIdb.removeItem("sc.otp.dur.v1." + id);
+    await otpB.saveNewPad(u.record, PAD_PASS);
+    const ws = await otpConnect(id);
+    assert.ok(ws && anyHint(/one-time-pad encrypted/), "round 4 F3: the stale cached key is dropped and the passphrase opens the pad");
+    assert.ok(!anyHint(/saved again elsewhere/), "…without the 'saved again elsewhere' dead end");
+    await dom.el("disconnect").click();
+  }
+  console.log("OK  package 6 round 4: a pad file imported in two tabs is refused after the KDF; imports/forgets hold the pad lock; no save under a foreign key; no save starts after a close and all in-flight saves hold the lock; reconnect waits; a stale cached key is dropped (executed, separate otp.js instances)");
+}
+
 // ---- F-ATREST-002 residual: latch BEFORE download -----------------------------
 {
   const p2 = await otp.generatePad({ label: "to-export", totalBytes: 8192, fingerBytes: new Uint8Array(0) });

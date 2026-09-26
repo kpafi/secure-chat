@@ -626,7 +626,11 @@ const PAD_BLOB_V = 3;
 // blob under a fresh id walked around that control. Everything now lives inside
 // the AEAD; only the KDF parameters and the ciphertext are outside (they cannot
 // redirect key material, and the tag covers the rest).
-async function writePadBlob(record, key, salt, iters) {
+// Round 4: the one caller allowed to replace records it cannot read (a pad saved
+// under a NEW key, whose "is it used?" check has just passed after the KDF).
+// Module-private, so nothing outside otp.js can pass it.
+const FRESH_SAVE = Symbol("fresh save: re-check just passed");
+async function writePadBlob(record, key, salt, iters, fresh = null) {
   // H-3/M-7: the watermarks only ever move forward, and they cover BOTH
   // directions. Mirrored inside the blob so a restored blob carries its own
   // floor, and written to the authenticated outer record so a restored blob is
@@ -640,6 +644,14 @@ async function writePadBlob(record, key, salt, iters) {
   // record) contributes nothing; unlockPad judges those.
   const storedWm = await readWatermark(record.padId, key);
   const storedDur = await readDurable(record.padId, key);
+  // Package 6 round 4: a record that is PRESENT but unreadable under this key
+  // (another key's progress — a second import of the same pad) is never
+  // discarded silently: only a fresh save whose re-check just passed may.
+  if ((storedWm === "corrupt" || storedDur === "corrupt") && fresh !== FRESH_SAVE) {
+    const err = new Error("this pad's progress record was written under another key (another tab or an older copy) — refusing to overwrite it; reload and unlock the pad again");
+    err.code = "FOREIGN_RECORD";
+    throw err;
+  }
   const wm = {
     send: maxOf(prev.send, record.sendOffset | 0,
       storedWm && storedWm !== "corrupt" ? storedWm.send : 0,
@@ -767,13 +779,20 @@ export async function saveNewPad(record, passphrase) {
   // an argument about why the callers are safe is not a control.
   if (nativeFloor && nativeFloor.broken) throw floorUnavailableError();
   requireDurable();
-  if (padWasUsed(record.padId) || await durablePadUsed(record.padId)) {
-    throw new Error(
-      "this pad has already been used on this device — saving it as new would erase its usage record and reuse key material. Generate and exchange a fresh pad in person.",
-    );
-  }
+  const usedHere = async () => padWasUsed(record.padId) || await durablePadUsed(record.padId);
+  const usedError = () => new Error(
+    "this pad has already been used on this device — saving it as new would erase its usage record and reuse key material. Generate and exchange a fresh pad in person.",
+  );
+  if (await usedHere()) throw usedError();
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const key = await deriveKey(passphrase, salt, KDF_ITERS);
+  // Package 6 round 4 (pre-existing MEDIUM): the check above ran BEFORE the
+  // 600k KDF and never after, so the same pad file imported in a second tab
+  // passed it, spent the KDF while the first tab imported, sent and saved,
+  // and then wrote {0,0} over that progress under its own new key — a
+  // two-time pad after the next reload. Every decision taken before a slow
+  // step is taken again after it, immediately before the write.
+  if (await usedHere()) throw usedError();
   // Belt and braces: seed from whatever floors DID survive rather than from
   // zero, so even a bypass of the refusal above cannot lower the watermark.
   // For a genuinely new pad every source is absent and this is {0,0}.
@@ -784,7 +803,7 @@ export async function saveNewPad(record, passphrase) {
     recv: maxOf(survivingRecv > NATIVE_ABSENT ? survivingRecv : 0),
   });
   durHigh.delete(record.padId); // a new at-rest key: the old record is not ours to max against
-  await writePadBlob(record, key, salt, KDF_ITERS);
+  await writePadBlob(record, key, salt, KDF_ITERS, FRESH_SAVE);
   return { key, salt, iters: KDF_ITERS };
 }
 
@@ -813,7 +832,9 @@ export async function unlockPad(padId, passphrase, opts = {}) {
   let key;
   if (opts.atRest) {
     if (opts.atRest.iters !== iters || b64(opts.atRest.salt) !== o.kdf.salt) {
-      throw new Error("this pad was saved again elsewhere — enter its passphrase to unlock it");
+      const err = new Error("this pad was saved again elsewhere — enter its passphrase to unlock it");
+      err.code = "KEY_STALE"; // round 4 (F3): the caller drops its cached key
+      throw err;
     }
     key = opts.atRest.key;
   } else {
@@ -870,6 +891,7 @@ export async function unlockPad(padId, passphrase, opts = {}) {
   // saved before 3b, or a deleted record); present = a record, and the one a
   // crash cannot lose.
   let dur = await readDurable(padId, key);
+  let strandedDur = false;
   // Review round 2 (I-6): a re-import under a NEW pad passphrase (saveNewPad:
   // new salt, new key) that crashed between writing its blob and its durable
   // record leaves the previous record, sealed under the OLD key, beside a new
@@ -885,6 +907,7 @@ export async function unlockPad(padId, passphrase, opts = {}) {
       sendOffset === 0 && recvHighWater === 0 && (inner.hwSend | 0) === 0 && (inner.hwRecv | 0) === 0 &&
       inner.exported !== true && (outerWm === null || (outerWm.send === 0 && outerWm.recv === 0))) {
     dur = null;
+    strandedDur = true; // round 4: the one unreadable record this call may replace (judged just now)
   }
   if (dur === "corrupt") {
     throw new Error(
@@ -1197,7 +1220,7 @@ export async function unlockPad(padId, passphrase, opts = {}) {
   // and the skipped bytes are zeroed on disk), and when it has no durable
   // record yet — the one-time adoption of every pad saved before 3b: its
   // record starts at the offsets just verified.
-  if (preV3 || healed || dur === null) await writePadBlob(record, key, salt, iters);
+  if (preV3 || healed || dur === null) await writePadBlob(record, key, salt, iters, strandedDur ? FRESH_SAVE : null);
   return { record, atRest };
 }
 
