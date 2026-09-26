@@ -2,7 +2,12 @@
 // the browser). Simulates two peers (A and B) for each algorithm and asserts a
 // full round-trip. Run: node client/crypto.test.mjs
 import assert from "node:assert";
-import { makeCipher, isAscii } from "./crypto.js";
+import { makeCipher, isAscii, REMOVED_ALGS } from "./crypto.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
 
 const ROOM = "a".repeat(64);
 const MSG = "Hello over the relay! ~ ASCII only 123 #@$";
@@ -40,10 +45,10 @@ async function roundtripHandshake(alg) {
   await b.init();
   assert.ok(a.needsHandshake, `${alg} needs handshake`);
   // Two rounds through the (simulated) relay. For DHKE the second payload is
-  // the same idempotent public key; for RSA/PQKEM round 1 is the offer and
-  // round 2 the answer (wrapped root secret / KEM encapsulation). Exchanging
-  // both offers + both answers mirrors the relay's join-order race (both
-  // peers' offers delivered), which RSA and PQKEM must converge on.
+  // the same idempotent public key; for PQKEM round 1 is the offer and
+  // round 2 the answer (the KEM encapsulation). Exchanging both offers + both
+  // answers mirrors the relay's join-order race (both peers' offers
+  // delivered), which PQKEM must converge on.
   const aOffer = await a.handshakePayload();
   const bOffer = await b.handshakePayload();
   await a.onPeerKey(bOffer);
@@ -78,119 +83,28 @@ async function negativeChecks() {
   console.log("OK  ascii guard");
 }
 
-// RSA-specific attacks the ratcheted framing must defeat. Mallory plays the
-// relay: she sees every handshake payload (so she learns both public keys)
-// but never the OAEP-wrapped root secret.
-async function rsaAttackChecks() {
-  const a = makeCipher("RSA", ROOM);
-  const b = makeCipher("RSA", ROOM);
-  await a.init();
-  await b.init();
-  // Staggered handshake: B offers, A answers (the realistic single-secret path).
-  const bOffer = await b.handshakePayload();
-  await a.onPeerKey(bOffer);
-  await b.onPeerKey(await a.handshakePayload());
-  assert.ok(a.ready && b.ready, "RSA ready");
-
-  const rejects = async (p, what) => {
-    let failed = false;
-    try {
-      await p();
-    } catch {
-      failed = true;
-    }
-    assert.ok(failed, what);
-  };
-
-  // FORGERY: Mallory saw B's offer go past, so she holds B's public key and
-  // can complete her own well-formed handshake against it — the classic
-  // encrypting-to-a-public-key-proves-nothing attack. Her chains descend from
-  // HER root secret, which B never processed, so her frames fail the AEAD.
-  const mallory = makeCipher("RSA", ROOM);
-  await mallory.init();
-  await mallory.onPeerKey(bOffer);
-  assert.ok(mallory.ready, "mallory can always build a well-formed frame");
-  await rejects(async () => b.decrypt(await mallory.encrypt("evil message")), "forged message must be rejected");
-  console.log("OK  RSA forgery by the relay rejected (relay never learns the root)");
-
-  // REFLECTION: A's own frame echoed back must not decrypt (direction chains).
-  await rejects(async () => a.decrypt(await a.encrypt(MSG)), "reflected message must be rejected");
-  console.log("OK  RSA reflection rejected (direction-separated chains)");
-
-  // REPLAY: the same genuine frame must not be accepted twice (and its
-  // one-time key is already deleted).
-  const wire = await a.encrypt(MSG);
-  assert.strictEqual(await b.decrypt(wire), MSG, "genuine frame accepted once");
-  await rejects(async () => b.decrypt(wire), "replayed frame must be rejected");
-  console.log("OK  RSA replay rejected (sequence + one-time keys)");
-
-  // TAMPER: flipping ciphertext must fail GCM authentication — and must NOT
-  // burn the receive chain (the step is committed only on success).
-  const m = JSON.parse(Buffer.from(await a.encrypt(MSG), "base64").toString());
-  m.ct = (m.ct[0] === "A" ? "B" : "A") + m.ct.slice(1);
-  const tampered = Buffer.from(JSON.stringify(m)).toString("base64");
-  await rejects(async () => b.decrypt(tampered), "tampered frame must be rejected");
-  assert.strictEqual(await b.decrypt(await a.encrypt("still alive")), "still alive",
-    "channel must survive a rejected frame");
-  console.log("OK  RSA tampering rejected (channel intact afterwards)");
-}
-
-// Forward-secrecy mechanics of the RSA ratchet. These are white-box checks:
-// they reach into the cipher to prove the sensitive material is actually gone.
-async function rsaForwardSecrecyChecks() {
-  const a = makeCipher("RSA", ROOM);
-  const b = makeCipher("RSA", ROOM);
-  await a.init();
-  await b.init();
-  const bOffer = await b.handshakePayload();
-  await a.onPeerKey(bOffer);
-  await b.onPeerKey(await a.handshakePayload());
-
-  const rejects = async (p, what) => {
-    let failed = false;
-    try {
-      await p();
-    } catch {
-      failed = true;
-    }
-    assert.ok(failed, what);
-  };
-
-  // SEAL: the first real message erases the RSA private key and root secret —
-  // the two things that, with a recorded transcript, would undo the ratchet.
-  assert.ok(a.kp !== null && a.secrets.size > 0, "handshake material held until traffic starts");
-  const w1 = await a.encrypt("one");
-  assert.ok(a.sealed && a.kp === null && a.secrets.size === 0 && a.peerPub === null,
-    "sender sealed on first encrypt");
-  assert.strictEqual(await b.decrypt(w1), "one");
-  assert.ok(b.sealed && b.kp === null && b.secrets.size === 0,
-    "receiver sealed on first decrypt");
-  console.log("OK  RSA seal: root secret + RSA private key erased once traffic starts");
-
-  // ONE-WAY CHAIN: deliver frame 3 with frame 2 lost in flight — the chain
-  // fast-forwards, and the skipped frame's one-time key is gone for good.
-  const w2 = await a.encrypt("two (lost in flight)");
-  const w3 = await a.encrypt("three");
-  assert.strictEqual(await b.decrypt(w3), "three", "gap tolerated");
-  await rejects(async () => b.decrypt(w2), "skipped frame's key must be unrecoverable");
-  console.log("OK  RSA skipped frame unrecoverable (keys deleted as the chain steps)");
-
-  // POST-SEAL HANDSHAKE: a replayed (validly-signed) offer after establishment
-  // must be ignored — no key desync, no resurrection of handshake state.
-  await a.onPeerKey(bOffer);
-  assert.ok(a.kp === null && a.secrets.size === 0, "sealed state untouched by late handshake frame");
-  assert.strictEqual(await b.decrypt(await a.encrypt("still here")), "still here",
-    "session survives a replayed offer");
-  console.log("OK  RSA post-seal handshake frames ignored (no desync)");
-
-  // SKIP BOUND: a far-future sequence number is rejected before any chain work.
-  const far = JSON.parse(Buffer.from(await a.encrypt("x"), "base64").toString());
-  far.n += 100000;
-  await rejects(
-    async () => b.decrypt(Buffer.from(JSON.stringify(far)).toString("base64")),
-    "far-future sequence must be rejected",
-  );
-  console.log("OK  RSA chain-stepping bounded (hostile skip rejected)");
+// Package 4, owner decision 1 (F-CRYPTO-009): RSA key transport is REMOVED.
+// makeCipher refuses the name with the reason — never a fallback to another
+// mode, which would be a silent downgrade — and the set of constructible modes
+// is pinned by ALLOW-list (a deny-list loses to a renamed mode). The source
+// check keeps the implementation deleted rather than merely unreachable.
+async function removedModeChecks() {
+  for (const alg of ["AES256", "DHKE", "PQKEM"]) {
+    assert.doesNotThrow(() => makeCipher(alg, ROOM, { passphrase: "p" }), `${alg} is still constructible`);
+  }
+  assert.throws(() => makeCipher("RSA", ROOM), /RSA mode was removed.*pick DHKE or Post-quantum/,
+    "makeCipher refuses RSA by name, with the reason");
+  for (const alg of ["rsa", "RSA_v2", "RSA-OAEP", "", undefined, "__proto__", "toString"]) {
+    assert.throws(() => makeCipher(alg, ROOM), /unsupported|removed/, `makeCipher refuses ${JSON.stringify(alg)}`);
+  }
+  assert.ok(Object.isFrozen(REMOVED_ALGS) && Object.keys(REMOVED_ALGS).join() === "RSA",
+    "REMOVED_ALGS names exactly the removed mode");
+  const src = readFileSync(join(HERE, "crypto.js"), "utf8");
+  const cases = [...src.matchAll(/^\s*case\s+"([^"]+)"\s*:/gm)].map((m) => m[1]).sort();
+  assert.deepStrictEqual(cases, ["AES256", "DHKE", "OTP", "PQKEM"],
+    "makeCipher's constructible modes are exactly the four live ones (allow-list over its case labels)");
+  assert.ok(!/RSA-OAEP"|class\s+Rsa\b|modulusLength/.test(src), "the RSA implementation is deleted, not left unreachable");
+  console.log("OK  RSA removed: makeCipher refuses it with the reason; exactly four modes are constructible");
 }
 
 // Reflection / replay / tamper checks for the symmetric modes (AES256, DHKE,
@@ -293,7 +207,7 @@ async function aesRatchetChecks() {
   console.log("OK  AES256 skipped frame unrecoverable (keys deleted as the chain steps)");
 }
 
-// In-session forward secrecy for the DHKE/PQKEM ratchets (mirrors the RSA
+// In-session forward secrecy for the DHKE/PQKEM ratchets (mirrored the removed RSA
 // checks): white-box proof that the handshake material really is erased and
 // that skipped one-time keys are gone. Plus the reflection guard shared by all
 // handshake modes: a peer "offer" carrying OUR OWN public key can only be a
@@ -332,7 +246,7 @@ async function handshakeRatchetChecks() {
     console.log("OK  DHKE in-session forward secrecy (private key dropped, one-way chains) + reflection guard");
   }
 
-  // PQKEM: seals on first traffic, like RSA (the join-order race means a
+  // PQKEM: seals on first traffic (the join-order race means a
   // second root secret may still arrive until then).
   {
     const a = makeCipher("PQKEM", ROOM);
@@ -360,14 +274,6 @@ async function handshakeRatchetChecks() {
     assert.strictEqual(await b.decrypt(await a.encrypt("still here")), "still here",
       "PQKEM session survives a replayed offer");
     console.log("OK  PQKEM in-session forward secrecy (seal on first traffic, one-way chains) + reflection guard");
-  }
-
-  // RSA got the same reflection guard.
-  {
-    const a = makeCipher("RSA", ROOM);
-    await a.init();
-    await rejects(async () => a.onPeerKey(await a.handshakePayload()), "RSA reflected handshake must be rejected");
-    console.log("OK  RSA reflection guard (own key echoed back refused)");
   }
 }
 
@@ -569,7 +475,7 @@ async function aeadParameterChecks() {
   try {
     const want = {
       AES256: "secure-chat/aes-msg/v2", DHKE: "secure-chat/dhke-msg/v2",
-      RSA: "secure-chat/rsa-msg/v2", PQKEM: "secure-chat/pqkem-msg/v2",
+      PQKEM: "secure-chat/pqkem-msg/v2",
     };
     for (const [alg, domain] of Object.entries(want)) {
       let a, b;
@@ -746,11 +652,9 @@ async function otpChecks() {
 
 await roundtripShared();
 await roundtripHandshake("DHKE");
-await roundtripHandshake("RSA");
 await roundtripHandshake("PQKEM");
 await negativeChecks();
-await rsaAttackChecks();
-await rsaForwardSecrecyChecks();
+await removedModeChecks();
 await aesRatchetChecks();
 await symmetricAttackChecks("AES256");
 await symmetricAttackChecks("DHKE");
@@ -760,7 +664,6 @@ await pqkemLateOfferChangesTheChains();
 await handshakeRatchetChecks();
 await concurrencyChecks("AES256");
 await concurrencyChecks("DHKE");
-await concurrencyChecks("RSA");
 await concurrencyChecks("PQKEM");
 otpChecksOffsetValidation();
 await otpChecks();

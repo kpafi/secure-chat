@@ -22,6 +22,7 @@ import javax.crypto.SecretKey
  *   exported:<padId>   OTP exported flag, 0/1 (F-ATREST-002)
  *   contacts:<idHash>  contact-store generation per identity (F-ATREST-003/004)
  *   chats:<idHash>     chat-store generation per identity (F-ATREST-005)
+ *   identity:<idHash>  identity-blob generation (package 4, F-ATREST-008)
  * Pad ids are validated to 32 hex characters on the JS side, so a pad file
  * cannot address another namespace. See client/nativefloor.js.
  *

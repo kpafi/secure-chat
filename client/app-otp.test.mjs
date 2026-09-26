@@ -19,7 +19,7 @@ import assert from "node:assert";
 import { fakeIdb } from "./fake-idb.test.mjs"; // package 3b: IndexedDB for node
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { installDom } from "./dom-stub.test.mjs";
+import { installDom, El } from "./dom-stub.test.mjs";
 import { makeCipher, bufToB64 } from "./crypto.js";
 import { freshNonce } from "./auth.js";
 
@@ -42,10 +42,13 @@ globalThis.fetch = async () => new Response("{}", { status: 404 });
 
 const dom = installDom(join(HERE, "index.html"));
 dom.body.appendChild(dom.el("tabbar"));
-dom.seedAlgRadios(["DHKE", "AES256", "RSA", "PQKEM", "OTP"], "DHKE");
+dom.seedAlgRadios(["DHKE", "AES256", "PQKEM", "OTP"], "DHKE");
 dom.seedNavItems(["live", "chats", "users", "profile"]);
 dom.seedChild("scrChat", "div", "topbar");
 for (const id of ["usersLocked", "chatsLocked"]) dom.seedChild(id, "p", "hint");
+// The username field's row (app.js hides it with `closest(".row")`): without it
+// showIdentityUnlocked throws, and an identity unlock here would never finish.
+{ const row = new El("div"); row.className = "row"; row.appendChild(dom.el("username")); }
 
 // Web Locks, modelled with the one property this file is about: `ifAvailable`
 // answers null while the name is held (dom-stub's version always grants).
@@ -69,9 +72,18 @@ URL.createObjectURL = (b) => { downloads++; return realObjectURL.call(URL, b); }
 // wordings below exist only where a floor exists). Monotone, and deletable by
 // the test the way a file-level attacker deletes a prefs entry.
 const floors = new Map();
+// Package 4 (F-ATREST-008): identity-floor bumps are recorded with the identity
+// blob stored AT THAT MOMENT (the floor must follow the stored blob, never lead
+// it), and one can be made to fail the way a failed commit() does.
+const identityBumps = [];
+let failIdentityBumps = 0;
 globalThis.__SECURE_CHAT_PAD_FLOOR__ = Object.freeze({
   read: (id) => (floors.has(id) ? floors.get(id) : -1),
   bump: (id, v) => {
+    if (id.startsWith("identity:")) {
+      identityBumps.push({ id, v, blob: store.get("sc.identity.v1"), durableBlob: fakeIdb.getItem("sc.identity.v1") });
+      if (failIdentityBumps > 0) { failIdentityBumps--; return -3; }
+    }
     const cur = floors.has(id) ? floors.get(id) : -1;
     const n = cur === -1 ? v : (v > cur ? v : cur);
     floors.set(id, n);
@@ -325,6 +337,238 @@ async function resealPad(padId, mutate) {
   await settle(10);
   assert.strictEqual(downloads, d0 + 1, "…and is handed out once it has");
   console.log("OK  3b: OTP transmit, display and export wait for the durable (IndexedDB) write (executed)");
+}
+
+// ==== package 4 (F-ATREST-008): the identity blob is never silently re-keyed =====
+// …and on a device with a native floor, an older copy is refused. Before: a
+// blob without encryption keys was given NEW ones on unlock and app.js stored
+// them — a restored older copy (one setItem) silently re-keyed the identity.
+{
+  const { Identity, identityFloorId, b64 } = await import("./identity.js");
+  const PASS = "identity passphrase for the tests";
+  const stored = () => store.get("sc.identity.v1");
+  const ED = async () => (await Identity.import(stored(), PASS)).edPubRaw;
+  const unlock = async () => {
+    dom.el("idPass").value = PASS;
+    await dom.el("idUnlock").click();
+    await settle(20);
+  };
+  // A keyless copy of an identity: `legacy` = the pre-v3 envelope (v:1).
+  const keylessBlob = async (id, legacy, gen = 0) => {
+    const k = new Identity({ edPriv: id._edPriv, edPubRaw: id.edPubRaw, mldsaSecret: id._mldsaSecret, mldsaPub: id.mldsaPub });
+    k.gen = gen;
+    const blob = JSON.parse(await k.export(PASS));
+    if (legacy) blob.v = 1;
+    return JSON.stringify(blob);
+  };
+  let asked = [];
+  let answer = false;
+  globalThis.confirm = (q) => { asked.push(q); return answer; };
+
+  // (1) create: the floor follows the stored blob (generation 1).
+  dom.el("idPass").value = PASS;
+  await dom.el("idCreate").click();
+  await settle(40);
+  const keyA = await identityFloorId(await ED());
+  assert.strictEqual(floors.get(keyA), 1, "F-ATREST-008: a new identity raises its floor to generation 1");
+  const bumpA = identityBumps.find((b) => b.id === keyA);
+  assert.ok(bumpA && bumpA.blob && JSON.parse(bumpA.blob).v === 3, "...AFTER the blob was stored (never a floor ahead of the only copy)");
+  assert.strictEqual(bumpA.durableBlob, stored(), "fix round L-1: ...and AFTER its DURABLE copy was written (localStorage alone is not on disk)");
+  const blobA = stored();
+  // An attacker (or a restored snapshot) that puts an old copy back puts it in
+  // both places; a lost write loses only the localStorage one (6, 7 below).
+  const plant = (blob) => { store.set("sc.identity.v1", blob); fakeIdb.setItem("sc.identity.v1", blob); };
+  const idA = await Identity.import(blobA, PASS);
+
+  // (2) Android: an older KEYLESS copy of this identity is put back. Refused
+  //     before anyone is asked; nothing re-keyed, nothing stored.
+  for (const legacy of [true, false]) {
+    const planted = await keylessBlob(idA, legacy);
+    plant(planted);
+    asked = [];
+    await unlock();
+    assert.strictEqual(asked.length, 0, `F-ATREST-008 (${legacy ? "legacy" : "v3"} envelope): a device that used this identity WITH keys does not even ask`);
+    assert.match(dom.el("idStatus").textContent, /Not unlocked: .*old copy has been put back/, "...it refuses, saying why");
+    assert.strictEqual(stored(), planted, "...and the stored copy was NOT upgraded with new keys");
+  }
+  // an older WITH-keys generation below the floor is refused too
+  floors.set(keyA, 3);
+  plant(blobA); // generation 1 < floor 3
+  await unlock();
+  assert.match(dom.el("idStatus").textContent, /Not unlocked: .*OLDER than one this device has already used/, "F-ATREST-008: a generation below the floor is refused");
+  floors.set(keyA, 1);
+
+  // (3) a keyless blob of an identity this device never saw (the browser case,
+  //     or a genuine first upgrade): the user is ASKED; Cancel changes nothing.
+  const idB = await Identity.generate();
+  const legacyB = await keylessBlob(idB, true);
+  const keyB = await identityFloorId(idB.edPubRaw);
+  store.set("sc.identity.v1", legacyB);
+  asked = []; answer = false;
+  await unlock();
+  assert.strictEqual(asked.length, 1, "F-ATREST-008: a keyless blob is never re-keyed without asking");
+  assert.match(asked[0], /old version of the app.*ALREADY used this identity with a newer version.*Cancel/s, "...the legacy question warns about a restored copy");
+  assert.strictEqual(stored(), legacyB, "...Cancel stores nothing");
+  assert.ok(!floors.has(keyB), "...and raises no floor");
+  assert.match(dom.el("idStatus").textContent, /Not unlocked/, "...and says it did not unlock");
+  // a v3 envelope without keys asks the LOUD question
+  store.set("sc.identity.v1", await keylessBlob(idB, false));
+  asked = [];
+  await unlock();
+  assert.match(asked[0] || "", /WARNING: your saved identity has NO encryption keys/, "F-ATREST-008: a v3 blob without keys gets the loud question");
+  // (4) confirmed: keys added once, stored, generation +1, floor raised after.
+  store.set("sc.identity.v1", legacyB);
+  asked = []; answer = true;
+  const bumps0 = identityBumps.length;
+  await unlock();
+  const up = await Identity.import(stored(), PASS);
+  assert.ok(up.publicBundle().ecdh && up.gen === 1 && !up.upgraded, "F-ATREST-008: confirmed — the new keys are stored once, as generation 1");
+  assert.ok(lines().some((l) => /new encryption keys were created for your identity — you confirmed it/.test(l)), "...and the transcript says so");
+  const bumpB = identityBumps.slice(bumps0).find((b) => b.id === keyB);
+  assert.ok(bumpB && bumpB.v === 1 && bumpB.blob === stored(), "...the floor was raised to 1 AFTER the upgraded blob was stored");
+  assert.strictEqual(bumpB.durableBlob, stored(), "fix round L-1: ...and after its DURABLE copy was written");
+  // (5) a crash/failed write between storing and raising: the blob is safe,
+  //     the next unlock catches the floor up (no brick).
+  const idC = await Identity.generate();
+  store.set("sc.identity.v1", await idC.export(PASS));
+  const keyC = await identityFloorId(idC.edPubRaw);
+  failIdentityBumps = 1;
+  await unlock();
+  assert.ok(!floors.has(keyC) && lines().some((l) => /rollback record for your identity could not be updated/.test(l)),
+    "F-ATREST-008: a failed floor write is said, and the identity still unlocks");
+  await unlock();
+  assert.strictEqual(floors.get(keyC), 1, "...and the next unlock raises the floor");
+
+  // ---- fix round (pentest of package 4), L-1: a lost localStorage write + kill --
+  // localStorage.setItem is not on disk (durable.js); PadFloor's commit() is.
+  // Modelled here: the upgrade's setItem is LOST (the pre-upgrade copy is what
+  // the disk still has), the floor and IndexedDB (strict, awaited) keep what
+  // they got. Before the fix: keyless gen-0 blob + floor 1 = IDENTITY_ROLLBACK
+  // forever, no override.
+  // (6) the one-time upgrade of an existing (pre-fix: localStorage-only) install
+  const idD = await Identity.generate();
+  const legacyD = await keylessBlob(idD, true);
+  const keyD = await identityFloorId(idD.edPubRaw);
+  store.set("sc.identity.v1", legacyD);
+  fakeIdb.removeItem("sc.identity.v1");
+  asked = []; answer = true;
+  await unlock();
+  const upD = await Identity.import(stored(), PASS);
+  assert.ok(upD.publicBundle().ecdh && floors.get(keyD) === 1, "fixture: the upgrade ran and the floor is at 1");
+  store.set("sc.identity.v1", legacyD); // the kill: the upgraded blob never reached the disk
+  asked = [];
+  await unlock();
+  assert.strictEqual(asked.length, 0, "fix round L-1: after a lost write + kill the next unlock is not asked about new keys");
+  assert.doesNotMatch(dom.el("idStatus").textContent, /Not unlocked|Wrong passphrase/, `fix round L-1: ...and it UNLOCKS (not a permanent rollback): ${dom.el("idStatus").textContent}`);
+  const againD = await Identity.import(stored(), PASS);
+  assert.strictEqual(againD.publicBundle().ecdh, upD.publicBundle().ecdh, "...with the keys the upgrade made (not new ones), put back from the durable copy");
+  assert.ok(lines().some((l) => /taken from the device's durable copy/.test(l)), "...and says so");
+  // (7) create, then the kill loses the localStorage write entirely
+  store.delete("sc.identity.v1");
+  fakeIdb.removeItem("sc.identity.v1");
+  dom.el("idPass").value = PASS;
+  await dom.el("idCreate").click();
+  await settle(40);
+  const created = stored();
+  const keyE = await identityFloorId((await Identity.import(created, PASS)).edPubRaw);
+  assert.strictEqual(floors.get(keyE), 1, "fixture: create raised the floor");
+  store.delete("sc.identity.v1"); // the kill
+  await unlock();
+  assert.doesNotMatch(dom.el("idStatus").textContent, /Not unlocked|Wrong passphrase|Nothing to unlock/, `fix round L-1: a created identity whose localStorage write was lost still unlocks: ${dom.el("idStatus").textContent}`);
+  assert.strictEqual(stored(), created, "...from the durable copy, which is put back");
+
+  // ---- final round (review of a5ac006) ------------------------------------------
+  const durableNow = () => fakeIdb.getItem("sc.identity.v1");
+  // (8) M1: the durable write FAILS -> the floor does not move, and it is said.
+  const idF = await Identity.generate();
+  const blobF = await idF.export(PASS);
+  const keyF = await identityFloorId(idF.edPubRaw);
+  store.set("sc.identity.v1", blobF);
+  fakeIdb.removeItem("sc.identity.v1");
+  fakeIdb.failWrites((k) => k === "sc.identity.v1", "QuotaExceeded");
+  try {
+    await unlock();
+  } finally {
+    fakeIdb.failWrites(null);
+  }
+  assert.ok(!floors.has(keyF), "final round M1: a failed durable write leaves the identity floor where it was");
+  assert.ok(lines().some((l) => /could not be saved to the device's durable storage — its rollback record was not advanced/.test(l)), "...and says so");
+  await unlock();
+  assert.strictEqual(floors.get(keyF), 1, "...and the next unlock (durable write OK) raises it");
+
+  // (9) M4: Create refuses while a durable copy exists (the localStorage one lost).
+  store.delete("sc.identity.v1");
+  assert.strictEqual(durableNow(), blobF, "fixture: only the durable copy is left");
+  dom.el("idPass").value = PASS;
+  await dom.el("idCreate").click();
+  await settle(10);
+  assert.match(dom.el("idStatus").textContent, /An identity already exists here/, "final round M4: Create refuses while a durable copy exists");
+  assert.strictEqual(durableNow(), blobF, "...and does not replace it");
+  // (10) Info-2: only the durable copy, and a WRONG passphrase: say so.
+  dom.el("idPass").value = "not the passphrase";
+  await dom.el("idUnlock").click();
+  await settle(20);
+  assert.strictEqual(dom.el("idStatus").textContent, "Wrong passphrase or corrupted identity.",
+    "final round Info-2: a wrong passphrase against the durable copy is a wrong passphrase, not 'nothing to unlock'");
+  // (11) Info-3: a DAMAGED localStorage copy does not hide a durable copy that opens.
+  store.set("sc.identity.v1", "{not an identity");
+  await unlock();
+  assert.doesNotMatch(dom.el("idStatus").textContent, /Wrong passphrase|Not unlocked|Nothing/, `final round Info-3: the durable copy opens: ${dom.el("idStatus").textContent}`);
+  assert.strictEqual(stored(), blobF, "...and replaces the damaged one");
+
+  // (12) Info-1: Forget while an unlock is in flight — the unlock must not put
+  //      the durable copy back afterwards (it would resurrect on reload).
+  {
+    const subtle = crypto.subtle, orig = subtle.deriveKey;
+    let release, entered = false;
+    const gate = new Promise((r) => { release = r; });
+    subtle.deriveKey = function (alg, ...rest) {
+      if (!entered && alg && alg.name === "PBKDF2") { entered = true; subtle.deriveKey = orig; return gate.then(() => orig.call(this, alg, ...rest)); }
+      return orig.call(this, alg, ...rest);
+    };
+    try {
+      dom.el("idPass").value = PASS;
+      const unlocking = dom.el("idUnlock").click();
+      const t0 = Date.now();
+      while (!entered && Date.now() - t0 < 5000) await new Promise((r) => setTimeout(r, 5));
+      assert.ok(entered, "fixture: the unlock is deriving its key");
+      globalThis.confirm = () => true;
+      await dom.el("idForget").click(); // (the handler does not return forgetIdentity's promise)
+      await settle(40);
+      assert.ok(stored() === undefined && durableNow() === null, "fixture: Forget removed both copies");
+      release();
+      await unlocking;
+      await settle(20);
+      assert.strictEqual(durableNow(), null, "final round Info-1: an unlock racing Forget does not put the durable copy back");
+      assert.strictEqual(stored(), undefined, "...nor the localStorage one");
+    } finally {
+      subtle.deriveKey = orig;
+      if (release) release();
+    }
+  }
+
+  // (13) M3: Forget removes BOTH copies, and nothing comes back on a reload
+  //      (a fresh instance of app.js runs the page-load restore again).
+  store.set("sc.identity.v1", blobF);
+  fakeIdb.setItem("sc.identity.v1", blobF);
+  await unlock();
+  globalThis.confirm = () => true;
+  await dom.el("idForget").click();
+  await settle(40);
+  assert.strictEqual(stored(), undefined, "final round M3: Forget removes the localStorage copy");
+  assert.strictEqual(durableNow(), null, "final round M3: ...AND the durable copy");
+  await import("./app.js?reload=1");
+  await settle(20);
+  assert.strictEqual(stored(), undefined, "final round M3: ...and nothing comes back on a reload");
+  // (14) M5: the page-load restore of a durable-only copy (a create whose
+  //      localStorage write was lost) — a reload puts it back.
+  fakeIdb.setItem("sc.identity.v1", blobF);
+  await import("./app.js?reload=2");
+  await settle(20);
+  assert.strictEqual(stored(), blobF, "final round M5: a reload puts a durable-only identity back into localStorage");
+  globalThis.confirm = () => true;
+  void b64;
+  console.log("OK  F-ATREST-008: a keyless identity blob is never silently re-keyed; an older copy is refused on a floored device; the floor follows the stored blob (executed)");
 }
 
 console.log("\nAll app.js OTP-path checks passed.");

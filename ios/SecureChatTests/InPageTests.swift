@@ -86,7 +86,7 @@ final class InPageTests: XCTestCase {
         XCTAssertEqual(r?["absent"] as? Int, -1)
         XCTAssertEqual(r?["b5"] as? Int, 5)
         XCTAssertEqual(r?["b3"] as? Int, 5)
-        XCTAssertEqual(r?["neg"] as? Int, 5)
+        XCTAssertEqual(r?["neg"] as? Int, -4, "package 4: a negative bump is INVALID, as on Android")
         XCTAssertEqual(r?["r"] as? Int, 5)
         XCTAssertEqual(r?["badId"] as? Int, -2)
         XCTAssertEqual(r?["nonString"] as? Int, -2)

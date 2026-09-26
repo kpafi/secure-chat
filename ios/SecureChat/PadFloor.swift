@@ -5,7 +5,7 @@ import Security
 /// Monotonic, tamper-evident floors for the at-rest stores — the iOS port of
 /// `android/app/src/main/java/org/securechat/app/PadFloor.kt`. Read that file
 /// first: the threat model, the namespace (`<padId>`, `recv:`, `exported:`,
-/// `contacts:`, `chats:`) and the H-1 "no lowering operation, no deletion"
+/// `contacts:`, `chats:`, `identity:`) and the H-1 "no lowering operation, no deletion"
 /// rule are the same, and deliberately so.
 ///
 /// STORAGE, and how it differs from Android:
@@ -49,6 +49,11 @@ let asciiDigits = CharacterSet(charactersIn: "0123456789")
 final class PadFloor {
     static let absent: Int64 = -1
     static let tampered: Int64 = -2
+    /// Package 4: `bump`'s answer for a value outside `0...maxValue`, as
+    /// PadFloor.kt's INVALID (-4) and NATIVE_INVALID in client/nativefloor.js.
+    static let invalid: Int64 = -4
+    /// The int32 range the JS side validates (FLOOR_MAX / PadFloor.kt MAX_VALUE).
+    static let maxValue: Int64 = Int64(Int32.max)
 
     private static let macContext = "secure-chat/otp-pad-floor/v1"
     private static let keychainService = "org.securechat.app.pad-floor"
@@ -96,13 +101,20 @@ final class PadFloor {
     }
 
     /// Raise the floor for `id` to `value` if higher. Never lowers. Returns the
-    /// floor in force afterwards, or TAMPERED (and writes nothing) if the stored
-    /// one did not verify.
+    /// floor in force afterwards, TAMPERED (and writes nothing) if the stored
+    /// one did not verify, or INVALID for a value outside `0...maxValue`.
+    ///
+    /// Package 4: a negative value used to be answered with the CURRENT floor,
+    /// as if it were a harmless read — the Android side made that a refusal in
+    /// package 3 (a generation of 2^31 passed as `v | 0` arrived negative and
+    /// was silently dropped, freezing the floor). client/nativefloor.js now
+    /// refuses such a value before the bridge, but the native side must not
+    /// depend on it: the same value is INVALID here as on Android.
     func bump(_ id: String, _ value: Int64) -> Int64 {
+        if value < 0 || value > Self.maxValue { return Self.invalid }
         lock.lock(); defer { lock.unlock() }
         guard var records = loadRecords() else { return Self.tampered }
         let current = verify(id: id, raw: records[id])
-        if value < 0 { return current }
         if current == Self.tampered { return Self.tampered }
         let next = current == Self.absent ? value : max(current, value)
         if next == current { return current }

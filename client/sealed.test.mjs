@@ -88,7 +88,10 @@ const legacy = new Identity({
   mldsaSecret: alice._mldsaSecret, mldsaPub: alice.mldsaPub,
 });
 const legacyBlob = await legacy.export(pass);
-const reimported = await Identity.import(legacyBlob, pass);
+// Package 4 (F-ATREST-008): never silently — a keyless blob is refused until
+// the user confirms new keys (a v3 envelope without keys is the loud variant).
+await assert.rejects(Identity.import(legacyBlob, pass), (e) => e.code === "IDENTITY_NEEDS_NEW_KEYS" && e.legacy === false);
+const reimported = await Identity.import(legacyBlob, pass, { allowNewEncryptionKeys: true });
 assert.ok(reimported.upgraded, "legacy blob triggers upgrade");
 assert.ok(reimported.publicBundle().ecdh, "upgraded identity has encryption keys");
 const reimportedV3 = await Identity.import(blobV3, pass);
@@ -134,6 +137,28 @@ console.log("OK  legacy identity blob upgrades; v3 blob round-trips enc keys");
   const legacy = await open(bob, await seal(posing({ ed: b.ed, mldsa: b.mldsa }), bobPub, "ok"));
   assert.deepStrictEqual(legacy.from, { ed: b.ed, mldsa: b.mldsa }, "control: a signing-only (pre-v2) sender still opens");
   console.log("OK  items 7-8: open() refuses a sender bundle that is non-canonical, wrong-sized, not a point, or half a pair");
+}
+
+// ---- package 4, F-CRYPTO-005 (Info): the ephemeral ECDH key is non-extractable --
+{
+  const subtle = crypto.subtle;
+  const orig = subtle.generateKey;
+  const made = [];
+  subtle.generateKey = function (alg, extractable, usages) {
+    if (alg && alg.name === "ECDH") made.push({ extractable, usages });
+    return orig.call(this, alg, extractable, usages);
+  };
+  let env3;
+  try {
+    env3 = await seal(alice, bobPub, "ephemeral key check");
+  } finally {
+    subtle.generateKey = orig;
+  }
+  assert.strictEqual(made.length, 1, "fixture: seal() makes exactly one ephemeral ECDH key");
+  assert.strictEqual(made[0].extractable, false, "F-CRYPTO-005: the ephemeral ECDH private key is generated non-extractable");
+  assert.deepStrictEqual(made[0].usages, ["deriveBits"], "...for deriveBits only");
+  assert.strictEqual((await open(bob, env3)).msg, "ephemeral key check", "control: the envelope still opens");
+  console.log("OK  F-CRYPTO-005: seal()'s ephemeral ECDH key is non-extractable, deriveBits only");
 }
 
 console.log("\nAll sealed-envelope checks passed.");

@@ -48,6 +48,7 @@ const relay = {
   registered: null,          // the last /api/register body (our public bundle)
   challenge: () => ({ status: 200, body: { challenge: b64(crypto.getRandomValues(new Uint8Array(32))) } }),
   verify: () => ({ status: 200, body: { token: "tkn", ttl: 3600 } }),
+  users: new Map(),          // package 4: directory answers for /api/users/<name>
   mailbox: [],               // envelopes handed out on the next GET /api/mailbox
   posted: [],                // envelopes we POSTed to a contact
 };
@@ -62,17 +63,27 @@ globalThis.fetch = async (url, opts = {}) => {
     relay.mailbox = [];
     return json(200, { messages });
   }
+  if (u.includes("/api/users/")) {
+    const name = decodeURIComponent(u.split("/api/users/")[1].split("?")[0]);
+    return relay.users.has(name) ? json(200, { username: name, ...relay.users.get(name) }) : json(404, { detail: "not found" });
+  }
   if (u.includes("/api/mailbox/") && opts.method === "POST") { relay.posted.push(JSON.parse(opts.body).envelope); return json(200, { ok: true }); }
   return json(404, { detail: "not found" });
 };
 
+const realLocks = globalThis.navigator.locks; // node's real Web Locks (package 4, decision 3)
 const dom = installDom(join(HERE, "index.html"));
+// The stub's `locks` serializes every request on one chain (enough for the OTP
+// pad lock it was written for); the store lock of decision 3 is held for as
+// long as the stores are open, and its tests need ifAvailable / steal. Node
+// implements the real thing — one process plays one browser tab.
+globalThis.navigator.locks = realLocks;
 // Structure the stub cannot infer from an id: the encryption radios, the tab
 // bar's buttons (the tab bar is put under <body> so showView's
 // document.querySelectorAll(".navitem") finds them), the chat top bar, and the
 // one <p> in each locked pane that app.js rewrites.
 dom.body.appendChild(dom.el("tabbar"));
-dom.seedAlgRadios(["DHKE", "AES256", "RSA", "PQKEM", "OTP"], "DHKE");
+dom.seedAlgRadios(["DHKE", "AES256", "PQKEM", "OTP"], "DHKE");
 dom.seedNavItems(["live", "chats", "users", "profile"]);
 dom.seedChild("scrChat", "div", "topbar");
 for (const id of ["usersLocked", "chatsLocked"]) dom.seedChild(id, "p", "hint");
@@ -142,6 +153,12 @@ const drain = async (ws) => {
   ws.onmessage({ data: JSON.stringify({ type: "error", reason: tag }) });
   await until(() => dom.el("hint").textContent.includes(tag), "the pump to drain");
 };
+// Package 4, decision 2: a guest now approves the peer's key before its
+// handshake runs. Blocks whose subject is something else approve it here.
+async function approvePeer(what = "the guest-side approval prompt") {
+  await until(() => !dom.el("admit").hidden && dom.el("admit").dataset.mode === "peer", what);
+  await dom.el("admitOk").click();
+}
 const junk = (i) => ({ type: "msg", room: ROOM, alg: "AES256", payload: Buffer.from(JSON.stringify({ iv: "AAAAAAAAAAAAAAAA", ct: "AAAA", n: 1000 + i })).toString("base64") });
 
 // ---- item 3 (F-PROTO-002): nothing runs after a refusal ------------------------
@@ -380,6 +397,52 @@ const me = relay.registered;
 assert.ok(me && me.ecdh && me.mlkem, "fixture: our public bundle was published (and captured)");
 const myBundle = { ed: me.ed, mldsa: me.mldsa, ecdh: me.ecdh, mlkem: me.mlkem };
 
+// ---- package 4, owner decision 1: RSA mode is removed --------------------------
+// A contact still on an old build that picked RSA tags every frame alg:"RSA".
+// They get ONE clear, kept line and a clean close — never a flood (F-P7-7:
+// phase7-local refused every RSA-tagged frame with a line each), never a crash.
+{
+  const html = readFileSync(join(HERE, "index.html"), "utf8");
+  assert.ok(!/value="RSA"/.test(html) && /value="DHKE"/.test(html) && /value="PQKEM"/.test(html),
+    "decision 1: the mode picker no longer offers RSA");
+  for (const role of ["owner", "guest"]) {
+    await nav("live");
+    const ws = await connect("DHKE");
+    if (role === "guest") await ws.deliver({ type: "pending" });
+    await ws.deliver({ type: "joined", role });
+    const before = count(/uses RSA mode/);
+    // control: a key frame in another live mode is not this refusal (no
+    // nonce in it: a hello here would start the handshake, see I-2 below)
+    await ws.deliver({ type: "key", room: ROOM, alg: "PQKEM", payload: "AAAA" });
+    assert.strictEqual(count(/uses RSA mode/), before, "control: a PQKEM-tagged frame is not the RSA refusal");
+    for (let i = 0; i < 200; i++) {
+      ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "RSA", payload: pack({ hello: true, n: freshNonce(), reply: i % 2 === 0 }) }) });
+    }
+    for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 5));
+    const rsaLines = lines().filter((l) => /the other side uses RSA mode, which this version no longer supports/.test(l));
+    assert.strictEqual(rsaLines.length - before, 1, `decision 1 (${role}): an RSA peer gets exactly one line (got ${rsaLines.length - before})`);
+    assert.doesNotMatch(rsaLines[rsaLines.length - 1], /×/, "...said once, not 200 times folded into a count");
+    assert.strictEqual(ws.readyState, 3, "...and the connection is closed cleanly");
+    assert.match(dom.el("roomHint").textContent, /uses RSA mode.*pick DHKE or Post-quantum/,
+      "...and the room screen says what to do");
+  }
+  // Fix round I-2: once the handshake has started (the peer's nonce is known),
+  // an RSA-tagged frame is relay injection, not an old peer: it must not close
+  // the session blaming the other side. It is an ordinary bad frame.
+  {
+    const ws = await connect("DHKE");
+    await ws.deliver({ type: "joined", role: "owner" });
+    await ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ hello: true, n: freshNonce(), reply: false }) });
+    const before = count(/uses RSA mode/);
+    await ws.deliver({ type: "key", room: ROOM, alg: "RSA", payload: "AAAA" });
+    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 5));
+    assert.strictEqual(count(/uses RSA mode/), before, "fix round I-2: mid-session, an injected RSA tag does not blame the peer");
+    assert.notStrictEqual(ws.readyState, 3, "...and does not close the session");
+    await dom.el("disconnect").click();
+  }
+  console.log("OK  decision 1: RSA is not offered; an RSA peer gets ONE latched line and a clean close, 200 frames or not (executed)");
+}
+
 // ---- item 4 (F-PROTO-003): our own key frame, reflected ------------------------
 // Guest side (the owner side is refused earlier: nobody was admitted). Before
 // the fix the reflection verified — the transcript folds both nonces, so our
@@ -409,6 +472,7 @@ const myBundle = { ed: me.ed, mldsa: me.mldsa, ecdh: me.ecdh, mlkem: me.mlkem };
   const pub = await pc.handshakePayload();
   const sig = await signHandshake(peer, ROOM, [myHello.n, peerNonce], pub);
   await ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub, reply: false, idb: peer.publicBundle(), sig }) });
+  await approvePeer();
   if (ws.readyState !== 3) await drain(ws);
   assert.ok(!said(/a SECOND identity tried to complete the key exchange/),
     "F-PROTO-003: a reflected own key frame must not pin our identity as the peer's (the real peer is then 'a SECOND identity')");
@@ -438,20 +502,21 @@ const SAFE_HINT = /^[\x20-\x7e\u2014\u2013\u2026\u00d7\u2713\u201c\u201d\u2018\u
 // ---- fix round, finding 2: relay bytes cannot reach a hint through e.message --
 // A SyntaxError echoes up to ~20 characters of its source. Two routes: (a) a
 // key frame whose payload is not JSON (unpackKey — now a fixed sentence), and
-// (b) a signed RSA handshake whose `pub` is not JSON, which the CIPHER parses
+// (b) a signed PQKEM handshake whose `pub` is not JSON, which the CIPHER parses
 // (crypto.js unpackMsg) — covered only by the sink, hint(), which now cleans
 // whatever it is given.
 {
-  const { ws, nonces } = await guestAwaitingHandshake("RSA");
+  const { ws, nonces } = await guestAwaitingHandshake("PQKEM");
   const evil = Buffer.from("\u202e{\u2028", "utf8").toString("base64");
-  ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "RSA", payload: evil }) });
+  ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "PQKEM", payload: evil }) });
   await until(() => /Key exchange failed/.test(dom.el("hint").textContent), "the key-frame refusal");
   assert.strictEqual(dom.el("hint").textContent, "Key exchange failed: malformed key frame",
     "finding 2 (a): a key frame that is not JSON is refused with a fixed sentence");
   const peer = await Identity.generate();
   const pub = Buffer.from("\u202e{\u2028x", "utf8").toString("base64");
   const sig = await signHandshake(peer, ROOM, nonces, pub);
-  ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "RSA", payload: pack({ pub, reply: false, idb: peer.publicBundle(), sig }) }) });
+  ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "PQKEM", payload: pack({ pub, reply: false, idb: peer.publicBundle(), sig }) }) });
+  await approvePeer();
   await until(() => /Key exchange failed: (?!malformed key frame)/.test(dom.el("hint").textContent), "the cipher's refusal");
   const h = dom.el("hint").textContent;
   assert.ok(SAFE_HINT.test(h), `finding 2 (b): the cipher's parse error of relay bytes reaches the hint cleaned: ${JSON.stringify(h)}`);
@@ -560,6 +625,7 @@ const SAFE_HINT = /^[\x20-\x7e\u2014\u2013\u2026\u00d7\u2713\u201c\u201d\u2018\u
   const pub2 = await pc2.handshakePayload();
   const sig2 = await signHandshake(peer2, ROOM, [myHello.n, pn], pub2);
   await fresh.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub: pub2, reply: false, idb: peer2.publicBundle(), sig: sig2 }) });
+  await approvePeer();
   if (fresh.readyState !== 3) await drain(fresh);
   assert.ok(!lines().slice(lines0).some((l) => /SECOND identity/.test(l)),
     "L-2: the new session's genuine peer is not refused as a second identity");
@@ -596,6 +662,7 @@ async function handshakeToConfirm(peer) {
   const pub = await pc.handshakePayload();
   const sig = await signHandshake(peer, ROOM, nonces, pub);
   await ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub, reply: false, idb: peer.publicBundle(), sig }) });
+  await approvePeer();
   await drain(ws);
   const answer = ws.sent.map((f) => (f.type === "key" ? unpack(f.payload) : null)).find((p) => p && p.sig && p.reply);
   await pc.onPeerKey(answer.pub);
@@ -633,6 +700,7 @@ const pinFor = () => contacts.getPin("room:" + ROOM);
   const mpub = await mc.handshakePayload();
   const msig = await signHandshake(mallory, ROOM, s2.nonces, mpub);
   await s2.ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub: mpub, reply: false, idb: mallory.publicBundle(), sig: msig }) });
+  await approvePeer();
   await drain(s2.ws);
   const lines0 = lines().length;
   await dom.el("verifyOk").click();
@@ -873,6 +941,7 @@ function sameKeyPin(pin, b) { return !!pin && pin.ed === b.ed && pin.mldsa === b
   const sig = await signHandshake(peer, ROOM, nonces, pub);
   const h = holdSubtle("deriveBits", (a) => algName(a) === "ECDH", true);
   ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub, reply: false, idb: peer.publicBundle(), sig }) }) });
+  await approvePeer();
   await until(h.entered, "the key agreement to be running");
   await connect("DHKE");
   h.release();
@@ -918,6 +987,7 @@ function sameKeyPin(pin, b) { return !!pin && pin.ed === b.ed && pin.mldsa === b
   const pub = await pc.handshakePayload();
   const sig = await signHandshake(peer, ROOM, nonces, pub);
   await ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub, reply: false, idb: peer.publicBundle(), sig }) });
+  await approvePeer();
   await drain(ws);
   const answer = ws.sent.map((f) => (f.type === "key" ? unpack(f.payload) : null)).find((p) => p && p.sig && p.reply);
   assert.ok(answer, "fixture: our signed answer went out");
@@ -1268,11 +1338,15 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
   const src = readFileSync(join(HERE, "app.js"), "utf8")
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .replace(/(^|[^:"'`\\])\/\/.*$/gm, "$1");
-  const fn = src.slice(src.indexOf("async function showNextKnock("), src.indexOf("function hideAdmitPrompt("));
-  assert.ok(fn.length > 200, "fixture: showNextKnock found");
-  assert.match(fn, /contacts\.list\(\)\.find\(\(c\) => sameSigning\(c, k\.bundle\)\)/,
+  // Package 4: the lookup moved into describePeer, shared with the guest's
+  // prompt; showNextKnock must still route its bundle through it.
+  const knockFn = src.slice(src.indexOf("async function showNextKnock("), src.indexOf("function describePeer("));
+  assert.match(knockFn, /describePeer\(k\.bundle, "Deny"\)/, "fixture: showNextKnock describes its knock via describePeer");
+  const fn = src.slice(src.indexOf("function describePeer("), src.indexOf("const PEER_PROMPT"));
+  assert.ok(fn.length > 200, "fixture: describePeer found");
+  assert.match(fn, /contacts\.list\(\)\.find\(\(c\) => sameSigning\(c, bundle\)\)/,
     "item 12: the knock's known-contact lookup compares keys with sameSigning");
-  assert.doesNotMatch(fn, /\.ed === k\.bundle\.ed|k\.bundle\.ed === /, "item 12: ...not the key strings");
+  assert.doesNotMatch(fn, /\.ed === bundle\.ed|bundle\.ed === /, "item 12: ...not the key strings");
   console.log("OK  item 12: the knock's known-contact match uses sameSigning (anchored on code)");
 }
 
@@ -1307,6 +1381,486 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
     "item 17: …and the gate says why");
   await dom.el("disconnect").click();
   console.log("OK  item 17: Unverify revokes the room: pin — a withdrawn peer is not auto-accepted in a remembered room (executed)");
+}
+
+// ==== package 4, owner decision 2: the GUEST side approves too ===================
+// Before: only the owner was asked. A relay that knows the code seats ANY
+// identity against a guest; the guest's client verified the signature, pinned
+// whoever it was, answered with its own key and derived the session — the
+// in-person gate was the only thing left. Now the guest's user sees the peer's
+// fingerprint and trust mark before any of that, and decides.
+{
+  const signedOffer = async (who, nonces, alg = "DHKE") => {
+    const c = makeCipher(alg, ROOM);
+    await c.init();
+    const pub = await c.handshakePayload();
+    const sig = await signHandshake(who, ROOM, nonces, pub);
+    return { type: "key", room: ROOM, alg, payload: pack({ pub, reply: false, idb: who.publicBundle(), sig }) };
+  };
+  const promptUp = () => !dom.el("admit").hidden && dom.el("admit").dataset.mode === "peer";
+  const answered = (ws) => ws.sent.some((f) => f.type === "key" && (() => { const p = unpack(f.payload); return !!(p.sig && p.reply) || typeof p.confirm === "string"; })());
+  const mallory = await Identity.generate();
+  const mb = mallory.publicBundle();
+  const malloryFp = await Identity.fingerprintOf(mb);
+
+  // (a) the relay seats Mallory against a guest: the prompt shows HER key; deny.
+  {
+    const { ws, nonces } = await guestAwaitingHandshake("DHKE");
+    const pin0 = pinFor();
+    ws.onmessage({ data: JSON.stringify(await signedOffer(mallory, nonces)) });
+    await until(promptUp, "the guest-side prompt");
+    await until(() => dom.el("admitFingerprint").textContent === malloryFp, "Mallory's fingerprint on the prompt");
+    assert.strictEqual(dom.el("admitFingerprint").textContent, malloryFp,
+      "decision 2: the guest is shown the fingerprint of the identity the relay seated (Mallory's)");
+    assert.match(dom.el("admitWho").textContent, /Not in your users list/, "...with its trust in OUR terms (unknown key)");
+    assert.match(dom.el("admitTitle").textContent, /who you are expecting/, "...in the guest's wording, not the owner's");
+    await settle(10);
+    assert.ok(!answered(ws), "decision 2: while the prompt is up the guest has not answered with its key (no key exchange, no confirmation)");
+    await dom.el("admitNo").click();
+    await settle(10);
+    assert.strictEqual(ws.readyState, 3, "decision 2: deny closes the connection");
+    assert.ok(!answered(ws), "...with nothing exchanged");
+    assert.ok(said(/you refused the key the other side presented — nothing was exchanged/), "...and says so");
+    assert.deepStrictEqual(pinFor(), pin0, "...and nothing is pinned");
+    assert.strictEqual(dom.el("admit").hidden, true, "...and the prompt is gone");
+    assert.strictEqual(dom.el("verify").hidden, true, "...and no safety-number gate is drawn for Mallory");
+    assert.match(dom.el("roomHint").textContent, /You refused the other side's key/, "...and the room screen says why");
+  }
+
+  // (b) approve pins it for the session: a SECOND identity afterwards is refused.
+  {
+    const bob = await Identity.generate();
+    const { ws, nonces } = await guestAwaitingHandshake("DHKE");
+    ws.onmessage({ data: JSON.stringify(await signedOffer(bob, nonces)) });
+    await until(promptUp, "the prompt for Bob");
+    await dom.el("admitOk").click();
+    await drain(ws);
+    assert.ok(said(/you approved the other side — their key is now pinned for this session/), "decision 2: approve pins the key");
+    assert.ok(answered(ws), "...and the handshake then runs (our signed answer went out)");
+    assert.strictEqual(dom.el("admit").hidden, true, "...and the prompt is gone");
+    await ws.deliver(await signedOffer(mallory, nonces)); // the relay swaps the seat afterwards
+    await settle(10);
+    assert.ok(said(/a different identity than the one you approved tried to complete the key exchange — refusing/),
+      "decision 2: a second identity after the approval is refused against the APPROVED key");
+    assert.strictEqual(ws.readyState, 3, "...and the connection closes");
+    assert.strictEqual(dom.el("admit").hidden, true, "...without a second prompt");
+  }
+
+  // (c) two identities queued: the second waits behind the decision and is
+  // judged against it (the pump is serialized) — never a second prompt.
+  {
+    const bob = await Identity.generate();
+    const { ws, nonces } = await guestAwaitingHandshake("DHKE");
+    ws.onmessage({ data: JSON.stringify(await signedOffer(bob, nonces)) });
+    ws.onmessage({ data: JSON.stringify(await signedOffer(mallory, nonces)) });
+    await until(promptUp, "the prompt for the first identity");
+    const fpBob = await Identity.fingerprintOf(bob.publicBundle());
+    await until(() => dom.el("admitFingerprint").textContent === fpBob, "Bob's fingerprint");
+    await dom.el("admitOk").click();
+    await settle(20);
+    assert.ok(ws.readyState === 3 && !promptUp(), "decision 2: the queued second identity is refused, not asked about");
+  }
+
+  // (d) the close while the prompt is up settles it: nothing pinned, no dead prompt.
+  {
+    const { ws, nonces } = await guestAwaitingHandshake("DHKE");
+    ws.onmessage({ data: JSON.stringify(await signedOffer(mallory, nonces)) });
+    await until(promptUp, "the prompt");
+    const refusedBefore = count(/you refused the key the other side presented/);
+    ws.close(); // the relay hangs up
+    await settle(10);
+    assert.strictEqual(dom.el("admit").hidden, true, "decision 2: a close settles the open prompt (no undismissable sheet)");
+    assert.ok(!answered(ws), "...and nothing was exchanged");
+    assert.strictEqual(count(/you refused the key the other side presented/), refusedBefore,
+      "fix round (M6): the relay's close is not narrated as the user's refusal");
+    assert.doesNotMatch(dom.el("roomHint").textContent, /You refused/, "...on the room screen either");
+  }
+
+  // (d2) fix round M16: a click while the prompt for a NEW key is still being
+  //      drawn (its fingerprint digest in flight) decides nothing — the sheet
+  //      on screen, if any, is not the one being asked about.
+  {
+    const realFp = Identity.fingerprintOf;
+    let release, entered = false;
+    const gate = new Promise((r) => { release = r; });
+    Identity.fingerprintOf = async (b) => {
+      if (b && b.ed === mallory.publicBundle().ed) { entered = true; await gate; }
+      return realFp.call(Identity, b);
+    };
+    try {
+      const { ws, nonces } = await guestAwaitingHandshake("DHKE");
+      const approvedBefore = count(/you approved the other side/);
+      ws.onmessage({ data: JSON.stringify(await signedOffer(mallory, nonces)) });
+      await until(() => entered, "the prompt's render to be in flight");
+      await dom.el("admitOk").click(); // lands before the prompt is drawn
+      await settle(5);
+      assert.strictEqual(count(/you approved the other side/), approvedBefore, "fix round M16: a click on a render in flight approves nothing");
+      assert.ok(!answered(ws), "...and nothing is exchanged");
+      release();
+      await until(promptUp, "the prompt, drawn after all");
+      await dom.el("admitNo").click();
+      await settle(5);
+    } finally {
+      Identity.fingerprintOf = realFp;
+      if (release) release();
+    }
+  }
+
+  // (d3) fix round I-1: frames piling up behind an open prompt are capped.
+  {
+    const { ws, nonces } = await guestAwaitingHandshake("DHKE");
+    ws.onmessage({ data: JSON.stringify(await signedOffer(mallory, nonces)) });
+    await until(promptUp, "the prompt");
+    for (let i = 0; i < 200; i++) ws.onmessage({ data: JSON.stringify(junk(7000 + i)) });
+    await settle(10);
+    assert.strictEqual(ws.readyState, 3, "fix round I-1: a flood queued behind the open prompt closes the connection");
+    assert.strictEqual(count(/the relay kept sending while you were deciding/), 1, "...with one line");
+    assert.strictEqual(dom.el("admit").hidden, true, "...and the prompt goes with it");
+    assert.ok(!answered(ws), "...nothing exchanged");
+    // control: a handful of frames behind a prompt is not a flood
+    const s2 = await guestAwaitingHandshake("DHKE");
+    s2.ws.onmessage({ data: JSON.stringify(await signedOffer(mallory, s2.nonces)) });
+    await until(promptUp, "the prompt again");
+    for (let i = 0; i < 10; i++) s2.ws.onmessage({ data: JSON.stringify(junk(8000 + i)) });
+    await settle(5);
+    assert.notStrictEqual(s2.ws.readyState, 3, "control: ten frames behind the prompt do not close it");
+    await dom.el("admitNo").click();
+    await settle(5);
+  }
+
+  // (e) trust mark + mismatch warning: the session named bob#tok (directory
+  // bundle = Bob), a known but unverified contact of ours is seated instead.
+  {
+    const bob = await Identity.generate();
+    const bb = bob.publicBundle();
+    relay.users.set("bob", { ed: bb.ed, mldsa: bb.mldsa, ecdh: bb.ecdh, mlkem: bb.mlkem });
+    const hal = await Identity.generate();
+    const hb = hal.publicBundle();
+    await contacts.upsert({ username: "hal", token: "tok-hal", ed: hb.ed, mldsa: hb.mldsa, ecdh: hb.ecdh, mlkem: hb.mlkem });
+    dom.el("contact").value = "bob#tok";
+    try {
+      const { ws, nonces } = await guestAwaitingHandshake("DHKE");
+      ws.onmessage({ data: JSON.stringify(await signedOffer(hal, nonces)) });
+      await until(promptUp, "the prompt for Hal");
+      await until(() => /hal/.test(dom.el("admitWho").textContent), "Hal's name on the prompt");
+      assert.match(dom.el("admitWho").textContent, /hal.*unverified/, "decision 2: the prompt shows our name for them and the trust mark");
+      assert.match(dom.el("admitWarn").textContent, /NOT the user you selected for this session. Refuse unless you know why/,
+        "decision 2: ...and warns when it is not the contact this session was aimed at");
+      await dom.el("admitNo").click();
+      await settle(5);
+    } finally {
+      dom.el("contact").value = "";
+    }
+  }
+
+  // (f) AUTO-APPROVAL: a contact this user verified in person (🟢) and pinned
+  // (user: pin, not revoked) with exactly these keys is let through without a
+  // prompt, and the transcript says so.
+  {
+    const gina = await Identity.generate();
+    const gb = gina.publicBundle();
+    await contacts.upsert({ username: "gina", token: "tok-gina", ed: gb.ed, mldsa: gb.mldsa, ecdh: gb.ecdh, mlkem: gb.mlkem, verified: true });
+    await contacts.savePin(contacts.pinKeyFor("gina"), gb);
+    const { ws, nonces } = await guestAwaitingHandshake("DHKE");
+    await ws.deliver(await signedOffer(gina, nonces));
+    await drain(ws);
+    assert.ok(!promptUp(), "decision 2: no prompt for a key verified in person and pinned");
+    assert.ok(said(/the other side is "gina", whom you verified in person — approved without asking/), "...and the transcript says why");
+    assert.ok(answered(ws), "...and the handshake runs");
+    await ws.deliver(await signedOffer(mallory, nonces));
+    await settle(10);
+    assert.ok(said(/different identity than the one you approved/) && ws.readyState === 3,
+      "...and the auto-approved key is pinned like a clicked one (a second identity is refused)");
+
+    // A 🟢 contact WITHOUT a pin, or with its pin revoked, still asks.
+    const ivy = await Identity.generate();
+    const ib = ivy.publicBundle();
+    await contacts.upsert({ username: "ivy", token: "tok-ivy", ed: ib.ed, mldsa: ib.mldsa, ecdh: ib.ecdh, mlkem: ib.mlkem, verified: true });
+    const s2 = await guestAwaitingHandshake("DHKE");
+    s2.ws.onmessage({ data: JSON.stringify(await signedOffer(ivy, s2.nonces)) });
+    await until(promptUp, "a prompt for a verified contact that was never pinned");
+    await dom.el("admitNo").click();
+    await settle(5);
+    await contacts.setVerified("gina", false); // revokes gina's pin …
+    await contacts.setVerified("gina", true);  // … and re-marking her 🟢 does not un-revoke it
+    const s3 = await guestAwaitingHandshake("DHKE");
+    s3.ws.onmessage({ data: JSON.stringify(await signedOffer(gina, s3.nonces)) });
+    await until(promptUp, "a prompt for a contact whose pin was revoked");
+    await dom.el("admitNo").click();
+    await settle(5);
+    // …and a 🟢 + pinned contact is still asked about when the session named someone else.
+    await contacts.savePin(contacts.pinKeyFor("gina"), gb);
+    const bob = await Identity.generate();
+    const bb = bob.publicBundle();
+    relay.users.set("bob2", { ed: bb.ed, mldsa: bb.mldsa, ecdh: bb.ecdh, mlkem: bb.mlkem });
+    dom.el("contact").value = "bob2#tok";
+    try {
+      const s4 = await guestAwaitingHandshake("DHKE");
+      s4.ws.onmessage({ data: JSON.stringify(await signedOffer(gina, s4.nonces)) });
+      await until(promptUp, "a prompt for a pinned contact the session was NOT aimed at");
+      await dom.el("admitNo").click();
+      await settle(5);
+    } finally {
+      dom.el("contact").value = "";
+    }
+    // …and a STALE pin does not speak for a record that moved on: jo's user:
+    // pin still holds his old key K1, his record holds K2 (re-verified from the
+    // profile sheet, which does not touch the pin). K1 showing up is asked about.
+    const joOld = await Identity.generate(), joNew = await Identity.generate();
+    const j1 = joOld.publicBundle(), j2 = joNew.publicBundle();
+    await contacts.upsert({ username: "jo", token: "tok-jo", ed: j1.ed, mldsa: j1.mldsa, ecdh: j1.ecdh, mlkem: j1.mlkem, verified: true });
+    await contacts.savePin(contacts.pinKeyFor("jo"), j1);
+    await contacts.upsert({ username: "jo", token: "tok-jo", ed: j2.ed, mldsa: j2.mldsa, ecdh: j2.ecdh, mlkem: j2.mlkem });
+    await contacts.setVerified("jo", true);
+    const s6 = await guestAwaitingHandshake("DHKE");
+    s6.ws.onmessage({ data: JSON.stringify(await signedOffer(joOld, s6.nonces)) });
+    await until(promptUp, "a prompt for a key only a stale pin still holds");
+    await dom.el("admitNo").click();
+    await settle(5);
+    // control: with the pin restored and no other contact named, gina is let through again
+    const s5 = await guestAwaitingHandshake("DHKE");
+    await s5.ws.deliver(await signedOffer(gina, s5.nonces));
+    await drain(s5.ws);
+    assert.ok(!promptUp() && answered(s5.ws), "control: the restored pin auto-approves again");
+    await dom.el("disconnect").click();
+  }
+
+  // (h) keyed on "not the owner", not on "guest": a relay that never says
+  // `pending`/`joined` (roomRole still null) cannot skip the question.
+  {
+    const ws = await connect("DHKE");
+    const pn = freshNonce();
+    await ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ hello: true, n: pn, reply: false }) });
+    await settle(20); // (no drain: with no seat there is no chat screen for its marker)
+    const myHello = ws.sent.map((f) => (f.type === "key" ? unpack(f.payload) : null)).find((p) => p && p.hello);
+    ws.onmessage({ data: JSON.stringify(await signedOffer(mallory, [myHello.n, pn])) });
+    await until(promptUp, "a prompt with no role assigned at all");
+    await dom.el("admitNo").click();
+    await settle(5);
+    assert.ok(ws.readyState === 3 && !answered(ws), "decision 2: a session the relay never seated asks too");
+  }
+
+  // (g) the OWNER is unchanged: it approved via the knock and is never asked again.
+  {
+    const ws = await connect("DHKE");
+    await ws.deliver({ type: "joined", role: "owner" });
+    const knocker = await Identity.generate();
+    await ws.deliver({ type: "knock", room: ROOM, jid: "00000000000000aa", payload: pack({ idb: knocker.publicBundle(), sig: await signKnock(knocker, ROOM) }) });
+    await until(() => !dom.el("admit").hidden && dom.el("admit").dataset.mode === "knock", "the owner's knock prompt");
+    assert.match(dom.el("admitOk").textContent + dom.el("admitTitle").textContent, /^(?!.*Continue)/, "the knock prompt keeps the owner's wording");
+    await dom.el("admitOk").click();
+    const myHello = ws.sent.map((f) => (f.type === "key" ? unpack(f.payload) : null)).find((p) => p && p.hello);
+    const pn = freshNonce();
+    await ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ hello: true, n: pn, reply: false }) });
+    await drain(ws);
+    await ws.deliver(await signedOffer(knocker, [myHello.n, pn]));
+    await drain(ws);
+    assert.ok(!promptUp() && answered(ws), "decision 2: the owner side is not asked a second time");
+    await dom.el("disconnect").click();
+  }
+  console.log("OK  decision 2: a guest sees and decides the seated identity (deny: closed, nothing pinned; approve: pinned, a second identity refused); in-person-verified + pinned contacts auto-approve (executed)");
+}
+
+// ==== package 4, F-PROTO-004 (Low): a full knock queue keeps the expected peer ====
+// The queue is capped at 16 and used to drop the NEWEST knock when full — the
+// one knock this session was aimed at included. The owner named kim#tok; a
+// flood fills the queue first. Kim's knock must still be asked about (in place
+// of the oldest non-expected entry that is not on screen); any other extra
+// knock is still dropped.
+{
+  const kim = await Identity.generate();
+  const kb = kim.publicBundle();
+  relay.users.set("kim", { ed: kb.ed, mldsa: kb.mldsa, ecdh: kb.ecdh, mlkem: kb.mlkem });
+  dom.el("contact").value = "kim#tok";
+  try {
+    await nav("live");
+    const ws = await connect("DHKE");
+    await ws.deliver({ type: "joined", role: "owner" });
+    const flood = [];
+    for (let i = 0; i < 16; i++) flood.push(await Identity.generate());
+    const knock = async (who, i) => ws.deliver({ type: "knock", room: ROOM, jid: i.toString(16).padStart(16, "0"),
+      payload: pack({ idb: who.publicBundle(), sig: await signKnock(who, ROOM) }) });
+    for (let i = 0; i < 16; i++) await knock(flood[i], 0x100 + i);
+    const extra = await Identity.generate();
+    // Beyond the cap a stranger costs no signature verify (the L-1 property).
+    const subtle = crypto.subtle, origVerify = subtle.verify;
+    let verifies = 0;
+    subtle.verify = function (...a) { verifies++; return origVerify.apply(this, a); };
+    try {
+      await knock(extra, 0x200);   // a 17th stranger: still dropped
+      await settle(5);
+    } finally {
+      subtle.verify = origVerify;
+    }
+    assert.strictEqual(verifies, 0, "F-PROTO-004: a knock beyond the cap that is not the expected peer is dropped before any verify");
+    // Kim's keys claimed with a signature that does not verify: not kept either
+    // — and (fix round I-3) a burst of such claims buys ONE verify, not one each.
+    const forged = pack({ idb: kb, sig: await signKnock(extra, ROOM) });
+    // Final round (review of a5ac006): this used the wall clock, so on a loaded
+    // machine the ten deliveries could span the 500 ms gap and buy a second
+    // verify — a flaky assertion (it also made unrelated mutants look killed
+    // once). The page's clock is now frozen for the burst and advanced past
+    // the gap by hand before the genuine knock.
+    const realPerf = globalThis.performance;
+    let clock = realPerf.now();
+    Object.defineProperty(globalThis, "performance", { value: { ...realPerf, now: () => clock }, configurable: true, writable: true });
+    verifies = 0;
+    subtle.verify = function (...a) { verifies++; return origVerify.apply(this, a); };
+    try {
+      for (let i = 0; i < 10; i++) {
+        await ws.deliver({ type: "knock", room: ROOM, jid: (0x250 + i).toString(16).padStart(16, "0"), payload: forged });
+      }
+      await settle(5);
+      subtle.verify = origVerify;
+      assert.strictEqual(verifies, 1, `fix round I-3: ten forged claims of the expected key cost ONE verify (${verifies} subtle.verify calls)`);
+      clock += 600; // past the gap: the genuine knock is verified
+      await knock(kim, 0x300);     // the expected peer: kept
+    } finally {
+      subtle.verify = origVerify;
+      Object.defineProperty(globalThis, "performance", { value: realPerf, configurable: true, writable: true });
+    }
+    await settle(10);
+    const fpOf = async (who) => Identity.fingerprintOf(who.publicBundle());
+    const [fpHead, fpKim, fpExtra] = [await fpOf(flood[0]), await fpOf(kim), await fpOf(extra)];
+    await until(() => dom.el("admitFingerprint").textContent.length > 20, "the knock prompt");
+    assert.strictEqual(dom.el("admitFingerprint").textContent, fpHead, "F-PROTO-004: the knock on screen is not the one evicted");
+    const seen = [];
+    for (let i = 0; i < 20 && !dom.el("admit").hidden; i++) {
+      const fp = dom.el("admitFingerprint").textContent;
+      seen.push(fp);
+      await dom.el("admitNo").click();
+      // the next knock is drawn after a digest: wait for it (or for the sheet to go)
+      await until(() => dom.el("admit").hidden || (dom.el("admitFingerprint").textContent !== fp &&
+        dom.el("admitFingerprint").textContent.length > 20), "the next knock to be drawn");
+    }
+    assert.ok(seen.includes(fpKim), "F-PROTO-004: the expected peer's knock is kept when the queue is full");
+    assert.ok(!seen.includes(fpExtra), "...while any other knock beyond the cap is still dropped");
+    assert.ok(!seen.includes(""), "...and a forged claim of kim's key (bad signature, shown without a fingerprint) did not take a place");
+    assert.strictEqual(seen.length, 16, `...and the queue stays at its cap (asked about ${seen.length})`);
+    await dom.el("disconnect").click();
+  } finally {
+    dom.el("contact").value = "";
+  }
+  console.log("OK  F-PROTO-004: a full knock queue keeps the expected peer's knock (evicting the oldest other one), drops the rest (executed)");
+}
+
+// ==== package 4, owner decision 3: contacts + chats live in ONE tab ================
+// Node has real Web Locks; the test plays the OTHER tab of the same browser by
+// requesting the same lock. Before: nothing held the stores to one tab — a
+// second tab opened them too, and only 3b's STALE refusal of a later save
+// noticed.
+{
+  await nav("live");
+  if (current && current.readyState === 1) await dom.el("disconnect").click();
+  await nav("users");
+  if (!contacts.isUnlocked()) {
+    dom.el("usersUnlockPass").value = PASS;
+    await dom.el("usersUnlock").click();
+    await until(() => contacts.isUnlocked() && chats.isUnlocked(), "the stores to be open");
+  }
+  const held = (await navigator.locks.query()).held.map((l) => l.name).filter((n) => n.startsWith("sc.stores.lock.v1."));
+  assert.strictEqual(held.length, 1, `decision 3: this tab holds exactly one store lock while the stores are open (${held})`);
+  const lockName = held[0];
+  const edHash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", unb64(myBundle.ed))), (b) => b.toString(16).padStart(2, "0")).join("");
+  assert.strictEqual(lockName, "sc.stores.lock.v1." + edHash, "...keyed on this identity");
+
+  // (a) another tab presses "Use here": this one locks both stores and says why.
+  let otherLost = null;
+  const other = navigator.locks.request(lockName, { steal: true }, () => new Promise(() => {}))
+    .catch((e) => { otherLost = e.name; });
+  await until(() => !contacts.isUnlocked() && !chats.isUnlocked(), "the stores to lock after the other tab took them");
+  assert.ok(said(/your contacts and chats were opened in another tab — they are locked here/), "decision 3: the tab that lost them says why");
+  assert.match(dom.el("usersLocked").querySelector("p").textContent, /were opened in another tab or window, so they were locked here/,
+    "...on the Users view too");
+  assert.strictEqual(dom.el("usersTakeover").hidden, false, "...which offers Use here");
+
+  // (b) unlocking here while the other tab holds them does NOT open them.
+  dom.el("usersUnlockPass").value = PASS;
+  await dom.el("usersUnlock").click();
+  await settle(10);
+  assert.ok(!contacts.isUnlocked() && !chats.isUnlocked(), "decision 3: a second tab does not open the stores");
+  assert.match(dom.el("usersLocked").querySelector("p").textContent, /open in another tab or window/, "...and says they are open elsewhere");
+  await nav("chats");
+  assert.match(dom.el("chatsLocked").querySelector("p").textContent, /open in another tab or window/, "...on the Chats view as well");
+  assert.strictEqual(dom.el("chatsTakeover").hidden, false, "...with Use here");
+
+  // (c) "Use here" takes them back; the other tab loses its lock.
+  dom.el("chatsUnlockPass").value = PASS;
+  await dom.el("chatsTakeover").click();
+  await until(() => contacts.isUnlocked() && chats.isUnlocked(), "Use here to open the stores");
+  await other;
+  assert.strictEqual(otherLost, "AbortError", "decision 3: Use here took the lock from the other tab (steal)");
+  assert.strictEqual(dom.el("chatsTakeover").hidden, true, "...and the button is gone");
+  const heldNow = (await navigator.locks.query()).held.filter((l) => l.name === lockName).length;
+  assert.strictEqual(heldNow, 1, "...and this tab holds it again");
+
+  // (e) fix round L-2: the other tab presses "Use here" WHILE this tab's own
+  //     unlock is still deriving its keys. Before the fix storesStolen() found
+  //     nothing open to lock, the unlock then finished, and BOTH tabs held the
+  //     stores. The late unlock must end locked, with the takeover line.
+  {
+    const takenBefore = count(/your contacts and chats were opened in another tab — they are locked here/);
+    const h = holdSubtle("deriveKey", (a) => algName(a) === "PBKDF2");
+    dom.el("usersUnlockPass").value = PASS;
+    const unlocking = dom.el("usersAdopt").click(); // the "Open anyway" path: unlockContacts alone
+    await until(h.entered, "this tab's store unlock to be deriving its key");
+    let stolenHere = null;
+    navigator.locks.request(lockName, { steal: true }, () => new Promise(() => {})).catch((e) => { stolenHere = e.name; });
+    await settle(10);
+    h.release();
+    await unlocking;
+    await settle(10);
+    assert.ok(!contacts.isUnlocked() && !chats.isUnlocked(),
+      "fix round L-2: a store unlock the other tab took over mid-way ends LOCKED (not open in both tabs)");
+    assert.strictEqual(count(/your contacts and chats were opened in another tab — they are locked here/), takenBefore + 1,
+      "...and says so once");
+    await nav("users");
+    assert.match(dom.el("usersLocked").querySelector("p").textContent, /were opened in another tab or window, so they were locked here/,
+      "...on the Users view, with Use here");
+    assert.strictEqual(dom.el("usersTakeover").hidden, false);
+    void stolenHere;
+  }
+
+  // (d) no Web Locks: the stores still open (3b's STALE is the control), said once.
+  const realNav = globalThis.navigator;
+  contacts.lock(); chats.lock();
+  Object.defineProperty(globalThis, "navigator", { value: { ...realNav, locks: undefined }, configurable: true, writable: true });
+  try {
+    await nav("users");
+    dom.el("usersUnlockPass").value = PASS;
+    await dom.el("usersUnlock").click();
+    await until(() => contacts.isUnlocked() && chats.isUnlocked(), "the stores to open without Web Locks");
+    assert.ok(said(/this browser cannot keep your contacts and chats to one tab/), "decision 3: without Web Locks the fallback is said");
+  } finally {
+    Object.defineProperty(globalThis, "navigator", { value: realNav, configurable: true, writable: true });
+  }
+  await nav("live");
+  console.log("OK  decision 3: contacts+chats live in one tab — a second tab does not open them; Use here takes over and the other tab locks and says why; no Web Locks falls back to 3b (executed)");
+}
+
+// ==== final round, Info-4: Forget while the stores are opening is not "another tab" ====
+// The L-2 re-check locked the stores and said "opened in another tab" whenever
+// the lock this unlock took was no longer held — also when THIS tab let it go
+// (Forget identity). Nobody else has them then; nothing about another tab.
+{
+  await nav("users");
+  const before = count(/your contacts and chats were opened in another tab/);
+  const h = holdSubtle("deriveKey", (a) => algName(a) === "PBKDF2");
+  // (the other "tab" of block (e) still holds the lock: take it with Use here)
+  dom.el("usersUnlockPass").value = PASS;
+  const unlocking = dom.el("usersTakeover").click();
+  await until(h.entered, "the store unlock to be deriving its key");
+  const forgetting = dom.el("idForget").click();
+  await settle(20);
+  h.release();
+  await unlocking;
+  await forgetting;
+  await settle(20);
+  assert.ok(!contacts.isUnlocked() && !chats.isUnlocked(), "final round Info-4: the stores end locked");
+  assert.strictEqual(count(/your contacts and chats were opened in another tab/), before,
+    "final round Info-4: Forget during the unlock is not narrated as another tab taking the stores");
+  assert.strictEqual(dom.el("usersTakeover").hidden, true, "...and no Use here is offered");
+  console.log("OK  final round Info-4: a Forget during the store unlock locks the stores without blaming another tab (executed)");
 }
 
 console.log("\nAll app.js behavioural checks passed.");

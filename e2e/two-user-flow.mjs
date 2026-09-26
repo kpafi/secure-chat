@@ -115,6 +115,16 @@ check("Users view offers an unlock control while locked",
 // Unlock right there (this is the flow that was impossible before).
 await inviteTab.page.type("#usersUnlockPass", alice.passphrase);
 await inviteTab.page.click("#usersUnlock");
+// Package 4, decision 3: alice's first tab still holds her contacts and chats,
+// so this tab says so and offers "Use here" — the invite is applied once it
+// has taken them over (the first tab then locks them).
+await inviteTab.page.waitForFunction(
+  () => !document.querySelector("#usersTakeover").hidden, { timeout: 40000 });
+const elsewhere = await inviteTab.page.evaluate(() => document.querySelector("#usersLocked p").textContent);
+check("decision 3: the invite tab says the contacts are open in another tab and offers Use here",
+  /open in another tab or window/.test(elsewhere), JSON.stringify(elsewhere));
+await inviteTab.page.type("#usersUnlockPass", alice.passphrase);
+await inviteTab.page.click("#usersTakeover");
 await inviteTab.page.waitForFunction(
   () => !document.querySelector("#usersUnlocked").hidden, { timeout: 40000 });
 await sleep(800);

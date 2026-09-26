@@ -51,7 +51,10 @@ export async function seal(senderIdentity, recipientBundle, content, senderName 
   if (!recipientBundle.ecdh || !recipientBundle.mlkem) {
     throw new Error("recipient has no encryption keys (they must re-register with the updated app)");
   }
-  const eph = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+  // Package 4, F-CRYPTO-005 (Info): the ephemeral private key is used once, by
+  // deriveBits below, and never exported — so it is generated NON-extractable.
+  // (Its public half is exportable regardless; WebCrypto always allows that.)
+  const eph = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
   const ephPubRaw = new Uint8Array(await crypto.subtle.exportKey("raw", eph.publicKey));
   const recipientEcdh = await crypto.subtle.importKey(
     "raw", unb64(recipientBundle.ecdh), { name: "ECDH", namedCurve: "P-256" }, false, [],

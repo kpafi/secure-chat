@@ -6,7 +6,7 @@
 // interpreted as markup.
 //
 // SECURITY — authenticated key exchange (closes the MITM gap):
-//   For the handshake modes (DHKE / RSA) the ephemeral/public key is signed by
+//   For the handshake modes (DHKE / PQKEM) the ephemeral/public key is signed by
 //   a long-term IDENTITY (Ed25519 + ML-DSA-65, see identity.js). The peer
 //   verifies that dual signature against the identity bundle that arrived, then
 //   the user confirms a SAFETY NUMBER in person. A relay that swaps the
@@ -18,8 +18,12 @@
 //   up by username and pre-pin their bundle. It is a convenience, not a trust
 //   root (it shares the relay's origin), so the in-person check still governs.
 
-import { makeCipher, isAscii, bufToB64, b64ToBuf } from "./crypto.js";
-import { Identity, canonicalPublicBundle } from "./identity.js";
+import { makeCipher, isAscii, bufToB64, b64ToBuf, REMOVED_ALGS } from "./crypto.js";
+import {
+  Identity, canonicalPublicBundle, checkIdentityGeneration, raiseIdentityFloor, identityFloorId,
+} from "./identity.js";
+import { captureNativeFloor } from "./nativefloor.js";
+import * as durable from "./durable.js";
 import {
   signHandshake, verifyHandshake, freshNonce, isValidNonce, signKnock, verifyKnock,
   unb64,
@@ -57,6 +61,7 @@ const els = {
   // room admission (owner approves who may join)
   admit: $("admit"), admitFingerprint: $("admitFingerprint"), admitWho: $("admitWho"),
   admitWarn: $("admitWarn"), admitOk: $("admitOk"), admitNo: $("admitNo"), admitLeave: $("admitLeave"),
+  admitTitle: $("admitTitle"), admitHint: $("admitHint"),
   idHint: $("idHint"), roomHint: $("roomHint"), roomHelp: $("roomHelp"),
   stepIdentity: $("stepIdentity"), stepRoom: $("stepRoom"),
   copyCode: $("copyCode"), algDetails: $("algDetails"), algSummary: $("algSummary"), peerFingerprint: $("peerFingerprint"),
@@ -83,6 +88,7 @@ const els = {
   chatsUnlockPass: $("chatsUnlockPass"), chatsUnlock: $("chatsUnlock"),
   chatsUnlockStatus: $("chatsUnlockStatus"),
   chatsAdopt: $("chatsAdopt"), chatsAdoptHint: $("chatsAdoptHint"),
+  usersTakeover: $("usersTakeover"), chatsTakeover: $("chatsTakeover"),
   profileName: $("profileName"), profileAvatar: $("profileAvatar"),
   profileHandleText: $("profileHandleText"),
   profileHandleActions: $("profileHandleActions"),
@@ -158,6 +164,34 @@ function promptSecret(message) {
 // localStorage keys. Private keys live only inside the passphrase-encrypted
 // identity blob; pins hold peers' PUBLIC bundles only.
 const LS_IDENTITY = "sc.identity.v1";
+// Package 4 (F-ATREST-008): the identity blob's native floor (Android; null in
+// a plain browser). See checkIdentityGeneration in identity.js.
+const identityFloor = captureNativeFloor();
+// Fix round (pentest of package 4, L-1): the identity blob's DURABLE copy.
+// localStorage.setItem returning is not "on disk" (durable.js: Chromium keeps
+// it off disk for up to a minute), while the native floor's commit() is on disk
+// at once — so "setItem, then raise the floor" could leave the floor AHEAD of
+// the only copy that survives a kill: a keyless gen-0 blob on disk, floor 1,
+// IDENTITY_ROLLBACK forever, no override. The blob is now also written to the
+// strict IndexedDB store, AWAITED, and the floor is raised only after that
+// write completed — for exactly the blob whose generation it records. At
+// unlock the durable copy is a second candidate: when the localStorage copy is
+// missing or older (a lost write), the durable one is used and put back.
+// localStorage stays the everyday copy (read synchronously by the UI, export).
+const IDB_IDENTITY = "sc.identity.v1";
+// Final round, Info-1: every write of the identity's durable copy, and Forget's
+// deletion of both copies, run under ONE exclusive Web Lock shared by all tabs
+// of the origin. Inside it a writer re-checks that the copy it is about to make
+// durable is still the one localStorage holds — Forget removes that first, so
+// an unlock racing a Forget (in this or another tab) cannot put the identity
+// back. Without Web Locks the section just runs (best effort; no browser this
+// app supports lacks them).
+const IDENTITY_LOCK = "sc.identity.lock.v1";
+function withIdentityLock(fn) {
+  const locks = typeof navigator !== "undefined" ? navigator.locks : null;
+  if (!locks || typeof locks.request !== "function") return Promise.resolve().then(fn);
+  return locks.request(IDENTITY_LOCK, { mode: "exclusive" }, () => fn());
+}
 const LS_PINS = "sc.pins.v1";
 const LS_USERNAME = "sc.username.v1";
 const LS_LOOKUP_TOKEN = "sc.lookuptoken.v1"; // our directory lookup token
@@ -187,10 +221,17 @@ let roomRole = null;       // "owner" | "guest" for this connection
 let admittedBundle = null; // the identity WE let in (owner side), or null
 let admittedAnon = false;  // we let in someone with no identity at all
 let wasPending = false;    // we sat in the approval queue (M-2, guest side)
+// Package 4, owner decision 2: the GUEST side approves too. `peerApproved` is
+// the identity this device's user approved (or that matched a contact they
+// verified in person) for this connection — pinned exactly like the owner's
+// `admittedBundle`. `peerApproval` is the open prompt: { bundle, resolve }.
+let peerApproved = null;
+let peerApproval = null;
 // Package 2, item 2 (phase7-local M-1 rounds): the two relay-driven arms whose
 // honest relay sends them once per connection are SAID once per connection.
 let saidTurnedAway = false;
 let saidDenied = false;
+let saidRemovedAlg = false; // package 4: "the other side uses RSA" is said once per connection
 // Pentest 2026-08-07 F-PROTO-001: the one fact about room ownership the relay
 // does NOT get to supply. `roomRole` above is whatever the relay answers to
 // `join`, and a hostile relay can answer the room's CREATOR with `pending` —
@@ -295,6 +336,10 @@ let currentRoom = null;    // the room this connection is in (keyconfirm effects
 // again. That is a permanent, silent denial of admission — a direct hit on the
 // P-08 property this was supposed to protect.
 const MAX_KNOCK_QUEUE = 16;
+// Fix round I-3: with the queue full, expected-peer claims are verified at most
+// once per this interval (see queueKnock).
+const EXPECTED_KNOCK_GAP_MS = 500;
+let expectedKnockNotBefore = 0;
 
 let identity = null;       // unlocked Identity, or null
 let myBundle = null;       // identity.publicBundle(), or null
@@ -700,7 +745,9 @@ function wsUrl() {
 }
 
 function algNeedsIdentity(alg) {
-  return alg === "DHKE" || alg === "RSA" || alg === "PQKEM";
+  // RSA was here until package 4 (F-CRYPTO-009, see the tombstone in
+  // crypto.js): index.html no longer offers it and makeCipher refuses it.
+  return alg === "DHKE" || alg === "PQKEM";
 }
 
 // The encryption picker is a radio-card group (one input per mode); exactly one
@@ -793,7 +840,7 @@ async function createIdentity() {
     setIdentityStatus("Choose a passphrase first — it encrypts your private keys on this device.", "err");
     return;
   }
-  if (localStorage.getItem(LS_IDENTITY)) {
+  if (localStorage.getItem(LS_IDENTITY) || (await durableIdentityBlob())) {
     setIdentityStatus("An identity already exists here. Unlock it, or Forget it first.", "err");
     return;
   }
@@ -802,6 +849,9 @@ async function createIdentity() {
     identity = await Identity.generate();
     const blob = await identity.export(pass);
     localStorage.setItem(LS_IDENTITY, blob);
+    // F-ATREST-008 / fix round L-1: the floor follows the DURABLE blob, never
+    // leads it (raiseIdentityFloorSaid writes it to IndexedDB first).
+    await raiseIdentityFloorSaid(identity, blob);
     await unlockContacts(pass, { expectStore: false }); // contact store shares the identity passphrase
     els.idPass.value = "";
     await showIdentityUnlocked();
@@ -815,29 +865,184 @@ async function createIdentity() {
 // the per-view unlock rows (Profile / Users / Chats), so a new tab opened from
 // an invite link can unlock where the user actually is instead of sending them
 // back to the Live room. Returns null on success, or an error message.
+// Package 4 (F-ATREST-008): the two questions a keyless identity blob raises.
+// The legacy one is the genuine one-time upgrade — but a restored OLD copy
+// looks exactly like it in a browser (the envelope's version is outside the
+// encryption), so it says what to do if this identity was used before.
+const NEW_KEYS_LEGACY_Q =
+  "This identity was saved by an old version of the app and has no encryption keys yet.\n\n" +
+  "Create them now? Your fingerprint does not change, but contacts will see new encryption keys.\n\n" +
+  "If you have ALREADY used this identity with a newer version of the app, press Cancel: " +
+  "an old copy has been put back, and new keys would make your mail unreadable.";
+const NEW_KEYS_MISSING_Q =
+  "WARNING: your saved identity has NO encryption keys, although this app always saves them. " +
+  "An older or edited copy has probably replaced it.\n\n" +
+  "Continuing creates NEW encryption keys: mail sealed to your old keys can no longer be opened, " +
+  "and every contact will see your keys change.\n\n" +
+  "Press Cancel and restore your newest backup unless you know exactly why this happened.";
+
+// Make `blob` (the identity `id` was loaded from or just saved as) durable,
+// THEN raise the identity floor to its generation. The order is the point
+// (fix round L-1): the floor's commit() is on disk at once, so it may only
+// ever record a generation whose blob is already on disk too. A durable write
+// that fails leaves the floor where it was (said); a floor write that fails
+// leaves it behind the blob (said) — both are caught up at the next unlock,
+// and neither can lock the user out.
+async function raiseIdentityFloorSaid(id, blob) {
+  let durableOk = false;
+  let forgotten = false;
+  if (durable.available()) {
+    try {
+      await withIdentityLock(async () => {
+        // Info-1: Forget ran meanwhile (it removes the localStorage copy under
+        // this lock): write nothing, raise nothing.
+        if (localStorage.getItem(LS_IDENTITY) !== blob) { forgotten = true; return; }
+        const have = await durable.get(IDB_IDENTITY);
+        if (have !== blob) await durable.put(IDB_IDENTITY, blob);
+        durableOk = true;
+      });
+    } catch {
+      durableOk = false;
+    }
+  }
+  if (forgotten || !identityFloor) return;
+  if (!durableOk) {
+    addLine("sys", "", "[your identity could not be saved to the device's durable storage — its rollback record was not advanced; retried at the next unlock]", true);
+    return;
+  }
+  try {
+    raiseIdentityFloor(identityFloor, await identityFloorId(id.edPubRaw), id.gen);
+  } catch (e) {
+    addLine("sys", "", "[the device's rollback record for your identity could not be updated — it will be retried at the next unlock]", true);
+  }
+}
+
+// The candidates for the stored identity: the everyday localStorage copy and
+// the durable IndexedDB copy (fix round L-1).
+async function durableIdentityBlob() {
+  if (!durable.available()) return null;
+  try {
+    const v = await durable.get(IDB_IDENTITY);
+    return typeof v === "string" ? v : null;
+  } catch {
+    return null;
+  }
+}
+// Info-3: a localStorage copy that is not even an identity envelope (damaged)
+// must not hide a durable copy that opens.
+function envelopeParses(blob) {
+  try {
+    const o = JSON.parse(blob);
+    return !!o && typeof o === "object" && typeof o.salt === "string" && typeof o.iv === "string" && typeof o.ct === "string";
+  } catch {
+    return false;
+  }
+}
+const sameEdRaw = (a, b) => !!a && !!b && a.length === b.length && a.every((x, i) => x === b[i]);
+async function tryImport(blob, pass) {
+  try {
+    return { blob, id: await Identity.import(blob, pass) };
+  } catch (err) {
+    return { blob, err };
+  }
+}
+// Which copy to unlock. The localStorage copy wins unless the durable copy is
+// the SAME identity and newer — or the localStorage copy is gone — which is
+// exactly what a localStorage write lost to a kill looks like (create: nothing
+// there; upgrade: the keyless gen-0 copy still there). A durable copy of a
+// different identity, or one the passphrase does not open, never replaces it.
+async function pickIdentityBlob(pass) {
+  const ls = localStorage.getItem(LS_IDENTITY);
+  const idb = await durableIdentityBlob();
+  const a = ls && envelopeParses(ls) ? await tryImport(ls, pass) : null;
+  const b = idb && idb !== ls ? await tryImport(idb, pass) : null;
+  if (b && b.id) {
+    const aEd = a ? (a.id ? a.id.edPubRaw : a.err && a.err.edPubRaw) : null;
+    const aGen = a ? (a.id ? a.id.storedGen : a.err && a.err.storedGen) : null;
+    const newer = !a || (sameEdRaw(aEd, b.id.edPubRaw) && typeof aGen === "number" &&
+      (b.id.storedGen > aGen || (a.err && a.err.code === "IDENTITY_NEEDS_NEW_KEYS")));
+    if (newer) {
+      // Info-1: only if Forget has not deleted the durable copy meanwhile.
+      let restored = false;
+      await withIdentityLock(async () => {
+        if ((await durableIdentityBlob()) !== b.blob) return;
+        localStorage.setItem(LS_IDENTITY, b.blob);
+        restored = true;
+      });
+      if (!restored) return null;
+      addLine("sys", "", "[your identity was taken from the device's durable copy — the last save had not reached the disk]", true);
+      return b;
+    }
+  }
+  // Info-2: nothing usable in localStorage, and the durable copy did not open
+  // with this passphrase — that is a wrong passphrase, not "nothing to unlock".
+  if (!a && b) return b;
+  if (!a && !b && ls) {
+    // A damaged localStorage copy and no durable one: the old answer stands.
+    const err = new Error("the saved identity is damaged");
+    return { blob: ls, err };
+  }
+  return a;
+}
+
 async function unlockWithPassphrase(pass) {
-  const blob = localStorage.getItem(LS_IDENTITY);
-  if (!blob) return "Nothing to unlock — create an identity in the Live room first.";
+  if (!localStorage.getItem(LS_IDENTITY) && !(await durableIdentityBlob())) {
+    return "Nothing to unlock — create an identity in the Live room first.";
+  }
   if (!pass) return "Enter your identity passphrase to unlock.";
   try {
-    identity = await Identity.import(blob, pass);
-    if (identity.upgraded) {
-      // Pre-v3 blob: encryption keys were just added — persist them so the
-      // upgrade happens exactly once, then re-publish the bundle below.
-      localStorage.setItem(LS_IDENTITY, await identity.export(pass));
+    const picked = await pickIdentityBlob(pass);
+    if (!picked) return "Nothing to unlock — create an identity in the Live room first.";
+    const blob = picked.blob;
+    let imported;
+    try {
+      if (picked.err) throw picked.err;
+      imported = picked.id;
+    } catch (e) {
+      if (e.code !== "IDENTITY_NEEDS_NEW_KEYS") throw e;
+      // F-ATREST-008: never re-key silently. On Android a device that has used
+      // this identity refuses outright (checkIdentityGeneration); otherwise the
+      // user decides, told what it costs.
+      await checkIdentityGeneration(e.edPubRaw, e.storedGen, false, identityFloor);
+      if (!confirm(e.legacy ? NEW_KEYS_LEGACY_Q : NEW_KEYS_MISSING_Q)) {
+        identity = null;
+        addLine("sys", "", "[identity NOT unlocked — its saved copy has no encryption keys and you chose not to create new ones]", true);
+        return "Not unlocked: " + e.message + ". Restore your newest identity backup, or unlock again and confirm new keys.";
+      }
+      imported = await Identity.import(blob, pass, { allowNewEncryptionKeys: true });
     }
+    // Refused BEFORE anything is stored or unlocked: a copy older than the one
+    // this device has used (Android).
+    await checkIdentityGeneration(imported.edPubRaw, imported.storedGen, !imported.upgraded, identityFloor);
+    identity = imported;
+    let stored = blob;
+    if (identity.upgraded) {
+      // Encryption keys were just added, with the user's consent — persist
+      // them (generation +1) so it happens exactly once, then (durable copy
+      // first, fix round L-1) raise the floor and re-publish the bundle below.
+      stored = await identity.export(pass);
+      localStorage.setItem(LS_IDENTITY, stored);
+      addLine("sys", "", "[new encryption keys were created for your identity — you confirmed it]", true);
+    }
+    await raiseIdentityFloorSaid(identity, stored);
     await unlockContacts(pass, { expectStore: true }); // contact store shares the identity passphrase
     await showIdentityUnlocked();
     return null;
   } catch (e) {
     identity = null;
+    // The package-4 refusals say what happened; everything else keeps the
+    // one sentence that does not help a guesser.
+    if (e && (e.code === "IDENTITY_ROLLBACK" || e.code === "IDENTITY_FLOOR")) {
+      addLine("sys", "", "[identity NOT unlocked — " + e.message + "]", true);
+      return "Not unlocked: " + e.message;
+    }
     return "Wrong passphrase or corrupted identity.";
   }
 }
 
 async function unlockIdentity() {
   const pass = els.idPass.value;
-  if (!localStorage.getItem(LS_IDENTITY)) {
+  if (!localStorage.getItem(LS_IDENTITY) && !(await durableIdentityBlob())) {
     setIdentityStatus("Nothing to unlock — create an identity first.", "err");
     return;
   }
@@ -909,7 +1114,21 @@ async function forgetIdentity() {
   apiToken = null;
   if (staleToken) await account.logout(API_BASE, staleToken);
 
-  localStorage.removeItem(LS_IDENTITY);
+  // Fix round L-1: the durable copy goes FIRST (awaited) — the other order
+  // could leave a copy that the next unlock would put back.
+  // Info-1: both copies go under the identity lock, so a durable write of an
+  // unlock in flight (this or another tab) either finished before — and is
+  // deleted here — or re-checks after and finds the localStorage copy gone.
+  await withIdentityLock(async () => {
+    if (durable.available()) {
+      try {
+        await durable.del(IDB_IDENTITY);
+      } catch {
+        addLine("sys", "", "[could not delete the durable copy of your identity from this device's database — reload and Forget again]", true);
+      }
+    }
+    localStorage.removeItem(LS_IDENTITY);
+  }).catch(() => { localStorage.removeItem(LS_IDENTITY); });
   closeContact(false); // it shows a record that is about to be gone
   retractPending.clear(); // they belonged to this identity's account
   retractInflight.clear();
@@ -921,6 +1140,9 @@ async function forgetIdentity() {
   // stores live in IndexedDB now, so their deletion is awaited — and a failure
   // is said, not swallowed (the records would outlive the identity).
   const wiped = await Promise.allSettled([contacts.wipe(), chats.wipe()]);
+  releaseStoreLock(); // decision 3: nothing of this identity is held open any more
+  storesElsewhere = false;
+  storesTakenOver = false;
   if (wiped.some((r) => r.status === "rejected")) {
     addLine("sys", "", "[could not delete the saved contacts / chat history from this device's database — reload and Forget again]", true);
   }
@@ -1077,6 +1299,83 @@ async function storeFloorId() {
 }
 let apiToken = null;      // directory session token (from Log in), memory only
 
+// ---- package 4, owner decision 3: contacts + chats in ONE tab at a time ------
+// Like an OTP pad (package 3), the contact and chat stores are now live in only
+// one tab or window of this browser at a time. Package 3b made a second tab's
+// write fail loudly (STALE) and settled conflicts at unlock; that stays, as the
+// backstop. The primary control is an exclusive Web Lock per IDENTITY (both
+// stores open and close together, and a second identity in another tab is a
+// different user's data), taken before either store is opened and held for as
+// long as they are.
+//
+// A second tab does not open them: its Users / Chats views say they are open
+// elsewhere and offer "Use here", which TAKES the lock (`steal: true`). The tab
+// that loses it locks both stores at once and says why — never a silent lock.
+// (Decided over a plain refusal: the other tab may be on another screen, or
+// hung, and a refusal would leave no way in but closing it.)
+//
+// Without Web Locks (none of the browsers this app supports; they all have it
+// in a secure context): the stores still open and 3b's STALE refusals are the
+// control, with one line saying so. Refusing to open them instead would switch
+// off key-change detection, which lives in the contact store — a worse outcome
+// than a refused cross-tab save.
+const STORES_ELSEWHERE_LINE = "Your contacts and chats are open in another tab or window. " +
+  "Use them there — or enter your passphrase and press \u201cUse here\u201d (the other tab then locks them).";
+const STORES_TAKEN_LINE = "Your contacts and chats were opened in another tab or window, so they were locked here. " +
+  "Enter your passphrase and press \u201cUse here\u201d to use them in this tab again.";
+let storeLock = null;          // { name, release } while this tab holds the stores
+let storesElsewhere = false;   // the last unlock found them held by another tab
+let storesTakenOver = false;   // another tab took them from this one
+let saidNoStoreLock = false;
+
+// Resolves "held" (this tab holds the lock for `floorId` now), "elsewhere"
+// (another tab holds it; not taken) or "none" (no Web Locks: 3b fallback).
+async function holdStoreLock(floorId, takeover) {
+  const locks = typeof navigator !== "undefined" ? navigator.locks : null;
+  if (!locks || typeof locks.request !== "function") return "none";
+  const name = "sc.stores.lock.v1." + floorId;
+  if (storeLock && storeLock.name === name) return "held";
+  releaseStoreLock(); // another identity's lock, if any
+  const mine = { name, release: null, lost: false };
+  const got = await new Promise((resolveGot) => {
+    locks.request(name, takeover ? { steal: true } : { ifAvailable: true }, (lock) => {
+      if (!lock) { resolveGot(false); return undefined; }
+      resolveGot(true);
+      return new Promise((r) => { mine.release = r; }); // held until released
+    }).catch(() => {
+      // AbortError: another tab stole it (the only way this rejects while held).
+      // `lost` is set whatever state this tab is in (fix round L-2): a steal
+      // can land while unlockContacts is still opening the stores, before
+      // storesStolen() has anything to lock — the unlock re-checks it at the end.
+      mine.lost = true;
+      if (storeLock === mine) storesStolen();
+      resolveGot(false);
+    });
+  });
+  if (!got || mine.lost) return "elsewhere";
+  storeLock = mine;
+  return "held";
+}
+function releaseStoreLock() {
+  const l = storeLock;
+  storeLock = null;
+  if (l) l.released = true; // final round Info-4: let go by this tab (Forget), not taken
+  if (l && l.release) l.release();
+}
+// Another tab pressed "Use here". Its copy is authoritative from now on, so
+// ours is locked at once — anything we wrote later would be a lost update the
+// 3b checks would have to catch — and the views say why.
+function storesStolen() {
+  storeLock = null;
+  storesTakenOver = true;
+  closeContact(false);
+  if (contacts.isUnlocked()) contacts.lock();
+  if (chats.isUnlocked()) chats.lock();
+  addLine("sys", "", "[your contacts and chats were opened in another tab — they are locked here]", true);
+  refreshUsers();
+  refreshChats();
+}
+
 // Unlock the contact store with the identity passphrase. Called wherever the
 // identity itself is created/unlocked, BEFORE the passphrase field is cleared.
 // P-02: a failure here leaves the identity usable but the PIN STORE LOCKED,
@@ -1108,6 +1407,27 @@ async function unlockContacts(pass, opts = {}) {
   });
   const contactOpts = flags("LEGACY_CONTACTS_ADOPTION", "DELETED_CONTACTS_ADOPTION");
   const chatOpts = flags("LEGACY_CHATS_ADOPTION", "DELETED_CHATS_ADOPTION");
+  // Decision 3: one tab at a time, decided BEFORE either store is read.
+  const held = floorId ? await holdStoreLock(floorId, !!opts.takeover) : "none";
+  const myLock = held === "held" ? storeLock : null; // fix round L-2, re-checked below
+  if (held === "elsewhere") {
+    storesElsewhere = true;
+    storesTakenOver = false;
+    closeContact(false);
+    if (contacts.isUnlocked()) contacts.lock();
+    if (chats.isUnlocked()) chats.lock();
+    contactsError = null;
+    contactsAdoptable = false;
+    adoptCodes.clear();
+    addLine("sys", "", "[your contacts and chats are open in another tab — not opened here]", true);
+    return;
+  }
+  storesElsewhere = false;
+  storesTakenOver = false;
+  if (held === "none" && !saidNoStoreLock) {
+    saidNoStoreLock = true;
+    addLine("sys", "", "[this browser cannot keep your contacts and chats to one tab — use them in one tab only]", true);
+  }
   contactsAdoptable = false;
   adoptCodes.clear();
   storeNotice = null;
@@ -1159,6 +1479,33 @@ async function unlockContacts(pass, opts = {}) {
     if (ADOPTABLE.has(e.code)) { contactsAdoptable = true; adoptCodes.add(e.code); }
     addLine("sys", "", "[chat store did not unlock — " + e.message + "]", true);
   }
+  // Fix round (pentest of package 4), L-2. Opening the stores is two 600k
+  // PBKDF2 derivations; another tab's "Use here" can take the lock in between.
+  // storesStolen() then ran with nothing open to lock, and without this check
+  // the stores opened here anyway — BOTH tabs held them, and this one's pins
+  // no longer saw the other's Unverify / Remove. The lock this call took must
+  // still be ours when the stores are open, or they are locked again at once.
+  if (myLock && myLock.released && !myLock.lost) {
+    // Final round Info-4: this tab let the lock go itself (Forget identity ran
+    // while the stores were opening). Nobody else has them: lock, say nothing
+    // about another tab.
+    closeContact(false);
+    if (contacts.isUnlocked()) contacts.lock();
+    if (chats.isUnlocked()) chats.lock();
+    refreshUsers();
+    refreshChats();
+  } else if (myLock && (myLock.lost || storeLock !== myLock)) {
+    const saidAlready = storesTakenOver;
+    if (storeLock === myLock) storeLock = null;
+    storesTakenOver = true;
+    storesElsewhere = false;
+    closeContact(false);
+    if (contacts.isUnlocked()) contacts.lock();
+    if (chats.isUnlocked()) chats.lock();
+    if (!saidAlready) addLine("sys", "", "[your contacts and chats were opened in another tab — they are locked here]", true);
+    refreshUsers();
+    refreshChats();
+  }
 }
 
 function usersStatus(text, isErr = false) {
@@ -1173,9 +1520,13 @@ function refreshUsers() {
   usersStatus("");
   const unlocked = contacts.isUnlocked();
   els.usersLocked.hidden = unlocked;
+  // Decision 3: "Use here" only while another tab holds (or took) the stores.
+  els.usersTakeover.hidden = unlocked || !(identity && (storesElsewhere || storesTakenOver));
   els.usersUnlocked.hidden = !unlocked;
   if (!unlocked) {
-    els.usersLocked.querySelector("p").textContent = hintSafe(contactsStale && identity ? STALE_LINE : contactsError
+    els.usersLocked.querySelector("p").textContent = hintSafe(!els.usersTakeover.hidden
+      ? (storesTakenOver ? STORES_TAKEN_LINE : STORES_ELSEWHERE_LINE)
+      : contactsStale && identity ? STALE_LINE : contactsError
       ? "Contact store error: " + contactsError +
         (contactsAdoptable ? "" :
           " (Forget + recreate the identity resets it — contacts are bound to the identity passphrase.)")
@@ -2075,12 +2426,16 @@ function renderMark(el, c, note = true) {
 function refreshChats() {
   const unlocked = chats.isUnlocked() && contacts.isUnlocked();
   els.chatsLocked.hidden = unlocked;
+  // Decision 3: "Use here" only while another tab holds (or took) the stores.
+  els.chatsTakeover.hidden = unlocked || !(identity && (storesElsewhere || storesTakenOver));
   els.chatsUnlocked.hidden = !unlocked;
   if (!unlocked) {
     // Fix review 2026-09-21: a chat store that refused while contacts opened
     // had no visible error and no override anywhere — a dead end whose only
     // exit was Forget identity. The Chats view now carries both.
-    els.chatsLocked.querySelector("p").textContent = hintSafe(contactsStale && identity ? STALE_LINE : contactsError && identity
+    els.chatsLocked.querySelector("p").textContent = hintSafe(!els.chatsTakeover.hidden
+      ? (storesTakenOver ? STORES_TAKEN_LINE : STORES_ELSEWHERE_LINE)
+      : contactsStale && identity ? STALE_LINE : contactsError && identity
       ? "Chat store error: " + contactsError
       : "Locked. Enter your passphrase.");
     els.chatsAdopt.hidden = !contactsAdoptable;
@@ -2641,7 +2996,7 @@ function stopMailboxPolling() {
 // ---- connection lifecycle -------------------------------------------------
 
 // Pentest 2026-07-26 P-19: connect() awaits a directory fetch, a pad unlock
-// (600k PBKDF2) and RSA keygen before it disabled the button, so a double-click
+// (600k PBKDF2) and a keypair generation before it disabled the button, so a double-click
 // ran two overlapping connects that fought over ws/cipher/otpRecord/
 // otpLockRelease — the second call's releaseOtpLock() dropped the lock the first
 // had just taken, and both opened sockets into a room capped at two members,
@@ -2776,8 +3131,11 @@ async function connectInner() {
   wasPending = false;
   saidTurnedAway = false;
   saidDenied = false;
+  saidRemovedAlg = false;
   keyConfirm.reset();
   knockQueue = [];
+  settlePeerApproval(false); // decision 2: a prompt of the old connection decides nothing
+  peerApproved = null;
   hideAdmitPrompt();
   // P-19: freeze the session's room/alg now; the send path uses these, never the
   // live DOM.
@@ -2823,6 +3181,19 @@ async function connectInner() {
     // so a bigger one is not from an honest relay. Refused before it is
     // queued or parsed — JSON.parse of an attacker-sized string is the cost.
     if (typeof ev.data !== "string" || ev.data.length > MAX_WS_FRAME_CHARS) return;
+    // Fix round (pentest of package 4), I-1: while the guest's approval prompt
+    // is open the pump is parked on the user's decision, so every frame the
+    // relay sends meanwhile is kept alive in msgChain (up to 64 KiB each, no
+    // limit) — a hostile relay could fill the tab's memory. An honest owner
+    // sends nothing while it waits for our answer, so past a small cap the
+    // connection is dropped, once, with one line.
+    if (peerApproval && sock === ws && !retiredSockets.has(sock)) {
+      if (++framesWhilePrompt > MAX_FRAMES_WHILE_PROMPT) {
+        addLine("sys", "", "[the relay kept sending while you were deciding — disconnecting]", true);
+        closeWs("The relay flooded the connection while you were deciding whom to let in. Disconnected — nothing was exchanged.", sock);
+        return;
+      }
+    }
     msgChain = msgChain.then(() => handleMessage(room, ev.data, sock)).catch(() => {});
   };
 
@@ -2842,6 +3213,10 @@ async function connectInner() {
     saidDenied = false;
     keyConfirm.reset();
     knockQueue = [];
+    // Decision 2: an open guest-side prompt is settled as "no" — the handler
+    // parked on it re-checks live() and returns; nothing is pinned.
+    settlePeerApproval(false);
+    peerApproved = null;
     hideAdmitPrompt(); // also lifts the B3 modal: nothing stays inert after a drop
     enableSend(false);
     els.verify.hidden = true;
@@ -2893,12 +3268,32 @@ async function queueKnock(m, live = () => true) {
   //
   // Note the cap sits BEFORE the two signature verifies below, so a flood costs
   // the owner a regex and an array scan, not the expensive part.
-  if (knockQueue.length >= MAX_KNOCK_QUEUE) return;
+  //
+  // Package 4, F-PROTO-004 (Low): "drop the newest" also dropped the ONE knock
+  // this session was aimed at — a flood that filled the queue first kept the
+  // expected contact out for as long as it kept refilling. So when the queue is
+  // full, a knock whose claimed bundle equals `expectedPeerBundle` still goes on
+  // (a cheap key comparison, still before the verifies), and once its signature
+  // verifies it takes the place of the OLDEST entry that is not the expected
+  // peer and not the one on screen. Any other knock is still dropped.
   let p;
   try {
     p = unpackKey(m.payload);
   } catch {
     return;
+  }
+  const full = knockQueue.length >= MAX_KNOCK_QUEUE;
+  if (full) {
+    let claimed = null;
+    try { claimed = p && p.idb ? canonicalBundle(p.idb) : null; } catch { claimed = null; }
+    if (!expectedPeerBundle || !claimed || !sameBundle(expectedPeerBundle, claimed)) return;
+    // Fix round I-3: a claim of the expected key is PUBLIC (anyone can copy the
+    // bundle), so with a full queue it must not buy a dual-signature verify per
+    // frame. At most one such verify per EXPECTED_KNOCK_GAP_MS; a genuine peer
+    // that lands in the gap knocks again, as any dropped knocker does.
+    const now = performance.now();
+    if (now < expectedKnockNotBefore) return;
+    expectedKnockNotBefore = now + EXPECTED_KNOCK_GAP_MS;
   }
   let entry = { jid: m.jid, bundle: null, anon: true };
   if (p && p.idb && p.sig) {
@@ -2918,6 +3313,14 @@ async function queueKnock(m, live = () => true) {
     const ok = idb ? await verifyKnock(idb, sessionRoom, p.sig).catch(() => false) : false;
     if (!live()) return; // L-2: the knock was for a session that has been replaced
     entry = { jid: m.jid, bundle: ok ? idb : null, anon: false, unproven: !ok };
+  }
+  if (knockQueue.length >= MAX_KNOCK_QUEUE) {
+    // F-PROTO-004: only a VERIFIED knock of the expected peer gets this far.
+    const expected = (k) => !!k.bundle && !!expectedPeerBundle && sameBundle(k.bundle, expectedPeerBundle);
+    if (!expected(entry)) return;
+    const victim = knockQueue.findIndex((k, i) => i > 0 && !expected(k));
+    if (victim < 0) return;
+    knockQueue.splice(victim, 1);
   }
   knockQueue.push(entry);
   await showNextKnock();
@@ -3015,35 +3418,7 @@ async function showNextKnock() {
     if (gen !== knockRenderGen || knockQueue[0] !== k) return;
     els.admitFingerprint.textContent = fp;
     els.admitFingerprint.hidden = false;
-    // Who is this, in OUR terms? Matched on the keys themselves — never on a
-    // name the other side chose (F-01).
-    // Package 2, item 12 (A4 item 11 residual): compared as KEYS (decoded
-    // bytes, sameSigning), like every other identity comparison in this file —
-    // not as the strings a store or a relay happened to spell them with.
-    const known = contacts.isUnlocked()
-      ? contacts.list().find((c) => sameSigning(c, k.bundle))
-      : null;
-    if (known) {
-      // B1 (design review): our name for them, then the same trust pill the
-      // lists draw.
-      const name = document.createElement("span");
-      name.className = "u-name"; // H1 (design review): a handle, set like every other one
-      name.textContent = dirName(known);
-      const mark = document.createElement("span");
-      renderMark(mark, known);
-      els.admitWho.textContent = "";
-      els.admitWho.append(name, " ", mark);
-    } else {
-      els.admitWho.textContent = pinsReadable()
-        ? "Not in your users list — you have never verified this key"
-        : "Unknown — your saved users could not be read, so trust cannot be checked";
-    }
-    // If this session was aimed at a specific contact, say whether it is them.
-    if (expectedPeerBundle && !sameBundle(expectedPeerBundle, k.bundle)) {
-      els.admitWarn.textContent =
-        "This is NOT the user you selected for this session. Deny unless you know why.";
-      els.admitWarn.className = "hint err";
-    }
+    describePeer(k.bundle, "Deny");
   } else if (k.unproven) {
     // B6 (design review): no key, no fingerprint well (was an empty "—" box).
     els.admitFingerprint.textContent = "";
@@ -3074,6 +3449,7 @@ async function showNextKnock() {
     els.admitWarn.className = "hint";
   }
   const fresh = els.admit.hidden || admitShownFor !== k;
+  els.admit.dataset.mode = "knock";
   els.admit.hidden = false;
   setAdmitModal(true); // B3; before the guard, so its focus lands on Deny
   if (fresh) armAdmitGuard(k);
@@ -3082,6 +3458,130 @@ async function showNextKnock() {
       (els.admitWarn.textContent ? " " : "") +
       `(${knockQueue.length - 1} more waiting — decide one at a time.)`;
   }
+}
+
+// Who is this, in OUR terms? Shared by the owner's knock prompt and the guest's
+// peer prompt (package 4, decision 2). Matched on the keys themselves — never
+// on a name the other side chose (F-01).
+// Package 2, item 12 (A4 item 11 residual): compared as KEYS (decoded bytes,
+// sameSigning), like every other identity comparison in this file — not as the
+// strings a store or a relay happened to spell them with.
+function describePeer(bundle, refuseWord) {
+  const known = contacts.isUnlocked()
+    ? contacts.list().find((c) => sameSigning(c, bundle))
+    : null;
+  if (known) {
+    // B1 (design review): our name for them, then the same trust pill the
+    // lists draw.
+    const name = document.createElement("span");
+    name.className = "u-name"; // H1 (design review): a handle, set like every other one
+    name.textContent = dirName(known);
+    const mark = document.createElement("span");
+    renderMark(mark, known);
+    els.admitWho.textContent = "";
+    els.admitWho.append(name, " ", mark);
+  } else {
+    els.admitWho.textContent = pinsReadable()
+      ? "Not in your users list — you have never verified this key"
+      : "Unknown — your saved users could not be read, so trust cannot be checked";
+  }
+  // If this session was aimed at a specific contact, say whether it is them.
+  if (expectedPeerBundle && !sameBundle(expectedPeerBundle, bundle)) {
+    els.admitWarn.textContent =
+      `This is NOT the user you selected for this session. ${refuseWord} unless you know why.`;
+    els.admitWarn.className = "hint err";
+  }
+}
+
+// ---- package 4, owner decision 2: the guest side approves too ----------------
+// Until now only the room OWNER was asked who to let in. A relay that knows the
+// code (it is in every `join` frame) can seat ANY identity against a guest — and
+// against a creator whose code was minted in another browser profile, who looks
+// like a guest here — and only the in-person safety-number gate stood in its
+// way. So before the guest's key exchange runs (before its cipher sees the
+// peer's key, before it answers, long before any message can be sent or
+// decrypted) the guest's user sees the owner's fingerprint and trust mark and
+// decides; "no" closes. The approved identity is pinned for the connection
+// exactly like `admittedBundle` on the owner side: a second identity is refused.
+//
+// No wire change: the owner's identity bundle already arrives, signed over this
+// connection's nonces, in its handshake frame — which is what is judged here.
+//
+// AUTO-APPROVAL (decided, stated): no prompt when the key is one this user
+// already verified IN PERSON and pinned — a contact marked verified (🟢) whose
+// four keys equal the offered bundle AND whose user: pin holds those same keys,
+// not revoked (Unverify / Remove revoke it) — and, if this session named a
+// contact, it is that contact. A 🟡 vouch, a room: pin or a directory answer is
+// NOT enough: none of them is this user's own in-person check of this key.
+// Everything else asks. The auto-approval says so in the transcript.
+const PEER_PROMPT = {
+  title: "Is this who you are expecting?",
+  hint: "You are joining someone else's chat. This is the key of the person who let you in. " +
+    "Only continue if it is who you meant to talk to.",
+  ok: "Continue",
+  no: "Refuse",
+};
+let knockLabels = null; // the owner-prompt wording from index.html, restored on hide
+
+function peerVerifiedInPerson(bundle) {
+  if (!contacts.isUnlocked()) return null;
+  if (expectedPeerBundle && !sameBundle(expectedPeerBundle, bundle)) return null;
+  for (const c of contacts.list()) {
+    if (!c.verified || !sameBundle(keysOf(c), bundle)) continue;
+    const pin = contacts.getPin(contacts.pinKeyFor(c.username));
+    if (pin && !pin.revoked && sameBundle(pin, bundle)) return c;
+  }
+  return null;
+}
+
+// Registers the pending decision SYNCHRONOUSLY, then renders: the other order
+// would let a close arriving mid-render find nothing to settle, and the message
+// pump would stay parked on a promise nothing could ever resolve.
+// I-1: frames queued behind an open prompt, per prompt.
+const MAX_FRAMES_WHILE_PROMPT = 64;
+let framesWhilePrompt = 0;
+function requestPeerApproval(bundle) {
+  settlePeerApproval(false);
+  framesWhilePrompt = 0;
+  const decided = new Promise((resolve) => { peerApproval = { bundle, resolve }; });
+  renderPeerApproval(peerApproval);
+  return decided;
+}
+
+async function renderPeerApproval(req) {
+  const fp = await Identity.fingerprintOf(req.bundle);
+  if (peerApproval !== req) return; // settled (or replaced) while we hashed
+  if (!knockLabels) {
+    knockLabels = {
+      title: els.admitTitle.textContent, hint: els.admitHint.textContent,
+      ok: els.admitOk.textContent, no: els.admitNo.textContent,
+    };
+  }
+  els.admitTitle.textContent = PEER_PROMPT.title;
+  els.admitHint.textContent = PEER_PROMPT.hint;
+  els.admitOk.textContent = PEER_PROMPT.ok;
+  els.admitNo.textContent = PEER_PROMPT.no;
+  els.admitWarn.textContent = "";
+  els.admitWarn.className = "hint";
+  els.admitFingerprint.textContent = fp;
+  els.admitFingerprint.hidden = false;
+  describePeer(req.bundle, "Refuse");
+  els.admitOk.disabled = false;
+  els.admit.dataset.mode = "peer";
+  const fresh = els.admit.hidden || admitShownFor !== req;
+  els.admit.hidden = false;
+  setAdmitModal(true); // B3
+  if (fresh) armAdmitGuard(req); // the same 500 ms tap-through guard as a knock
+}
+
+// Settles the parked handshake. Safe with nothing pending — onclose and
+// connectInner call it unconditionally.
+function settlePeerApproval(ok) {
+  if (!peerApproval) return;
+  const { resolve } = peerApproval;
+  peerApproval = null;
+  hideAdmitPrompt();
+  resolve(ok);
 }
 
 function hideAdmitPrompt() {
@@ -3097,6 +3597,14 @@ function hideAdmitPrompt() {
   els.admitFingerprint.hidden = false; // B6
   els.admitWho.textContent = "";
   els.admitWarn.textContent = "";
+  // Decision 2: the sheet goes back to the owner's wording.
+  delete els.admit.dataset.mode;
+  if (knockLabels) {
+    els.admitTitle.textContent = knockLabels.title;
+    els.admitHint.textContent = knockLabels.hint;
+    els.admitOk.textContent = knockLabels.ok;
+    els.admitNo.textContent = knockLabels.no;
+  }
 }
 
 // The verdict. Admitting PINS the identity we let in: the handshake below
@@ -3133,8 +3641,8 @@ function admittedSomeone() {
 }
 
 // Produce + sign the next handshake payload. Computed fresh each call (not
-// cached): for PQKEM and RSA the initial "offer" and the "answer" are different
-// payloads (RSA's answer transports the wrapped root secret), and each must
+// cached): for PQKEM the initial "offer" and the "answer" are different
+// payloads (the answer carries the KEM encapsulation), and each must
 // carry its own signature. For DHKE the payload is idempotent, so re-signing
 // the reply is just a negligible extra signature. The signature covers both
 // per-connection nonces, so it is only meaningful once the hello exchange
@@ -3178,7 +3686,7 @@ function sendSignedKey(room, reply, sock = ws, live = () => true) {
 // Pentest 2026-07-29 M-5. The exchange above was right, but it assumed the
 // chains it confirms never change afterwards. They can: `_derive` REPLACES
 // `this.chan` (and so both confirmation tags) whenever its input signature
-// changes, in PQKEM and RSA alike. Two consequences, both of which this block
+// changes (PQKEM; the removed RSA mode did too). Two consequences, both of which this block
 // now handles explicitly:
 //
 //  1. THE ATTACK. A relay replays one genuine hello and delays one genuine
@@ -3458,6 +3966,32 @@ async function handleMessage(room, raw, sock) {
     }
 
     case "key": {
+      // Package 4, owner decision 1 (F-CRYPTO-009): RSA mode is removed. A
+      // contact still running an old build in RSA mode tags every frame
+      // alg:"RSA"; its key material is undecodable here, so without this the
+      // user got a generic "Key exchange failed" and a session that never
+      // starts. Say what is actually wrong, ONCE, and close cleanly.
+      //
+      // Deliberately NOT phase7-local's pre-switch refusal of every RSA-tagged
+      // frame (F-P7-7: a relay could flood the transcript with them): only a
+      // `key` frame is judged, the line is latched, and closeWs() retires the
+      // socket, so every frame queued behind this one is dropped at dispatch.
+      // The tag is advisory and relay-writable — the worst a relay does with it
+      // is close a session it could have dropped anyway — and it never selects
+      // a cipher: the mode is this page's own choice, frozen in `sessionAlg`.
+      // Fix round I-2: only BEFORE the handshake started (no peer nonce yet) —
+      // an old RSA client's very first frame is its hello, so that is where it
+      // shows. A relay injecting one RSA-tagged frame mid-session must not get
+      // to close the session blaming the peer; later it is an ordinary frame.
+      if (peerNonce === null && typeof m.alg === "string" && m.alg !== sessionAlg &&
+          Object.prototype.hasOwnProperty.call(REMOVED_ALGS, m.alg)) {
+        if (saidRemovedAlg) break;
+        saidRemovedAlg = true;
+        addLine("sys", "", `[the other side uses ${m.alg} mode, which this version no longer supports — refusing]`, true);
+        closeWs(`The other side uses ${m.alg} mode, which this version no longer supports. ` +
+          "Both of you: pick DHKE or Post-quantum under Security options, then connect again.", sock);
+        return;
+      }
       try {
         const p = unpackKey(m.payload);
 
@@ -3607,6 +4141,42 @@ async function handleMessage(room, raw, sock) {
           return;
         }
 
+        // Package 4, owner decision 2: the guest's half of the approval (see
+        // requestPeerApproval). Everything above is the OWNER's half; here a
+        // side that approved nobody — a guest, or anyone the relay has not
+        // told it owns the room — asks its user before any key material is
+        // touched. Keyed on "not the owner" rather than "guest" so a relay
+        // that withholds `joined` cannot skip it. Awaited in place: the pump
+        // is serialized, so every later frame (another identity included)
+        // waits behind this decision and is judged against it.
+        if (roomRole !== "owner" && peerApproved === null) {
+          const known = peerVerifiedInPerson(idbCanon);
+          if (known) {
+            peerApproved = idbCanon;
+            addLine("sys", "", `the other side is "${dirName(known)}", whom you verified in person — approved without asking`, true);
+          } else {
+            const allowed = await requestPeerApproval(idbCanon);
+            // Closed (or replaced) while the prompt was up. Fix round M6: a
+            // RELAY close does not retire the socket, so live() alone still
+            // held and onclose's settle(false) was narrated as the user's
+            // "you refused" — the socket's own state decides too.
+            if (!live() || sock.readyState !== WebSocket.OPEN) return;
+            if (!allowed) {
+              addLine("sys", "", "[you refused the key the other side presented — nothing was exchanged]", true);
+              closeWs("You refused the other side's key. Nothing was exchanged. " +
+                "If you expected them, check the chat code and their fingerprint with them out of band.", sock);
+              return;
+            }
+            peerApproved = idbCanon;
+            addLine("sys", "", "you approved the other side — their key is now pinned for this session", true);
+          }
+        }
+        if (peerApproved && !sameBundle(peerApproved, idbCanon)) {
+          addLine("sys", "", "[a different identity than the one you approved tried to complete the key exchange — refusing]", true);
+          closeWs("The identity that completed the key exchange differs from the one you approved. Disconnecting.", sock);
+          return;
+        }
+
         // C-01: atomically bind the peer IDENTITY to the FIRST accepted
         // handshake. The ciphers are first-key-wins (a later ephemeral key is
         // ignored), so if we let a second, differently-signed handshake through
@@ -3615,8 +4185,8 @@ async function handleMessage(room, raw, sock) {
         // in — decoupling the verified identity from the live channel key. So:
         // pin the identity on first accept; hard-refuse any later frame whose
         // identity differs, and close the connection (that is a MITM attempt).
-        // (F-PROTO-003: the pin stays BEFORE cipher.onPeerKey on purpose. RSA's
-        // onPeerKey locks the peer key first-write-wins and can still throw
+        // (F-PROTO-003: the pin stays BEFORE cipher.onPeerKey on purpose. A
+        // cipher's onPeerKey may lock the peer key first-write-wins and still throw
         // afterwards — pinning only on success would leave the cipher keyed to
         // identity X with nothing pinned, and let identity Y's next frame pin Y.
         // The reflection is refused above instead, before anything is pinned.)
@@ -4349,6 +4919,27 @@ function wireAdopt(btnEl, passEl, statusEl, render) {
   });
 }
 wireAdopt(els.usersAdopt, els.usersUnlockPass, els.usersUnlockStatus, refreshUsers);
+// Decision 3: "Use here" takes the stores over from the other tab.
+function wireTakeover(btnEl, passEl, statusEl, render) {
+  btnEl.addEventListener("click", async () => {
+    const pass = passEl.value;
+    const status = setUnlockStatus(statusEl);
+    if (!identity) { status("Unlock your identity first.", true); return; }
+    if (!pass) { status("Enter your identity passphrase, then press Use here.", true); return; }
+    status("Opening…");
+    await unlockContacts(pass, { expectStore: true, takeover: true });
+    passEl.value = "";
+    status(contactsError ? contactsError : "", !!contactsError);
+    // Each view drawn ONCE, this one last: refreshUsers() applies a pending
+    // invite and writes its line, and a second render would erase it (and the
+    // invite is consumed by then).
+    if (render !== refreshUsers) refreshUsers();
+    if (render !== refreshChats) refreshChats();
+    render();
+  });
+}
+wireTakeover(els.usersTakeover, els.usersUnlockPass, els.usersUnlockStatus, refreshUsers);
+wireTakeover(els.chatsTakeover, els.chatsUnlockPass, els.chatsUnlockStatus, refreshChats);
 wireAdopt(els.chatsAdopt, els.chatsUnlockPass, els.chatsUnlockStatus, refreshChats);
 wireViewUnlock(els.chatsUnlockPass, els.chatsUnlock,
   setUnlockStatus(els.chatsUnlockStatus), refreshChats);
@@ -4377,14 +4968,13 @@ els.copyCode.addEventListener("click", async () => {
 const ALG_LABELS = {
   DHKE: "DHKE (recommended)",
   AES256: "AES-256 with a shared passphrase",
-  RSA: "RSA",
   PQKEM: "post-quantum (ML-KEM-768)",
   OTP: "one-time pad",
 };
 function syncAlgUI() {
   const alg = algValue();
   els.passRow.hidden = alg !== "AES256";
-  els.contactRow.hidden = !algNeedsIdentity(alg); // lookup only aids DHKE/RSA
+  els.contactRow.hidden = !algNeedsIdentity(alg); // lookup only aids DHKE/PQKEM
   els.otpPanel.hidden = alg !== "OTP";
   els.algSummary.textContent = "Security options — currently: " + (ALG_LABELS[alg] || alg);
   // A non-default choice needs the panel to stay open, or the setting becomes
@@ -4403,7 +4993,14 @@ els.verifyOk.addEventListener("click", onVerifyOk);
 els.verifyNo.addEventListener("click", onVerifyNo);
 for (const [btn, allow] of [[els.admitOk, true], [els.admitNo, false]]) {
   btn.addEventListener("click", (e) => {
-    if (knockQueue[0] !== admitShownFor || e.timeStamp - admitShownAt < 500) return;
+    if (e.timeStamp - admitShownAt < 500) return;
+    // Decision 2: the same sheet asks the guest about the peer. Only the
+    // prompt that is on screen may be decided (a render still in flight is not).
+    if (peerApproval) {
+      if (admitShownFor === peerApproval && els.admit.dataset.mode === "peer") settlePeerApproval(allow);
+      return;
+    }
+    if (knockQueue[0] !== admitShownFor) return;
     decideKnock(allow);
   });
 }
@@ -4543,6 +5140,18 @@ showScreen("identity");
 showView("live"); // establishes aria-current / active state on first paint
 syncAlgUI();
 refreshIdentityUI();
+// Fix round L-1: a create whose localStorage write was lost to a kill left the
+// identity only in the durable copy — put it back, so the page offers Unlock
+// (not Create, which would replace it).
+if (!localStorage.getItem(LS_IDENTITY)) {
+  withIdentityLock(async () => {
+    const b = await durableIdentityBlob();
+    if (b && !localStorage.getItem(LS_IDENTITY) && !identity) {
+      localStorage.setItem(LS_IDENTITY, b);
+      refreshIdentityUI();
+    }
+  }).catch(() => {});
+}
 
 // Start with a chat code already in the box. Pressing Connect on an empty field
 // used to fail a validation check whose message was written to a hidden element,

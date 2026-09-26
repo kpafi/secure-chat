@@ -16,6 +16,7 @@
 
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { ml_kem768 } from "@noble/post-quantum/ml-kem.js";
+import { NATIVE_ABSENT, NATIVE_TAMPERED, bumpFloor } from "./nativefloor.js";
 
 const enc = new TextEncoder();
 
@@ -113,6 +114,12 @@ export class Identity {
     this._mlkemSecret = mlkemSecret || null; // Uint8Array
     this.mlkemPub = mlkemPub || null;    // Uint8Array(1184)
     this.upgraded = false; // true when import() added missing encryption keys
+    // Package 4 (F-ATREST-008): the blob's GENERATION, carried inside the AEAD.
+    // It moves only when the key material changes (a new identity is 1; adding
+    // encryption keys to an existing one is +1), and on Android it is checked
+    // against a native floor (see checkIdentityGeneration). Blobs written
+    // before package 4 carry none and read as 0.
+    this.gen = 1;
   }
 
   static async _genEncKeys() {
@@ -189,6 +196,7 @@ export class Identity {
     if (!passphrase) throw new Error("a passphrase is required to protect the identity");
     const edPkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", await this._reimportExtractable()));
     const inner = {
+      gen: this.gen,
       edPriv: b64(edPkcs8),
       edPub: b64(this.edPubRaw),
       mldsaSecret: b64(this._mldsaSecret),
@@ -219,7 +227,11 @@ export class Identity {
     return this._edPriv;
   }
 
-  static async import(blob, passphrase) {
+  // `opts.allowNewEncryptionKeys` — the USER confirmed that an identity whose
+  // blob has no encryption keys may be given NEW ones (package 4,
+  // F-ATREST-008). Without it such a blob is refused with
+  // code IDENTITY_NEEDS_NEW_KEYS (`err.legacy` says which kind it is).
+  static async import(blob, passphrase, opts = {}) {
     // Audit 2026-07-18 L-01: cap the file before any parsing/decoding. A
     // genuine backup (incl. ML-DSA/ML-KEM private material) is well under
     // 64 KiB; 256 KiB leaves room for future fields without letting a crafted
@@ -227,7 +239,7 @@ export class Identity {
     if (typeof blob !== "string" || blob.length > 256 * 1024) {
       throw new Error("not a valid identity backup file");
     }
-    const { salt, iv, ct, iters } = JSON.parse(blob);
+    const { salt, iv, ct, iters, v } = JSON.parse(blob);
     const key = await deriveKey(passphrase, unb64(salt), iters || 310000);
     let plain;
     try {
@@ -236,6 +248,10 @@ export class Identity {
       throw new Error("wrong passphrase or corrupted identity");
     }
     const o = JSON.parse(new TextDecoder().decode(plain));
+    const gen = o.gen === undefined ? 0 : o.gen;
+    if (typeof gen !== "number" || (gen | 0) !== gen || gen < 0 || gen >= 0x7fffffff) {
+      throw new Error("identity backup has a malformed generation — refusing to load it");
+    }
     const edPriv = await crypto.subtle.importKey("pkcs8", unb64(o.edPriv), { name: "Ed25519" }, true, ["sign"]);
     const fields = {
       edPriv,
@@ -252,15 +268,41 @@ export class Identity {
       fields.mlkemPub = unb64(o.mlkemPub);
     }
     const id = new Identity(fields);
+    id.gen = gen;
+    id.storedGen = gen; // what the blob said, before any upgrade below
     if (!o.ecdhPriv) {
-      // Pre-v3 blob: add encryption keys now. The SIGNING identity (and thus
-      // fingerprint/safety number/pins) is unchanged; the caller should
-      // re-export the blob and re-register so the directory learns the keys.
+      // Package 4 (F-ATREST-008): this used to add NEW encryption keys here,
+      // silently, and app.js persisted them — so a restored OLDER blob (one
+      // setItem) re-keyed the identity: mail sealed to the real keys became
+      // unreadable, and the directory and every contact were handed keys the
+      // user never chose to rotate. A blob without encryption keys is now
+      // refused unless the user confirms. Two kinds, told apart for the
+      // wording: a pre-v3 (legacy) blob that genuinely predates encryption keys
+      // — the one-time upgrade, now asked instead of assumed — and a v3+ blob,
+      // which this app has never written without them: something replaced or
+      // edited it.
+      await id._assertKeypairsConsistent(); // a broken blob fails as broken, not as "confirm?"
+      if (!opts.allowNewEncryptionKeys) {
+        const legacy = !(typeof v === "number" && v >= 3);
+        const err = new Error(legacy
+          ? "this identity was saved by an old version of the app and has no encryption keys yet"
+          : "this identity's saved copy has NO encryption keys, though this app always saves them — " +
+            "an older or edited copy may have replaced it");
+        err.code = "IDENTITY_NEEDS_NEW_KEYS";
+        err.legacy = legacy;
+        err.edPubRaw = fields.edPubRaw; // for the floor check BEFORE anyone is asked
+        err.storedGen = gen;
+        throw err;
+      }
+      // Confirmed: add them. The SIGNING identity (and thus fingerprint /
+      // safety number / pins) is unchanged; the caller re-exports the blob
+      // (generation +1) and re-registers so the directory learns the keys.
       Object.assign(id, await Identity._genEncKeys().then((k) => ({
         _ecdhPriv: k.ecdhPriv, ecdhPubRaw: k.ecdhPubRaw,
         _mlkemSecret: k.mlkemSecret, mlkemPub: k.mlkemPub,
       })));
       id.upgraded = true;
+      id.gen = gen + 1;
     }
     // Pentest 2026-07-26 P-17: prove the imported PUBLIC keys really belong to
     // the imported PRIVATE keys. A truncated, mismatched or hand-edited backup
@@ -489,3 +531,67 @@ export function canonicalPublicBundle(b) {
 }
 
 export { b64, unb64, concat };
+
+// ---- package 4 (F-ATREST-008): the identity blob's native floor ---------------
+// On Android the blob's generation is held to a floor the page cannot lower
+// (PadFloor.kt, id `identity:<sha256(ed25519 public key) hex>`, the same hash
+// the contact/chat floors use). A blob OLDER than the floor is a rollback and
+// is refused; a newer one raises it. Ordering makes a crash harmless: callers
+// make the blob DURABLE first — app.js writes it to the strict IndexedDB store
+// (durable.js) and awaits completion, because localStorage.setItem is NOT on
+// disk when it returns (fix round L-1: setItem-then-raise left a floor ahead of
+// the copy a kill preserved = permanent IDENTITY_ROLLBACK) — and raise the
+// floor after (raiseIdentityFloor), so a crash in between leaves floor < blob,
+// which the next unlock raises; a lost localStorage write is recovered from
+// the durable copy. Never a floor ahead of every surviving copy. In a plain
+// browser there is no floor (`floor` null): the confirmation in import() is the
+// control there, and a like-for-like older copy of the SAME keys is not
+// detectable — stated in README.
+export async function identityFloorId(edPubRaw) {
+  const d = new Uint8Array(await crypto.subtle.digest("SHA-256", edPubRaw));
+  return "identity:" + Array.from(d, (x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+// Throws (code IDENTITY_ROLLBACK / IDENTITY_FLOOR) or returns the floor id to
+// raise once the blob is safely stored. `storedGen` is the generation the
+// STORED blob carries — before any upgrade, so a rolled-back legacy copy cannot
+// pass by being upgraded to the floor's value. `floor` is captureNativeFloor()'s
+// object (null in a plain browser).
+//
+// A floor record is only ever written after a blob WITH encryption keys was
+// loaded (a keyless one is refused, or upgraded and re-stored, first). So once
+// this device has a floor for the identity, a keyless blob is never the
+// one-time legacy upgrade: it is an old copy put back — refused here, before
+// anyone is asked to confirm new keys (`hasEncKeys`).
+export async function checkIdentityGeneration(edPubRaw, storedGen, hasEncKeys, floor) {
+  if (!floor) return null;
+  const key = await identityFloorId(edPubRaw);
+  const f = floor.broken ? NATIVE_TAMPERED : floor.read(key);
+  if (f !== NATIVE_ABSENT && !(f >= 0)) {
+    const err = new Error("this device's rollback record for your identity is damaged or unreachable — refusing to load it. " +
+      "Reinstall or update the app; your backup is probably fine.");
+    err.code = "IDENTITY_FLOOR";
+    throw err;
+  }
+  if (f >= 0 && !hasEncKeys) {
+    const err = new Error("this copy of your identity has no encryption keys, but this device has used it WITH them — " +
+      "an old copy has been put back. Refusing it: restore your newest backup.");
+    err.code = "IDENTITY_ROLLBACK";
+    throw err;
+  }
+  if (f > storedGen) {
+    const err = new Error(`this copy of your identity is OLDER than one this device has already used (version ${storedGen}, ` +
+      `device record ${f}) — an old copy may have been put back. Refusing it: restore your newest backup.`);
+    err.code = "IDENTITY_ROLLBACK";
+    throw err;
+  }
+  return key;
+}
+
+// Raise the floor to the stored blob's generation — only AFTER the blob is
+// stored (see above). Throws FLOOR_WRITE_FAILED when the record did not move;
+// the blob is already safe then, and the next unlock catches up.
+export function raiseIdentityFloor(floor, key, gen) {
+  if (!floor || !key) return;
+  bumpFloor(floor, key, gen, "your identity");
+}

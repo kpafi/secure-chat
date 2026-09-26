@@ -52,9 +52,51 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   (an older client refuses loudly); **reload every open tab after updating**;
   OTP needs IndexedDB (refused in private modes without it). On-device checks
   owed: android/README.md ("Owed on the phone (package 3b …)") + iOS twin.
-- **Next:** package 4 (RSA removal, guest-side
-  approval, chats single tab, F-ATREST-008). Then release 0.4.0 (APK first if the wire
-  contract changes), deploy, phone APK, archive `phase7-local`.
+- **Package 4 on branch `fix/owner-decisions`, NOT merged (2026-09-25):** the
+  four owner decisions. (1) **RSA removed** (F-CRYPTO-009, moots F-CRYPTO-007):
+  implementation deleted, makeCipher refuses it by name, picker has four modes;
+  an old client in RSA mode gets ONE latched line + a clean close (not
+  phase7-local's per-frame refusal, F-P7-7); relay enum keeps "RSA" for the
+  transition (the relay ignores alg; rejecting it would hide the line). (2)
+  **Guest approves too** (DHKE/PQKEM): the owner's key is shown on the #admit
+  sheet (data-mode="peer") before the guest's exchange runs; Refuse closes,
+  Continue pins; no prompt for an in-person-verified 🟢 contact whose user: pin
+  holds exactly that key. No wire change. (3) **One tab** for contacts + chats:
+  a Web Lock per identity; a second tab offers "Use here" (steal), the losing
+  tab locks and says why; no Web Locks → 3b's STALE fallback, said once. (4)
+  **F-ATREST-008:** a keyless identity blob is never re-keyed silently (asked;
+  Cancel changes nothing); generation inside the AEAD; Android native floor
+  `identity:<hash>` refuses older copies (and keyless ones on a device that
+  used the identity with keys), raised only after the blob is stored. Small:
+  F-PROTO-004 (full knock queue keeps the expected peer), F-CRYPTO-005 (sealed
+  ephemeral ECDH key non-extractable), iOS PadFloor INVALID on a negative bump
+  (XCTest, CI only). Every item bound by hand-run mutants (commit messages).
+  Checked on the branch: npm test (all files), backend 297, e2e against a
+  scratch relay on 8051 — hostile-relay 24/24, room-admission 49/49 (new
+  section 12: a stranger in the owner seat is refused by the guest),
+  two-user-flow 15/15, no-dead-ends 17/17, all-modes 28/28 (four modes),
+  contact-profile 67/67 (new 5c: one tab), durable-crash — gradle
+  assembleDebug + 12 unit tests.
+  **Pentest of 3b6243f..9adf87f (2026-09-26):** no Critical/High/Medium; fix
+  round in one commit: L-1 (identity floor could lead every surviving copy —
+  setItem is not on disk; now the blob is written to strict IndexedDB,
+  awaited, before the floor moves, and a lost localStorage write is recovered
+  from that copy at unlock), L-2 ("Use here" mid-unlock left both tabs open;
+  re-checked after the stores open), I-1 (frames behind an open prompt capped
+  at 64), I-2 (RSA wording only before the handshake starts), I-3 (≤1
+  expected-peer verify per 500 ms with a full queue), M6/M16 bound (M6 was a
+  real bug: a relay close was narrated as "you refused"). Re-checked: see the
+  fix-round commit.
+  **Owed:** a re-review of the fix round; the on-device checks in
+  android/README.md ("Owed on the phone (package 4 …)"); the iOS XCTests run
+  in CI only; merge on the owner's word. **Release notes:** a guest now confirms the owner's key once
+  per live session (unless verified+pinned); RSA is gone; a second tab shows
+  "Use here" (an invite link opened while the app is open in another tab
+  needs it too); an identity saved without encryption keys now asks before
+  new ones are made.
+- **Next:** review + merge package 4. Then release 0.4.0 (APK first if the wire
+  contract changes — package 4 does not change it), deploy, phone APK, archive
+  `phase7-local`.
 - **Relay deployed:** still 0.3.1 (`v0.3.1`).
 - The full itemised 2026-08-07 list (all 47, incl. 18 Low / 15 Info) lives
   outside the repo at `~/secure-chat-pentest/state/findings/INDEX.md`.
