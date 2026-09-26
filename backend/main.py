@@ -406,6 +406,17 @@ async def security_headers(request: Request, call_next):
     return resp
 
 
+# Pentest 2026-07-26 (Info): /healthz has no rate limit. Decided in package 6:
+# it stays that way. It answers two constants (status, release version — the
+# version is public anyway: it is in every served client), touches no database,
+# file, lock or per-client state, and allocates nothing that outlives the
+# request, so a flood of it costs the relay exactly what a flood of any 404
+# costs, and the per-host buckets in front of /api would only add per-client
+# state to a path that has none. A limiter would also make the one "is it up,
+# which build?" probe the deploy checks and monitors use answer 429 behind a
+# shared exit (Tor: every client is one host). Pinned by
+# tests/test_static_hardening.py::test_healthz_is_constant_and_stateless — if
+# this handler ever grows a lookup, that test fails and the decision is redone.
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok", "version": config.VERSION}

@@ -85,6 +85,28 @@ def test_healthz_reports_the_release_version():
     assert re.fullmatch(r"\d+\.\d+\.\d+", r.json()["version"]), r.json()
 
 
+def test_healthz_is_constant_and_stateless(monkeypatch):
+    """Package 6 decision (2026-07-26 Info, "/healthz unthrottled"): no rate
+    limit, BECAUSE it answers two constants and touches nothing. If the handler
+    ever opens the database, reads a file or answers with more than status and
+    version, this fails and the no-limit decision must be revisited."""
+    import sqlite3
+    import builtins
+    import accounts
+
+    def refuse(*a, **k):
+        raise AssertionError("/healthz must not touch the database or the filesystem")
+
+    monkeypatch.setattr(sqlite3, "connect", refuse)
+    monkeypatch.setattr(accounts, "_db", refuse)
+    monkeypatch.setattr(builtins, "open", refuse)
+    for _ in range(200):  # no limiter: the 200th answer is the first one
+        r = client.get("/healthz")
+        assert r.status_code == 200
+    assert set(r.json()) == {"status", "version"}, r.json()
+    assert r.json() == {"status": "ok", "version": config.VERSION}
+
+
 # ---- Home Screen web app ---------------------------------------------------
 
 def test_web_app_manifest_is_served_as_a_manifest():
