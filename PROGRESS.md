@@ -94,11 +94,38 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   "Use here" (an invite link opened while the app is open in another tab
   needs it too); an identity saved without encryption keys now asks before
   new ones are made.
-- **Next:** package 6 (sweep of the remaining Low/Info findings + a "Known
-  limits" section in README.md). Then release 0.4.0 (no wire change; release
-  notes: IndexedDB migration, no downgrade, reload open tabs, OTP needs
-  IndexedDB, RSA removed, guest approval, one active tab), deploy incl.
-  deploy/README.md "Pending on the box", phone APK, archive `phase7-local`.
+- **Package 6 on `fix/sweep`, NOT merged (2026-09-26):** the last
+  Lows/Infos, and README **"Known limits"** — the one place that lists every
+  finding left open by design (what an attacker needs, what they get, why it
+  stays). Fixed: **F-CRYPTO-001** (a gap in the peer's frames is one
+  transcript line with its count; our own pre-verification drops are not
+  blamed on the relay), **F-PROTO-006** (a 🟡 counts 7 days after the last
+  SUCCESSFUL check, errors never extend it, a future stamp is stale, an
+  un-verified voucher stops counting at once), **F-PROTO-007** (`GET
+  /api/users/{u}/vouches?by=…`, ≤ 50 names, same gate and bucket; the client
+  asks by its own verified contacts; NO per-target cap — decided, it would be
+  a new lever), **F-ANDROID-002** (`frame-src`/`child-src 'none'` explicit in
+  both CSPs, why not addWebMessageListener in android/README.md),
+  **F-P7-24** (WebView SafeBrowsing off), **passphrase policy** (weak
+  identity / pad / transfer / AES256 passphrases warned about, never
+  refused). Decided and pinned, not changed: **F-CRYPTO-002**
+  (RATCHET_MAX_SKIP stays 64 — the slower side's pre-verification drops are
+  an honest gap), **/healthz** stays unthrottled (constant, stateless).
+  Every item bound by hand-run mutants (commit messages). Checked on the
+  branch: backend 301, `npm test` (all files), ios dist, gradle assembleDebug
+  + 12 unit tests (APK web files 30), e2e against a scratch relay on 8061 —
+  hostile-relay 24/24, room-admission 49/49, two-user-flow 15/15,
+  no-dead-ends 17/17, all-modes 28/28, contact-profile 67/67, durable-crash.
+  **Wire:** additive only (`?by=` is ignored by a 0.3.1 relay; old clients
+  get the old answer). **Release notes 0.4.0 add:** the gap line; "vouch not
+  re-checked"; weak-passphrase warnings. iOS WebShell.swift's CSP should get
+  the same two frame directives (iOS branch, not touched here).
+  **Owed:** review of the branch (pentest-new-code), merge on the owner's word.
+- **Next:** merge package 6, then release 0.4.0 (no wire change beyond the
+  additive `?by=`; release notes: IndexedDB migration, no downgrade, reload
+  open tabs, OTP needs IndexedDB, RSA removed, guest approval, one active
+  tab, package 6's three new messages), deploy incl. deploy/README.md
+  "Pending on the box", phone APK, archive `phase7-local`.
 - **Relay deployed:** still 0.3.1 (`v0.3.1`).
 - The full itemised 2026-08-07 list (all 47, incl. 18 Low / 15 Info) lives
   outside the repo at `~/secure-chat-pentest/state/findings/INDEX.md`.
