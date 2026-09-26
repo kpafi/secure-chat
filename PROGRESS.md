@@ -143,7 +143,33 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   dist, gradle + 12 unit tests, e2e on 8061 — hostile-relay 24/24,
   room-admission 49/49, two-user-flow 15/15, no-dead-ends 17/17, all-modes
   28/28, contact-profile 67/67, durable-crash passed.
-  **Owed:** a re-review of the fix round, merge on the owner's word.
+  **Round 2 (2026-09-26, review of 4ec8084..933990d):** round 1 confirmed.
+  A MEDIUM was found, pre-existing on master. Exporting, generating or
+  importing ANOTHER pad while an OTP connection was opening (a relay can
+  stall `joined` indefinitely) redirected the live session's saves to that
+  pad. The live pad then reopened after a reload at spent keystream.
+  Fixed in `0176186`:
+  - the OTP panel has its own cache (`otpPanel`); only connectInner writes
+    the session's pad;
+  - persist refuses a record that is not the cipher's pad;
+  - Connect re-reads its pad from storage under the pad lock (a stale cache
+    across tabs connected at a spent offset — found while fixing).
+
+  Decision: the panel is NOT disabled during a connection (not needed, and
+  it would give a stalling relay a lock-out).
+
+  F2: the export lock is proven HELD for the whole export (serialising lock
+  stub, two-tab race both orders, the reviewer's mutant RED). F3: a waiting
+  tab says "Waiting for this pad's export in another tab…".
+
+  Re-checked:
+  - backend 302, `npm test` (all files), ios dist
+  - gradle + 12 unit tests
+  - e2e on 8061: hostile-relay 24/24, room-admission 49/49, two-user-flow
+    15/15, no-dead-ends 17/17, all-modes 28/28, contact-profile 67/67,
+    durable-crash passed
+
+  **Owed:** a re-review of round 2, merge on the owner's word.
 - **Next:** merge package 6, then release 0.4.0 (no wire change beyond the
   additive `?by=`; release notes: IndexedDB migration, no downgrade, reload
   open tabs, OTP needs IndexedDB, RSA removed, guest approval, one active
