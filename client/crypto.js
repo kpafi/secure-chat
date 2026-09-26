@@ -130,6 +130,22 @@ class CallQueue {
 // keys in memory for frames that may never arrive, trading a real
 // confidentiality property against a captured-state adversary for a
 // performance win against an adversary the smaller window already handles.
+//
+// Pentest 2026-08-07 F-CRYPTO-002 (Info) asked whether 64 can go lower (a
+// forged frame at the window still costs ~18x an honest one). Checked in
+// package 6: NO, not without hurting honest use. "Messages are in order over
+// one WebSocket, so a gap means loss" is not the whole story — in DHKE/PQKEM
+// each side passes its in-person gate on its own, and the side that confirms
+// first may write at once while the other side still drops every frame UNREAD
+// (app.js `case "msg"`, before `verified`). Those frames never touch this
+// chain, so the first frame after the slower side's "It matches" steps over
+// all of them. A window of W therefore means: W or more messages typed before
+// your contact finished comparing numbers, and the session is dead (every
+// later frame "too far ahead"). 64 keeps that out of reach of a real
+// conversation; 32 halves the margin to buy a 2x cut in a cost the relay can
+// only spend at its own frame rate on a session it can simply cut anyway.
+// Pinned at exactly 64 in crypto.test.mjs; app-behaviour.test.mjs executes
+// the pre-verification gap (F-CRYPTO-001 block).
 const RATCHET_MAX_SKIP = 64;
 
 const HMAC_CHAIN = { name: "HMAC", hash: "SHA-256", length: 256 };

@@ -1893,28 +1893,32 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
     "...and a later gap of one says 1");
   await dom.el("disconnect").click();
 
-  // (b) the peer passes its gate first and writes; we drop two frames unread.
+  // (b) the peer passes its gate first and writes; we drop its frames unread.
+  //     F-CRYPTO-002 (package 6): 40 of them — more than a window of 32 — so
+  //     the first frame after our "It matches" must still decrypt. That is
+  //     the honest use a smaller RATCHET_MAX_SKIP would break.
   const fay = await Identity.generate();
   const { ws: w2, pc } = await handshakeToConfirm(fay);
   await w2.deliver(confirmFrame(pc));
   await until(() => !dom.el("verify").hidden, "Fay's gate");
   const g0 = gapLines().length;
-  await w2.deliver({ type: "msg", room: ROOM, alg: "DHKE", payload: await pc.encrypt("early-1") });
-  await w2.deliver({ type: "msg", room: ROOM, alg: "DHKE", payload: await pc.encrypt("early-2") });
+  for (let i = 1; i <= 40; i++) {
+    await w2.deliver({ type: "msg", room: ROOM, alg: "DHKE", payload: await pc.encrypt("early-" + i) });
+  }
   await settle(10);
   assert.ok(!said(/^peerearly-/), "fixture: frames before our gate are dropped unread");
   await dom.el("verifyOk").click();
   await until(() => dom.el("text").disabled === false, "Fay's session to unlock");
-  await deliverMsg(w2, "DHKE", pc, "after-3");
-  assert.ok(said(/^peerafter-3$/), "control: the first frame after our gate is shown");
+  await deliverMsg(w2, "DHKE", pc, "after-41");
+  assert.ok(said(/^peerafter-41$/), "F-CRYPTO-002: the first frame after our gate is shown — 40 frames dropped unread before it");
   // (position, not only count: a narration that is already in the log folds
   // and MOVES instead of adding a line)
-  assert.ok(gapLines().length === g0 && !GAP.test(lines()[lines().indexOf("peerafter-3") - 1]),
+  assert.ok(gapLines().length === g0 && !GAP.test(lines()[lines().indexOf("peerafter-41") - 1]),
     "F-CRYPTO-001: frames WE dropped before verifying are not reported as lost by the relay");
-  await pc.encrypt("after-lost-4");
-  await deliverMsg(w2, "DHKE", pc, "after-5");
+  await pc.encrypt("after-lost-42");
+  await deliverMsg(w2, "DHKE", pc, "after-43");
   // (a narration: the same sentence folds by membership and moves here, ×n)
-  assert.match(lines()[lines().indexOf("peerafter-5") - 1], ONE,
+  assert.match(lines()[lines().indexOf("peerafter-43") - 1], ONE,
     "...but a gap after that is ");
   await dom.el("disconnect").click();
   console.log("OK  F-CRYPTO-001: a skipped gap shows one line with its count; our own pre-verification drops are not blamed on the relay (executed)");
