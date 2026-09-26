@@ -94,6 +94,16 @@ site into an async round trip with its own failure and ordering cases, a
 larger change than the risk it removes while no frame can load. Revisit if the
 app ever needs a frame.
 
+## SafeBrowsing is off (F-P7-24)
+`AndroidManifest.xml` sets `android.webkit.WebView.EnableSafeBrowsing` to
+`false`. SafeBrowsing checks every URL the WebView loads against Google's lists,
+sending URL hash prefixes to Google; this WebView only ever loads the app's own
+bundled files (`https://secure-chat.internal/…`) and the one relay the user
+configured, so the check can protect nothing and would tell a third party
+when, and to which relay host, the app connects. Pinned in
+`client/android-source.test.mjs`. On a device this needs only the normal
+smoke test (the app still loads and reaches its relay).
+
 ## Relay-side requirement
 Because the app's origin differs from the relay's, the relay must allow-list it
 (it is a single fixed origin, not a wildcard). This is already wired:

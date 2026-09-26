@@ -386,4 +386,21 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
   ok("F-ANDROID-001: MainActivity has taskAffinity=\"\" and the default launch mode");
 }
 
+// --- 8. the manifest: SafeBrowsing off (package 6, F-P7-24) --------------------
+{
+  const noComments = manifest.replace(/<!--[\s\S]*?-->/g, "");
+  const app = /<application\b[\s\S]*?<\/application>/.exec(noComments);
+  assert.ok(app, "the manifest has an <application>");
+  // application-level only: a <meta-data> inside <activity> is not the WebView switch
+  const appLevel = app[0].replace(/<activity\b[\s\S]*?<\/activity>/g, "");
+  const metas = [...appLevel.matchAll(/<meta-data\b[^>]*>/g)].map((m) => m[0]);
+  const sb = metas.filter((m) => /android:name="android\.webkit\.WebView\.EnableSafeBrowsing"/.test(m));
+  assert.strictEqual(sb.length, 1, `F-P7-24: exactly one EnableSafeBrowsing meta-data inside <application> (found ${sb.length})`);
+  assert.match(sb[0], /android:value="false"/, "F-P7-24: SafeBrowsing must be disabled (it sends URL hash prefixes to Google)");
+  // The same switch exists at runtime; nothing may turn it back on in code.
+  assert.ok(!lines.some((l) => /safeBrowsingEnabled\s*=\s*true|setSafeBrowsingEnabled\(\s*true|startSafeBrowsing\(/.test(l)),
+    "F-P7-24: no code path re-enables SafeBrowsing");
+  ok("F-P7-24: WebView SafeBrowsing is disabled in the manifest and never re-enabled in code");
+}
+
 console.log(`\nAll ${n} Android source checks passed.`);
