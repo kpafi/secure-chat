@@ -161,22 +161,27 @@ async function exchangePad(alice, bob) {
   for (const a of [alice, bob]) {
     await selectMode(a.page, "OTP");
     await a.page.waitForFunction(() => !document.querySelector("#otpPanel").hidden, { timeout: T(20000) });
-    await a.page.evaluate(() => { const d = document.querySelector("#otpTools"); if (d) d.open = true; });
-    await setValue(a.page, "#otpPass", PAD_LOCAL_PASS);
-    await setValue(a.page, "#otpXferPass", PAD_XFER_PASS);
   }
-
+  // The OTP sheets (otp-transfer-brief.md § 8): alice makes the pad in the
+  // New pad sheet and hands straight over to Export; bob imports in the
+  // Import sheet. A bottom-row tap within 500 ms of a sheet appearing is
+  // ignored (the double-tap guard), hence the pauses.
+  await alice.page.click("#otpNewOpen");
+  await alice.page.waitForFunction(() => !document.querySelector("#otpNewSheet").hidden, { timeout: T(5000) });
+  await setValue(alice.page, "#otpNewPass", PAD_LOCAL_PASS);
+  await setValue(alice.page, "#otpLabel", "e2e-pad");
   // Smallest offered pad: this test sends a handful of short messages.
   await alice.page.evaluate(() => {
     const sel = document.querySelector("#otpSize");
     sel.value = sel.options[0].value;
     sel.dispatchEvent(new Event("change", { bubbles: true }));
   });
-  await setValue(alice.page, "#otpLabel", "e2e-pad");
+  await sleep(600);
   await alice.page.click("#otpGenerate");
   await alice.page.waitForFunction(
-    () => document.querySelector("#otpSelect").value !== "", { timeout: T(60000) });
-  check("OTP pad generated on alice", true, await text(alice.page, "#otpStatus"));
+    () => document.querySelector("#otpNewSheet").dataset.state === "done", { timeout: T(60000) });
+  check("OTP pad generated on alice", await alice.page.evaluate(() => document.querySelector("#otpSelect").value !== ""),
+    await text(alice.page, "#otpStatus"));
 
   // downloadText() hands the file to the browser via a blob URL; intercept it
   // instead of engaging Chromium's download machinery.
@@ -188,22 +193,35 @@ async function exchangePad(alice, bob) {
       return orig(blob);
     };
   });
+  await alice.page.click("#otpNewToExport");
+  await alice.page.waitForFunction(() => !document.querySelector("#otpExportSheet").hidden, { timeout: T(5000) });
+  await setValue(alice.page, "#otpXferPass", PAD_XFER_PASS);
+  await sleep(600);
   await alice.page.click("#otpExport");
   await alice.page.waitForFunction(() => window.__padFile !== null, { timeout: T(30000) });
   const padJson = await alice.page.evaluate(() => window.__padFile);
   check("pad exported as a transfer file", padJson.length > 100, `${padJson.length} bytes`);
+  await alice.page.waitForFunction(() => document.querySelector("#otpExportSheet").dataset.state === "done", { timeout: T(10000) });
+  await alice.page.click("#otpExportDone");
 
   const dir = mkdtempSync(join(tmpdir(), "sc-pad-"));
   const padPath = join(dir, "secure-chat-pad-e2e.json");
   writeFileSync(padPath, padJson);
 
-  // Upload straight to the hidden input: clicking Import opens a native file
-  // chooser, which headless Chromium cannot answer.
+  await bob.page.click("#otpImportOpen");
+  await bob.page.waitForFunction(() => !document.querySelector("#otpImportSheet").hidden, { timeout: T(5000) });
+  await setValue(bob.page, "#otpImportXfer", PAD_XFER_PASS);
+  await setValue(bob.page, "#otpImportPass", PAD_LOCAL_PASS);
+  // Upload straight to the hidden input: clicking "Choose pad file…" opens a
+  // native file chooser, which headless Chromium cannot answer.
   const input = await bob.page.$("#otpFile");
   await input.uploadFile(padPath);
   await bob.page.waitForFunction(
-    () => document.querySelector("#otpSelect").value !== "", { timeout: T(60000) });
-  check("pad imported on bob", true, await text(bob.page, "#otpStatus"));
+    () => document.querySelector("#otpImportSheet").dataset.state === "done", { timeout: T(60000) });
+  check("pad imported on bob", await bob.page.evaluate(() => document.querySelector("#otpSelect").value !== ""),
+    await text(bob.page, "#otpStatus"));
+  await sleep(600);
+  await bob.page.click("#otpImportDone");
 }
 
 // ---------------------------------------------------------------------------

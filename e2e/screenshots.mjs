@@ -107,6 +107,19 @@ const PLAN = [
   ["22", "contact-profile", "Contact profile (#contactSheet) over Users: bob, verified in person", "viewport"],
   ["23", "contact-profile-stranger", "Contact profile over Users: the stranger, handle labelled a claim", "viewport"],
   ["24", "contact-profile-convo", "Contact profile opened from the conversation's name (no Message button)", "viewport"],
+  // One-time pad transfer (otp-transfer-brief.md; canvas row "One-time pad transfer").
+  ["25", "otp-new", "OTP: New pad sheet, a weak pad passphrase warned about live", "viewport"],
+  ["26", "otp-new-done", "OTP: New pad done — Export to your contact / Later", "viewport"],
+  ["27", "otp-export", "OTP: Export sheet, form (the carried pad passphrase refused as the transfer passphrase)", "viewport"],
+  ["28", "otp-export-done", "OTP: Export done in a browser — File downloaded, On their device", "viewport"],
+  ["29", "otp-panel", "OTP: the panel with a pad made here, unlocked for this session"],
+  ["30", "otp-export-again", "OTP: the re-export confirm — Don't export / Export again, no primary", "viewport"],
+  ["31", "otp-import", "OTP: Import sheet, form (receiver)", "viewport"],
+  ["32", "otp-import-error", "OTP: Import — wrong transfer passphrase marks the field, Try again", "viewport"],
+  ["33", "otp-import-done", "OTP: Import done", "viewport"],
+  ["34", "otp-panel-imported", "OTP: the panel with a received pad — no Export, the note"],
+  ["35", "otp-export-ready-android", "OTP: Android file ready — Share… / Save to device (a stand-in bridge)", "viewport"],
+  ["36", "otp-export-shared-android", "OTP: Android — File shared", "viewport"],
 ].map(([n, id, what, mode]) => ({ n, id, what, fullPage: mode !== "viewport", state: "pending", note: "", files: [] }));
 const byId = Object.fromEntries(PLAN.map((p) => [p.id, p]));
 
@@ -1178,6 +1191,189 @@ await step("users-unlock-wrong-passphrase", async () => {
   }, { timeout: 30000 }).catch(() => { throw new Error("#usersUnlockStatus never reported the failure"); });
   const said = await text(q, "#usersUnlockStatus");
   await capture(q, "users-unlock-wrong-passphrase", /wrong/i.test(said) ? "" : `status reads ${JSON.stringify(said)}`);
+});
+
+// ---- 25-36: one-time pad transfer ------------------------------------------------
+// Own agents without an identity (a pad needs none): a maker, a receiver, and
+// an Android stand-in whose `__SECURE_CHAT_FILES__` is a frozen fake that
+// answers with a request id (the test then plays the shell's result).
+
+async function otpAgent(label, android = false) {
+  const a = await openTab(label);
+  if (android) { // openTab has loaded the page: add the bridge at document-start and load again
+    await a.page.evaluateOnNewDocument(() => {
+      let n = 0;
+      const b = Object.freeze({ share: () => (++n).toString(16).padStart(16, "0"), save: () => (++n).toString(16).padStart(16, "0") });
+      Object.defineProperty(window, "__SECURE_CHAT_FILES__", { value: b, writable: false, configurable: false });
+    });
+    await a.page.reload({ waitUntil: "networkidle0" });
+  }
+  const p = a.page;
+  await click(p, "#toRoom");
+  await waitShown(p, "#scrRoom", 30000);
+  await setOptionsOpen(p, true);
+  await pickMode(p, "OTP", /one-time pad/i);
+  await waitShown(p, "#otpPanel", 10000);
+  // The browser download is caught, not written.
+  await p.evaluate(() => {
+    window.__padFile = null;
+    const orig = URL.createObjectURL.bind(URL);
+    URL.createObjectURL = (blob) => { blob.text().then((t) => { window.__padFile = t; }); return orig(blob); };
+    const click = HTMLAnchorElement.prototype.click;
+    HTMLAnchorElement.prototype.click = function () { if (this.download) return; return click.call(this); };
+  });
+  return a;
+}
+const otpState = (p, sheet, st, timeout = 60000) =>
+  p.waitForFunction((s, v) => document.querySelector(s).dataset.state === v, { timeout }, sheet, st)
+    .catch(() => { throw new Error(`${sheet} never reached "${st}"`); });
+const otpGuard = () => sleep(600); // bottom-row taps in a sheet's first 500 ms are ignored
+const otpSet = (p, sel, v) => p.evaluate((s, x) => { const e = document.querySelector(s); e.value = x; e.dispatchEvent(new Event("input", { bubbles: true })); }, sel, v);
+let otpMaker = null, otpReceiver = null, otpFile = null;
+
+await runSetup("otp-agents", async () => {
+  otpMaker = await otpAgent("otp-maker");
+  otpReceiver = await otpAgent("otp-receiver");
+});
+
+await step("otp-new", async () => {
+  req("otp-agents");
+  const p = otpMaker.page;
+  await click(p, "#otpNewOpen");
+  await waitShown(p, "#otpNewSheet", 5000);
+  await typeInto(p, "#otpLabel", "Chess club");
+  await typeInto(p, "#otpNewPass", "moonlight7");
+  await capture(p, "otp-new");
+});
+
+await step("otp-new-done", async () => {
+  req("otp-agents");
+  const p = otpMaker.page;
+  await otpSet(p, "#otpNewPass", "quiet walnut semaphore harbour");
+  await otpGuard();
+  await click(p, "#otpGenerate");
+  await otpState(p, "#otpNewSheet", "done");
+  await capture(p, "otp-new-done");
+});
+
+await step("otp-export", async () => {
+  req("otp-agents");
+  const p = otpMaker.page;
+  await click(p, "#otpNewToExport");
+  await waitShown(p, "#otpExportSheet", 5000);
+  await otpSet(p, "#otpXferPass", "quiet walnut semaphore harbour");
+  await otpGuard();
+  await click(p, "#otpExport");
+  await p.waitForFunction(() => document.querySelector("#otpExportStatus").textContent !== "", { timeout: 10000 });
+  await capture(p, "otp-export");
+});
+
+await step("otp-export-done", async () => {
+  req("otp-agents");
+  const p = otpMaker.page;
+  await otpSet(p, "#otpXferPass", "harbour mint cobalt fern");
+  await click(p, "#otpExport");
+  await otpState(p, "#otpExportSheet", "done");
+  await p.waitForFunction(() => window.__padFile !== null, { timeout: 10000 });
+  otpFile = { name: await text(p, "#otpExportDoneFile"), text: await p.evaluate(() => window.__padFile) };
+  await capture(p, "otp-export-done");
+});
+
+await step("otp-panel", async () => {
+  req("otp-agents");
+  const p = otpMaker.page;
+  await otpGuard();
+  await click(p, "#otpExportDone");
+  await p.waitForFunction(() => document.querySelector("#otpExportSheet").hidden, { timeout: 5000 });
+  await setOptionsOpen(p, false); // the panel then fits a phone's first screen (capture scrolls to the top)
+  await capture(p, "otp-panel");
+});
+
+await step("otp-export-again", async () => {
+  req("otp-agents");
+  const p = otpMaker.page;
+  await click(p, "#otpExportOpen");
+  await waitShown(p, "#otpExportSheet", 5000);
+  await otpSet(p, "#otpXferPass", "another transfer passphrase");
+  await otpGuard();
+  await click(p, "#otpExport");
+  await otpState(p, "#otpExportSheet", "confirm");
+  await capture(p, "otp-export-again");
+  await click(p, "#otpExportCancel");
+});
+
+await step("otp-import", async () => {
+  req("otp-agents");
+  const p = otpReceiver.page;
+  await click(p, "#otpImportOpen");
+  await waitShown(p, "#otpImportSheet", 5000);
+  await typeInto(p, "#otpImportXfer", "harbour mint cobalt fern");
+  await typeInto(p, "#otpImportPass", "my own pad words here");
+  await capture(p, "otp-import");
+});
+
+await step("otp-import-error", async () => {
+  req("otp-agents");
+  if (!otpFile) throw new Error("no exported file (otp-export-done missed)");
+  const p = otpReceiver.page;
+  const { mkdtempSync, writeFileSync: wf } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const path = join(mkdtempSync(join(tmpdir(), "sc-otp-shot-")), otpFile.name);
+  wf(path, otpFile.text);
+  otpFile.path = path;
+  await otpSet(p, "#otpImportXfer", "harbor mint cobalt fern");
+  await (await p.$("#otpFile")).uploadFile(path);
+  await p.waitForFunction(() => document.querySelector("#otpImportStatus").textContent !== "", { timeout: 60000 });
+  await capture(p, "otp-import-error");
+});
+
+await step("otp-import-done", async () => {
+  req("otp-agents");
+  const p = otpReceiver.page;
+  await otpSet(p, "#otpImportXfer", "harbour mint cobalt fern");
+  await click(p, "#otpImportRetry");
+  await otpState(p, "#otpImportSheet", "done");
+  await capture(p, "otp-import-done");
+});
+
+await step("otp-panel-imported", async () => {
+  req("otp-agents");
+  const p = otpReceiver.page;
+  await otpGuard();
+  await click(p, "#otpImportDone");
+  await p.waitForFunction(() => document.querySelector("#otpImportSheet").hidden, { timeout: 5000 });
+  await setOptionsOpen(p, false); // the panel then fits a phone's first screen (capture scrolls to the top)
+  await capture(p, "otp-panel-imported");
+});
+
+await step("otp-export-ready-android", async () => {
+  const a = await otpAgent("otp-android", true);
+  const p = a.page;
+  if (!(await p.evaluate(() => !!window.__SECURE_CHAT_FILES__))) throw new Error("the stand-in bridge is missing");
+  await click(p, "#otpNewOpen");
+  await waitShown(p, "#otpNewSheet", 5000);
+  await typeInto(p, "#otpLabel", "Chess club");
+  await otpSet(p, "#otpNewPass", "quiet walnut semaphore harbour");
+  await otpGuard();
+  await click(p, "#otpGenerate");
+  await otpState(p, "#otpNewSheet", "done");
+  await click(p, "#otpNewToExport");
+  await waitShown(p, "#otpExportSheet", 5000);
+  await otpSet(p, "#otpXferPass", "harbour mint cobalt fern");
+  await otpGuard();
+  await click(p, "#otpExport");
+  await otpState(p, "#otpExportSheet", "ready");
+  await capture(p, "otp-export-ready-android");
+  otpMaker.android = p;
+});
+
+await step("otp-export-shared-android", async () => {
+  const p = otpMaker && otpMaker.android;
+  if (!p) throw new Error("otp-export-ready-android missed");
+  await click(p, "#otpShare");
+  await p.evaluate(() => window.__SECURE_CHAT_FILES_RESULT__("0000000000000001", "shared"));
+  await otpState(p, "#otpExportSheet", "done");
+  await capture(p, "otp-export-shared-android");
 });
 
 await finish();
