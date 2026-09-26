@@ -169,7 +169,32 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
     15/15, no-dead-ends 17/17, all-modes 28/28, contact-profile 67/67,
     durable-crash passed
 
-  **Owed:** a re-review of round 2, merge on the owner's word.
+  **Round 3 (2026-09-26, full sweep of the OTP state flows at 8f58925):**
+  round 2 confirmed. One MEDIUM, pre-existing, reproduced in real Chromium
+  with two tabs (plaintext recovered): an export ran beside a LIVE session on
+  the same pad in another tab, and its latch wrote the pre-KDF snapshot over
+  the session's saved progress, so the pad reopened at spent keystream.
+  Fixed in `401f2bd`, three layers:
+  - export holds the pad's session lock (ifAvailable; in use → refused, said
+    why; lock order: pad lock, then export lock);
+  - the latch goes onto a post-KDF re-read (used meanwhile → no file);
+  - otp.js writePadBlob maxes against STORAGE (watermark + durable record),
+    not only the page's caches.
+
+  Also: the panel caches only the at-rest key (F2, Low from 0176186: a
+  never-zeroed pad copy kept spent keystream in memory); I1 send bound to its
+  session; I2 lock released on failed connects; I3 lock released only after
+  an in-flight save. Cross-tab tests now run on a separate otp.js instance.
+  The reviewer's browser PoC now prints "no reuse" (reopens at 68).
+
+  Re-checked:
+  - backend 302, `npm test` (all files), ios dist
+  - gradle + 12 unit tests
+  - e2e on 8061: hostile-relay 24/24, room-admission 49/49, two-user-flow
+    15/15, no-dead-ends 17/17, all-modes 28/28, contact-profile 67/67,
+    durable-crash passed
+
+  **Owed:** a re-review of round 3, merge on the owner's word.
 - **Next:** merge package 6, then release 0.4.0 (no wire change beyond the
   additive `?by=`; release notes: IndexedDB migration, no downgrade, reload
   open tabs, OTP needs IndexedDB, RSA removed, guest approval, one active
