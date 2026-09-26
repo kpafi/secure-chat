@@ -632,10 +632,23 @@ async function writePadBlob(record, key, salt, iters) {
   // floor, and written to the authenticated outer record so a restored blob is
   // measured against the newest state this device ever reached.
   const prev = cachedWm(record.padId);
+  // Package 6 round 3 (F1): and against what STORAGE holds now, not only this
+  // page's caches — another tab (another module instance, other caches) may
+  // have saved progress since this page last read the pad. A record older
+  // than storage must never lower the stored watermark or durable record.
+  // Unreadable under this key (a pad re-saved with a new key, a corrupt
+  // record) contributes nothing; unlockPad judges those.
+  const storedWm = await readWatermark(record.padId, key);
+  const storedDur = await readDurable(record.padId, key);
   const wm = {
-    send: maxOf(prev.send, record.sendOffset | 0),
-    recv: maxOf(prev.recv, record.recvHighWater | 0),
+    send: maxOf(prev.send, record.sendOffset | 0,
+      storedWm && storedWm !== "corrupt" ? storedWm.send : 0,
+      storedDur && storedDur !== "corrupt" ? storedDur.send : 0),
+    recv: maxOf(prev.recv, record.recvHighWater | 0,
+      storedWm && storedWm !== "corrupt" ? storedWm.recv : 0,
+      storedDur && storedDur !== "corrupt" ? storedDur.recv : 0),
   };
+  if (storedDur && storedDur !== "corrupt" && storedDur.exported) record.exported = true;
   // Package 3: every native slot this blob is about to claim must EXIST before
   // the claim is sealed (armPadFloors throws FLOOR_WRITE_FAILED otherwise, and
   // nothing has been written yet).

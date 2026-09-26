@@ -93,6 +93,7 @@ globalThis.__SECURE_CHAT_PAD_FLOOR__ = Object.freeze({
 
 await import("./app.js");
 const otp = await import("./otp.js"); // the same module instance app.js uses
+const otpB = await import("./otp.js?tab=B"); // package 6 round 3: ANOTHER TAB — its own module state (wmCache, durHigh), sharing storage and locks
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
 const settle = async (n = 40) => { for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 5)); };
@@ -265,13 +266,13 @@ async function otpConnect(padId = pad.padId) {
   assert.ok(p, "fixture: the pad was generated here");
   dom.el("otpSelect").value = p.padId;
   dom.el("otpXferPass").value = "transfer passphrase";
-  const other = await otp.unlockPad(p.padId, PAD_PASS);      // tab B's own unlock
-  const fileB = await otp.exportPad(other.record, "tab b transfer");
-  await otp.markExported(other.record, other.atRest);        // tab B latches and hands out its file
+  const other = await otpB.unlockPad(p.padId, PAD_PASS);      // tab B's own unlock
+  const fileB = await otpB.exportPad(other.record, "tab b transfer");
+  await otpB.markExported(other.record, other.atRest);        // tab B latches and hands out its file
   void fileB;
   // The cached-key re-read is only for the blob's own salt: a pad saved again
   // under a new salt (re-imported elsewhere) needs the passphrase again.
-  await assert.rejects(otp.unlockPad(p.padId, null, { atRest: { ...other.atRest, salt: new Uint8Array(16) } }),
+  await assert.rejects(otpB.unlockPad(p.padId, null, { atRest: { ...other.atRest, salt: new Uint8Array(16) } }),
     /saved again elsewhere/, "a cached key for another salt is refused with its own sentence");
   d0 = downloads;
   await dom.el("otpExport").click();
@@ -377,11 +378,11 @@ async function otpConnect(padId = pad.padId) {
   await dom.el("otpGenerate").click();
   await settle(10);
   const id = otp.listPads().find((m) => m.label === "used-elsewhere").padId;
-  const b = await otp.unlockPad(id, PAD_PASS);                 // tab B
+  const b = await otpB.unlockPad(id, PAD_PASS);                 // tab B
   const bc = makeCipher("OTP", ROOM, { pad: b.record });
   await bc.encrypt("sent from the other tab");
   b.record.sendOffset = bc.sendOffset;
-  await otp.savePadProgress(b.record, b.atRest);
+  await otpB.savePadProgress(b.record, b.atRest);
   const spent = b.record.sendOffset;
   assert.ok(spent > 0, "fixture: the other tab spent pad bytes");
   const ws = await otpConnect(id);
@@ -428,11 +429,11 @@ async function otpConnect(padId = pad.padId) {
     let bEntered;
     const bInside = new Promise((r) => { bEntered = r; });
     const tabB = navigator.locks.request("sc.otp.export.v1." + p.padId, { mode: "exclusive" }, async () => {
-      const u = await otp.unlockPad(p.padId, PAD_PASS);
-      await otp.exportPad(u.record, "tab b transfer");
+      const u = await otpB.unlockPad(p.padId, PAD_PASS);
+      await otpB.exportPad(u.record, "tab b transfer");
       bEntered();
       await bMayFinish;                       // tab B is mid-export (e.g. sitting in a confirm())
-      await otp.markExported(u.record, u.atRest);
+      await otpB.markExported(u.record, u.atRest);
     });
     await bInside;
     const d0 = downloads;
@@ -476,10 +477,10 @@ async function otpConnect(padId = pad.padId) {
     assert.ok(pageInside, "fixture: this page's export is running (held in its transfer KDF)");
     let otherFiles = 0;
     const tabB2 = navigator.locks.request("sc.otp.export.v1." + q.padId, { mode: "exclusive" }, async () => {
-      const u = await otp.unlockPad(q.padId, PAD_PASS);
+      const u = await otpB.unlockPad(q.padId, PAD_PASS);
       if (u.record.exported) return;       // tab B's own guard: it sees the export and stops
-      await otp.exportPad(u.record, "tab b transfer");
-      await otp.markExported(u.record, u.atRest);
+      await otpB.exportPad(u.record, "tab b transfer");
+      await otpB.markExported(u.record, u.atRest);
       otherFiles++;
     });
     await settle(20);
@@ -493,6 +494,265 @@ async function otpConnect(padId = pad.padId) {
     setLocks(saved);
   }
   console.log("OK  package 6 round 2: the export lock is held for the whole export — a concurrent export in another tab yields one file (executed)");
+}
+
+// ---- package 6 round 3 (MEDIUM, pre-existing): an export never runs beside a live session ----
+// Reviewer's PoC (two-time pad reproduced in Chromium): tab B chats on pad P
+// while tab A re-exports P. A's latch wrote its pre-KDF snapshot (offset 0)
+// back over B's saved progress; after a reload P reopened at 0. Tab B is a
+// SEPARATE otp.js instance here (its own caches), as a real tab is.
+{
+  const queues = new Map();
+  const heldNow = new Set();
+  const queued = {
+    request(name, opts, fn) {
+      if (typeof opts === "function") { fn = opts; opts = {}; }
+      if (opts && opts.ifAvailable && heldNow.has(name)) return Promise.resolve(fn(null));
+      const run = (queues.get(name) || Promise.resolve()).then(async () => {
+        heldNow.add(name);
+        try { return await fn({ name }); } finally { heldNow.delete(name); }
+      });
+      queues.set(name, run.catch(() => {}));
+      return run;
+    },
+    query: async () => ({ held: [...heldNow].map((name) => ({ name })) }),
+  };
+  const saved = globalThis.navigator.locks;
+  setLocks(queued);
+  const st = dom.el("otpStatus");
+  const holdLock = (name) => new Promise((res) => {
+    let release;
+    navigator.locks.request(name, { ifAvailable: true }, (l) => {
+      if (!l) { res(null); return; }
+      res(() => release());
+      return new Promise((r) => { release = r; });
+    });
+  });
+  const sendOn = async (u, text) => {           // tab B's session: persist before transmit
+    const c = makeCipher("OTP", ROOM, { pad: u.record });
+    u.record.sendOffset = u.record.sendOffset; // (the cipher starts at the stored offset)
+    const frame = await c.encrypt(text);
+    u.record.sendOffset = c.sendOffset; u.record.recvHighWater = c.recvHighWater;
+    await otpB.savePadProgress(u.record, u.atRest);
+    return { frame, spent: c.sendOffset };
+  };
+  try {
+    // (a) tab B holds the pad's SESSION lock (a live chat): this page's export
+    //     is refused, says why, hands out nothing — and B's progress survives.
+    const p = await otp.generatePad({ label: "live-elsewhere", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    await otp.saveNewPad(p, PAD_PASS);
+    dom.el("otpSelect").value = p.padId;
+    dom.el("otpPass").value = PAD_PASS;
+    dom.el("otpXferPass").value = "transfer passphrase";
+    const releaseB = await holdLock("sc.otp.lock.v1." + p.padId);
+    assert.ok(releaseB, "fixture: tab B holds the pad's session lock");
+    const b = await otpB.unlockPad(p.padId, PAD_PASS);
+    // Where the PoC struck: tab B sends while this page's export sits in its
+    // transfer KDF (held here). A fixed page never gets that far.
+    const subtleA = crypto.subtle;
+    const realImportA = subtleA.importKey;
+    let gateA;
+    const mayGoA = new Promise((r) => { gateA = r; });
+    let insideA = false;
+    subtleA.importKey = function (fmt, raw, ...rest) {
+      if (fmt === "raw" && raw instanceof Uint8Array && new TextDecoder().decode(raw) === "transfer passphrase") {
+        subtleA.importKey = realImportA;
+        insideA = true;
+        return mayGoA.then(() => realImportA.call(this, fmt, raw, ...rest));
+      }
+      return realImportA.call(this, fmt, raw, ...rest);
+    };
+    const d0 = downloads;
+    const exporting = dom.el("otpExport").click();
+    for (let i = 0; i < 100 && !insideA; i++) await new Promise((r) => setTimeout(r, 5));
+    const { spent } = await sendOn(b, "attack at dawn");
+    subtleA.importKey = realImportA;
+    gateA();
+    await exporting;
+    await settle(10);
+    assert.strictEqual(downloads, d0, "round 3 F1: no pad file while the pad is live in another tab");
+    assert.match(st.textContent, /This pad is in use/, "…and the refusal says why: " + st.textContent);
+    releaseB();
+    const otpC = await import("./otp.js?tab=C-" + p.padId); // a reload: fresh module state
+    const c = await otpC.unlockPad(p.padId, PAD_PASS);
+    assert.ok(c.record.sendOffset >= spent,
+      `round 3 F1: after a reload the pad opens at ${c.record.sendOffset}, not below what tab B spent (${spent})`);
+
+    // (b) a tab that does NOT hold the pad lock (an older version) spends pad
+    //     bytes while this page's export sits in its KDF: the latch re-reads
+    //     the pad after the KDF, sees the use, and hands out nothing.
+    const q = await otp.generatePad({ label: "used-mid-export", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    await otp.saveNewPad(q, PAD_PASS);
+    dom.el("otpSelect").value = q.padId;
+    const subtle = crypto.subtle;
+    const realImport = subtle.importKey;
+    let gate;
+    const mayGo = new Promise((r) => { gate = r; });
+    let inside = false;
+    subtle.importKey = function (fmt, raw, ...rest) {
+      if (fmt === "raw" && raw instanceof Uint8Array && new TextDecoder().decode(raw) === "transfer passphrase") {
+        subtle.importKey = realImport;
+        inside = true;
+        return mayGo.then(() => realImport.call(this, fmt, raw, ...rest));
+      }
+      return realImport.call(this, fmt, raw, ...rest);
+    };
+    const d1 = downloads;
+    const ex2 = dom.el("otpExport").click();
+    for (let i = 0; i < 200 && !inside; i++) await new Promise((r) => setTimeout(r, 5));
+    assert.ok(inside, "fixture: this page's export is in its transfer KDF");
+    const bq = await otpB.unlockPad(q.padId, PAD_PASS);
+    const used = await sendOn(bq, "sent by a tab without the lock");
+    gate();
+    await ex2;
+    await settle(10);
+    assert.strictEqual(downloads, d1, "round 3 F1b: a pad used during the export's KDF is not handed out");
+    assert.match(st.textContent, /used while it was being exported/, "…and it says so: " + st.textContent);
+    const otpD = await import("./otp.js?tab=D-" + q.padId);
+    const d = await otpD.unlockPad(q.padId, PAD_PASS);
+    assert.ok(d.record.sendOffset >= used.spent, `round 3 F1b: the pad's stored progress is intact (${d.record.sendOffset} ≥ ${used.spent})`);
+
+    // (c) otp.js on its own: a save from a STALE record (this instance's
+    //     snapshot) after another instance saved further never lowers what
+    //     storage holds — the watermark and the durable record are maxed
+    //     against storage, not only this instance's caches.
+    const r = await otp.generatePad({ label: "stale-writer", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    await otp.saveNewPad(r, PAD_PASS);
+    const staleA = await otp.unlockPad(r.padId, PAD_PASS);    // this page's snapshot at 0
+    const rb = await otpB.unlockPad(r.padId, PAD_PASS);
+    const usedR = await sendOn(rb, "tab B moves on");
+    await otp.markExported(staleA.record, staleA.atRest);        // a latch from the stale snapshot
+    const otpE = await import("./otp.js?tab=E-" + r.padId);
+    const e = await otpE.unlockPad(r.padId, PAD_PASS);
+    assert.ok(e.record.sendOffset >= usedR.spent,
+      `round 3 F1 (belt and braces): a stale save does not rewind storage (${e.record.sendOffset} ≥ ${usedR.spent})`);
+    assert.strictEqual(e.record.exported, true, "…and the latch it carried still lands");
+  } finally {
+    setLocks(saved);
+  }
+  console.log("OK  package 6 round 3: an export never runs beside a live session; a pad used mid-export is not handed out; a stale save never rewinds storage (executed, separate otp.js instances)");
+}
+
+// ---- package 6 round 3 (F2, Low): no copy of the pad keeps spent keystream ----
+// The panel cache used to hold a full, never-zeroed copy of the pad while the
+// session zeroed its own as it consumed it. Every Uint8Array of the pad's size
+// created while the session is opened and used is tracked (WeakRef); after a
+// garbage collection, none that is still reachable may hold the spent span.
+{
+  const v8 = await import("node:v8");
+  const vm = await import("node:vm");
+  v8.setFlagsFromString("--expose-gc");
+  const gc = vm.runInNewContext("gc");
+  const PAD_BYTES = 8192;
+  const pad = await otp.generatePad({ label: "heap-check", totalBytes: PAD_BYTES, fingerBytes: new Uint8Array(0) });
+  await otp.saveNewPad(pad, PAD_PASS);
+  const ref = pad.bytes.slice(0, 64);            // our own copy of the first 64 bytes, to recognise copies
+  const RealU8 = globalThis.Uint8Array;
+  const tracked = [];
+  class TrackedU8 extends RealU8 {
+    constructor(...a) {
+      super(...a);
+      if (this.length === PAD_BYTES) tracked.push(new WeakRef(this));
+    }
+    static [Symbol.hasInstance](x) { return x instanceof RealU8; }
+  }
+  globalThis.Uint8Array = TrackedU8;
+  let spent = 0;
+  try {
+    // The panel unlocks it first (as Export or Connect does), then a session.
+    dom.el("otpSelect").value = pad.padId;
+    dom.el("otpPass").value = PAD_PASS;
+    const ws = await otpConnect(pad.padId);
+    assert.ok(ws, "fixture: the session opened");
+    for (const t of ["heap one", "heap two"]) {
+      dom.el("text").value = t;
+      await dom.el("sendForm").dispatch("submit");
+      await settle(5);
+    }
+    spent = (await otp.unlockPad(pad.padId, PAD_PASS)).record.sendOffset;
+    assert.ok(spent > 0, "fixture: pad bytes were spent");
+  } finally {
+    globalThis.Uint8Array = RealU8;
+  }
+  for (let i = 0; i < 3; i++) { await new Promise((r) => setTimeout(r, 10)); gc(); }
+  const alive = tracked.map((w) => w.deref()).filter(Boolean);
+  const copies = alive.filter((a) => a.subarray(32, 64).every((v, i) => v === ref[32 + i]) || a.subarray(0, spent).some((v) => v !== 0));
+  const leaking = alive.filter((a) => {
+    const role0 = a.subarray(0, Math.min(spent, 64));
+    return role0.length > 0 && role0.every((v, i) => v === ref[i]);
+  });
+  assert.ok(tracked.length > 0, "fixture: pad-sized arrays were created and tracked");
+  assert.strictEqual(leaking.length, 0,
+    `round 3 F2: ${leaking.length} reachable copy/copies of the pad still hold the spent keystream (of ${alive.length} alive, ${copies.length} pad-like)`);
+  await dom.el("disconnect").click();
+  console.log("OK  package 6 round 3: after a session spends pad bytes, no reachable copy of the pad still holds them (executed, WeakRef + gc)");
+}
+
+// ---- package 6 round 3, infos I1-I3: the pad lock and the send follow the session ----
+{
+  const lockFree = (id) => new Promise((res) => {
+    navigator.locks.request("sc.otp.lock.v1." + id, { ifAvailable: true }, (l) => { res(!!l); });
+  });
+  // I2: the relay socket cannot even be constructed — the pad lock is released.
+  const p = await otp.generatePad({ label: "i2", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  await otp.saveNewPad(p, PAD_PASS);
+  if (current && current.readyState === 1) await dom.el("disconnect").click();
+  const RealWS = globalThis.WebSocket;
+  globalThis.WebSocket = function () { throw new Error("SecurityError: insecure ws from a secure page"); };
+  Object.assign(globalThis.WebSocket, { OPEN: 1, CLOSED: 3, CONNECTING: 0, CLOSING: 2 });
+  try {
+    const room = dom.el("room");
+    room.value = ROOM;
+    await room.dispatch("input");
+    dom.selectAlg("OTP");
+    dom.el("otpSelect").value = p.padId;
+    dom.el("otpPass").value = PAD_PASS;
+    await dom.el("connect").click();
+  } finally {
+    globalThis.WebSocket = RealWS;
+  }
+  assert.ok(anyHint(/Could not open the relay connection/), "fixture (I2): the socket could not be constructed");
+  assert.ok(await lockFree(p.padId), "round 3 I2: a connect that failed releases the pad's lock");
+
+  // I3: the socket closes while a save of the pad is still on its way to disk —
+  //     the lock is released only once that save has settled.
+  const ws = await otpConnect(p.padId);
+  assert.ok(ws, "fixture (I3): the session opened");
+  fakeIdb.hold();
+  dom.el("text").value = "i3 in flight";
+  const submitted = dom.el("sendForm").dispatch("submit");
+  await settle(10);
+  ws.close();                                      // the relay hangs up mid-save
+  await settle(5);
+  assert.strictEqual(await lockFree(p.padId), false, "round 3 I3: the pad lock is held while its save is in flight");
+  fakeIdb.release();
+  await submitted;
+  await settle(10);
+  assert.ok(await lockFree(p.padId), "…and released once the save settled");
+
+  // I1: a reconnect while a send is encrypting — the old frame never goes out
+  //     on the NEW socket.
+  const w1 = await otpConnect(p.padId);
+  const h = crypto.subtle;
+  const realSign = h.sign;
+  let gate;
+  const mayGo = new Promise((r) => { gate = r; });
+  let inside = false;
+  h.sign = function (...a) { h.sign = realSign; inside = true; return mayGo.then(() => realSign.apply(this, a)); };
+  dom.el("text").value = "i1 old session";
+  const sending = dom.el("sendForm").dispatch("submit");
+  for (let i = 0; i < 100 && !inside; i++) await new Promise((r) => setTimeout(r, 5));
+  assert.ok(inside, "fixture (I1): the send is inside its encrypt");
+  h.sign = realSign;
+  const w2 = await otpConnect(p.padId);
+  assert.ok(w2 && w2 !== w1, "fixture (I1): a new connection");
+  gate();
+  await sending;
+  await settle(10);
+  assert.strictEqual(w2.sent.filter((f) => f.type === "msg").length, 0,
+    "round 3 I1: a frame encrypted for the old session is not sent on the new one");
+  await dom.el("disconnect").click();
+  console.log("OK  package 6 round 3: I1-I3 — no old frame on a new socket; the pad lock is released on every failed connect and only after an in-flight save (executed)");
 }
 
 // ---- F-ATREST-002 residual: latch BEFORE download -----------------------------

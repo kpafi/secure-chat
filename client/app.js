@@ -209,7 +209,11 @@ let cipher = null;
 // offset (a two-time pad). The panel now has its own cache, `otpPanel`.
 let otpRecord = null;      // the OTP pad in use this session (bytes + offsets), or null
 let otpAtRest = null;      // its at-rest key {key,salt,iters} for cheap re-saves
-let otpPanel = null;       // the OTP PANEL's unlocked pad {padId, record, atRest} — never the session's
+// Round 3 (F2): the panel keeps only {padId, atRest} — the at-rest KEY, never
+// a copy of the pad. A record kept here was never zeroed while the session
+// consumed (and zeroed) its own copy, so spent keystream stayed in memory
+// until reload. Every reader re-reads the pad from storage anyway.
+let otpPanel = null;       // the OTP PANEL's unlocked pad {padId, atRest} — never the session's
 let otpLockRelease = null; // releases this pad's exclusive same-origin lock
 let joined = false;
 let verified = false; // in-person gate passed; gates RECEIVING as well as sending
@@ -3145,7 +3149,7 @@ async function connectInner() {
     expectedPeerName = parsed.username;
   }
 
-  releaseOtpLock();
+  releaseOtpLockAfterSave();
   otpRecord = null;
   otpAtRest = null;
   const opts = { passphrase: els.pass.value };
@@ -3200,6 +3204,7 @@ async function connectInner() {
     cipher = makeCipher(alg, room, opts);
     await cipher.init();
   } catch (e) {
+    releaseOtpLock(); // round 3 (I2): no session, no lock
     hint("Could not set up encryption: " + e.message, true);
     return;
   }
@@ -3240,6 +3245,7 @@ async function connectInner() {
     // it so the UI reports the cause instead of hanging on "connecting…".
     ws = new WebSocket(wsUrl());
   } catch (e) {
+    releaseOtpLock(); // round 3 (I2): no session, no lock
     setStatus("connection blocked", "err");
     hint(
       "Could not open the relay connection: " + e.message +
@@ -3313,7 +3319,7 @@ async function connectInner() {
     closeRelayReason = null;
     clientClosing = false;
     els.connect.disabled = false;
-    releaseOtpLock();
+    releaseOtpLockAfterSave();
   };
 
   ws.onerror = () => setStatus("connection error", "err");
@@ -4628,8 +4634,14 @@ async function sendText(e) {
   }
   sending = true;
   els.send.disabled = true;
+  // Round 3 (I1): the session this send belongs to, captured before any await.
+  // A reconnect during the encrypt/save must not make this frame go out on
+  // the NEW socket or be saved against the new session's pad.
+  const sess = otpSession();
+  const sock = ws;
+  const gen = sessionGen;
   try {
-    const payload = await cipher.encrypt(text);
+    const payload = await sess.cipher.encrypt(text);
     // Pentest 2026-07-26 P-04: a one-time pad must record consumption DURABLY
     // BEFORE the ciphertext is transmitted. This used to run after ws.send(),
     // un-awaited, with failures downgraded to a hint — so a tab kill or a
@@ -4639,16 +4651,19 @@ async function sendText(e) {
     // makes the failure mode OVER-consumption (wasted pad bytes), which is
     // harmless; under-consumption is the one that breaks the pad.
     try {
-      await persistOtpProgress();
+      await persistOtpProgress(sess);
     } catch (err) {
       // The pad bytes are already spent in memory; refusing to transmit means
       // we merely waste them, which is the safe direction.
-      otpPersistFailed(err);
+      if (sessionLive(sock, gen)) otpPersistFailed(err);
       return;
     }
+    // Round 3 (I1): the session ended or was replaced meanwhile — the frame is
+    // not sent (its pad bytes, if any, are recorded as spent: the safe side).
+    if (!sessionLive(sock, gen)) return;
     // Session-captured room/alg (P-19): never re-read live UI state at send
     // time — the envelope must describe the session we actually negotiated.
-    ws.send(JSON.stringify({ type: "msg", room: sessionRoom, payload, alg: sessionAlg }));
+    sock.send(JSON.stringify({ type: "msg", room: sessionRoom, payload, alg: sessionAlg }));
     addLine("me", "me", text);
     els.text.value = "";
     hint("");
@@ -4687,17 +4702,31 @@ function fmtBytes(n) {
 // mid-session would have silently stopped recording consumption — the one thing
 // that must never stop. `otpRecord`/`otpAtRest` are set only by an OTP connect()
 // and cleared on every connect, so they are the reliable signal.
-async function persistOtpProgress() {
-  if (!otpRecord || !otpAtRest || !cipher) return;
-  if (typeof cipher.sendOffset !== "number" || typeof cipher.recvHighWater !== "number") return;
+// Round 3 (I1/I3): `s` is the session captured by the caller BEFORE its
+// awaits (sendText), so a reconnect meanwhile cannot swap the pad under it;
+// and the save in flight is tracked, so the pad lock is released only after it.
+let otpSaveInFlight = null;
+function otpSession() {
+  return { cipher, record: otpRecord, atRest: otpAtRest };
+}
+async function persistOtpProgress(s = otpSession()) {
+  const { cipher: c, record, atRest } = s;
+  if (!record || !atRest || !c) return;
+  if (typeof c.sendOffset !== "number" || typeof c.recvHighWater !== "number") return;
   // Round 2: the record saved must be the very pad the cipher consumes. If it
   // is not, saving would record THIS pad's offsets on ANOTHER pad — refuse
   // (the caller stops the session) rather than save the wrong one.
-  if (otpRecord.bytes !== cipher.pad) throw new Error("the pad being saved is not the one in use");
-  otpRecord.sendOffset = cipher.sendOffset;
-  otpRecord.recvHighWater = cipher.recvHighWater;
-  await otp.savePadProgress(otpRecord, otpAtRest);
-  updateOtpBudget();
+  if (record.bytes !== c.pad) throw new Error("the pad being saved is not the one in use");
+  record.sendOffset = c.sendOffset;
+  record.recvHighWater = c.recvHighWater;
+  const save = otp.savePadProgress(record, atRest);
+  otpSaveInFlight = save;
+  try {
+    await save;
+  } finally {
+    if (otpSaveInFlight === save) otpSaveInFlight = null;
+  }
+  if (record === otpRecord) updateOtpBudget();
 }
 
 // A pad whose consumption cannot be written to disk is unsafe to keep using:
@@ -4752,6 +4781,18 @@ function acquirePadLock(padId) {
 function releaseOtpLock() {
   if (otpLockRelease) { try { otpLockRelease(); } catch { /* ignore */ } otpLockRelease = null; }
 }
+// Round 3 (I3): a socket close or a new connect used to drop the pad lock while
+// a save of the pad could still be in flight — another tab could then open the
+// pad and read the pre-save state. The lock now goes only once that save has
+// settled (whatever its outcome).
+function releaseOtpLockAfterSave() {
+  const release = otpLockRelease;
+  otpLockRelease = null;
+  if (!release) return;
+  const pending = otpSaveInFlight;
+  const go = () => { try { release(); } catch { /* ignore */ } };
+  if (pending) pending.then(go, go); else go();
+}
 
 // Decrypt the selected pad at rest using the pad passphrase, caching the result
 // for the session. Returns { record, atRest }.
@@ -4760,7 +4801,7 @@ function releaseOtpLock() {
 // panel just generated or imported connects without a second KDF.
 async function ensureUnlocked(padId) {
   if (otpPanel && otpPanel.padId === padId) {
-    return { record: otpPanel.record, atRest: otpPanel.atRest };
+    return { atRest: otpPanel.atRest };
   }
   if (!els.otpPass.value) throw new Error("Enter this pad's passphrase to unlock it.");
   let unlocked;
@@ -4798,8 +4839,9 @@ async function ensureUnlocked(padId) {
     }
     unlocked = await otp.unlockPad(padId, els.otpPass.value, { adoptLegacy: true });
   }
-  otpPanel = { padId, record: unlocked.record, atRest: unlocked.atRest };
-  return unlocked;
+  otpPanel = { padId, atRest: unlocked.atRest };
+  unlocked.record.bytes.fill(0); // round 3: no copy of the pad outlives this call
+  return { atRest: unlocked.atRest };
 }
 
 function updateOtpBudget() {
@@ -4900,7 +4942,8 @@ async function otpGenerate() {
     const totalBytes = parseInt(els.otpSize.value, 10);
     const rec = await otp.generatePad({ label: els.otpLabel.value.trim(), totalBytes, fingerBytes: entropyBytes() });
     const atRest = await otp.saveNewPad(rec, els.otpPass.value); // encrypted at rest
-    otpPanel = { padId: rec.padId, record: rec, atRest }; // keep unlocked so Export works immediately
+    otpPanel = { padId: rec.padId, atRest }; // keep the KEY, so Export works without a second KDF
+    rec.bytes.fill(0); // round 3: the stored pad is the only copy now
     clearEntropy();
     els.otpLabel.value = "";
     refreshOtpPads(rec.padId);
@@ -4954,12 +4997,29 @@ async function otpExport() {
   otpExporting = true; // synchronous: before the first await
   els.otpExport.disabled = true;
   try {
-    const name = "sc.otp.export.v1." + id;
-    // Round 2 (Info): if another tab is exporting this pad, say so instead of
-    // a silently disabled button (it may be sitting in a confirm()).
-    const held = await locks.query?.().then((q) => (q.held || []).some((l) => l.name === name)).catch(() => false);
-    if (held) otpStatusMsg("Waiting for this pad's export in another tab or window to finish…");
-    await locks.request(name, { mode: "exclusive" }, () => otpExportLocked(id));
+    // Round 3 (F1, pre-existing MEDIUM): an export must never run beside a
+    // live session on the same pad. It used to take only its own export lock,
+    // so a tab chatting on the pad could spend keystream during the export's
+    // KDF, and the export's latch then wrote its pre-KDF snapshot back over
+    // that progress (offset 0) — a two-time pad after the next reload. The
+    // export now holds the pad's SESSION lock (the one connect takes) for its
+    // whole length, taken without waiting: in use elsewhere → refused, said
+    // why. Lock order everywhere: the pad lock, then the export lock.
+    const got = await acquirePadLock(id);
+    if (!got || got === NO_WEB_LOCKS) {
+      otpStatusMsg("This pad is in use — open in a chat or being exported in this or another tab or window. Close or finish it there first, then export.", true);
+      return;
+    }
+    try {
+      const name = "sc.otp.export.v1." + id;
+      // Round 2 (Info): if something else holds the export lock, say so
+      // instead of a silently disabled button.
+      const held = await locks.query?.().then((q) => (q.held || []).some((l) => l.name === name)).catch(() => false);
+      if (held) otpStatusMsg("Waiting for this pad's export in another tab or window to finish…");
+      await locks.request(name, { mode: "exclusive" }, () => otpExportLocked(id));
+    } finally {
+      got();
+    }
   } catch (e) {
     otpStatusMsg("Export failed: " + e.message, true);
   } finally {
@@ -4972,10 +5032,17 @@ async function otpExportLocked(id) {
   // `exported` flag inside the pad blob, so it has to unlock first. Clearing
   // the plaintext index entry no longer disarms the one warning that stands
   // between a user and handing one pristine pad to two importers.
-  const cached = await ensureUnlocked(id); // decrypt at rest first (or the cache)
+  const cached = await ensureUnlocked(id); // the at-rest key (a KDF only the first time)
   // …and then read it AGAIN, under the lock, from what is stored — the cache
   // may be another tab's past (see above).
   const { record, atRest } = await otp.unlockPad(id, null, { atRest: cached.atRest });
+  try {
+    await otpExportFrom(id, record, atRest);
+  } finally {
+    record.bytes.fill(0); // round 3 (F2): no copy of the pad outlives the export
+  }
+}
+async function otpExportFrom(id, record, atRest) {
   // Re-export guard (Finding 3): sharing one pad with more than one importer
   // causes key reuse. Warn once and require a second click to confirm.
   if (record.exported && pendingReexportId !== id) {
@@ -4998,9 +5065,19 @@ async function otpExportLocked(id) {
   // could go to a second importer: a two-time pad by construction. A failed
   // latch now means no file at all ("Export failed: …"); the reverse failure
   // (latched, then the download is lost) only costs a confirm on re-export.
-  await otp.markExported(record, atRest);
-  cached.record.exported = true; // the panel cache follows (it may also be the live pad's record)
-  cached.record.exportedInferred = false;
+  // Round 3 (F1b): latch onto the pad AS STORED NOW (re-read after the KDF,
+  // under the pad lock), never onto the pre-KDF snapshot — the latch must
+  // write the exported flag and nothing else it did not just read.
+  const now = await otp.unlockPad(id, null, { atRest });
+  if (now.record.sendOffset !== 0 || now.record.recvHighWater !== 0) {
+    now.record.bytes.fill(0);
+    throw new Error("this pad was used while it was being exported — no file was handed out");
+  }
+  try {
+    await otp.markExported(now.record, atRest);
+  } finally {
+    now.record.bytes.fill(0);
+  }
   downloadText(`secure-chat-pad-${record.label || record.padId}.json`, text);
   const weak = passphraseWarning(els.otpXferPass.value); // package 6: warn, never block
   otpStatusMsg("Exported. Give the file to your contact in person; they Import it with the same TRANSFER passphrase." +
@@ -5044,7 +5121,8 @@ async function otpFileChosen() {
     // on it, and cost a third 600k-iteration KDF for no property this does not
     // already have.
     const atRest = await otp.saveNewPad(rec, els.otpPass.value); // encrypt at rest with the pad passphrase
-    otpPanel = { padId: rec.padId, record: rec, atRest };
+    otpPanel = { padId: rec.padId, atRest };
+    rec.bytes.fill(0); // round 3: the stored pad is the only copy now
     refreshOtpPads(rec.padId);
     const weak = passphraseWarning(els.otpPass.value); // package 6: warn, never block
     otpStatusMsg(`Imported + encrypted pad "${rec.label}". Select it, use the same room id as your contact, and Connect.` +
