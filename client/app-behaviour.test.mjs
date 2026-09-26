@@ -1688,6 +1688,11 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
     const knock = async (who, i) => ws.deliver({ type: "knock", room: ROOM, jid: i.toString(16).padStart(16, "0"),
       payload: pack({ idb: who.publicBundle(), sig: await signKnock(who, ROOM) }) });
     for (let i = 0; i < 16; i++) await knock(flood[i], 0x100 + i);
+    // The flood's own verifies run behind the relay frames (msgChain): count
+    // only once all 16 are queued, or the 16th's verify lands in the window
+    // below and reads as the 17th's (a race that failed ~1 run in 2 once the
+    // page grew; the property is unchanged).
+    await until(() => /15 more waiting/.test(dom.el("admitWarn").textContent), "the flood fills the queue");
     const extra = await Identity.generate();
     // Beyond the cap a stranger costs no signature verify (the L-1 property).
     const subtle = crypto.subtle, origVerify = subtle.verify;
