@@ -23,6 +23,7 @@ import { makeCipher, bufToB64, b64ToBuf } from "./crypto.js";
 import { Identity, b64, unb64 } from "./identity.js";
 import { freshNonce, signHandshake, signKnock } from "./auth.js";
 import * as sealed from "./sealed.js";
+import { vouchMessageBytes } from "./account.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOM = "a".repeat(64);
@@ -62,6 +63,12 @@ globalThis.fetch = async (url, opts = {}) => {
     const messages = relay.mailbox.map((envelope) => ({ envelope, created_at: 0 }));
     relay.mailbox = [];
     return json(200, { messages });
+  }
+  // package 6: the vouch list, played per block (relay.vouches), else 404
+  if (u.includes("/api/users/") && u.includes("/vouches?")) {
+    if (!relay.vouches) return json(404, { detail: "not found" });
+    const r = relay.vouches(u);
+    return json(r.status, r.body);
   }
   if (u.includes("/api/users/")) {
     const name = decodeURIComponent(u.split("/api/users/")[1].split("?")[0]);
@@ -1922,6 +1929,117 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
     "...but a gap after that is ");
   await dom.el("disconnect").click();
   console.log("OK  F-CRYPTO-001: a skipped gap shows one line with its count; our own pre-verification drops are not blamed on the relay (executed)");
+}
+
+// ==== package 6, F-PROTO-006 + F-PROTO-007: vouch marks age out; the lookup asks by verified contacts ====
+// F-PROTO-006: a 🟡 used to have no maximum age — every fetch error kept the
+// last answer for ever. Now it counts for 7 days after the last SUCCESSFUL
+// check; older (or stamped in the future) it reads "vouch not re-checked".
+// F-PROTO-007: the lookup names the user's own in-person verified contacts
+// (`?by=`, ≤ 50 per request), so a flood of throwaway vouches cannot bury them.
+{
+  const realNow = Date.now;
+  const DAY = 24 * 60 * 60 * 1000;
+  const keysOf = (b) => ({ ed: b.ed, mldsa: b.mldsa, ecdh: b.ecdh, mlkem: b.mlkem });
+  const vic = await Identity.generate();
+  const tgt = await Identity.generate();
+  const vb = vic.publicBundle();
+  const tb = tgt.publicBundle();
+  await contacts.upsert({ username: "vic6", token: "tok-vic6", ...keysOf(vb), verified: true });
+  const extra = [];
+  for (let i = 0; i < 54; i++) {
+    const b = (await Identity.generate()).publicBundle();
+    extra.push("vv" + i);
+    await contacts.upsert({ username: "vv" + i, token: "tok-vv" + i, ...keysOf(b), verified: true });
+  }
+  await contacts.upsert({ username: "tgt6", token: "tok-tgt6", ...keysOf(tb) });
+  const sig = await vic.sign(vouchMessageBytes("tgt6", keysOf(tb)));
+  const good = { status: 200, body: { target: "tgt6", vouches: [{
+    voucher: "vic6", voucher_ed: vb.ed, voucher_mldsa: vb.mldsa, sig: sig.ed, mldsa_sig: sig.mldsa, created_at: 0,
+  }] } };
+  const asked = [];
+  // The relay honours `by` like the backend does; `oldRelay` ignores it (< 0.4.0).
+  let oldRelay = false;
+  let answer = (by) => (oldRelay || (by || "").split(",").includes("vic6") ? good : { status: 200, body: { vouches: [] } });
+  relay.vouches = (u) => {
+    const by = new URL(u, "http://relay.test").searchParams.get("by");
+    if (!u.includes("/api/users/tgt6/")) return { status: 200, body: { vouches: [] } };
+    asked.push(by);
+    return answer(by);
+  };
+  const markOf = (name) => {
+    const li = dom.el("userList").children.find((x) => x.dataset.user === name);
+    return li ? li.querySelector(".u-open").children[0].children[1] : null;
+  };
+  const show = async () => { await nav("chats"); await nav("users"); };
+  try {
+    await show();
+    await until(() => markOf("tgt6") && markOf("tgt6").textContent === "vouched by vic6", "the vouched mark");
+    assert.ok(markOf("tgt6").className.split(" ").includes("mid"), "control: a fresh vouch is 🟡 (mid)");
+    // F-PROTO-007: by = every verified contact whose record name is its directory
+    // name, never the target, in requests of at most 50 names.
+    // (earlier blocks left a few verified contacts of their own: they count too)
+    const expected = contacts.list().filter((c) => c.verified && !c.addrUsername).map((c) => c.username).sort();
+    assert.ok(expected.length > 50 && expected.includes("vic6") && extra.every((n) => expected.includes(n)), "fixture");
+    assert.strictEqual(asked.length, Math.ceil(expected.length / 50),
+      `F-PROTO-007: ${expected.length} verified contacts are asked about in ${Math.ceil(expected.length / 50)} requests (${asked.length})`);
+    const lists = asked.map((b) => (b || "").split(","));
+    assert.ok(lists.every((l) => l.length <= 50), "F-PROTO-007: at most 50 names per request");
+    assert.deepStrictEqual(lists.flat().sort(), expected,
+      "F-PROTO-007: the lookup asks by exactly the user's own in-person verified contacts (never the target, never an unverified one)");
+
+    // Compatibility: a relay older than 0.4.0 ignores `by` and answers the same
+    // newest list to both requests — the mark names the voucher once.
+    oldRelay = true;
+    Date.now = () => realNow() + 20 * 60 * 1000; // past the 10-minute re-check
+    const b0 = asked.length;
+    await show();
+    await until(() => asked.length >= b0 + 2, "the re-check against an old relay");
+    await settle(10);
+    await show();
+    assert.strictEqual(markOf("tgt6").textContent, "vouched by vic6", "compat: an old relay's repeated answer names the voucher once");
+    oldRelay = false;
+
+    // F-PROTO-006: 8 days later every check fails — the mark is no longer 🟡.
+    const working = answer;
+    answer = () => ({ status: 500, body: { detail: "down" } });
+    Date.now = () => realNow() + 8 * DAY;
+    const before = asked.length;
+    await show();
+    await until(() => asked.length > before, "the re-check to be attempted");
+    await settle(10);
+    await show();
+    assert.strictEqual(markOf("tgt6").textContent, "vouch not re-checked",
+      "F-PROTO-006: a vouch last confirmed more than 7 days ago is not shown as vouched");
+    assert.ok(!markOf("tgt6").className.split(" ").includes("mid"), "F-PROTO-006: ...and is not 🟡");
+    Date.now = () => realNow() + 6 * DAY;
+    await show();
+    assert.strictEqual(markOf("tgt6").textContent, "vouched by vic6",
+      "control: the failed fetches did not touch the age — at 6 days (fetch still failing) it is still 🟡");
+    // A stamp in the future (the clock was set back) is stale, and is re-checked.
+    Date.now = () => realNow() - DAY;
+    const b2 = asked.length;
+    await show();
+    assert.strictEqual(markOf("tgt6").textContent, "vouch not re-checked",
+      "F-PROTO-006: a check stamped in the future does not count as fresh");
+    await until(() => asked.length > b2, "a re-check despite the future stamp");
+    // A fresh successful answer restores it.
+    answer = working;
+    Date.now = () => realNow() + 9 * DAY;
+    await show();
+    await until(() => markOf("tgt6").textContent === "vouched by vic6", "a fresh answer to restore the mark");
+    // Un-verifying the voucher takes the mark off at once (no re-check needed).
+    await contacts.setVerified("vic6", false);
+    await show();
+    assert.strictEqual(markOf("tgt6").textContent, "unverified",
+      "F-PROTO-006: a voucher you no longer have verified vouches for nobody, from the next render on");
+  } finally {
+    Date.now = realNow;
+    relay.vouches = null;
+  }
+  for (const n of ["vic6", "tgt6", ...extra]) await contacts.remove(n);
+  await nav("live");
+  console.log("OK  F-PROTO-006/007: a vouch mark ages out 7 days after the last successful check (fetch errors do not extend it); the lookup asks by the user's verified contacts, ≤ 50 per request (executed)");
 }
 
 // ==== final round, Info-4: Forget while the stores are opening is not "another tab" ====

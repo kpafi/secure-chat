@@ -486,6 +486,16 @@ MAILBOX_FETCH_RATE_REFILL_PER_SEC = 1.0   # sustained fetches/second per user
 MAX_VOUCHES_PER_VOUCHER = 200   # statements one account may publish
 MAX_VOUCHES_TOTAL = 200_000     # global table bound
 MAX_VOUCHES_RETURNED = 50       # per lookup response
+# Pentest 2026-08-07 F-PROTO-007 (vouch burial): a lookup may name the
+# vouchers it asks about (`?by=a,b,…`) — the client names its own in-person
+# verified contacts, so a flood of throwaway vouches cannot push theirs out
+# of the newest-50 answer. At most this many names per request (the answer is
+# still capped at MAX_VOUCHES_RETURNED). NO per-target storage cap (decided in
+# package 6): it would hand the flooder a new lever — fill one target's slots
+# and that person's real friends can no longer vouch for them at all — while
+# `by` already makes the number of stored vouches irrelevant to what a client
+# sees. Storage stays bounded by the per-voucher and global caps above.
+MAX_VOUCHES_BY = 50
 
 # --- Anti-enumeration: token-gated lookup (I1) ----------------------------
 # Registration mints a random, unguessable lookup token. A contact fetches a

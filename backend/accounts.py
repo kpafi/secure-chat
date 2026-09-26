@@ -987,15 +987,34 @@ def unvouch(target: str, username: str = Depends(current_user)) -> dict:
 
 
 @router.get("/users/{username}/vouches")
-def get_vouches(username: str, t: str = Query(default="", max_length=64)) -> dict:
+def get_vouches(
+    username: str,
+    t: str = Query(default="", max_length=64),
+    by: str = Query(default="", max_length=config.MAX_VOUCHES_BY * (config.USERNAME_MAX + 1)),
+) -> dict:
     """Vouches ABOUT `username`, gated by the same lookup token as the bundle.
 
     Includes each voucher's public keys so a client can check the signatures —
     but a client must only award the 🟡 mark when the voucher matches a contact
     it has ITSELF verified in person (pinned keys), so a lying server gains
     nothing by inventing vouchers here.
+
+    `by` (optional, F-PROTO-007): a comma-separated list of at most
+    MAX_VOUCHES_BY voucher names; only their vouches are returned. Without it
+    the answer is the newest MAX_VOUCHES_RETURNED vouches, as before (old
+    clients), which a flood of throwaway vouches can bury. Same token gate,
+    same one charge of the per-target bucket either way.
     """
     _check_username(username)
+    # Validated before the gate: a malformed list is refused from the input
+    # alone, whether or not `username` exists (no oracle).
+    names = by.split(",") if by else []
+    if len(names) > config.MAX_VOUCHES_BY:
+        raise HTTPException(status_code=422, detail="too many names in by")
+    for name in names:
+        _check_username(name)
+        if not config.USERNAME_MIN <= len(name) <= config.USERNAME_MAX:
+            raise HTTPException(status_code=422, detail="bad name in by")
     with _db() as conn:
         row = conn.execute(
             "SELECT lookup_token FROM accounts WHERE username = ?", (username,)
@@ -1004,13 +1023,16 @@ def get_vouches(username: str, t: str = Query(default="", max_length=64)) -> dic
         if not token_matches(t, stored) or row is None:
             raise HTTPException(status_code=404, detail="no such user")
         _charge_lookup("lookup:" + username)  # F-P7-3: after the gate, per target
+        only = ""
+        if names:
+            only = " AND v.voucher IN (" + ",".join("?" * len(names)) + ")"
         rows = conn.execute(
             """
             SELECT v.voucher, v.sig_ed, v.sig_mldsa, v.created_at, a.ed_pub, a.mldsa_pub
             FROM vouches v JOIN accounts a ON a.username = v.voucher
-            WHERE v.target = ? ORDER BY v.created_at DESC LIMIT ?
+            WHERE v.target = ?""" + only + """ ORDER BY v.created_at DESC LIMIT ?
             """,
-            (username, config.MAX_VOUCHES_RETURNED),
+            (username, *names, config.MAX_VOUCHES_RETURNED),
         ).fetchall()
     return {
         "target": username,

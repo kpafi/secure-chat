@@ -344,3 +344,90 @@ def test_vouch_list_is_token_gated():
     r2 = client.get("/api/users/wot-nobody/vouches", params={"t": "wrong"})
     assert r1.status_code == r2.status_code == 404
     assert r1.json() == r2.json()
+
+
+def _vouch_as(voucher, target):
+    tok = _login(voucher)
+    accounts._vouch_host_limiter._buckets.clear()
+    accounts._lookup_limiter._buckets.clear()
+    r = client.post("/api/vouch", json=_vouch_body(voucher, target), headers=_auth(tok))
+    assert r.status_code == 200, r.text
+
+
+def test_vouch_burial_is_answered_by_asking_by_voucher(monkeypatch):
+    """Package 6, F-PROTO-007: a flood of newer throwaway vouches used to push a
+    verified friend's vouch out of the newest-N answer, and no client could ask
+    for it any other way. `?by=` names the vouchers a client can use at all
+    (its own in-person verified contacts); without it the old answer stands."""
+    monkeypatch.setattr(config, "MAX_VOUCHES_RETURNED", 3)
+    target = _register("bur-target")
+    friend = _register("bur-friend")
+    other = _register("bur-other")
+    _vouch_as(friend, target)
+    _vouch_as(other, target)
+    flood = [_register(f"bur-flood{i}") for i in range(3)]
+    for f in flood:
+        _vouch_as(f, target)
+    # Make the order unambiguous: the friend's and other's are the oldest.
+    with accounts._db() as conn:
+        conn.execute("UPDATE vouches SET created_at = 1 WHERE target = ? AND voucher IN (?, ?)",
+                     (target["username"], friend["username"], other["username"]))
+
+    def get(**p):
+        accounts._lookup_limiter._buckets.clear()
+        return client.get(f"/api/users/{target['username']}/vouches", params={"t": target["token"], **p})
+
+    old = get()
+    assert old.status_code == 200
+    names = [v["voucher"] for v in old.json()["vouches"]]
+    assert "bur-friend" not in names and len(names) == 3, "fixture: the flood buries the friend (old behaviour kept)"
+
+    r = get(by="bur-friend")
+    assert r.status_code == 200, r.text
+    assert [v["voucher"] for v in r.json()["vouches"]] == ["bur-friend"], (
+        "F-PROTO-007: asking by the friend's name returns the friend's vouch, whatever the flood"
+    )
+    v = r.json()["vouches"][0]
+    assert v["voucher_ed"] == friend["ed"] and v["sig"] and v["mldsa_sig"], "the same fields as the old answer"
+
+    r = get(by="bur-friend,bur-nobody,bur-friend,bur-flood0")
+    assert sorted(v["voucher"] for v in r.json()["vouches"]) == ["bur-flood0", "bur-friend"], (
+        "only the named vouchers (a repeated name is one row); an unknown name is simply absent"
+    )
+
+    # Same gate: a wrong token with `by` is the same 404 as without.
+    accounts._lookup_limiter._buckets.clear()
+    r1 = client.get(f"/api/users/{target['username']}/vouches", params={"t": "wrong", "by": "bur-friend"})
+    r2 = client.get("/api/users/bur-nobody/vouches", params={"t": "wrong", "by": "bur-friend"})
+    assert r1.status_code == r2.status_code == 404 and r1.json() == r2.json()
+
+
+def test_vouch_by_is_bounded_and_validated():
+    target = _register("byb-target")
+    url = f"/api/users/{target['username']}/vouches"
+    ok = client.get(url, params={"t": target["token"], "by": ",".join(f"byb-n{i}" for i in range(config.MAX_VOUCHES_BY))})
+    assert ok.status_code == 200, ok.text
+    for bad in (
+        ",".join(f"byb-n{i}" for i in range(config.MAX_VOUCHES_BY + 1)),  # one name too many
+        "byb-a,,byb-b",                                                    # empty name
+        "BYB-UPPER",                                                       # not a username
+        "ab",                                                              # too short
+        "x" * (config.USERNAME_MAX + 1),                                   # too long
+        "byb-a\n",
+    ):
+        accounts._lookup_limiter._buckets.clear()
+        r = client.get(url, params={"t": target["token"], "by": bad})
+        assert r.status_code == 422, (bad, r.status_code, r.text)
+    # Refused from the input alone: an unknown target with a bad list is the same 422.
+    r = client.get("/api/users/byb-nobody/vouches", params={"t": "wrong", "by": "BAD"})
+    assert r.status_code == 422
+
+
+def test_vouch_by_charges_the_per_target_bucket_once(monkeypatch):
+    target = _register("byc-target")
+    charged = []
+    monkeypatch.setattr(accounts, "_charge_lookup", lambda key: charged.append(key))
+    r = client.get(f"/api/users/{target['username']}/vouches",
+                   params={"t": target["token"], "by": "byc-a,byc-b,byc-c"})
+    assert r.status_code == 200
+    assert charged == ["lookup:byc-target"], "one lookup charge per request, keyed on the target, as before"

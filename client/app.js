@@ -2289,6 +2289,23 @@ els.contactRemove.addEventListener("click", async (e) => {
 // copy, and (c) the dual signature verifies over the target bundle YOU hold.
 // A lying directory therefore cannot invent a vouched mark.
 const VOUCH_RECHECK_MS = 10 * 60 * 1000;
+// Pentest 2026-08-07 F-PROTO-006 (Low): a cached 🟡 had no maximum age — any
+// fetch error (offline, a relay answering 429 or 500 on purpose) left the last
+// answer in place for ever, so a vouch the voucher had RETRACTED kept showing.
+// Now a vouch mark counts only for VOUCH_MAX_AGE_MS after the last SUCCESSFUL
+// check (`vouchCheckedAt`, stamped by contacts.setVouches and nowhere else, so
+// a failed fetch never extends it); older, the mark reads "vouch not
+// re-checked" and is not 🟡 until a fresh answer confirms it. A stamp in the
+// future (the clock was set back) is treated as stale and re-checked, never
+// as fresh.
+const VOUCH_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+function vouchAge(c) {
+  return Date.now() - (Number(c.vouchCheckedAt) || 0);
+}
+function vouchFresh(c) {
+  const age = vouchAge(c);
+  return age >= 0 && age < VOUCH_MAX_AGE_MS;
+}
 let vouchRefreshRunning = false;
 
 async function refreshVouchMarks() {
@@ -2298,12 +2315,24 @@ async function refreshVouchMarks() {
   try {
     for (const c of contacts.list()) {
       if (c.verified || !c.token) continue;
-      if (c.vouchCheckedAt && Date.now() - c.vouchCheckedAt < VOUCH_RECHECK_MS) continue;
-      let raw;
+      if (c.vouchCheckedAt && vouchAge(c) >= 0 && vouchAge(c) < VOUCH_RECHECK_MS) continue;
+      // F-PROTO-007: ask by the only vouchers that can ever count — contacts
+      // YOU verified in person whose record name is their directory name (the
+      // award below looks the voucher up by that name) — in chunks of the
+      // relay's bound. A flood of throwaway vouches then cannot bury them.
+      // None at all: no vouch can count, so there is nothing to ask.
+      const by = contacts.list()
+        .filter((v) => v.verified && v.username !== c.username && dirName(v) === v.username)
+        .map((v) => v.username);
+      let raw = [];
       try {
-        raw = await account.fetchVouches(API_BASE, mailHandle(c));
+        for (let i = 0; i < by.length; i += account.VOUCHES_BY_MAX) {
+          const part = await account.fetchVouches(API_BASE, mailHandle(c), by.slice(i, i + account.VOUCHES_BY_MAX));
+          if (part === null) { raw = null; break; } // no such handle any more
+          raw.push(...part);
+        }
       } catch {
-        continue; // offline / rate-limited: leave the cache, retry next render
+        continue; // offline / rate-limited: leave the cache (it ages), retry next render
       }
       const names = [];
       for (const v of raw || []) {
@@ -2322,7 +2351,9 @@ async function refreshVouchMarks() {
           }),
           { ed: v.sig, mldsa: v.mldsa_sig },
         ).catch(() => false);
-        if (ok) names.push(v.voucher);
+        // once each: a relay older than 0.4.0 ignores `by` and answers every
+        // chunk with the same newest list
+        if (ok && !names.includes(v.voucher)) names.push(v.voucher);
       }
       // F-PROTO-005: `c` is the snapshot the signatures were checked against;
       // the store refuses the write if the record's keys moved meanwhile.
@@ -2410,13 +2441,27 @@ function chatHint(text, isErr = false) {
 // into the pill's words; it is now a caption span on its own line inside the
 // box-shaped `.changed` mark. Its " — " stays in the text, visually hidden, so
 // the mark's textContent reads exactly as it did.
+// F-PROTO-006: a cached voucher counts only while YOU still have them verified
+// in person — un-verifying or removing a voucher takes their 🟡 off every
+// contact at once, not at the next successful re-check.
+function stillVerified(name) {
+  try {
+    const v = contacts.get(name);
+    return !!(v && v.verified);
+  } catch {
+    return false; // store locked: nothing is vouched for
+  }
+}
 function renderMark(el, c, note = true) {
-  const vouched = !!(c && !c.verified && c.vouchedBy && c.vouchedBy.length);
+  const vouchers = c && !c.verified && Array.isArray(c.vouchedBy) ? c.vouchedBy.filter(stillVerified) : [];
+  const hasVouch = vouchers.length > 0;
+  const vouched = hasVouch && vouchFresh(c); // F-PROTO-006: a 🟡 has a maximum age
   const changed = !!(c && !c.verified && c.keyChangedAt);
   el.className = "u-mark" + (c && c.verified ? " ok" : vouched ? " mid" : "") + (changed ? " changed" : "");
   el.textContent = !c ? "not in your users list"
     : c.verified ? "verified by you"
-      : vouched ? "vouched by " + c.vouchedBy.join(", ") : "unverified";
+      : vouched ? "vouched by " + vouchers.join(", ")
+        : hasVouch ? "vouch not re-checked" : "unverified";
   if (changed && note) {
     const cap = document.createElement("span");
     cap.className = "u-mark-note";
