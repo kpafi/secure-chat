@@ -1565,4 +1565,52 @@ console.log("OK  F-CRYPTO-012: 64 KiB, 256 KiB and 1 MiB pads all generate (chun
 }
 console.log("OK  fix round 2: FULL fails closed; re-import advice only where a floor can verify it");
 
+// ---- OTP transfer sheets (design round 1, M9): only the maker exports ----------
+// A pad this device IMPORTED (role 1) used to export with `recipientRole: 0` —
+// the generator's own role — so a third device importing it shared the
+// generator's send region: a two-time pad. Both ends refuse now.
+{
+  const XFER2 = "m9 transfer passphrase";
+  // A pad file built by hand, so the test controls recipientRole (exportPad
+  // itself can no longer write 0). 100k iterations: the KDF floor importPad accepts.
+  const sealFile = async (plainObj, pass) => {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(pass), "PBKDF2", false, ["deriveKey"]);
+    const key = await crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" },
+      base, { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key,
+      new TextEncoder().encode(JSON.stringify(plainObj))));
+    const b = (u) => Buffer.from(u).toString("base64");
+    return JSON.stringify({ fmt: "secure-chat-otp-pad", v: 1, kdf: { salt: b(salt), iters: 100000 }, iv: b(iv), ct: b(ct) });
+  };
+  const maker = await otp.generatePad({ label: "m9-maker", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const plainFor = (role) => ({
+    padId: maker.padId, label: maker.label, regionSize: maker.regionSize,
+    recipientRole: role, bytes: Buffer.from(maker.bytes).toString("base64"),
+  });
+
+  // exportPad: a received pad (role 1, as importPad returns it) is refused.
+  const received = await otp.importPad(await otp.exportPad(maker, XFER2), XFER2);
+  assert.strictEqual(received.role, 1, "fixture: an imported pad has role 1");
+  await assert.rejects(otp.exportPad(received, XFER2),
+    (e) => e.message === "you received this pad — only the person who made it can export it",
+    "M9: exportPad refuses a pad this device received (role 1), with the sheet's sentence");
+  // …and any role that is not the maker's, whatever else is true of the record.
+  await assert.rejects(otp.exportPad({ ...maker, role: undefined }, XFER2), /only the person who made it/,
+    "M9: a record without a role is not the maker's either");
+  // Control: the maker's own pad still exports.
+  assert.match(await otp.exportPad(maker, XFER2), /secure-chat-otp-pad/, "control: the maker (role 0) exports");
+
+  // importPad: a file naming recipientRole 0 is refused; the same file with 1 imports.
+  const bad = await sealFile(plainFor(0), XFER2);
+  await assert.rejects(otp.importPad(bad, XFER2),
+    (e) => e.message === "this file was exported by someone who received the pad, not by its maker — importing it would reuse key material",
+    "M9: importPad refuses recipientRole 0 (a re-export of a received pad)");
+  const good = await otp.importPad(await sealFile(plainFor(1), XFER2), XFER2);
+  assert.strictEqual(good.role, 1, "control: the hand-built file with recipientRole 1 imports (the refusal is about the role, not the build)");
+  good.bytes.fill(0); received.bytes.fill(0);
+}
+console.log("OK  M9: exportPad refuses a received pad; importPad refuses recipientRole 0 (exact sentences)");
+
 console.log("\nAll OTP rollback checks passed.");

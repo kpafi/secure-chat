@@ -457,7 +457,16 @@ async function deriveKey(passphrase, salt, iters) {
 
 // Serialize a PRISTINE pad into a passphrase-encrypted file string. The importer
 // becomes the opposite role, so their send region is the other half.
+//
+// OTP transfer sheets (design round 1, M9): only the MAKER exports. A pad this
+// device imported has role 1; exporting it used to write `recipientRole: 1 -
+// 1 = 0`, the generator's role, so a third device importing that file sent
+// from the same half of the pad as the generator: a two-time pad. The role is
+// the one inside the authenticated record (unlockPad's AEAD), never the index.
 export async function exportPad(record, passphrase) {
+  if (!record || record.role !== 0) {
+    throw new Error("you received this pad — only the person who made it can export it");
+  }
   if (!passphrase) throw new Error("choose a transfer passphrase (agree on it in person)");
   if (record.sendOffset !== 0 || record.recvHighWater !== 0) {
     throw new Error("this pad has already been used — export a freshly generated pad only");
@@ -515,6 +524,14 @@ export async function importPad(fileText, passphrase) {
   const bytes = unb64(o.bytes);
   if (bytes.length !== 2 * o.regionSize) throw new Error("pad file is internally inconsistent");
   if (o.recipientRole !== 0 && o.recipientRole !== 1) throw new Error("pad file has an invalid role");
+  // The other half of the M9 fix (see exportPad): a genuine file is written by
+  // the maker (role 0) for the one importer (role 1). `recipientRole: 0` can
+  // only come from a device that re-exported a pad it received (an older
+  // client) — its holder and the maker would share the maker's send region.
+  if (o.recipientRole !== 1) {
+    bytes.fill(0);
+    throw new Error("this file was exported by someone who received the pad, not by its maker — importing it would reuse key material");
+  }
   if (!looksRandom(bytes)) {
     throw new Error("this pad is not random enough to be safe (all-zero or low-entropy) — do not use it");
   }
