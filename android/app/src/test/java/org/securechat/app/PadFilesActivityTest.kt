@@ -121,6 +121,10 @@ class PadFilesActivityTest {
         // A stray second result must not answer the callback again.
         result(started, Activity.RESULT_OK, Intent().setData(Uri.parse("content://x/y")))
         assertEquals(1, cb.answers.size)
+        // …and neither may the next chooser's "cancel the pending one" step:
+        // an answered callback must no longer count as pending (mutant J5).
+        chooser(Recorder())
+        assertEquals("an answered callback is never answered again", 1, cb.answers.size)
     }
 
     @Test
