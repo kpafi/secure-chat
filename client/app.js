@@ -4877,46 +4877,81 @@ function downloadText(name, text) {
 }
 
 let pendingReexportId = null;
+// Package 6 fix round (MEDIUM, pre-existing): one pad could be EXPORTED TWICE.
+// The re-export guard read `record.exported` before two long awaits (the
+// transfer KDF, then the latch), so a double click — or a second click during
+// the KDF — passed the guard twice and handed out two files of the same
+// pristine pad: two importers, one keystream, a two-time pad, and no warning.
+// And the record came from the page's unlock CACHE, which nothing refreshes
+// when ANOTHER tab exports the same pad. Now:
+//  * a synchronous in-flight latch, set before the first await, refuses a
+//    second export in this page while one runs (and the button is disabled);
+//  * the whole export runs under a per-pad Web Lock, so a second tab waits
+//    for the first to finish (no Web Locks: no export — OTP needs them anyway);
+//  * inside the lock the pad is RE-READ from its authenticated blob, durable
+//    record and native floor (otp.unlockPad with the cached key, no second
+//    KDF), and the exported check, the export and the latch use that fresh
+//    record — never the cache.
+let otpExporting = false;
 async function otpExport() {
+  if (otpExporting) { otpStatusMsg("An export is already running — wait for it to finish.", true); return; }
   const id = els.otpSelect.value;
   if (!id) { otpStatusMsg("Select a pad to export.", true); return; }
   if (!els.otpXferPass.value) { otpStatusMsg("Enter a transfer passphrase first (agree on it with your contact in person).", true); return; }
+  const locks = navigator.locks;
+  if (!locks || typeof locks.request !== "function") {
+    otpStatusMsg("One-time pads are disabled in this browser: it cannot lock a pad to a single tab (no Web Locks support). Use the app or a current browser.", true);
+    return;
+  }
+  otpExporting = true; // synchronous: before the first await
+  els.otpExport.disabled = true;
   try {
-    // Pentest 2026-07-27 L-3: the re-export guard now consults the AUTHENTICATED
-    // `exported` flag inside the pad blob, so it has to unlock first. Clearing
-    // the plaintext index entry no longer disarms the one warning that stands
-    // between a user and handing one pristine pad to two importers.
-    const { record, atRest } = await ensureUnlocked(id); // decrypt at rest first
-    // Re-export guard (Finding 3): sharing one pad with more than one importer
-    // causes key reuse. Warn once and require a second click to confirm.
-    if (record.exported && pendingReexportId !== id) {
-      pendingReexportId = id;
-      // Fix round 2 (Info): when "exported" is only INFERRED (a pad from before
-      // v0.3.2 whose export history cannot be verified), say that — telling an
-      // honest never-exported pad it "was already exported" teaches users to
-      // click through the one warning that matters. The confirm stays.
-      otpStatusMsg(record.exportedInferred
-        ? "This pad's export history can't be verified on this device (it predates the current version). If you have already given it to someone, exporting it again would reuse key material. Click Export again to confirm it has not been exported before."
-        : "This pad was already exported. A pad must be imported on only ONE device — re-exporting risks catastrophic key reuse. Click Export again to confirm you know what you are doing.", true);
-      return;
-    }
-    pendingReexportId = null;
-    const text = await otp.exportPad(record, els.otpXferPass.value);
-    // Package 3, F-ATREST-002 residual: latch FIRST, file second. This used to
-    // download and then mark, so a markExported that failed (a full disk, a
-    // floor write that did not commit) had already handed out a file nothing
-    // recorded — the re-export warning never armed, and the same pristine pad
-    // could go to a second importer: a two-time pad by construction. A failed
-    // latch now means no file at all ("Export failed: …"); the reverse failure
-    // (latched, then the download is lost) only costs a confirm on re-export.
-    await otp.markExported(record, atRest);
-    downloadText(`secure-chat-pad-${record.label || record.padId}.json`, text);
-    const weak = passphraseWarning(els.otpXferPass.value); // package 6: warn, never block
-    otpStatusMsg("Exported. Give the file to your contact in person; they Import it with the same TRANSFER passphrase." +
-      (weak ? " Transfer passphrase — " + weak : ""), !!weak);
+    await locks.request("sc.otp.export.v1." + id, { mode: "exclusive" }, () => otpExportLocked(id));
   } catch (e) {
     otpStatusMsg("Export failed: " + e.message, true);
+  } finally {
+    otpExporting = false;
+    els.otpExport.disabled = false;
   }
+}
+async function otpExportLocked(id) {
+  // Pentest 2026-07-27 L-3: the re-export guard consults the AUTHENTICATED
+  // `exported` flag inside the pad blob, so it has to unlock first. Clearing
+  // the plaintext index entry no longer disarms the one warning that stands
+  // between a user and handing one pristine pad to two importers.
+  const cached = await ensureUnlocked(id); // decrypt at rest first (or the cache)
+  // …and then read it AGAIN, under the lock, from what is stored — the cache
+  // may be another tab's past (see above).
+  const { record, atRest } = await otp.unlockPad(id, null, { atRest: cached.atRest });
+  // Re-export guard (Finding 3): sharing one pad with more than one importer
+  // causes key reuse. Warn once and require a second click to confirm.
+  if (record.exported && pendingReexportId !== id) {
+    pendingReexportId = id;
+    // Fix round 2 (Info): when "exported" is only INFERRED (a pad from before
+    // v0.3.2 whose export history cannot be verified), say that — telling an
+    // honest never-exported pad it "was already exported" teaches users to
+    // click through the one warning that matters. The confirm stays.
+    otpStatusMsg(record.exportedInferred
+      ? "This pad's export history can't be verified on this device (it predates the current version). If you have already given it to someone, exporting it again would reuse key material. Click Export again to confirm it has not been exported before."
+      : "This pad was already exported. A pad must be imported on only ONE device — re-exporting risks catastrophic key reuse. Click Export again to confirm you know what you are doing.", true);
+    return;
+  }
+  pendingReexportId = null;
+  const text = await otp.exportPad(record, els.otpXferPass.value);
+  // Package 3, F-ATREST-002 residual: latch FIRST, file second. This used to
+  // download and then mark, so a markExported that failed (a full disk, a
+  // floor write that did not commit) had already handed out a file nothing
+  // recorded — the re-export warning never armed, and the same pristine pad
+  // could go to a second importer: a two-time pad by construction. A failed
+  // latch now means no file at all ("Export failed: …"); the reverse failure
+  // (latched, then the download is lost) only costs a confirm on re-export.
+  await otp.markExported(record, atRest);
+  cached.record.exported = true; // the cache follows (it is also the live pad)
+  cached.record.exportedInferred = false;
+  downloadText(`secure-chat-pad-${record.label || record.padId}.json`, text);
+  const weak = passphraseWarning(els.otpXferPass.value); // package 6: warn, never block
+  otpStatusMsg("Exported. Give the file to your contact in person; they Import it with the same TRANSFER passphrase." +
+    (weak ? " Transfer passphrase — " + weak : ""), !!weak);
 }
 
 function otpImportClick() {

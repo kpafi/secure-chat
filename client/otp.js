@@ -793,7 +793,19 @@ export async function unlockPad(padId, passphrase, opts = {}) {
   const o = JSON.parse(raw);
   const salt = unb64(o.kdf.salt);
   const iters = o.kdf.iters || KDF_ITERS;
-  const key = await deriveKey(passphrase, salt, iters);
+  // Package 6 fix round (the double export): `opts.atRest` re-reads a pad this
+  // page already unlocked WITHOUT a second 600k KDF — every check below runs
+  // exactly as on a first unlock. Only for the blob's own salt/iterations;
+  // anything else needs the passphrase again.
+  let key;
+  if (opts.atRest) {
+    if (opts.atRest.iters !== iters || b64(opts.atRest.salt) !== o.kdf.salt) {
+      throw new Error("this pad was saved again elsewhere — enter its passphrase to unlock it");
+    }
+    key = opts.atRest.key;
+  } else {
+    key = await deriveKey(passphrase, salt, iters);
+  }
   let plain;
   try {
     plain = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(o.iv) }, key, unb64(o.ct)));

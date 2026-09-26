@@ -210,6 +210,90 @@ async function otpConnect(padId = pad.padId) {
   console.log("OK  package 6: weak pad and transfer passphrases are accepted with a warning; strong ones draw none (executed)");
 }
 
+// ---- package 6 fix round (MEDIUM): one pad is exported ONCE ------------------
+// (a) Two clicks, neither awaited (a double click / double tap), and a second
+//     click while the first export's KDF runs: exactly one file.
+// (b) Another tab exports the pad this page has cached as "not exported":
+//     this page's Export must see the stored state, warn, and hand out nothing.
+{
+  const st = dom.el("otpStatus");
+  const fresh = async (label) => {
+    const p = await otp.generatePad({ label, totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    await otp.saveNewPad(p, PAD_PASS);
+    dom.el("otpSelect").value = p.padId;
+    dom.el("otpPass").value = PAD_PASS;
+    dom.el("otpXferPass").value = "transfer passphrase";
+    return p;
+  };
+  // (a) same instant
+  await fresh("double-a");
+  let d0 = downloads;
+  const lockNames = [];
+  const realRequest = navigator.locks.request;
+  navigator.locks.request = function (name, ...rest) { lockNames.push(name); return realRequest.call(this, name, ...rest); };
+  let firstDone = false;
+  const c1 = dom.el("otpExport").click().then(() => { firstDone = true; });
+  assert.strictEqual(dom.el("otpExport").disabled, true, "the Export button is disabled while an export runs");
+  const c2 = dom.el("otpExport").click();
+  await c2;
+  assert.ok(!firstDone && /already running/.test(dom.el("otpStatus").textContent),
+    "the second click is refused AT ONCE by the in-flight latch (it does not queue behind the first)");
+  await c1;
+  navigator.locks.request = realRequest;
+  await settle(10);
+  assert.strictEqual(downloads, d0 + 1, `package 6 fix round: a double click exports ONE file, not ${downloads - d0}`);
+  const padA = dom.el("otpSelect").value;
+  assert.deepStrictEqual(lockNames.filter((n) => n.startsWith("sc.otp.export.")), ["sc.otp.export.v1." + padA],
+    "the export runs under the pad's own Web Lock (a second tab waits for it)");
+  // (a') 30 ms apart — the second click lands during the first export's KDF
+  await fresh("double-b");
+  d0 = downloads;
+  const c3 = dom.el("otpExport").click();
+  await new Promise((r) => setTimeout(r, 30));
+  const c4 = dom.el("otpExport").click();
+  await c3; await c4;
+  await settle(10);
+  assert.strictEqual(downloads, d0 + 1, `package 6 fix round: a second click during the export adds no file (${downloads - d0})`);
+  assert.strictEqual(dom.el("otpExport").disabled, false, "…and the button is usable again afterwards");
+  // (b) this page unlocks (and caches) a pad; "another tab" exports it.
+  // Generate fills this page's unlock cache with the new pad (exported: false).
+  dom.el("otpPass").value = PAD_PASS;
+  dom.el("otpLabel").value = "two-tabs";
+  await dom.el("otpGenerate").click();
+  await settle(10);
+  const p = otp.listPads().find((m) => m.label === "two-tabs");
+  assert.ok(p, "fixture: the pad was generated here");
+  dom.el("otpSelect").value = p.padId;
+  dom.el("otpXferPass").value = "transfer passphrase";
+  const other = await otp.unlockPad(p.padId, PAD_PASS);      // tab B's own unlock
+  const fileB = await otp.exportPad(other.record, "tab b transfer");
+  await otp.markExported(other.record, other.atRest);        // tab B latches and hands out its file
+  void fileB;
+  // The cached-key re-read is only for the blob's own salt: a pad saved again
+  // under a new salt (re-imported elsewhere) needs the passphrase again.
+  await assert.rejects(otp.unlockPad(p.padId, null, { atRest: { ...other.atRest, salt: new Uint8Array(16) } }),
+    /saved again elsewhere/, "a cached key for another salt is refused with its own sentence");
+  d0 = downloads;
+  await dom.el("otpExport").click();
+  assert.strictEqual(downloads, d0, "package 6 fix round: a pad another tab already exported is not handed out again silently");
+  assert.match(st.textContent, /already exported/, "…the re-export warning appears: " + st.textContent);
+  // (c) no Web Locks: no export (a second tab could not be kept out).
+  {
+    await fresh("no-locks");
+    const realNav = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { value: { ...realNav, locks: undefined }, configurable: true, writable: true });
+    d0 = downloads;
+    try {
+      await dom.el("otpExport").click();
+    } finally {
+      Object.defineProperty(globalThis, "navigator", { value: realNav, configurable: true, writable: true });
+    }
+    assert.strictEqual(downloads, d0, "without Web Locks no pad file is handed out");
+    assert.match(st.textContent, /no Web Locks support/, "…and it says why");
+  }
+  console.log("OK  package 6 fix round: an OTP pad is exported once — a double click, a click during the export and a second tab's stale cache all hand out no second file (executed)");
+}
+
 // ---- F-ATREST-002 residual: latch BEFORE download -----------------------------
 {
   const p2 = await otp.generatePad({ label: "to-export", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
@@ -380,6 +464,20 @@ async function resealPad(padId, mutate) {
   await settle(10);
   assert.strictEqual(downloads, d0 + 1, "…and is handed out once it has");
   console.log("OK  3b: OTP transmit, display and export wait for the durable (IndexedDB) write (executed)");
+}
+
+// Package 6 fix round: a SECOND import of app.js (the page-reload tests at the
+// end of the block below) wires every listener again on the same DOM, so from
+// then on one click runs each handler twice — or three times after the second
+// reload. That is how a double export first showed up here, as a harness
+// artefact. Such tests therefore run LAST, and reloadApp makes that explicit:
+// after it, any click or event on the stub DOM throws.
+async function reloadApp(query) {
+  await import("./app.js?" + query);
+  El.prototype.dispatch = function () {
+    throw new Error("app.js was imported again: every listener now exists more than once — " +
+      "nothing may be clicked after a reload test (put the block before it, or in another file)");
+  };
 }
 
 // ==== package 4 (F-ATREST-008): the identity blob is never silently re-keyed =====
@@ -600,13 +698,13 @@ async function resealPad(padId, mutate) {
   await settle(40);
   assert.strictEqual(stored(), undefined, "final round M3: Forget removes the localStorage copy");
   assert.strictEqual(durableNow(), null, "final round M3: ...AND the durable copy");
-  await import("./app.js?reload=1");
+  await reloadApp("reload=1");
   await settle(20);
   assert.strictEqual(stored(), undefined, "final round M3: ...and nothing comes back on a reload");
   // (14) M5: the page-load restore of a durable-only copy (a create whose
   //      localStorage write was lost) — a reload puts it back.
   fakeIdb.setItem("sc.identity.v1", blobF);
-  await import("./app.js?reload=2");
+  await reloadApp("reload=2");
   await settle(20);
   assert.strictEqual(stored(), blobF, "final round M5: a reload puts a durable-only identity back into localStorage");
   globalThis.confirm = () => true;
