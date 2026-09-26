@@ -391,4 +391,40 @@ await testLegacyBlobImport();
 await testIdentityGenerationFloor();
 await testMitmDefeated();
 await testCrossSessionReplayDefeated();
+// Package 6 (2026-07-26 Info, passphrase policy): a warning for the obvious
+// cases, never a refusal. Each class has a case, and a strong passphrase has none.
+{
+  const { passphraseWarning, PASSPHRASE_MIN_CHARS } = await import("./identity.js");
+  assert.strictEqual(PASSPHRASE_MIN_CHARS, 12, "the warning threshold is 12 characters");
+  const weak = {
+    "1234": /only digits/,
+    "123456789012345": /only digits/,
+    "aaaaaaaaaaaaaaaaaa": /one character repeated/,
+    "abcdefghijklmnop": /simple sequence/,
+    "zyxwvutsrqpo": /simple sequence/,
+    "Password1234!": /common password/,
+    "qwertyuiop2024": /common password/,
+    "Pass Word 2024!!": /common password/, // split by spaces/digits, still the common word
+    "hunter2": /shorter than 12/,
+    // package 6 fix round (review Info)
+    "111111111111!": /no letters/,
+    "1234-5678-90": /no letters/,
+    "2024-01-01!!": /no letters/,
+    "passwordpassword": /one short block repeated/,
+    "abcabcabcabc": /one short block repeated/,
+    "Summer2024!!": /one short word with digits or symbols added/,
+    "elevenchars": /shorter than 12/,
+  };
+  for (const [p, why] of Object.entries(weak)) {
+    const w = passphraseWarning(p);
+    assert.ok(w && why.test(w), `${JSON.stringify(p)} must be warned about (${why}): ${w}`);
+    assert.match(w, /offline/, "the warning says why it matters");
+  }
+  for (const p of ["correct horse battery staple", "twelve chars", "tr0ub4dor&3xyz", "password manager drawer lamp"]) {
+    assert.strictEqual(passphraseWarning(p), null, `${JSON.stringify(p)} is not flagged`);
+  }
+  assert.strictEqual(passphraseWarning(""), null, "empty is the callers' own refusal, not this warning");
+  console.log("OK  passphrase warning: short, digits-only, repeated, sequence and common-word passphrases are flagged; strong ones are not");
+}
+
 console.log("\nAll identity / authenticated-handshake checks passed.");

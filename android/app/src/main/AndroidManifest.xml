@@ -15,6 +15,14 @@
         android:networkSecurityConfig="@xml/network_security_config"
         android:theme="@style/Theme.SecureChat">
 
+        <!-- Package 6, F-P7-24: no SafeBrowsing. It sends URL hash prefixes of
+             every load to Google; this WebView loads only the bundled client
+             and the one configured relay, so it protects nothing here and
+             would tell a third party when and where the app connects. -->
+        <meta-data
+            android:name="android.webkit.WebView.EnableSafeBrowsing"
+            android:value="false" />
+
         <!-- Package 3, F-ANDROID-001: taskAffinity="" so no other app can
              declare OUR affinity and have its activity placed into this task
              (the StrandHogg-style overlay: a lookalike screen asking for the

@@ -326,11 +326,21 @@ export async function unvouch(base, sessionToken, targetUsername, signal = undef
 // Vouches ABOUT a contact (requires their username#token handle, same gate as
 // the bundle lookup). Returns the server's raw list — the CALLER must verify
 // each signature against its own pinned voucher keys before trusting it.
-export async function fetchVouches(base, handle) {
+//
+// `by` (package 6, F-PROTO-007): the voucher names to ask about — at most
+// VOUCHES_BY_MAX (the relay's MAX_VOUCHES_BY). Without it the relay answers
+// its newest 50, which a flood of throwaway vouches can fill. A relay
+// without package 6 (0.3.1 and earlier) ignores the parameter and answers
+// the newest 50 as before; the caller filters by its own verified contacts
+// either way.
+export const VOUCHES_BY_MAX = 50;
+export async function fetchVouches(base, handle, by = null) {
   const parsed = parseHandle(handle);
   if (!parsed) throw new Error("expected a contact handle of the form username#token");
+  if (by && by.length > VOUCHES_BY_MAX) throw new Error("too many voucher names in one lookup");
   const res = await fetch(
-    base + "/api/users/" + encodeURIComponent(parsed.username) + "/vouches?t=" + encodeURIComponent(parsed.token),
+    base + "/api/users/" + encodeURIComponent(parsed.username) + "/vouches?t=" + encodeURIComponent(parsed.token) +
+      (by && by.length ? "&by=" + encodeURIComponent(by.join(",")) : ""),
   );
   if (res.status === 404) return null;
   if (!res.ok) throw new Error("vouch lookup failed: " + (await asError(res)));

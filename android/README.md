@@ -71,6 +71,43 @@ re-derived from the passphrase) and needs a timed design and a `lockAll()`
 in the client first. Verify on a device by backgrounding the app and opening
 recents (blank card), and with `adb shell screencap` (refused or black).
 
+## The pad-floor bridge and frames (F-ANDROID-002)
+The native OTP/store floor is reached through ONE `addJavascriptInterface`
+bridge, `SecureChatPadFloor`. Android exposes such a bridge to **every frame**
+of the WebView, of any origin — so the bridge is only as narrow as the set of
+frames the WebView can ever load. The app loads no framed content, and since
+package 6 that is a pinned invariant rather than an accident: the CSP stamped
+on `index.html` (`MainActivity.csp`) says `frame-src 'none'; child-src 'none'`
+(and `worker-src 'none'`) explicitly (not only through the `default-src 'none'`
+fallback, which a later edit could widen), the web relay's and the iOS shell's
+CSPs say the same, and all three are pinned (`client/android-source.test.mjs`,
+`backend/tests/test_static_hardening.py`, `backend/tests/test_csp_hash.py`).
+Honest limit: `frame-src` cannot stop an `about:blank` or `srcdoc` frame (there
+is no URL to fetch). Such a frame inherits the page's CSP, so no script runs in
+it — the bridge is still visible there, but nothing can call it — and the
+client creates none. What the bridge accepts is small
+anyway (read/bump of integer floors under an app-private HMAC, see
+`PadFloor.kt`).
+
+Why not `WebViewCompat.addWebMessageListener` (which can be limited to an
+origin allow-list)? It is asynchronous — messages, no return value — while the
+client's floor check runs synchronously inside unlock/persist decisions
+(`nativefloor.js`: "is this copy older than the floor?" must be answered
+before the next statement runs). Moving to it means reworking every floor call
+site into an async round trip with its own failure and ordering cases, a
+larger change than the risk it removes while no framed content loads. Revisit if the
+app ever needs a frame.
+
+## SafeBrowsing is off (F-P7-24)
+`AndroidManifest.xml` sets `android.webkit.WebView.EnableSafeBrowsing` to
+`false`. SafeBrowsing checks every URL the WebView loads against Google's lists,
+sending URL hash prefixes to Google; this WebView only ever loads the app's own
+bundled files (`https://secure-chat.internal/…`) and the one relay the user
+configured, so the check can protect nothing and would tell a third party
+when, and to which relay host, the app connects. Pinned in
+`client/android-source.test.mjs`. On a device this needs only the normal
+smoke test (the app still loads and reaches its relay).
+
 ## Relay-side requirement
 Because the app's origin differs from the relay's, the relay must allow-list it
 (it is a single fixed origin, not a wildcard). This is already wired:

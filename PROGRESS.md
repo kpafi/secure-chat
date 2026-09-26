@@ -94,11 +94,160 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   "Use here" (an invite link opened while the app is open in another tab
   needs it too); an identity saved without encryption keys now asks before
   new ones are made.
-- **Next:** package 6 (sweep of the remaining Low/Info findings + a "Known
-  limits" section in README.md). Then release 0.4.0 (no wire change; release
-  notes: IndexedDB migration, no downgrade, reload open tabs, OTP needs
-  IndexedDB, RSA removed, guest approval, one active tab), deploy incl.
-  deploy/README.md "Pending on the box", phone APK, archive `phase7-local`.
+- **Package 6 on `fix/sweep`, NOT merged (2026-09-26):** the last
+  Lows/Infos, and README **"Known limits"** — the one place that lists every
+  finding left open by design (what an attacker needs, what they get, why it
+  stays). Fixed: **F-CRYPTO-001** (a gap in the peer's frames is one
+  transcript line with its count; our own pre-verification drops are not
+  blamed on the relay), **F-PROTO-006** (a 🟡 counts 7 days after the last
+  SUCCESSFUL check, errors never extend it, a future stamp is stale, an
+  un-verified voucher stops counting at once), **F-PROTO-007** (`GET
+  /api/users/{u}/vouches?by=…`, ≤ 50 names, same gate and bucket; the client
+  asks by its own verified contacts; NO per-target cap — decided, it would be
+  a new lever), **F-ANDROID-002** (`frame-src`/`child-src 'none'` explicit in
+  both CSPs, why not addWebMessageListener in android/README.md),
+  **F-P7-24** (WebView SafeBrowsing off), **passphrase policy** (weak
+  identity / pad / transfer / AES256 passphrases warned about, never
+  refused). Decided and pinned, not changed: **F-CRYPTO-002**
+  (RATCHET_MAX_SKIP stays 64 — the slower side's pre-verification drops are
+  an honest gap), **/healthz** stays unthrottled (constant, stateless).
+  Every item bound by hand-run mutants (commit messages). Checked on the
+  branch: backend 301, `npm test` (all files), ios dist, gradle assembleDebug
+  + 12 unit tests (APK web files 30), e2e against a scratch relay on 8061 —
+  hostile-relay 24/24, room-admission 49/49, two-user-flow 15/15,
+  no-dead-ends 17/17, all-modes 28/28, contact-profile 67/67, durable-crash.
+  **Wire:** additive only (`?by=` is ignored by a 0.3.1 relay; old clients
+  get the old answer). **Release notes 0.4.0 add:** the gap line; "vouch not
+  re-checked"; weak-passphrase warnings. iOS WebShell.swift's CSP should get
+  the same two frame directives (iOS branch, not touched here).
+  **Fix round (2026-09-26, two reviews: no Critical/High in the branch):**
+  MEDIUM, pre-existing on master — one OTP pad could be EXPORTED TWICE
+  (double click / click during the KDF / another tab's stale unlock cache →
+  two files of one pad, a two-time pad): now a synchronous in-flight latch,
+  a per-pad Web Lock around the export (no Web Locks → no export), and a
+  fresh authenticated re-read (otp.unlockPad with the cached key) under the
+  lock; app-otp.test.mjs's page-reload imports are fenced (any click after a
+  reload throws). Low — the gap notice subtracted every pre-gate frame, so
+  injected junk hid real drops: AES256/OTP now hold/subtract nothing (and say
+  "before the secure channel was ready"); DHKE/PQKEM hold ≤ 64 pre-gate frames
+  and subtract only those that AUTHENTICATE on a scratch walk
+  (countAuthentic) — closes the documented masking residual; hold reset per
+  connection (bound). iOS CSP parity: worker/frame/child-src 'none' on iOS
+  (and worker-src on Android), pinned via test_csp_hash.py + XCTest.
+  Passphrase screen: no-letters, repeated-block and short-word+digits rules.
+  README corrections: window is "64 or more", a hostile relay can keep a
+  retracted but validly signed vouch (no time in the signature — known
+  limit), the gap notice needs a later frame, about:blank/srcdoc frames.
+  Mutants per item in the fix-round commits (ae0c6a2, 216e3e1, b54ce8b,
+  e699fe2, 79209eb). Re-checked: backend 302, npm test (all files), ios
+  dist, gradle + 12 unit tests, e2e on 8061 — hostile-relay 24/24,
+  room-admission 49/49, two-user-flow 15/15, no-dead-ends 17/17, all-modes
+  28/28, contact-profile 67/67, durable-crash passed.
+  **Round 2 (2026-09-26, review of 4ec8084..933990d):** round 1 confirmed.
+  A MEDIUM was found, pre-existing on master. Exporting, generating or
+  importing ANOTHER pad while an OTP connection was opening (a relay can
+  stall `joined` indefinitely) redirected the live session's saves to that
+  pad. The live pad then reopened after a reload at spent keystream.
+  Fixed in `0176186`:
+  - the OTP panel has its own cache (`otpPanel`); only connectInner writes
+    the session's pad;
+  - persist refuses a record that is not the cipher's pad;
+  - Connect re-reads its pad from storage under the pad lock (a stale cache
+    across tabs connected at a spent offset — found while fixing).
+
+  Decision: the panel is NOT disabled during a connection (not needed, and
+  it would give a stalling relay a lock-out).
+
+  F2: the export lock is proven HELD for the whole export (serialising lock
+  stub, two-tab race both orders, the reviewer's mutant RED). F3: a waiting
+  tab says "Waiting for this pad's export in another tab…".
+
+  Re-checked:
+  - backend 302, `npm test` (all files), ios dist
+  - gradle + 12 unit tests
+  - e2e on 8061: hostile-relay 24/24, room-admission 49/49, two-user-flow
+    15/15, no-dead-ends 17/17, all-modes 28/28, contact-profile 67/67,
+    durable-crash passed
+
+  **Round 3 (2026-09-26, full sweep of the OTP state flows at 8f58925):**
+  round 2 confirmed. One MEDIUM, pre-existing, reproduced in real Chromium
+  with two tabs (plaintext recovered): an export ran beside a LIVE session on
+  the same pad in another tab, and its latch wrote the pre-KDF snapshot over
+  the session's saved progress, so the pad reopened at spent keystream.
+  Fixed in `401f2bd`, three layers:
+  - export holds the pad's session lock (ifAvailable; in use → refused, said
+    why; lock order: pad lock, then export lock);
+  - the latch goes onto a post-KDF re-read (used meanwhile → no file);
+  - otp.js writePadBlob maxes against STORAGE (watermark + durable record),
+    not only the page's caches.
+
+  Also: the panel caches only the at-rest key (F2, Low from 0176186: a
+  never-zeroed pad copy kept spent keystream in memory); I1 send bound to its
+  session; I2 lock released on failed connects; I3 lock released only after
+  an in-flight save. Cross-tab tests now run on a separate otp.js instance.
+  The reviewer's browser PoC now prints "no reuse" (reopens at 68).
+
+  Re-checked:
+  - backend 302, `npm test` (all files), ios dist
+  - gradle + 12 unit tests
+  - e2e on 8061: hostile-relay 24/24, room-admission 49/49, two-user-flow
+    15/15, no-dead-ends 17/17, all-modes 28/28, contact-profile 67/67,
+    durable-crash passed
+
+  **Round 4 (2026-09-26, independent OTP sweep of 92efe63):** round 3
+  confirmed. One more MEDIUM, pre-existing and browser only: the same pad
+  file imported in two tabs gave a two-time pad (no pad lock; saveNewPad
+  checked "used?" only before its KDF; a new-key write discarded the other
+  tab's records). Fixed in `c272817` by enforcing a GENERAL invariant rather
+  than one more point fix:
+
+  > every writer of a pad's storage holds that pad's session lock, and every
+  > decision taken before a KDF is re-checked after it, right before the
+  > write.
+
+  - Import, Generate and Forget go through `withPadLock`.
+  - saveNewPad re-checks after its KDF.
+  - writePadBlob refuses to overwrite another key's records (only a
+    module-private FRESH_SAVE token may).
+  - Saves never start after a close; all in-flight saves hold the lock.
+  - A reconnect waits for the previous session's save; a stale cached key is
+    dropped.
+
+  The per-writer audit table is in the commit message. A real two-tab
+  Chromium check of this finding (not committed) reports "B refused, no
+  rewind". The round-3 browser PoC still reports "no reuse".
+
+  Re-checked:
+  - backend 302, `npm test` (all files), ios dist
+  - gradle + 12 unit tests
+  - e2e on 8061: hostile-relay 24/24, room-admission 49/49, two-user-flow
+    15/15, no-dead-ends 17/17, all-modes 28/28, contact-profile 67/67,
+    durable-crash passed
+
+  **Final round (2026-09-26, sweep of c225278: no Critical/High/Medium):**
+  fixed in `46126f0`.
+  - Low: the shared pad index lost entries across tabs. It is now only a
+    render cache; listPads/padMeta read the stored blobs.
+  - Low: a hung save blocked every Connect. The wait now runs before
+    `connecting` is set, only for the same OTP pad, and for at most 10 s.
+  - Info: a Disconnect during a receive's save is said.
+  - Mutants Ma/Mb/Mf bound. Ma needed the receive path to capture its
+    session.
+
+  Re-checked:
+  - backend 302, `npm test` (all files), ios dist
+  - gradle + 12 unit tests
+  - e2e on 8061: hostile-relay 24/24, two-user-flow 15/15, no-dead-ends
+    17/17, all-modes 28/28, contact-profile 67/67, durable-crash passed;
+    room-admission 49/49 once Chromium's TMPDIR was moved off /tmp (at 99 %,
+    it timed out on c225278 too).
+
+  **Owed:** merge on the owner's word.
+- **Next:** merge package 6, then release 0.4.0 (no wire change beyond the
+  additive `?by=`; release notes: IndexedDB migration, no downgrade, reload
+  open tabs, OTP needs IndexedDB, RSA removed, guest approval, one active
+  tab, package 6's three new messages), deploy incl. deploy/README.md
+  "Pending on the box", phone APK, archive `phase7-local`.
 - **Relay deployed:** still 0.3.1 (`v0.3.1`).
 - The full itemised 2026-08-07 list (all 47, incl. 18 Low / 15 Info) lives
   outside the repo at `~/secure-chat-pentest/state/findings/INDEX.md`.

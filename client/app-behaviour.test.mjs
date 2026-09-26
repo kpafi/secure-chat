@@ -23,6 +23,7 @@ import { makeCipher, bufToB64, b64ToBuf } from "./crypto.js";
 import { Identity, b64, unb64 } from "./identity.js";
 import { freshNonce, signHandshake, signKnock } from "./auth.js";
 import * as sealed from "./sealed.js";
+import { vouchMessageBytes } from "./account.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOM = "a".repeat(64);
@@ -62,6 +63,12 @@ globalThis.fetch = async (url, opts = {}) => {
     const messages = relay.mailbox.map((envelope) => ({ envelope, created_at: 0 }));
     relay.mailbox = [];
     return json(200, { messages });
+  }
+  // package 6: the vouch list, played per block (relay.vouches), else 404
+  if (u.includes("/api/users/") && u.includes("/vouches?")) {
+    if (!relay.vouches) return json(404, { detail: "not found" });
+    const r = relay.vouches(u);
+    return json(r.status, r.body);
   }
   if (u.includes("/api/users/")) {
     const name = decodeURIComponent(u.split("/api/users/")[1].split("?")[0]);
@@ -225,7 +232,7 @@ const junk = (i) => ({ type: "msg", room: ROOM, alg: "AES256", payload: Buffer.f
   const sessions = count(/joined room/);
   for (let i = 0; i < 600; i++) await ws.deliver(junk(i));
   assert.strictEqual(count(/joined room/), sessions, "M-5: a junk flood does not evict the session line");
-  const repeated = lines().filter((l) => /arrived before you verified/.test(l));
+  const repeated = lines().filter((l) => /arrived before the secure channel was ready/.test(l));
   assert.strictEqual(repeated.length, 1, `600 identical narrations are ONE line (got ${repeated.length})`);
   assert.match(repeated[0], /×\s*\d+/, "...carrying its count");
   assert.ok(lines().length <= 500, "...and the transcript stays bounded");
@@ -280,7 +287,7 @@ const junk = (i) => ({ type: "msg", room: ROOM, alg: "AES256", payload: Buffer.f
   assert.strictEqual(count(/joined room/), sessions, "...and the session line is untouched");
   const isKept = (re) => log().filter((c) => re.test(c.textContent)).every((c) => c.dataset.keep === "1");
   assert.ok(isKept(/joined room/) && isKept(/you created this chat/), "the session lines carry the `keep` marker");
-  assert.ok(log().some((c) => /arrived before you verified/.test(c.textContent) && !c.dataset.keep), "...a junk refusal does not");
+  assert.ok(log().some((c) => /arrived before the secure channel was ready/.test(c.textContent) && !c.dataset.keep), "...a junk refusal does not");
   console.log("OK  item 2: repeated `joined` is free; 2 800 interleaved frames cost at most three lines (executed)");
 }
 {
@@ -290,9 +297,9 @@ const junk = (i) => ({ type: "msg", room: ROOM, alg: "AES256", payload: Buffer.f
   await ws.deliver(junk(9000));
   await ws.deliver({ type: "denied" });
   await ws.deliver(junk(9001));
-  assert.strictEqual(count(/arrived before you verified/), 1,
+  assert.strictEqual(count(/arrived before the secure channel was ready/), 1,
     "an identical narration anywhere in the transcript is folded, not appended");
-  assert.match(lines()[lines().length - 1], /arrived before you verified.*×\s*\d+/, "...and moved to the end with its count");
+  assert.match(lines()[lines().length - 1], /arrived before the secure channel was ready.*×\s*\d+/, "...and moved to the end with its count");
   assert.strictEqual(count(/did not let you in/), 0, "an owner is never `denied` — the frame is dropped");
   const ws2 = await connect();
   await ws2.deliver({ type: "pending" });
@@ -1278,7 +1285,7 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
   }
   assert.strictEqual(lines().length, 500, "tier 1: the transcript is capped at 500");
   assert.ok(!lines().includes("mem0") && lines().includes("mem599"), "tier 1: the OLDEST conversation lines go");
-  assert.ok(said(/undecryptable message/) && said(/arrived before you verified/), "tier 1: no narration goes while conversation remains");
+  assert.ok(said(/undecryptable message/) && said(/arrived before the secure channel was ready/), "tier 1: no narration goes while conversation remains");
   const subtle = crypto.subtle;
   const origDerive = subtle.deriveBits;
   subtle.deriveBits = function (alg, key, len) {
@@ -1838,6 +1845,257 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
   console.log("OK  decision 3: contacts+chats live in one tab — a second tab does not open them; Use here takes over and the other tab locks and says why; no Web Locks falls back to 3b (executed)");
 }
 
+// ==== package 6, F-CRYPTO-001 (Low): a skipped gap is said, once per gap ==========
+// The ratchet fast-forwards over frames that never arrived and destroys their
+// keys; that used to be silent, so a relay dropping messages left no trace.
+// (a) AES256: every gap an authenticated frame steps over is one line just
+//     above it, with the count; no gap, no line; a forged frame far ahead is
+//     not a gap (it fails authentication and says "undecryptable").
+// (b) DHKE: frames WE dropped unread before our gate passed are not blamed on
+//     the relay — only a gap beyond them is.
+{
+  const GAP = /never arrived — the relay may have dropped them/;
+  const gapLines = () => lines().filter((l) => GAP.test(l));
+  const ONE = /^\[1 message from your contact never arrived — the relay may have dropped them\]( \(×\d+\))?$/;
+  // The eviction block above leaves 500 record lines; at the cap a new
+  // conversation line is the first thing evicted. Start from an empty log.
+  dom.el("log").textContent = "";
+  // The relay's `error` frame (drain) is not queued behind a decrypt, so the
+  // shown line itself is what is waited for.
+  const deliverMsg = async (ws, alg, pc, text) => {
+    await ws.deliver({ type: "msg", room: ROOM, alg, payload: await pc.encrypt(text) });
+    await until(() => said(new RegExp("^peer" + text + "$")), "the peer line " + text);
+  };
+  await nav("live");
+  const ws = await connect("AES256");
+  await ws.deliver({ type: "joined", role: "owner" });
+  const hello = ws.sent.map((f) => (f.type === "key" ? unpack(f.payload) : null)).find((p) => p && p.hello);
+  const peer = makeCipher("AES256", ROOM, { passphrase: PASS });
+  await peer.init();
+  const peerNonce = freshNonce();
+  await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: pack({ hello: true, n: peerNonce, reply: true }) });
+  await peer.setNonces(peerNonce, hello.n);
+  // Fix round (review Low): junk BEFORE key confirmation. No honest AES256
+  // frame can come before the peer's confirm tag, so these are not counted as
+  // ours — they used to be, and hid the same number of real drops below.
+  await ws.deliver(junk(9200));
+  await ws.deliver(junk(9201));
+  await until(() => said(/arrived before the secure channel was ready — dropped/), "the pre-confirmation narration");
+  assert.ok(!said(/before you verified the safety number/), "AES256 has no safety number: the narration does not mention one");
+  await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: pack({ confirm: peer.confirmation.mine }) });
+  assert.strictEqual(dom.el("text").disabled, false, "fixture: the AES256 session is confirmed");
+  const before = gapLines().length;
+  await deliverMsg(ws, "AES256", peer, "gap-m1");
+  assert.ok(said(/^peergap-m1$/) && gapLines().length === before, "control: an in-order frame shows no gap line ");
+  await peer.encrypt("gap-lost-2");
+  await peer.encrypt("gap-lost-3");
+  await deliverMsg(ws, "AES256", peer, "gap-m4");
+  const L = lines();
+  const at = L.indexOf("peergap-m4");
+  assert.ok(at > 0, "control: the frame after the gap is shown");
+  assert.strictEqual(L[at - 1], "[2 messages from your contact never arrived — the relay may have dropped them]",
+    "F-CRYPTO-001: a frame that stepped over 2 earlier ones says so, with the count, just above it");
+  await deliverMsg(ws, "AES256", peer, "gap-m5");
+  assert.ok(gapLines().length === before + 1 && !GAP.test(lines()[lines().indexOf("peergap-m5") - 1]),
+    "F-CRYPTO-001: one line per gap — the next in-order frame adds none");
+  await ws.deliver(junk(9100)); // n far ahead, fails authentication
+  await until(() => /undecryptable message/.test(lines()[lines().length - 1]), "the forged frame's narration");
+  assert.strictEqual(gapLines().length, before + 1, "a forged frame is never a gap (it does not authenticate)");
+  await peer.encrypt("gap-lost-6");
+  await deliverMsg(ws, "AES256", peer, "gap-m7");
+  assert.match(lines()[lines().indexOf("peergap-m7") - 1], ONE,
+    "...and a later gap of one says 1");
+  await dom.el("disconnect").click();
+
+  // (b) the peer passes its gate first and writes; we drop its frames unread.
+  //     F-CRYPTO-002 (package 6): 40 of them — more than a window of 32 — so
+  //     the first frame after our "It matches" must still decrypt. That is
+  //     the honest use a smaller RATCHET_MAX_SKIP would break.
+  const fay = await Identity.generate();
+  const { ws: w2, pc } = await handshakeToConfirm(fay);
+  await w2.deliver(confirmFrame(pc));
+  await until(() => !dom.el("verify").hidden, "Fay's gate");
+  const g0 = gapLines().length;
+  for (let i = 1; i <= 40; i++) {
+    await w2.deliver({ type: "msg", room: ROOM, alg: "DHKE", payload: await pc.encrypt("early-" + i) });
+  }
+  await settle(10);
+  assert.ok(!said(/^peerearly-/), "fixture: frames before our gate are dropped unread");
+  await dom.el("verifyOk").click();
+  await until(() => dom.el("text").disabled === false, "Fay's session to unlock");
+  await deliverMsg(w2, "DHKE", pc, "after-41");
+  assert.ok(said(/^peerafter-41$/), "F-CRYPTO-002: the first frame after our gate is shown — 40 frames dropped unread before it");
+  // (position, not only count: a narration that is already in the log folds
+  // and MOVES instead of adding a line)
+  assert.ok(gapLines().length === g0 && !GAP.test(lines()[lines().indexOf("peerafter-41") - 1]),
+    "F-CRYPTO-001: frames WE dropped before verifying are not reported as lost by the relay");
+  await pc.encrypt("after-lost-42");
+  await deliverMsg(w2, "DHKE", pc, "after-43");
+  // (a narration: the same sentence folds by membership and moves here, ×n)
+  assert.match(lines()[lines().indexOf("peerafter-43") - 1], ONE,
+    "...but a gap after that is ");
+  await dom.el("disconnect").click();
+
+  // (c) fix round: the relay drops the peer's LAST pre-verification frame and
+  //     injects junk plus a replay before our gate. Only frames that
+  //     authenticate against the chain are ours; the drop is still reported.
+  {
+    const gil = await Identity.generate();
+    const { ws: w3, pc: p3 } = await handshakeToConfirm(gil);
+    await w3.deliver(confirmFrame(p3));
+    await until(() => !dom.el("verify").hidden, "Gil's gate");
+    const early = [];
+    for (let i = 1; i <= 5; i++) early.push(await p3.encrypt("c-early-" + i));
+    for (const f of early.slice(0, 4)) await w3.deliver({ type: "msg", room: ROOM, alg: "DHKE", payload: f });
+    await w3.deliver({ type: "msg", room: ROOM, alg: "DHKE", payload: early[0] }); // a replay of an honest frame
+    for (let i = 0; i < 3; i++) await w3.deliver(Object.assign(junk(9300 + i), { alg: "DHKE" }));
+    // early[4] is dropped by the relay
+    await settle(10);
+    await dom.el("verifyOk").click();
+    await until(() => dom.el("text").disabled === false, "Gil's session to unlock");
+    await deliverMsg(w3, "DHKE", p3, "c-after-6");
+    assert.match(lines()[lines().indexOf("peerc-after-6") - 1], ONE,
+      "fix round: junk and a replay injected before the gate do not hide a dropped frame — 1 is reported");
+    await dom.el("disconnect").click();
+  }
+
+  // (d) fix round (coverage): what was held on one connection is gone on the
+  //     next. Connection 1 fills the hold with junk and ends unverified;
+  //     on connection 2 the peer's honest pre-verification frames must count.
+  {
+    const w4a = await connect("DHKE");
+    await w4a.deliver({ type: "joined", role: "owner" });
+    for (let i = 0; i < 64; i++) await w4a.deliver(Object.assign(junk(9400 + i), { alg: "DHKE" }));
+    await settle(10);
+    await dom.el("disconnect").click();
+    const hal2 = await Identity.generate();
+    const { ws: w4, pc: p4 } = await handshakeToConfirm(hal2);
+    await w4.deliver(confirmFrame(p4));
+    await until(() => !dom.el("verify").hidden, "Hal's gate");
+    for (let i = 1; i <= 2; i++) await w4.deliver({ type: "msg", room: ROOM, alg: "DHKE", payload: await p4.encrypt("d-early-" + i) });
+    await settle(10);
+    const g1 = gapLines().length;
+    await dom.el("verifyOk").click();
+    await until(() => dom.el("text").disabled === false, "Hal's session to unlock");
+    await deliverMsg(w4, "DHKE", p4, "d-after-3");
+    assert.ok(gapLines().length === g1 && !GAP.test(lines()[lines().indexOf("peerd-after-3") - 1]),
+      "fix round: a new connection starts with nothing held — the last connection's junk does not crowd out this one's frames");
+    await dom.el("disconnect").click();
+  }
+  console.log("OK  F-CRYPTO-001: a skipped gap shows one line with its count; only frames that authenticate as the peer's are subtracted — junk, replays and a previous connection hide nothing (executed)");
+}
+
+// ==== package 6, F-PROTO-006 + F-PROTO-007: vouch marks age out; the lookup asks by verified contacts ====
+// F-PROTO-006: a 🟡 used to have no maximum age — every fetch error kept the
+// last answer for ever. Now it counts for 7 days after the last SUCCESSFUL
+// check; older (or stamped in the future) it reads "vouch not re-checked".
+// F-PROTO-007: the lookup names the user's own in-person verified contacts
+// (`?by=`, ≤ 50 per request), so a flood of throwaway vouches cannot bury them.
+{
+  const realNow = Date.now;
+  const DAY = 24 * 60 * 60 * 1000;
+  const keysOf = (b) => ({ ed: b.ed, mldsa: b.mldsa, ecdh: b.ecdh, mlkem: b.mlkem });
+  const vic = await Identity.generate();
+  const tgt = await Identity.generate();
+  const vb = vic.publicBundle();
+  const tb = tgt.publicBundle();
+  await contacts.upsert({ username: "vic6", token: "tok-vic6", ...keysOf(vb), verified: true });
+  const extra = [];
+  for (let i = 0; i < 54; i++) {
+    const b = (await Identity.generate()).publicBundle();
+    extra.push("vv" + i);
+    await contacts.upsert({ username: "vv" + i, token: "tok-vv" + i, ...keysOf(b), verified: true });
+  }
+  await contacts.upsert({ username: "tgt6", token: "tok-tgt6", ...keysOf(tb) });
+  const sig = await vic.sign(vouchMessageBytes("tgt6", keysOf(tb)));
+  const good = { status: 200, body: { target: "tgt6", vouches: [{
+    voucher: "vic6", voucher_ed: vb.ed, voucher_mldsa: vb.mldsa, sig: sig.ed, mldsa_sig: sig.mldsa, created_at: 0,
+  }] } };
+  const asked = [];
+  // The relay honours `by` like the backend does; `oldRelay` ignores it (< 0.4.0).
+  let oldRelay = false;
+  let answer = (by) => (oldRelay || (by || "").split(",").includes("vic6") ? good : { status: 200, body: { vouches: [] } });
+  relay.vouches = (u) => {
+    const by = new URL(u, "http://relay.test").searchParams.get("by");
+    if (!u.includes("/api/users/tgt6/")) return { status: 200, body: { vouches: [] } };
+    asked.push(by);
+    return answer(by);
+  };
+  const markOf = (name) => {
+    const li = dom.el("userList").children.find((x) => x.dataset.user === name);
+    return li ? li.querySelector(".u-open").children[0].children[1] : null;
+  };
+  const show = async () => { await nav("chats"); await nav("users"); };
+  try {
+    await show();
+    await until(() => markOf("tgt6") && markOf("tgt6").textContent === "vouched by vic6", "the vouched mark");
+    assert.ok(markOf("tgt6").className.split(" ").includes("mid"), "control: a fresh vouch is 🟡 (mid)");
+    // F-PROTO-007: by = every verified contact whose record name is its directory
+    // name, never the target, in requests of at most 50 names.
+    // (earlier blocks left a few verified contacts of their own: they count too)
+    const expected = contacts.list().filter((c) => c.verified && !c.addrUsername).map((c) => c.username).sort();
+    assert.ok(expected.length > 50 && expected.includes("vic6") && extra.every((n) => expected.includes(n)), "fixture");
+    assert.strictEqual(asked.length, Math.ceil(expected.length / 50),
+      `F-PROTO-007: ${expected.length} verified contacts are asked about in ${Math.ceil(expected.length / 50)} requests (${asked.length})`);
+    const lists = asked.map((b) => (b || "").split(","));
+    assert.ok(lists.every((l) => l.length <= 50), "F-PROTO-007: at most 50 names per request");
+    assert.deepStrictEqual(lists.flat().sort(), expected,
+      "F-PROTO-007: the lookup asks by exactly the user's own in-person verified contacts (never the target, never an unverified one)");
+
+    // Compatibility: a relay older than 0.4.0 ignores `by` and answers the same
+    // newest list to both requests — the mark names the voucher once.
+    oldRelay = true;
+    Date.now = () => realNow() + 20 * 60 * 1000; // past the 10-minute re-check
+    const b0 = asked.length;
+    await show();
+    await until(() => asked.length >= b0 + 2, "the re-check against an old relay");
+    await settle(10);
+    await show();
+    assert.strictEqual(markOf("tgt6").textContent, "vouched by vic6", "compat: an old relay's repeated answer names the voucher once");
+    oldRelay = false;
+
+    // F-PROTO-006: 8 days later every check fails — the mark is no longer 🟡.
+    const working = answer;
+    answer = () => ({ status: 500, body: { detail: "down" } });
+    Date.now = () => realNow() + 8 * DAY;
+    const before = asked.length;
+    await show();
+    await until(() => asked.length > before, "the re-check to be attempted");
+    await settle(10);
+    await show();
+    assert.strictEqual(markOf("tgt6").textContent, "vouch not re-checked",
+      "F-PROTO-006: a vouch last confirmed more than 7 days ago is not shown as vouched");
+    assert.ok(!markOf("tgt6").className.split(" ").includes("mid"), "F-PROTO-006: ...and is not 🟡");
+    Date.now = () => realNow() + 6 * DAY;
+    await show();
+    assert.strictEqual(markOf("tgt6").textContent, "vouched by vic6",
+      "control: the failed fetches did not touch the age — at 6 days (fetch still failing) it is still 🟡");
+    // A stamp in the future (the clock was set back) is stale, and is re-checked.
+    Date.now = () => realNow() - DAY;
+    const b2 = asked.length;
+    await show();
+    assert.strictEqual(markOf("tgt6").textContent, "vouch not re-checked",
+      "F-PROTO-006: a check stamped in the future does not count as fresh");
+    await until(() => asked.length > b2, "a re-check despite the future stamp");
+    // A fresh successful answer restores it.
+    answer = working;
+    Date.now = () => realNow() + 9 * DAY;
+    await show();
+    await until(() => markOf("tgt6").textContent === "vouched by vic6", "a fresh answer to restore the mark");
+    // Un-verifying the voucher takes the mark off at once (no re-check needed).
+    await contacts.setVerified("vic6", false);
+    await show();
+    assert.strictEqual(markOf("tgt6").textContent, "unverified",
+      "F-PROTO-006: a voucher you no longer have verified vouches for nobody, from the next render on");
+  } finally {
+    Date.now = realNow;
+    relay.vouches = null;
+  }
+  for (const n of ["vic6", "tgt6", ...extra]) await contacts.remove(n);
+  await nav("live");
+  console.log("OK  F-PROTO-006/007: a vouch mark ages out 7 days after the last successful check (fetch errors do not extend it); the lookup asks by the user's verified contacts, ≤ 50 per request (executed)");
+}
+
 // ==== final round, Info-4: Forget while the stores are opening is not "another tab" ====
 // The L-2 re-check locked the stores and said "opened in another tab" whenever
 // the lock this unlock took was no longer held — also when THIS tab let it go
@@ -1861,6 +2119,45 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
     "final round Info-4: Forget during the unlock is not narrated as another tab taking the stores");
   assert.strictEqual(dom.el("usersTakeover").hidden, true, "...and no Use here is offered");
   console.log("OK  final round Info-4: a Forget during the store unlock locks the stores without blaming another tab (executed)");
+}
+
+// ==== package 6 (2026-07-26 Info): weak passphrases are warned about, never refused ====
+// (The block above forgot the identity, so a new one can be created here.)
+{
+  assert.strictEqual(dom.el("idCreate").hidden, false, "fixture: no identity, Create is offered");
+  dom.el("idPass").value = "hunter2";
+  await dom.el("idCreate").click();
+  await until(() => /Weak passphrase/.test(dom.el("idStatus").textContent) || /Could not create/.test(dom.el("idStatus").textContent), "the identity to be created");
+  assert.match(dom.el("idStatus").textContent, /^Identity created\. Weak passphrase: it is shorter than 12 characters\. .*offline/,
+    "a weak identity passphrase is accepted and warned about: " + dom.el("idStatus").textContent);
+  assert.match(dom.el("idStatus").className, /\berr\b/, "…as a warning");
+  assert.strictEqual(dom.el("idFingerprint").hidden, false, "…and the identity exists (not blocked)");
+
+  // The Live room's AES256 shared passphrase: said once the room is joined.
+  const joinWith = async (pass) => {
+    if (current && current.readyState === 1) await dom.el("disconnect").click();
+    await nav("live");
+    const room = dom.el("room");
+    room.value = ROOM;
+    await room.dispatch("input");
+    dom.el("pass").value = pass;
+    dom.selectAlg("AES256");
+    await dom.el("connect").click();
+    const ws = dom.socket();
+    ws.open();
+    await tick();
+    await ws.deliver({ type: "joined", role: "owner" });
+    current = ws;
+    const L = lines();
+    return L.slice(L.lastIndexOf("joined room — encryption: AES256"));
+  };
+  const weakLive = await joinWith("letmein2024");
+  assert.ok(weakLive.some((l) => /^\[Weak passphrase: it is a common password with a few characters added\. .*offline/.test(l)),
+    "a weak AES256 shared passphrase is said in the transcript at join: " + JSON.stringify(weakLive));
+  const strongLive = await joinWith(PASS);
+  assert.ok(!strongLive.some((l) => /Weak passphrase/.test(l)), "control: a strong shared passphrase draws no warning");
+  await dom.el("disconnect").click();
+  console.log("OK  package 6: a weak identity or AES256 shared passphrase is accepted with a warning; a strong one draws none (executed)");
 }
 
 console.log("\nAll app.js behavioural checks passed.");

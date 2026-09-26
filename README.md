@@ -315,18 +315,128 @@ contacts and chats are open in one tab or window of a browser at a time. A
 second tab says so and offers **Use here**, which moves them: the first tab
 locks them and says why.
 
-**Other known limits.**
-- The web client trusts the server to serve honest code (see above).
-- The onion shares a host with the clearnet site, so it does not hide the
+## Known limits
+Every pentest finding up to the Phase-7 round (2026-09-16) is either fixed or
+listed here (package 6 closed the last Lows and Infos it could). Each entry
+says what an attacker needs, what they get, and why it stays.
+
+**Trust and deployment**
+- **The web client trusts the server to serve honest code.** Whoever controls
+  the relay host (or its TLS) can ship changed JavaScript on the next load and
+  read everything that page decrypts. It stays because it is how every
+  web-delivered E2EE app works; the Android and iOS apps bundle the client and
+  are the answer (see "Trust boundary of the web client").
+- **The onion shares a host with the clearnet site**, so it does not hide the
   server's location (`deploy/README.md`).
-- `@noble/post-quantum` has no constant-time guarantee — an assurance note, not
-  a known vulnerability.
+- **`@noble/post-quantum` has no constant-time guarantee** — an assurance
+  note, not a known vulnerability.
+
+**What the relay sees and can do**
+- **Metadata.** The relay sees room ids, when each frame is sent and how big
+  it is (no padding), which handles you look up and whom you mail. It cannot
+  read or forge content. Routing needs this much; hiding it needs a mixnet.
+- **It can drop messages — visibly, once a later message arrives.** A relay
+  that drops frames in a live chat produces "N message(s) from your contact
+  never arrived" (F-CRYPTO-001) — but only above the next genuine message
+  that does arrive: the notice needs a later frame to measure the gap by, so
+  dropping the LAST messages of a chat (or dropping and then closing the
+  connection) leaves no notice. Frames injected before your check do not hide
+  drops: only the peer's own frames, checked against the key, count as
+  "yours". A gap of 64 or more frames (for example 64+ messages sent while
+  the other side had not yet verified) ends that session: every later frame
+  is undecryptable, a reconnect fixes it. The window stays 64: lowering it
+  would make this happen sooner in honest use (F-CRYPTO-002, reasoning in
+  `client/crypto.js`).
+- **Rooms: the first joiner owns the room, and the waiting queue can be
+  filled (P-08).** Anyone holding a room code can join first and become its
+  owner, or fill its few waiting slots with knocks. They get availability only:
+  the guest is shown the owner's key before anything is exchanged, and the
+  owner sees each knocker's key before letting anyone in. It stays because a
+  room code is a bearer capability by design; use a fresh code per chat.
+- **A handle holder can suppress a victim's new mail while the victim is
+  offline** (package 1, `backend/config.py`). With the victim's
+  `username#token` handle and ~65 throwaway accounts, an attacker can keep the
+  victim's inbox the heaviest and keep evicting the newest envelope — i.e. new
+  honest mail — until the victim comes online. Sealed sender means the relay
+  cannot tell padding from mail, so only the eviction order can be chosen;
+  older mail survives, senders see their message accepted.
+- **Registration replay can roll back published encryption keys
+  (F-RELAY-005).** Anyone who captured an older signed registration of an
+  account can replay it and put that account's older encryption keys back in
+  the directory. It only matters if the account ever published two different
+  key pairs; the identity keys cannot change this way, and the client
+  re-registers its current bundle on every unlock. Closing it needs a signed
+  counter in the registration, a wire change.
+- **A port-bearing `X-Forwarded-For` is not caught by the misconfiguration
+  detector (F-RELAY-002).** Only on a relay started with proxy headers ON
+  without a trusted proxy — which the shipped service never does
+  (`--no-proxy-headers`, pinned by `backend/tests/test_service_unit.py`). Then
+  a client could mint a fresh rate-limit bucket per forged header.
+- **Vouches.** A lookup now names the vouchers it asks about (your own
+  in-person verified contacts), so a flood of throwaway vouches cannot bury
+  theirs (F-PROTO-007) — but that tells the relay whom you have verified, by
+  name, on each re-check. The global vouch table has no eviction: filling it
+  (1000 accounts × 200 vouches) stops new vouches relay-wide until an
+  operator clears it. A 🟡 counts for 7 days after the last successful check
+  (F-PROTO-006), so a relay that answers every re-check with an ERROR can keep
+  a retracted vouch on screen for at most that long. A hostile relay can do
+  more: a vouch is a signature with no time or version in it, and a
+  retraction only deletes the relay's row — so a relay that kept the old
+  signature can keep serving it as a valid answer, and the 🟡 stays for as
+  long as you still have the voucher verified. Closing that needs a time or
+  epoch inside the signed vouch (a wire change); until then, un-verifying the
+  voucher is what removes the mark reliably.
+
+**Cryptography, by design**
+- **An AES256 room's key-confirmation tag is an offline passphrase verifier
+  (F-CRYPTO-004).** The relay (or anyone recording the traffic) can take the
+  tag from a session and test passphrase guesses offline against it,
+  PBKDF2-600k per guess. Key confirmation needs some value derived from the
+  passphrase; the only defence is a strong shared passphrase — the app now
+  warns about weak ones.
+- **Weak passphrases are warned about, not refused.** Identity, pad, pad-file
+  (transfer) and AES256 passphrases shorter than 12 characters, digits only,
+  one repeated character, a simple sequence or a common password draw a
+  warning. The owner has not decided a hard policy. Everything at rest is
+  PBKDF2-SHA256 with 600,000 iterations; Argon2id would need a migration of
+  every stored blob and is not planned yet.
+- **The PQKEM combiner has no transcript binding (F-CRYPTO-008).** The
+  hybrid key is derived from the two raw shared secrets, not from the
+  exchanged public keys and ciphertexts. The handshake that carries them is
+  signed by both identities, which gives the binding at the protocol layer;
+  changing the combiner would break interoperability between old and new
+  clients.
+- **Sealed (async) mail has no forward secrecy for the recipient
+  (F-CRYPTO-011).** Whoever later obtains your identity's encryption keys
+  (your device and passphrase) can open every sealed envelope sent to you that
+  they recorded. The keys are long-lived by design (they are your published
+  address). A chat in AES256 mode adds a shared-passphrase layer inside the
+  envelope, which that attacker also needs.
+- **The safety number's concatenation is not injective across bundle
+  versions (F-CRYPTO-013 / F-P7-21).** A signing-only bundle (1984 bytes) and
+  a full one (3233 bytes) can be re-split into a different pair with the same
+  bytes. Using that against the in-person check would need private keys for
+  public keys equal to chosen byte strings — every key field has a fixed
+  length, so that is a key-generation preimage for several schemes at once.
+  Owner decision (2026-09-24): the format stays unchanged, documented only.
+
+**This device**
+- **Browser storage can be rolled back as a whole.** In a plain browser
+  there is no storage the page cannot rewrite, so someone with access to the
+  browser profile can restore an OTP pad together with its usage records (key
+  reuse, OTP H-3), restore the contact and chat stores together with their
+  generation records (older pins and trust marks), or delete a store together
+  with every trace of it so the app starts empty (F-ATREST-003 in the
+  browser). The apps keep a native floor that refuses all three; use pads and
+  contacts in the app.
+- **Locking on background is not done** (owner decision). An unlocked
+  identity and open stores stay unlocked while the app is in the background;
+  a lock would end every live chat, since session keys cannot be derived
+  again from the passphrase.
 
 ## Security reviews
 The project has had one external audit (2026-07-18) and several pentest rounds
 (2026-07-25 … 2026-08-07); each report is in the repository root
 (`secure-chat-security-audit-*.md`, `secure-chat-pentest-*.md`); the fixes and
-what was left open are recorded in `PROGRESS.md`. The Low and Info findings of
-the 2026-08-07 round have not been worked yet. What was accepted by design
-rather than fixed is described above: the web client's trust in the server, the
-browser's OTP rollback residual, and the relay's routing metadata.
+what was left open are recorded in `PROGRESS.md`. Everything accepted by
+design rather than fixed is listed under "Known limits" above.

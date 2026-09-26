@@ -373,6 +373,16 @@ async def security_headers(request: Request, call_next):
         # outlives the fix. It does NOT stop a compromised relay, which writes
         # its own headers. The client uses no workers (pentest dist-1 F3/2 L1).
         "worker-src 'none'; "
+        # No framed content (package 6, F-ANDROID-002): default-src 'none'
+        # already covers frame-src/child-src, but only as a fallback — a later
+        # edit to default-src would silently open them. The client embeds
+        # nothing, and the Android shell's JS bridge is exposed to EVERY frame
+        # of its WebView, so this is spelled out on all three shells. Honest
+        # limit: frame-src cannot stop an about:blank or srcdoc frame, which
+        # has no URL to fetch — such a frame inherits this CSP, so no script
+        # runs in it (and the client creates none).
+        "frame-src 'none'; "
+        "child-src 'none'; "
         "base-uri 'none'; "
         "form-action 'none'; "
         "frame-ancestors 'none'"
@@ -399,6 +409,17 @@ async def security_headers(request: Request, call_next):
     return resp
 
 
+# Pentest 2026-07-26 (Info): /healthz has no rate limit. Decided in package 6:
+# it stays that way. It answers two constants (status, release version — the
+# version is public anyway: it is in every served client), touches no database,
+# file, lock or per-client state, and allocates nothing that outlives the
+# request, so a flood of it costs the relay exactly what a flood of any 404
+# costs, and the per-host buckets in front of /api would only add per-client
+# state to a path that has none. A limiter would also make the one "is it up,
+# which build?" probe the deploy checks and monitors use answer 429 behind a
+# shared exit (Tor: every client is one host). Pinned by
+# tests/test_static_hardening.py::test_healthz_is_constant_and_stateless — if
+# this handler ever grows a lookup, that test fails and the decision is redone.
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok", "version": config.VERSION}

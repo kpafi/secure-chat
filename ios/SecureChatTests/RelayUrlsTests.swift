@@ -61,6 +61,10 @@ final class RelayUrlsTests: XCTestCase {
         XCTAssertTrue(csp.contains("script-src 'self' '\(WebShell.importMapHash)';"))
         XCTAssertTrue(csp.hasPrefix("default-src 'none';"))
         XCTAssertFalse(csp.contains("unsafe"))
+        // Package 6 fix round: no frames, no workers — as on Android and the web.
+        for directive in ["worker-src 'none';", "frame-src 'none';", "child-src 'none';"] {
+            XCTAssertTrue(csp.contains(directive), directive)
+        }
     }
 
     @MainActor
