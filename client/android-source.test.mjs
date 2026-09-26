@@ -30,6 +30,8 @@ const SRC = new URL("../android/app/src/main/java/org/securechat/app/", import.m
 const activityRaw = await readFile(new URL("MainActivity.kt", SRC), "utf8");
 const floorRaw = await readFile(new URL("PadFloor.kt", SRC), "utf8");
 const manifest = await readFile(new URL("../android/app/src/main/AndroidManifest.xml", import.meta.url), "utf8");
+const padFilesRaw = await readFile(new URL("PadFiles.kt", SRC), "utf8");
+const sharePaths = await readFile(new URL("../android/app/src/main/res/xml/pad_share_paths.xml", import.meta.url), "utf8");
 
 // Replace every Kotlin comment with whitespace (newlines kept, so line structure
 // survives). Strings — "…" with escapes and ${ } templates, """…""" raw strings,
@@ -255,9 +257,13 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
   }
   assert.ok(!lines.some((l) => /allow(File|Content|UniversalAccessFromFile|FileAccessFromFile)\w* = true/.test(l)),
     "F-P7-A5: no file/content access setting may be switched on anywhere");
+  // OTP transfer sheets: a second bridge, the pad-file one (section 9). Still
+  // an exact list — a third bridge, or either one under another name, is red.
   const bridges = lines.filter((l) => /addJavascriptInterface\(/.test(l));
-  assert.deepStrictEqual(bridges, ['wv.addJavascriptInterface(PadFloorBridge(this), "SecureChatPadFloor")'],
-    `F-P7-A5: exactly ONE JavaScript bridge, the pad floor — found ${JSON.stringify(bridges)}`);
+  assert.deepStrictEqual(bridges, [
+    'wv.addJavascriptInterface(PadFloorBridge(this), "SecureChatPadFloor")',
+    'wv.addJavascriptInterface(padFiles, "SecureChatFiles")',
+  ], `F-P7-A5: exactly TWO JavaScript bridges, the pad floor and the pad files — found ${JSON.stringify(bridges)}`);
   assert.deepStrictEqual(lines.filter((l) => /setWebContentsDebuggingEnabled\(/.test(l)),
     ["if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true)"],
     "F-P7-A5: remote debugging (localStorage over the devtools socket) only in debug builds");
@@ -281,7 +287,7 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
   assert.ok(csp.includes('"frame-src \'none\'; " +') && csp.includes('"child-src \'none\'; " +'),
     "F-ANDROID-002: the app CSP must say frame-src 'none' and child-src 'none' explicitly");
   assert.ok(csp.includes('"worker-src \'none\'; " +'), "package 6 fix round: no workers either, as on the web and iOS");
-  ok("F-P7-A5: file/content access off, one bridge, debug-only devtools, CSP pinned");
+  ok("F-P7-A5: file/content access off, two bridges (floor, pad files), debug-only devtools, CSP pinned");
 }
 
 // --- 5. the injected document-start script (H-1 / H-A descriptors) -------------
@@ -307,8 +313,8 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
     }
     calls.push(script.slice(m.index, i + 1));
   }
-  assert.strictEqual(calls.length, 2, `exactly two defineProperty calls in the injected script, found ${calls.length}`);
-  for (const name of ["__SECURE_CHAT_PAD_FLOOR__", "__SECURE_CHAT_NATIVE_FLOOR__"]) {
+  assert.strictEqual(calls.length, 3, `exactly three defineProperty calls in the injected script, found ${calls.length}`);
+  for (const name of ["__SECURE_CHAT_PAD_FLOOR__", "__SECURE_CHAT_NATIVE_FLOOR__", "__SECURE_CHAT_FILES__"]) {
     const call = calls.find((c) => c.includes(`'${name}'`));
     assert.ok(call, `the script must publish ${name} with Object.defineProperty`);
     assert.match(call, /writable:\s*false/, `${name}: non-writable`);
@@ -318,9 +324,26 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
   const bridgeCall = calls.find((c) => c.includes("'__SECURE_CHAT_PAD_FLOOR__'"));
   assert.match(bridgeCall, /value:\s*Object\.freeze\(\{\s*read:\s*b\.read\.bind\(b\),\s*bump:\s*b\.bump\.bind\(b\)\s*\}\)/,
     "H-A: the published bridge is FROZEN with BOUND methods (a later `b.read = fake` must not be obeyed)");
+  // OTP transfer sheets: the pad-file bridge is captured in the SAME
+  // document-start script, from the raw bridge global, frozen with BOUND
+  // methods — the H-A lesson: a closure calling `f.share(…)` would obey a
+  // later `SecureChatFiles.share = fake`.
+  const filesCall = calls.find((c) => c.includes("'__SECURE_CHAT_FILES__'"));
+  assert.match(filesCall, /value:\s*Object\.freeze\(\{\s*share:\s*f\.share\.bind\(f\),\s*save:\s*f\.save\.bind\(f\)\s*\}\)/,
+    "the published pad-file bridge is FROZEN with BOUND share/save");
+  assert.match(script, /var f = window\.SecureChatFiles;\s*\n\s*if \(!!f && typeof f\.share === 'function' && typeof f\.save === 'function'\) \{\s*\n\s*Object\.defineProperty\(window, '__SECURE_CHAT_FILES__'/,
+    "`f` is the shell's SecureChatFiles, read at document-start, and the capture is guarded on both methods");
+  // verifyRelayConfig refuses to run a page where the capture did not land:
+  // without it the client falls back to a download the WebView drops AFTER
+  // the pad is latched as exported (the bug this bridge fixes).
+  const verify = kotlinFun(/^private fun verifyRelayConfig\(\) \{$/, "verifyRelayConfig").join("\n");
+  for (const m of ["share", "save"]) {
+    assert.ok(verify.includes(`"&& typeof (window.__SECURE_CHAT_FILES__||{}).${m} === 'function'`),
+      `verifyRelayConfig must require the frozen __SECURE_CHAT_FILES__.${m}`);
+  }
   assert.ok(/relayScript = WebViewCompat\.addDocumentStartJavaScript\(\nbinding\.webview, js, setOf\(appOrigin\),\n\)/
     .test(lines.join("\n")), "the script is injected at document-start for the app origin only");
-  ok("H-1/H-A: both injected globals are non-writable, non-configurable, non-enumerable; the bridge is frozen and bound");
+  ok("H-1/H-A: all three injected globals are non-writable, non-configurable, non-enumerable; both bridges are frozen and bound");
 }
 
 // --- 6. PadFloor.kt: every bump answer is honest (Package 3, ROUND-3 F-4, 7b) --
@@ -403,6 +426,175 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
   assert.ok(!lines.some((l) => /safeBrowsingEnabled\s*=\s*true|setSafeBrowsingEnabled\(\s*true|startSafeBrowsing\(/.test(l)),
     "F-P7-24: no code path re-enables SafeBrowsing");
   ok("F-P7-24: WebView SafeBrowsing is disabled in the manifest and never re-enabled in code");
+}
+
+// --- 9. the pad-file bridge: export (share / save) and import (OTP transfer sheets)
+// design/research/reviews/otp-transfer-brief.md 5, 6, 9. The bridge is reachable
+// by any script in the page, so what it accepts, what it can write where, and
+// what it evaluates back into the page are pinned here; the behaviour is in
+// android/app/src/test (PadFilesTest, PadFilesActivityTest).
+{
+  const pf = stripKotlinComments(padFilesRaw);
+  const pfLines = codeLines(pf);
+  assert.ok(/ICU/.test(padFilesRaw) && !/ICU/.test(pf), "control: PadFiles.kt comments are stripped");
+
+  // (a) the name: brief 7, exactly; [0-9] (ICU's \d is any Unicode digit), whole-input match.
+  assert.ok(pfLines.includes('val NAME = Regex("secure-chat-pad-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}\\\\.json")'),
+    "PadFileRules.NAME is exactly secure-chat-pad-YYYY-MM-DD-HHMM.json with ASCII digits");
+  assert.ok(pfLines.includes("fun validName(name: String?): Boolean = name != null && NAME.matches(name)"),
+    "validName matches the WHOLE name (Regex.matches, not find/containsMatchIn)");
+  // (b) the size cap and the text check, in this order (cheap length first).
+  assert.ok(pfLines.includes("const val MAX_BYTES = 4 * 1024 * 1024"), "the text cap is 4 MiB, as importPad's");
+  assert.deepStrictEqual(kotlinFun(/^fun validText\(text: String\?\): Boolean \{$/, "validText", pfLines).slice(1, -1), [
+    "if (text == null || text.length > MAX_BYTES) return false",
+    "if (text.toByteArray(Charsets.UTF_8).size > MAX_BYTES) return false",
+    "return ENVELOPE.matches(text)",
+  ], "validText: null / over-length refused, UTF-8 bytes capped, then the WHOLE text must be the envelope");
+  assert.ok(pfLines.includes("fun valid(name: String?, text: String?): Boolean = validName(name) && validText(text)"),
+    "valid() needs both");
+  // (c) one request at a time; nothing starts before validation and the slot.
+  assert.deepStrictEqual(kotlinFun(/^private fun request\(kind: PadFileRequest\.Kind, name: String\?, text: String\?\): String \{$/,
+    "PadFilesBridge.request", pfLines).slice(1, -1), [
+    "if (inFlight.get() != null) return BUSY",
+    "if (!PadFileRules.valid(name, text)) return INVALID",
+    "val id = newId()",
+    "if (!inFlight.compareAndSet(null, id)) return BUSY",
+    "start(PadFileRequest(kind, id, name!!, text!!))",
+    "return id",
+  ], "request(): busy / invalid refused before anything starts; the slot is claimed atomically");
+  assert.strictEqual(pfLines.filter((l) => l === "@JavascriptInterface").length, 2, "exactly two page-callable methods");
+  for (const m of ["share", "save"]) {
+    assert.ok(pfLines.includes(`fun ${m}(name: String?, text: String?): String = request(PadFileRequest.Kind.${m.toUpperCase()}, name, text)`),
+      `${m}() takes only (name, text) and goes through request()`);
+  }
+  // (d) the way back into the page: our hex id and a constant outcome, nothing else.
+  assert.ok(pfLines.includes('private val ID = Regex("[0-9a-f]{16}")'), "request ids are 16 lowercase hex");
+  assert.deepStrictEqual(kotlinFun(/^fun resultScript\(id: String, outcome: String\): String \{$/, "resultScript", pfLines).slice(1, -1), [
+    'require(ID.matches(id)) { "request id must be 16 lowercase hex" }',
+    'require(outcome in PadFileOutcome.ALL) { "unknown outcome" }',
+    'return "window.__SECURE_CHAT_FILES_RESULT__ && " +',
+    '"window.__SECURE_CHAT_FILES_RESULT__(\\"$id\\", \\"$outcome\\")"',
+  ], "resultScript: a checked id and a checked outcome are the only interpolations");
+  assert.ok(pfLines.includes("val ALL = setOf(SHARED, SAVED, CANCELLED, ERROR)"), "four outcomes");
+  for (const [k, v] of [["SHARED", "shared"], ["SAVED", "saved"], ["CANCELLED", "cancelled"], ["ERROR", "error"]]) {
+    assert.ok(pfLines.includes(`const val ${k} = "${v}"`), `outcome ${k} = "${v}" (the web client's contract)`);
+  }
+  const evals = lines.filter((l) => /evaluateJavascript\(/.test(l));
+  assert.deepStrictEqual(evals, [
+    "binding.webview.evaluateJavascript(PadFilesBridge.resultScript(id, outcome), null)",
+    "binding.webview.evaluateJavascript(",
+  ], `MainActivity evaluates only resultScript and the verifyRelayConfig probe — found ${JSON.stringify(evals)}`);
+
+  // (e) the envelope pattern holds the REAL exportPad() output (and the
+  // largest pad fits the cap) — so native and client cannot drift apart.
+  const envLine = pfLines.find((l) => l.startsWith('"""\\{"fmt":'));
+  assert.ok(envLine, "PadFileRules.ENVELOPE is a raw-string regex");
+  const envelope = new RegExp("^(?:" + envLine.slice(3, envLine.lastIndexOf('"""')) + ")$");
+  const { exportPad, PAD_SIZES } = await import("./otp.js");
+  const biggest = Math.max(...PAD_SIZES.map((p) => p.bytes));
+  const bytes = new Uint8Array(biggest);
+  for (let o = 0; o < biggest; o += 65536) crypto.getRandomValues(bytes.subarray(o, o + 65536));
+  const fileText = await exportPad({ padId: "ab".repeat(16), label: "Chess club é—\"</script>",
+    regionSize: biggest / 2, role: 0, sendOffset: 0, recvHighWater: 0, bytes }, "transfer passphrase");
+  assert.match(fileText, envelope, "the real exportPad() output matches PadFileRules.ENVELOPE");
+  assert.ok(Buffer.byteLength(fileText, "utf8") <= 4 * 1024 * 1024,
+    `the largest export (${Buffer.byteLength(fileText)} bytes) fits under MAX_BYTES`);
+  assert.doesNotMatch(fileText + "<html>", envelope, "control: the pattern is anchored");
+  assert.doesNotMatch(fileText.replace('"v":1', '"v":1,"x":1'), envelope, "control: no extra key");
+
+  // (f) share: fixed type, one extra (our FileProvider URI), a READ grant only,
+  // the file in cacheDir/pad-share under the validated name.
+  const share = kotlinFun(/^private fun startShare\(req: PadFileRequest\) \{$/, "startShare");
+  for (const must of [
+    "val dir = clearShareDir()",
+    "val file = File(dir, req.name)",
+    'if (file.parentFile != dir) throw IOException("share file escapes its directory")',
+    'val uri = FileProvider.getUriForFile(this, "$packageName.files", file)',
+    "val send = Intent(Intent.ACTION_SEND).apply {",
+    'type = "application/json"',
+    "putExtra(Intent.EXTRA_STREAM, uri)",
+    "clipData = ClipData.newRawUri(req.name, uri)",
+    "addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)",
+    "Intent(shareChosenAction).setPackage(packageName).putExtra(EXTRA_REQUEST, req.id),",
+    "shareLauncher.launch(Intent.createChooser(send, getString(R.string.share_pad_title), chosen.intentSender))",
+  ]) assert.ok(share.includes(must), `startShare must contain \`${must}\``);
+  assert.deepStrictEqual(share.join("\n").match(/putExtra\([^)]*\)/g),
+    ["putExtra(Intent.EXTRA_STREAM, uri)", "putExtra(EXTRA_REQUEST, req.id)"],
+    "the share intent carries EXTRA_STREAM only (plus our own request id on the chooser callback)");
+  assert.ok(!lines.some((l) => /FLAG_GRANT_(WRITE|PERSISTABLE|PREFIX)_URI_PERMISSION|takePersistableUriPermission/.test(l)),
+    "no write, persistable or prefix URI grant anywhere");
+  assert.ok(kotlinFun(/^private fun clearShareDir\(\): File \{$/, "clearShareDir").includes("val dir = File(cacheDir, SHARE_DIR)"),
+    "the share dir is under cacheDir");
+  assert.ok(lines.includes('const val SHARE_DIR = "pad-share"'), "SHARE_DIR is pad-share");
+  const onCreate = kotlinFun(/^override fun onCreate\(/, "onCreate");
+  const clearAt = onCreate.indexOf("clearShareDir()");
+  assert.ok(clearAt > 0 && clearAt < onCreate.indexOf("configureWebView()"),
+    "stale pad files are removed at every start, before the page can run");
+  assert.ok(callAt(onCreate, onCreate.findIndex((l) => l.startsWith("ContextCompat.registerReceiver(")), "registerReceiver(")
+    .includes("ContextCompat.RECEIVER_NOT_EXPORTED"), "the chooser-callback receiver is NOT exported");
+
+  // (g) the FileProvider: not exported, one authority, one directory.
+  const noComments = manifest.replace(/<!--[\s\S]*?-->/g, "");
+  const providers = [...noComments.matchAll(/<provider\b[\s\S]*?<\/provider>/g)].map((m) => m[0]);
+  assert.strictEqual(providers.length, 1, "exactly one provider");
+  for (const attr of ['android:name="androidx.core.content.FileProvider"', 'android:authorities="${applicationId}.files"',
+    'android:exported="false"', 'android:grantUriPermissions="true"', 'android:resource="@xml/pad_share_paths"']) {
+    assert.ok(providers[0].includes(attr), `the FileProvider declares ${attr}`);
+  }
+  const paths = sharePaths.replace(/<!--[\s\S]*?-->/g, "");
+  assert.deepStrictEqual([...paths.matchAll(/<([a-z-]+)\b[^>]*\/>/g)].map((m) => m[0]),
+    ['<cache-path name="pad-share" path="pad-share/" />'],
+    "the FileProvider exposes cacheDir/pad-share/ and NOTHING else (no root-/files-/external-path, no bare cache-path)");
+  assert.deepStrictEqual([...noComments.matchAll(/<uses-permission\b[^>]*>/g)].map((m) => m[0]),
+    ['<uses-permission android:name="android.permission.INTERNET" />'],
+    "no new permission: SAF and a FileProvider grant need none");
+
+  // (h) Import: onShowFileChooser on the WebChromeClient the WebView uses.
+  const configure = kotlinFun(/^private fun configureWebView\(\) \{$/, "configureWebView");
+  assert.ok(configure.includes("override fun onShowFileChooser(") &&
+    configure.includes("): Boolean = showFileChooser(filePathCallback, fileChooserParams)"),
+    "the WebChromeClient overrides onShowFileChooser (without it <input type=file> is ignored)");
+  const chooser = kotlinFun(/^private fun showFileChooser\($/, "showFileChooser");
+  assert.deepStrictEqual(chooser.slice(chooser.indexOf("): Boolean {") + 1, -1), [
+    "fileChooserCallback?.onReceiveValue(null)",
+    "fileChooserCallback = null",
+    "if (params.mode != WebChromeClient.FileChooserParams.MODE_OPEN) {",
+    "callback.onReceiveValue(null)",
+    "return true",
+    "}",
+    "fileChooserCallback = callback",
+    "try {",
+    'openLauncher.launch(arrayOf("*/*"))',
+    "} catch (e: ActivityNotFoundException) {",
+    "fileChooserCallback = null",
+    "callback.onReceiveValue(null)",
+    "}",
+    "return true",
+  ], "showFileChooser: old callback cancelled, open mode only, one document of any type, every path answers");
+  assert.deepStrictEqual(kotlinFun(/^private fun onFileChosen\(uri: Uri\?\) \{$/, "onFileChosen").slice(1, -1), [
+    "val callback = fileChooserCallback ?: return",
+    "fileChooserCallback = null",
+    "callback.onReceiveValue(uri?.let { arrayOf(it) })",
+  ], "onFileChosen hands the WebView the picked URI (or null) exactly once");
+  assert.ok(!lines.some((l) => /EXTRA_ALLOW_MULTIPLE|OpenMultipleDocuments|GetContent|ACTION_GET_CONTENT/.test(l)),
+    "one document, through the SAF picker only");
+
+  // (i) both document intents: CATEGORY_OPENABLE and — design critic r2 N-M1 —
+  // EXTRA_LOCAL_ONLY, so the save dialog (and the import picker) offer no
+  // cloud roots. A hint providers may ignore (README), pinned all the same.
+  for (const [launcher, contract] of [
+    ["saveLauncher", 'object : ActivityResultContracts.CreateDocument("application/json") {'],
+    ["openLauncher", "object : ActivityResultContracts.OpenDocument() {"],
+  ]) {
+    const at = lines.indexOf(`private val ${launcher} = registerForActivityResult(`);
+    assert.ok(at > 0 && lines[at + 1] === contract, `${launcher} uses ${contract}`);
+    assert.deepStrictEqual(lines.slice(at + 3, at + 5), [
+      "super.createIntent(context, input).addCategory(Intent.CATEGORY_OPENABLE)",
+      ".putExtra(Intent.EXTRA_LOCAL_ONLY, true)",
+    ], `${launcher}: CATEGORY_OPENABLE and EXTRA_LOCAL_ONLY on the intent it launches`);
+  }
+  ok("pad files: exact name, 4 MiB, canonical envelope (= real exportPad), one at a time, fixed result script, " +
+    "share = read grant on cacheDir/pad-share only, save/import local-only + openable, onShowFileChooser answers once");
 }
 
 console.log(`\nAll ${n} Android source checks passed.`);

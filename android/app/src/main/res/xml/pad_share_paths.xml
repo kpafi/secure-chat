@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider paths for the OTP pad share (MainActivity.startShare). ONE entry,
+  the one cache subdirectory the app writes the file being shared into. No
+  root-path, files-path, external-path or a bare cache-path: a grant can then
+  only ever name a file in pad-share/, which holds at most the one pad export
+  (the transfer-passphrase-encrypted envelope) and is emptied at every start
+  and before every share. Pinned in client/android-source.test.mjs.
+-->
+<paths>
+    <cache-path name="pad-share" path="pad-share/" />
+</paths>

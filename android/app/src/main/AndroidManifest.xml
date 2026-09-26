@@ -2,7 +2,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!-- The relay is remote; the app needs the network. No other permissions:
-         crypto, identity storage (WebView localStorage) and UI are all local. -->
+         crypto, identity storage (WebView localStorage) and UI are all local.
+         Handing a pad file out (share sheet, system save dialog) and picking
+         one to import (system document picker) need none either: the Storage
+         Access Framework and a FileProvider grant work per document, on the
+         user's pick. -->
     <uses-permission android:name="android.permission.INTERNET" />
 
     <application
@@ -40,5 +44,19 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- OTP transfer sheets: the exported pad file handed to the share
+             sheet. Not exported: nothing can open a URI of ours except a
+             target the chooser grants read access to, one file at a time.
+             The paths xml exposes cacheDir/pad-share/ and nothing else. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/pad_share_paths" />
+        </provider>
     </application>
 </manifest>

@@ -11,4 +11,5 @@
     <string name="webview_unsupported_title">Cannot start securely</string>
     <string name="webview_unsupported_msg">This device\'s Android System WebView is too old to run secure-chat. The app configures the encrypted client before any page code runs, and that step is unavailable here — continuing would load a client that cannot reach the relay and cannot mask passphrase entry. Update Android System WebView (or Chrome) from the Play Store and start the app again.</string>
     <string name="close">Close</string>
+    <string name="share_pad_title">Share the pad file</string>
 </resources>
