@@ -21,7 +21,7 @@
 import { makeCipher, isAscii, bufToB64, b64ToBuf, REMOVED_ALGS } from "./crypto.js";
 import {
   Identity, canonicalPublicBundle, checkIdentityGeneration, raiseIdentityFloor, identityFloorId,
-  passphraseWarning,
+  passphraseWarning, passphraseWeakness, PASSPHRASE_MIN_CHARS,
 } from "./identity.js";
 import { captureNativeFloor } from "./nativefloor.js";
 import * as durable from "./durable.js";
@@ -36,6 +36,41 @@ import * as chats from "./chats.js";
 import * as sealed from "./sealed.js";
 import { makeKeyConfirmation } from "./keyconfirm.js";
 import { generate as qrGenerate } from "lean-qr";
+
+// ---- Android file bridge (OTP export: Share… / Save to device) ------------
+// The Android shell captures its @JavascriptInterface at document-start and
+// republishes it as `window.__SECURE_CHAT_FILES__`: a FROZEN object on a
+// non-writable, non-configurable property (like __SECURE_CHAT_PAD_FLOOR__).
+// Only that shape is accepted — a writable or configurable global, or an
+// object whose methods could be swapped, is not the shell's and means "no
+// bridge" (the browser path). Captured once, here, before anything else runs.
+// `share(name, text)` / `save(name, text)` return at once with a request id
+// (or "busy" / "invalid"); the shell reports the outcome later by calling
+// `__SECURE_CHAT_FILES_RESULT__(id, outcome)`, defined right below as
+// non-writable and non-configurable so nothing can take the name first.
+// No secret flows back through it: only "shared" / "saved" / "cancelled" /
+// "error" about a request this page made (otpNativeResult checks the id).
+const FILES_BRIDGE = (() => {
+  try {
+    const d = Object.getOwnPropertyDescriptor(globalThis, "__SECURE_CHAT_FILES__");
+    if (!d || !("value" in d) || d.writable || d.configurable) return null;
+    const b = d.value;
+    if (!b || typeof b !== "object" || !Object.isFrozen(b)) return null;
+    if (typeof b.share !== "function" || typeof b.save !== "function") return null;
+    return b;
+  } catch {
+    return null;
+  }
+})();
+try {
+  Object.defineProperty(globalThis, "__SECURE_CHAT_FILES_RESULT__", {
+    value: (id, outcome) => otpNativeResult(id, outcome),
+    writable: false, configurable: false, enumerable: false,
+  });
+} catch { /* already taken: results never arrive, so Share/Save stay disabled — fails closed */ }
+// iOS: the shell turns a blob download into the share sheet
+// (ShellNavigationDelegate.swift); the page gets no result back.
+const IS_IOS_SHELL = typeof location !== "undefined" && location.protocol === "secure-chat:";
 
 const $ = (id) => document.getElementById(id);
 const els = {
@@ -56,6 +91,45 @@ const els = {
   otpEntropy: $("otpEntropy"), otpEntropyStatus: $("otpEntropyStatus"),
   otpGenerate: $("otpGenerate"), otpPass: $("otpPass"), otpXferPass: $("otpXferPass"),
   otpExport: $("otpExport"), otpImport: $("otpImport"), otpFile: $("otpFile"),
+  // one-time pad: the panel's entries and states (otp-transfer-brief.md § 1)
+  otpEmpty: $("otpEmpty"), otpPadRow: $("otpPadRow"), otpPassRow: $("otpPassRow"),
+  otpUnlocked: $("otpUnlocked"), otpLock: $("otpLock"), otpActions: $("otpActions"),
+  otpNewOpen: $("otpNewOpen"), otpExportOpen: $("otpExportOpen"), otpImportOpen: $("otpImportOpen"),
+  otpExportNote: $("otpExportNote"), otpScrim: $("otpScrim"),
+  // New pad sheet
+  otpNewSheet: $("otpNewSheet"), otpNewClose: $("otpNewClose"), otpNewForm: $("otpNewForm"),
+  otpNewPass: $("otpNewPass"), otpNewPassWarn: $("otpNewPassWarn"), otpSizeHint: $("otpSizeHint"),
+  otpNewStatus: $("otpNewStatus"), otpNewProgress: $("otpNewProgress"),
+  otpNewDoneBlock: $("otpNewDoneBlock"), otpNewPadLabel: $("otpNewPadLabel"), otpNewPadMeta: $("otpNewPadMeta"),
+  otpNewWeak: $("otpNewWeak"), otpNewWeakWhy: $("otpNewWeakWhy"),
+  otpNewToExport: $("otpNewToExport"), otpNewLater: $("otpNewLater"),
+  // Export sheet
+  otpExportSheet: $("otpExportSheet"), otpExportClose: $("otpExportClose"),
+  otpExportPadCard: $("otpExportPadCard"), otpExportPadLabel: $("otpExportPadLabel"),
+  otpExportPadMeta: $("otpExportPadMeta"), otpExportPadWarn: $("otpExportPadWarn"),
+  otpExportSteps: $("otpExportSteps"), otpExportStep1: $("otpExportStep1"),
+  otpExportStep2: $("otpExportStep2"), otpExportStep3: $("otpExportStep3"),
+  otpExportStep1Title: $("otpExportStep1Title"),
+  otpExportStep2Title: $("otpExportStep2Title"), otpExportStep2Caption: $("otpExportStep2Caption"),
+  otpExportStep3Caption: $("otpExportStep3Caption"), otpXferRow: $("otpXferRow"), otpXferWarn: $("otpXferWarn"),
+  otpExportStatus: $("otpExportStatus"), otpExportProgress: $("otpExportProgress"),
+  otpExportProgressText: $("otpExportProgressText"), otpExportCancel: $("otpExportCancel"),
+  otpShare: $("otpShare"), otpSave: $("otpSave"), otpExportDoneBlock: $("otpExportDoneBlock"),
+  otpExportDoneDisc: $("otpExportDoneDisc"), otpExportDoneTitle: $("otpExportDoneTitle"),
+  otpExportDoneFile: $("otpExportDoneFile"), otpHanded: $("otpHanded"), otpExportTheirs: $("otpExportTheirs"),
+  otpExportWeak: $("otpExportWeak"), otpExportWeakWhy: $("otpExportWeakWhy"),
+  otpExportDone: $("otpExportDone"), otpSendAgain: $("otpSendAgain"),
+  // Import sheet
+  otpImportSheet: $("otpImportSheet"), otpImportClose: $("otpImportClose"),
+  otpImportSteps: $("otpImportSteps"), otpImportStep1: $("otpImportStep1"),
+  otpImportStep2: $("otpImportStep2"), otpImportStep3: $("otpImportStep3"),
+  otpImportStep3Caption: $("otpImportStep3Caption"),
+  otpImportXfer: $("otpImportXfer"), otpImportXferErr: $("otpImportXferErr"),
+  otpImportPass: $("otpImportPass"), otpImportPassWarn: $("otpImportPassWarn"),
+  otpImportStatus: $("otpImportStatus"), otpImportProgress: $("otpImportProgress"),
+  otpImportRetry: $("otpImportRetry"), otpImportDoneBlock: $("otpImportDoneBlock"),
+  otpImportPadLabel: $("otpImportPadLabel"), otpImportPadMeta: $("otpImportPadMeta"),
+  otpImportWeak: $("otpImportWeak"), otpImportWeakWhy: $("otpImportWeakWhy"), otpImportDone: $("otpImportDone"),
   // verification gate
   verify: $("verify"), verifyTitle: $("verifyTitle"), verifyHint: $("verifyHint"),
   safetyNumber: $("safetyNumber"),
@@ -526,6 +600,8 @@ let screenShown = false;
 
 function showView(name) {
   closeContact(false); // the profile belongs to the view it was opened over
+  // …and an OTP sheet to the Live room — unless it is working (a KDF cannot be stopped).
+  if (otpUi.sheet && !otpSheetWorking()) closeOtpSheet({ restoreFocus: false, force: true });
   const liveWasHidden = els.viewLive.hidden;
   els.viewProfile.hidden = name !== "profile";
   els.viewLive.hidden = name !== "live";
@@ -3187,7 +3263,7 @@ async function connectInner() {
   if (alg === "OTP") {
     const padId = els.otpSelect.value;
     if (!padId) {
-      hint("Choose a one-time pad first, under Security options \u2192 Generate / share a pad.", true);
+      hint("Choose a one-time pad first \u2014 New pad or Import, under Security options.", true);
       return;
     }
     // Round 4 (F3): the wait for the previous session's save happens in
@@ -3504,9 +3580,15 @@ function setAdmitModal(on) {
 function applyModal() {
   const admit = admitModalOn && !els.viewLive.hidden;
   const contact = contactShown !== null;
+  // An OTP sheet (New pad / Export / Import) sits over the Live room: the
+  // room, the tab bar and the app bar are inert while it is up.
+  const otpSheet = otpUi.sheet !== null;
   for (const el of [els.chatTop, els.verify, els.chat]) el.inert = admit;
-  els.tabbar.inert = admit || contact;
+  els.tabbar.inert = admit || contact || otpSheet;
   for (const el of [els.viewUsers, els.viewChats, els.viewProfile]) el.inert = contact;
+  els.viewLive.inert = otpSheet;
+  const head = document.querySelector(".apphead");
+  if (head) head.inert = otpSheet;
 }
 // With the rest inert, Tab would walk off the sheet into the browser chrome:
 // wrap it between the sheet's first and last focusable instead. Escape does
@@ -4732,9 +4814,17 @@ async function sendText(e) {
 
 // ---- one-time pad UI ------------------------------------------------------
 
-function otpStatusMsg(text, isErr = false) {
+// OTP transfer sheets: #otpStatus still receives every sentence, byte for
+// byte (the tests read it). `quiet` — the four success sentences — keeps it
+// there for tests and assistive tech but off the screen (`.vh`): the sheet's
+// done block has said it. While a sheet is open, its errors land in the
+// sheet's own status line too, and a `wait` in its progress well.
+function otpStatusMsg(text, isErr = false, { quiet = false, wait = false } = {}) {
   els.otpStatus.textContent = hintSafe(text);
-  els.otpStatus.className = "hint" + (isErr ? " err" : "");
+  els.otpStatus.className = "hint" + (isErr ? " err" : "") + (quiet ? " vh" : "");
+  if (!otpUi.sheet || quiet) return;
+  if (isErr) otpSheetStatus(otpUi.sheet, text, "err");
+  else if (wait) otpSheetWait(otpUi.sheet, text);
 }
 
 function fmtBytes(n) {
@@ -4910,7 +5000,7 @@ async function readPadFresh(padId) {
     return await otp.unlockPad(padId, null, { atRest: cached.atRest });
   } catch (e) {
     if (e.code !== "KEY_STALE") throw e;
-    if (otpPanel && otpPanel.padId === padId) otpPanel = null;
+    if (otpPanel && otpPanel.padId === padId) { otpPanel = null; refreshOtpPanel(); }
     const again = await ensureUnlocked(padId); // needs the passphrase field
     return otp.unlockPad(padId, null, { atRest: again.atRest });
   }
@@ -4963,6 +5053,7 @@ async function ensureUnlocked(padId) {
   }
   otpPanel = { padId, atRest: unlocked.atRest };
   unlocked.record.bytes.fill(0); // round 3: no copy of the pad outlives this call
+  refreshOtpPanel(); // the unlocked row
   return { atRest: unlocked.atRest };
 }
 
@@ -4975,6 +5066,49 @@ function updateOtpBudget() {
 
 function syncOtpSelection() {
   els.otpForget.hidden = !els.otpSelect.value;
+  refreshOtpPanel();
+}
+// Design round 2 (minor 5): the passphrase carried in after New pad / Import
+// belongs to THAT pad. Choosing another pad empties the field, so it never
+// stands under a pad it does not unlock (Connect would fail "wrong passphrase").
+function otpSelectChanged() {
+  if (!otpPanel || otpPanel.padId !== els.otpSelect.value) els.otpPass.value = "";
+  syncOtpSelection();
+}
+
+// The panel (otp-transfer-brief.md § 1): the empty card, or the pad, its
+// passphrase (or "Unlocked for this session") and the three entries. Decides
+// emphasis too: nothing is blue while there is no pad (New pad and Import are
+// equal — design round 2, minor 1) and Connect is aria-disabled; a pad this
+// device made and never exported makes Export the primary, not Connect
+// (minor 6: Connect cannot work before the contact has the pad). The index
+// is only a hint for this; every refusal stays where it was.
+function refreshOtpPanel() {
+  const pads = otp.listPads();
+  const empty = pads.length === 0;
+  els.otpEmpty.hidden = !empty;
+  els.otpPadRow.hidden = empty;
+  els.otpPassRow.hidden = empty;
+  if (empty) {
+    if (els.otpActions.parentNode !== els.otpEmpty) els.otpEmpty.appendChild(els.otpActions);
+  } else if (els.otpActions.parentNode === els.otpEmpty) {
+    els.otpPassRow.after(els.otpActions);
+  }
+  const id = els.otpSelect.value;
+  const meta = id ? otp.padMeta(id) : null;
+  const received = !!meta && meta.role === 1;
+  els.otpExportOpen.hidden = empty || received;
+  els.otpExportNote.hidden = empty || !received;
+  els.otpActions.classList.toggle("two", empty || received);
+  const unlocked = !!id && !!otpPanel && otpPanel.padId === id;
+  els.otpUnlocked.hidden = !unlocked;
+  els.otpPass.hidden = unlocked;
+  const otpChosen = algValue() === "OTP";
+  const unexported = !!meta && meta.role === 0 && !meta.exported;
+  els.otpExportOpen.classList.toggle("primary", unexported);
+  els.connect.classList.toggle("primary", !(otpChosen && (empty || unexported)));
+  if (otpChosen && empty) els.connect.setAttribute("aria-disabled", "true");
+  else els.connect.removeAttribute("aria-disabled");
 }
 
 function refreshOtpPads(selectId) {
@@ -4994,15 +5128,21 @@ function refreshOtpPads(selectId) {
   syncOtpSelection();
 }
 
+// The option shows the size only ("256 KiB"); #otpSizeHint says what it holds.
 function populateOtpSizes() {
   els.otpSize.textContent = "";
   otp.PAD_SIZES.forEach((s, i) => {
     const o = document.createElement("option");
     o.value = String(s.bytes);
-    o.textContent = s.label;
+    o.textContent = s.label.split(" — ")[0];
     if (i === 1) o.selected = true; // default to the middle size
     els.otpSize.appendChild(o);
   });
+  syncOtpSizeHint();
+}
+function syncOtpSizeHint() {
+  const size = otp.PAD_SIZES.find((s) => String(s.bytes) === els.otpSize.value) || otp.PAD_SIZES[1];
+  els.otpSizeHint.textContent = (size.label.split(" — ")[1] || "").replace("/side", " each way");
 }
 
 // Draw-to-generate entropy: capture pointer motion samples to fold into the pad.
@@ -5054,11 +5194,22 @@ function setupEntropyCanvas() {
   c.addEventListener("pointercancel", end);
 }
 
+// New pad (sheet § 4). Reads the sheet's own passphrase field, captured once
+// before the first await (a value typed during the KDF changes nothing). On
+// success the passphrase is carried into #otpPass (§ 2: the same secret with
+// the same meaning), so the must-differ rule works in New pad → Export.
+let otpGenerating = false;
 async function otpGenerate() {
-  if (!els.otpPass.value) {
+  if (otpGenerating) return; // the button is hidden while it runs; a second click makes no second pad
+  const pass = els.otpNewPass.value;
+  if (!pass) {
     otpStatusMsg("Set a pad passphrase first — it encrypts the pad on this device.", true);
+    els.otpNewPass.focus();
     return;
   }
+  otpGenerating = true;
+  otpSheetBegin("new");
+  let done = null;
   try {
     otpStatusMsg("Generating pad… (deriving the at-rest key, this takes a moment)");
     const totalBytes = parseInt(els.otpSize.value, 10);
@@ -5067,7 +5218,7 @@ async function otpGenerate() {
     try {
       // Round 4: a writer of the pad's storage, so under the pad's lock.
       await withPadLock(rec.padId, async () => {
-        atRest = await otp.saveNewPad(rec, els.otpPass.value); // encrypted at rest
+        atRest = await otp.saveNewPad(rec, pass); // encrypted at rest
       });
     } finally {
       if (!atRest) rec.bytes.fill(0);
@@ -5077,12 +5228,17 @@ async function otpGenerate() {
     rec.bytes.fill(0); // round 3: the stored pad is the only copy now
     clearEntropy();
     els.otpLabel.value = "";
+    els.otpPass.value = pass; // carried (§ 2); the unlocked row hides it
     refreshOtpPads(rec.padId);
-    const weak = passphraseWarning(els.otpPass.value); // package 6: warn, never block
+    const weak = passphraseWarning(pass); // package 6: warn, never block
     otpStatusMsg(`Generated + encrypted pad "${rec.label}". Now Export it and give the file to your contact in person.` +
-      (weak ? " Pad passphrase — " + weak : ""), !!weak);
+      (weak ? " Pad passphrase — " + weak : ""), !!weak, { quiet: true });
+    done = { label: rec.label, regionSize: rec.regionSize, weak };
   } catch (e) {
     otpStatusMsg("Generation failed: " + e.message, true);
+  } finally {
+    otpGenerating = false;
+    otpNewFinished(done);
   }
 }
 
@@ -5115,11 +5271,27 @@ let pendingReexportId = null;
 //    KDF), and the exported check, the export and the latch use that fresh
 //    record — never the cache.
 let otpExporting = false;
+const OTP_LOCK_WAIT_MS = 30000;
 async function otpExport() {
   if (otpExporting) { otpStatusMsg("An export is already running — wait for it to finish.", true); return; }
   const id = els.otpSelect.value;
   if (!id) { otpStatusMsg("Select a pad to export.", true); return; }
-  if (!els.otpXferPass.value) { otpStatusMsg("Enter a transfer passphrase first (agree on it with your contact in person).", true); return; }
+  // Captured once: the file is encrypted under what was typed at the click.
+  const xfer = els.otpXferPass.value;
+  if (!xfer) {
+    otpStatusMsg("Enter a transfer passphrase first (agree on it with your contact in person).", true);
+    els.otpXferPass.focus();
+    return;
+  }
+  // Owner decision (2026-09-26): the transfer passphrase may not BE the pad
+  // passphrase — refused, not warned. Only the two live input values are
+  // compared; nothing is stored or hashed. #otpPass holds the carried pad
+  // passphrase after New pad (§ 2), so this fires in New pad → Export too.
+  if (els.otpPass.value && xfer === els.otpPass.value) {
+    otpStatusMsg("Use a different passphrase for the file — this one is your pad passphrase.", true);
+    otpMarkField(els.otpXferPass);
+    return;
+  }
   const locks = navigator.locks;
   if (!locks || typeof locks.request !== "function") {
     otpStatusMsg("One-time pads are disabled in this browser: it cannot lock a pad to a single tab (no Web Locks support). Use the app or a current browser.", true);
@@ -5127,6 +5299,8 @@ async function otpExport() {
   }
   otpExporting = true; // synchronous: before the first await
   els.otpExport.disabled = true;
+  otpSheetBegin("export");
+  let file = null;
   try {
     // Round 3 (F1, pre-existing MEDIUM): an export must never run beside a
     // live session on the same pad. It used to take only its own export lock,
@@ -5146,8 +5320,24 @@ async function otpExport() {
       // Round 2 (Info): if something else holds the export lock, say so
       // instead of a silently disabled button.
       const held = await locks.query?.().then((q) => (q.held || []).some((l) => l.name === name)).catch(() => false);
-      if (held) otpStatusMsg("Waiting for this pad's export in another tab or window to finish…");
-      await locks.request(name, { mode: "exclusive" }, () => otpExportLocked(id));
+      if (held) otpStatusMsg("Waiting for this pad's export in another tab or window to finish…", false, { wait: true });
+      // The export sheet cannot be closed while it works, so the wait for
+      // another tab's export is bounded (that tab may be frozen in the
+      // background): past OTP_LOCK_WAIT_MS the request is withdrawn and the
+      // sheet says why. Once granted, the lock is held to the end as before.
+      const opts = { mode: "exclusive" };
+      if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+        opts.signal = AbortSignal.timeout(OTP_LOCK_WAIT_MS);
+      }
+      let granted = false;
+      try {
+        file = await locks.request(name, opts, () => { granted = true; return otpExportLocked(id, xfer); });
+      } catch (e) {
+        if (!granted && e && (e.name === "TimeoutError" || e.name === "AbortError")) {
+          throw new Error("another tab or window is still exporting this pad — finish or close it there, then try again");
+        }
+        throw e;
+      }
     } finally {
       got();
     }
@@ -5157,8 +5347,11 @@ async function otpExport() {
     otpExporting = false;
     els.otpExport.disabled = false;
   }
+  // The latch is committed (otpExportFrom returns a file only after
+  // markExported): only now is the file handed out.
+  otpExportFinished(id, file && file.text ? file : null);
 }
-async function otpExportLocked(id) {
+async function otpExportLocked(id, xfer) {
   // Pentest 2026-07-27 L-3: the re-export guard consults the AUTHENTICATED
   // `exported` flag inside the pad blob, so it has to unlock first. Clearing
   // the plaintext index entry no longer disarms the one warning that stands
@@ -5167,12 +5360,12 @@ async function otpExportLocked(id) {
   // tab's past (see above).
   const { record, atRest } = await readPadFresh(id);
   try {
-    await otpExportFrom(id, record, atRest);
+    return await otpExportFrom(id, record, atRest, xfer);
   } finally {
     record.bytes.fill(0); // round 3 (F2): no copy of the pad outlives the export
   }
 }
-async function otpExportFrom(id, record, atRest) {
+async function otpExportFrom(id, record, atRest, xfer) {
   // Re-export guard (Finding 3): sharing one pad with more than one importer
   // causes key reuse. Warn once and require a second click to confirm.
   if (record.exported && pendingReexportId !== id) {
@@ -5184,10 +5377,10 @@ async function otpExportFrom(id, record, atRest) {
     otpStatusMsg(record.exportedInferred
       ? "This pad's export history can't be verified on this device (it predates the current version). If you have already given it to someone, exporting it again would reuse key material. Click Export again to confirm it has not been exported before."
       : "This pad was already exported. A pad must be imported on only ONE device — re-exporting risks catastrophic key reuse. Click Export again to confirm you know what you are doing.", true);
-    return;
+    return null;
   }
   pendingReexportId = null;
-  const text = await otp.exportPad(record, els.otpXferPass.value);
+  const text = await otp.exportPad(record, xfer);
   // Package 3, F-ATREST-002 residual: latch FIRST, file second. This used to
   // download and then mark, so a markExported that failed (a full disk, a
   // floor write that did not commit) had already handed out a file nothing
@@ -5208,31 +5401,83 @@ async function otpExportFrom(id, record, atRest) {
   } finally {
     now.record.bytes.fill(0);
   }
-  downloadText(`secure-chat-pad-${record.label || record.padId}.json`, text);
-  const weak = passphraseWarning(els.otpXferPass.value); // package 6: warn, never block
+  // File name (§ 7, owner: neutral): the local date and minute of the export,
+  // nothing else — no label (who talks to whom), no padId (the key of this
+  // device's storage entries). Handed out by otpExportFinished.
+  const weak = passphraseWarning(xfer); // package 6: warn, never block
   otpStatusMsg("Exported. Give the file to your contact in person; they Import it with the same TRANSFER passphrase." +
-    (weak ? " Transfer passphrase — " + weak : ""), !!weak);
+    (weak ? " Transfer passphrase — " + weak : ""), !!weak, { quiet: true });
+  return { name: otpFileName(new Date()), text, weak };
+}
+const OTP_FILE_NAME_RE = /^secure-chat-pad-\d{4}-\d{2}-\d{2}-\d{4}\.json$/;
+const OTP_FILE_MAX = 4 * 1024 * 1024; // = importPad's cap
+function otpFileName(d) {
+  const z = (n, w = 2) => String(n).padStart(w, "0");
+  return `secure-chat-pad-${z(d.getFullYear(), 4)}-${z(d.getMonth() + 1)}-${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}.json`;
 }
 
-function otpImportClick() {
-  if (!els.otpXferPass.value) {
+// Import (sheet § 6). The two passphrases come from the sheet's own fields;
+// the picked file's text is held (≤ 4 MiB) so "Try again" needs no second
+// pick, and dropped on success, on a file-level error and on close.
+function otpImportChecks() {
+  const xfer = els.otpImportXfer.value, pass = els.otpImportPass.value;
+  if (!xfer) {
     otpStatusMsg("Enter the TRANSFER passphrase your contact agreed on, then choose their file.", true);
-    return;
+    els.otpImportXfer.focus();
+    return null;
   }
-  if (!els.otpPass.value) {
-    otpStatusMsg("Also set a pad passphrase (top of this panel) — it encrypts the imported pad on this device.", true);
-    return;
+  if (!pass) {
+    otpStatusMsg("Also set a pad passphrase — it encrypts the imported pad on this device.", true);
+    els.otpImportPass.focus();
+    return null;
   }
+  if (xfer === pass) {
+    otpStatusMsg("Use a different passphrase on this device — the transfer passphrase is known to your contact.", true);
+    otpMarkField(els.otpImportPass);
+    return null;
+  }
+  return { xfer, pass };
+}
+function otpImportClick() {
+  if (!otpImportChecks()) return;
   els.otpFile.click();
 }
 
 async function otpFileChosen() {
   const file = els.otpFile.files[0];
   els.otpFile.value = "";
-  if (!file) return;
+  if (!file) return; // a cancelled picker changes nothing
+  if (typeof file.size === "number" && file.size > OTP_FILE_MAX) {
+    otpImportFile = null;
+    otpStatusMsg("Import failed: not a valid pad file", true);
+    otpImportFinished("file");
+    return;
+  }
+  let text;
   try {
-    const text = await file.text();
-    const rec = await otp.importPad(text, els.otpXferPass.value); // transfer passphrase + entropy check
+    text = await file.text();
+  } catch (e) {
+    otpImportFile = null;
+    otpStatusMsg("Import failed: " + e.message, true);
+    otpImportFinished("file");
+    return;
+  }
+  otpImportFile = { name: typeof file.name === "string" ? file.name : "", text };
+  await otpRunImport();
+}
+
+let otpImporting = false;
+async function otpRunImport() {
+  if (otpImporting || !otpImportFile) return;
+  const creds = otpImportChecks();
+  if (!creds) { otpImportFinished(null); return; }
+  const { text } = otpImportFile;
+  otpImporting = true;
+  otpSheetBegin("import");
+  let outcome = "retry"; // "done" | "pass" (wrong transfer passphrase) | "retry" | "file"
+  let done = null;
+  try {
+    const rec = await otp.importPad(text, creds.xfer); // transfer passphrase + entropy check
     // Package 6 round 4 (pre-existing MEDIUM): the same pad file imported in
     // two tabs was a two-time pad — nothing held the pad's lock, and
     // saveNewPad's "is it used?" check ran only before its 600k KDF. The
@@ -5256,7 +5501,7 @@ async function otpFileChosen() {
     // unlockPad round trip: that would put the check beside the path instead of
     // on it, and cost a third 600k-iteration KDF for no property this does not
     // already have.
-        atRest = await otp.saveNewPad(rec, els.otpPass.value); // encrypt at rest with the pad passphrase
+        atRest = await otp.saveNewPad(rec, creds.pass); // encrypt at rest with the pad passphrase
       });
     } finally {
       if (!atRest) rec.bytes.fill(0);
@@ -5264,17 +5509,25 @@ async function otpFileChosen() {
     if (already) {
       refreshOtpPads(rec.padId);
       otpStatusMsg("You already have this pad on this device — not importing again (a pad must live on exactly one device per side).", true);
+      outcome = "file";
       return;
     }
-    if (!atRest) return; // (said by withPadLock)
+    if (!atRest) return; // (said by withPadLock) — PAD_BUSY / no Web Locks: "Try again"
     otpPanel = { padId: rec.padId, atRest };
     rec.bytes.fill(0); // round 3: the stored pad is the only copy now
+    els.otpPass.value = creds.pass; // carried (§ 2); the unlocked row hides it
     refreshOtpPads(rec.padId);
-    const weak = passphraseWarning(els.otpPass.value); // package 6: warn, never block
+    const weak = passphraseWarning(creds.pass); // package 6: warn, never block
     otpStatusMsg(`Imported + encrypted pad "${rec.label}". Select it, use the same room id as your contact, and Connect.` +
-      (weak ? " Pad passphrase — " + weak : ""), !!weak);
+      (weak ? " Pad passphrase — " + weak : ""), !!weak, { quiet: true });
+    outcome = "done";
+    done = { label: rec.label, regionSize: rec.regionSize, weak };
   } catch (e) {
     otpStatusMsg("Import failed: " + e.message, true);
+    outcome = e.message === "wrong passphrase or corrupted pad file" ? "pass" : "file";
+  } finally {
+    otpImporting = false;
+    otpImportFinished(outcome, done);
   }
 }
 
@@ -5288,8 +5541,535 @@ async function otpForgetSelected() {
   });
   if (!done) return;
   refreshOtpPads();
-  otpStatusMsg("Pad forgotten (deleted from this device).");
+  otpStatusMsg("Pad forgotten (deleted from this device).", false, { quiet: true });
 }
+
+// ---- one-time pad sheets: New pad, Export, Import ---------------------------
+// design/research/reviews/otp-transfer-brief.md § Design decisions. The
+// handlers above do not depend on a sheet being open (the dom-stub tests drive
+// them with every sheet hidden); they report to the sheet through the
+// *Finished functions below, which touch a sheet only while it is open.
+// Mechanics are the contact sheet's: one scrim, the rest inert, Tab wraps,
+// Escape / × / scrim close — never while working (a KDF cannot be stopped) —
+// and focus goes back to the entry that opened the chain. Clearing happens on
+// close only (resetOtpSheet), never inside a handler on success.
+const OTP_SHEETS = {
+  new: {
+    sheet: els.otpNewSheet, close: els.otpNewClose, status: els.otpNewStatus, progress: els.otpNewProgress,
+    inputs: [els.otpNewPass], warns: [els.otpNewPassWarn], first: () => els.otpLabel,
+  },
+  export: {
+    sheet: els.otpExportSheet, close: els.otpExportClose, status: els.otpExportStatus, progress: els.otpExportProgress,
+    inputs: [els.otpXferPass], warns: [els.otpXferWarn], first: () => els.otpXferPass,
+  },
+  import: {
+    sheet: els.otpImportSheet, close: els.otpImportClose, status: els.otpImportStatus, progress: els.otpImportProgress,
+    inputs: [els.otpImportXfer, els.otpImportPass], warns: [els.otpImportPassWarn], first: () => els.otpImportXfer,
+  },
+};
+const otpUi = {
+  sheet: null,     // "new" | "export" | "import" | null: the sheet on screen
+  opener: null,    // the panel entry that opened the chain (focus goes back to it)
+  shownAt: 0,      // the 500 ms rule (as the contact sheet's)
+  state: { new: "form", export: "form", import: "form" },
+};
+let otpNewInfo = null;        // { label, regionSize, weak } for New pad's done block
+let otpExportPad = null;      // { label, regionSize, exportedBefore } for the Export pad card
+let otpExportFile = null;     // { name, text, weak }: the file handed out, held until close
+let otpExportResult = null;   // "shared" | "saved" | "downloaded" | "ios"
+let otpExportDelivered = false; // Android: a share or save succeeded at least once
+let otpNativeReq = null;      // Android: { id, kind } of the request in flight
+let otpImportFile = null;     // { name, text }: the picked file, held for "Try again"
+let otpImportErr = null;      // null | "pass" | "retry" | "file": the Import sheet's error state
+let otpImportInfo = null;     // { label, regionSize, weak } for Import's done block
+
+const otpSheetWorking = () => otpUi.sheet !== null && otpUi.state[otpUi.sheet] === "working";
+// Same rule as the contact sheet: an activation within 500 ms of a sheet
+// appearing is the second half of the tap that opened it, not a decision.
+const OTP_GUARD_MS = 500;
+const otpTooSoon = (e) => otpUi.sheet !== null && !!e && typeof e.timeStamp === "number" &&
+  e.timeStamp < otpUi.shownAt + OTP_GUARD_MS;
+const otpPointerFine = () => typeof matchMedia === "function" && matchMedia("(pointer: fine)").matches;
+const otpPadMetaText = (info, role) =>
+  `${fmtBytes(info.regionSize)} per side · ${role === 0 ? "you generated" : "imported"}`;
+
+function otpSheetStatus(kind, text, tone = "") {
+  const el = OTP_SHEETS[kind].status;
+  el.textContent = text ? hintSafe(text) : "";
+  el.className = "otp-status" + (text && tone ? " " + tone : "");
+}
+function otpSheetWait(kind, text) {
+  if (kind !== "export") return;
+  els.otpExportProgressText.textContent = hintSafe(text);
+}
+// A refusal about a field marks it (icon, 2px border, aria-invalid) and
+// focuses it; the mark goes on its next input. Empty-field refusals only focus.
+function otpMarkField(input) {
+  input.setAttribute("aria-invalid", "true");
+  input.focus();
+}
+function otpClearMark(input) {
+  input.removeAttribute("aria-invalid");
+  if (input === els.otpImportXfer) {
+    els.otpImportXferErr.hidden = true;
+    input.removeAttribute("aria-describedby");
+  }
+}
+
+// A step: idle, current (accent ring, aria-current) or done (check, " — done").
+function otpStep(li, how) {
+  li.classList.toggle("is-current", how === "current");
+  li.classList.toggle("is-done", how === "done");
+  if (how === "current") li.setAttribute("aria-current", "step");
+  else li.removeAttribute("aria-current");
+}
+function otpSetState(kind, state) {
+  otpUi.state[kind] = state;
+  OTP_SHEETS[kind].sheet.dataset.state = state;
+  OTP_SHEETS[kind].sheet.setAttribute("data-state", state);
+  otpRender(kind);
+}
+function otpRender(kind) {
+  if (kind === "new") renderOtpNew();
+  else if (kind === "export") renderOtpExport();
+  else renderOtpImport();
+}
+function otpWeakBlock(block, why, weak) {
+  block.hidden = !weak;
+  why.textContent = weak || "";
+}
+
+function renderOtpNew() {
+  const st = otpUi.state.new;
+  els.otpNewForm.hidden = st === "done";
+  els.otpNewProgress.hidden = st !== "working";
+  els.otpNewDoneBlock.hidden = st !== "done";
+  els.otpGenerate.hidden = st !== "form";
+  els.otpNewToExport.hidden = els.otpNewLater.hidden = st !== "done";
+  els.otpNewClose.hidden = st === "working";
+  if (st === "done" && otpNewInfo) {
+    els.otpNewPadLabel.textContent = otpNewInfo.label;
+    els.otpNewPadMeta.textContent = otpPadMetaText(otpNewInfo, 0);
+    otpWeakBlock(els.otpNewWeak, els.otpNewWeakWhy, otpNewInfo.weak);
+  }
+}
+
+function renderOtpExport() {
+  const st = otpUi.state.export;
+  const android = !!FILES_BRIDGE;
+  // Steps. In the form step 1 is current (its field is the sheet's one
+  // input; steps 2 and 3 are what the bottom-row action does); then step 2
+  // while the file is made or the re-export is confirmed; step 3 once an
+  // Android file waits to be shared or saved.
+  otpStep(els.otpExportStep1, st === "form" ? "current" : "done");
+  otpStep(els.otpExportStep2, st === "ready" ? "done" : st === "confirm" || st === "working" ? "current" : "idle");
+  otpStep(els.otpExportStep3, st === "ready" ? "current" : "idle");
+  els.otpExportSteps.hidden = st === "done";
+  els.otpXferRow.hidden = st !== "form";
+  els.otpExportStep1Title.textContent = st === "form" ? "Agree on a transfer passphrase — in person" : "Transfer passphrase set";
+  els.otpExportStep2Title.textContent = st === "ready" ? "File created" : "Create the file";
+  els.otpExportStep2Caption.hidden = st !== "ready";
+  els.otpExportStep2Caption.textContent = st === "ready" && otpExportFile ? otpExportFile.name : "";
+  els.otpExportProgress.hidden = st !== "working";
+  els.otpExportStep3Caption.textContent = st === "ready" && android
+    ? "Quick Share or Bluetooth, face to face. Or save it and copy it to a USB stick."
+    : "Give it to them face to face.";
+  // The pad card: "· exported before" is the index's hint at open; "· exported" once it is.
+  if (otpExportPad) {
+    els.otpExportPadLabel.textContent = otpExportPad.label;
+    els.otpExportPadMeta.textContent = otpPadMetaText(otpExportPad, 0) +
+      (st === "ready" || st === "done" ? " · exported" : "");
+  }
+  els.otpExportPadWarn.hidden = !(otpExportPad && otpExportPad.exportedBefore) || st === "ready" || st === "done";
+  // Done: disc + title + line (+ the browser's file name), then the card and
+  // "On their device".
+  els.otpExportDoneBlock.hidden = els.otpExportTheirs.hidden = st !== "done";
+  if (st === "done") {
+    const r = otpExportResult;
+    const T = {
+      shared: ["File shared", "Keep this open until it has arrived."],
+      saved: ["File saved", "Now give it to them in person — USB stick, Bluetooth or Quick Share."],
+      ios: ["Share sheet opened", "AirDrop it to them, face to face. Keep this open until it has arrived."],
+      downloaded: ["File downloaded", "Now give it to them in person — USB stick or Bluetooth."],
+    }[r] || ["", ""];
+    els.otpExportDoneTitle.textContent = T[0];
+    els.otpHanded.textContent = T[1];
+    els.otpExportDoneDisc.className = "otp-done-disc " + (r === "shared" ? "ok" : r === "ios" ? "share" : "download");
+    els.otpExportDoneFile.hidden = !(r === "downloaded" || r === "saved") || !otpExportFile;
+    els.otpExportDoneFile.textContent = otpExportFile ? otpExportFile.name : "";
+    els.otpExportDoneFile.classList.toggle("mono", r === "downloaded"); // mono only for the browser's name
+    otpWeakBlock(els.otpExportWeak, els.otpExportWeakWhy, otpExportFile && otpExportFile.weak);
+  }
+  // The bottom row: every action of this state, at most one primary.
+  els.otpExportCancel.hidden = st !== "confirm";
+  els.otpExport.hidden = !(st === "form" || st === "confirm");
+  els.otpExport.textContent = st === "confirm" ? "Export again" : "Create transfer file";
+  els.otpExport.classList.toggle("primary", st !== "confirm");
+  els.otpExport.classList.toggle("danger", st === "confirm");
+  els.otpShare.hidden = els.otpSave.hidden = st !== "ready";
+  els.otpShare.disabled = els.otpSave.disabled = !!otpNativeReq;
+  els.otpExportDone.hidden = els.otpSendAgain.hidden = st !== "done";
+  els.otpSendAgain.textContent = android ? "Didn't arrive? Send it again"
+    : IS_IOS_SHELL ? "Share it again" : "Download it again";
+  els.otpExportClose.hidden = st === "working";
+}
+
+function renderOtpImport() {
+  const st = otpUi.state.import;
+  // Current = the first step whose input is empty, else the last; a wrong
+  // transfer passphrase makes step 1 current again.
+  const cur = otpImportErr === "pass" || !els.otpImportXfer.value ? 1 : !els.otpImportPass.value ? 2 : 3;
+  [els.otpImportStep1, els.otpImportStep2, els.otpImportStep3].forEach((li, i) =>
+    otpStep(li, st === "form" && cur === i + 1 ? "current" : st === "working" && i === 2 ? "current" : "idle"));
+  els.otpImportSteps.hidden = st === "done";
+  els.otpImportStep3Caption.textContent = otpImportFile && otpImportFile.name
+    ? otpImportFile.name + " — chosen" : "Usually in Downloads.";
+  els.otpImportProgress.hidden = st !== "working";
+  const marked = st === "form" && otpImportErr === "pass";
+  if (marked) {
+    els.otpImportXfer.setAttribute("aria-invalid", "true");
+    els.otpImportXfer.setAttribute("aria-describedby", "otpImportXferErr otpImportStatus");
+  }
+  els.otpImportXferErr.hidden = !marked;
+  els.otpImportDoneBlock.hidden = st !== "done";
+  if (st === "done" && otpImportInfo) {
+    els.otpImportPadLabel.textContent = otpImportInfo.label;
+    els.otpImportPadMeta.textContent = otpPadMetaText(otpImportInfo, 1);
+    otpWeakBlock(els.otpImportWeak, els.otpImportWeakWhy, otpImportInfo.weak);
+  }
+  const held = !!otpImportFile;
+  els.otpImportRetry.hidden = !(st === "form" && held);
+  els.otpImport.hidden = st !== "form";
+  els.otpImport.textContent = held || otpImportErr ? "Choose another file" : "Choose pad file…";
+  els.otpImport.classList.toggle("primary", !held);
+  els.otpImport.classList.toggle("ghost", held);
+  els.otpImportDone.hidden = st !== "done";
+  els.otpImportClose.hidden = st === "working";
+}
+
+// A handler starts its slow step: the open sheet goes to "working" (no ×,
+// no Escape, no scrim), its status empties and focus goes to the progress.
+function otpSheetBegin(kind) {
+  if (otpUi.sheet !== kind) return;
+  otpSheetStatus(kind, "");
+  if (kind === "import") otpImportErr = null;
+  if (kind === "export") els.otpExportProgressText.textContent = "Encrypting the file…";
+  otpSetState(kind, "working");
+  OTP_SHEETS[kind].progress.focus();
+}
+function otpFocusError(kind, field) {
+  const status = OTP_SHEETS[kind].status;
+  if (field) field.focus();
+  else if (status.textContent) status.focus();
+}
+
+function otpNewFinished(info) {
+  if (otpUi.sheet !== "new") return;
+  if (info) {
+    otpNewInfo = info;
+    otpSetState("new", "done");
+    els.otpNewToExport.focus();
+  } else {
+    otpSetState("new", "form");
+    otpFocusError("new", null);
+  }
+}
+
+function otpExportFinished(id, file) {
+  if (file) refreshOtpPanel(); // exported now: Connect is the primary again (index hint)
+  if (otpUi.sheet !== "export") {
+    // No sheet (the handler driven on its own): hand the file out at once,
+    // the way the panel always did; nothing is held.
+    if (file) downloadText(file.name, file.text);
+    return;
+  }
+  if (!file) {
+    // The re-export confirm, or a refusal: back to the form (or the confirm).
+    const confirmNow = pendingReexportId === id;
+    otpSetState("export", confirmNow ? "confirm" : "form");
+    if (confirmNow) els.otpExportStatus.focus();
+    else otpFocusError("export", null);
+    return;
+  }
+  otpExportFile = file;
+  otpExportDelivered = false;
+  if (FILES_BRIDGE) {
+    // Android: the owner's choice of Share… or Save to device (two taps, one each).
+    otpSetState("export", "ready");
+    els.otpShare.focus();
+    return;
+  }
+  downloadText(file.name, file.text);
+  otpExportResult = IS_IOS_SHELL ? "ios" : "downloaded";
+  otpSetState("export", "done");
+  els.otpExportDone.focus();
+}
+
+function otpImportFinished(outcome, info = null) {
+  if (outcome === "done" || outcome === "file" || otpUi.sheet !== "import") otpImportFile = null;
+  if (otpUi.sheet !== "import") return;
+  if (outcome) otpImportErr = outcome === "done" ? null : outcome;
+  if (outcome === "done") {
+    otpImportInfo = info;
+    otpSetState("import", "done");
+    els.otpImportDone.focus();
+    return;
+  }
+  otpSetState("import", "form");
+  if (outcome === "pass") { els.otpImportXfer.focus(); els.otpImportXfer.select?.(); }
+  else if (outcome === "file") els.otpImport.focus();
+  else if (outcome === "retry") otpFocusError("import", null);
+}
+
+// ---- Android: Share… / Save to device over the file bridge ----------------
+function otpNativeSend(kind) {
+  if (!FILES_BRIDGE || otpNativeReq || otpUi.sheet !== "export" || otpUi.state.export !== "ready" || !otpExportFile) return;
+  const { name, text } = otpExportFile;
+  const fail = kind === "share" ? "Could not share the file." : "Could not save the file.";
+  // What the shell also checks: the exact neutral name, the size cap, the envelope.
+  if (!OTP_FILE_NAME_RE.test(name) || typeof text !== "string" || text.length > OTP_FILE_MAX) {
+    otpSheetStatus("export", fail, "err");
+    return;
+  }
+  let r;
+  try {
+    r = kind === "share" ? FILES_BRIDGE.share(name, text) : FILES_BRIDGE.save(name, text);
+  } catch {
+    r = null;
+  }
+  if (r === "busy") {
+    otpSheetStatus("export", fail + " Another share or save is still open — finish it first.", "err");
+    return;
+  }
+  if (typeof r !== "string" || r === "invalid" || !/^[\w-]{1,64}$/.test(r)) {
+    otpSheetStatus("export", fail, "err");
+    return;
+  }
+  otpNativeReq = { id: r, kind };
+  otpSheetStatus("export", "");
+  renderOtpExport(); // Share and Save stay disabled while the request is open
+}
+// Called by the shell (see FILES_BRIDGE at the top). Only the outcome of the
+// request in flight, by its id, and only the outcome that request can have.
+function otpNativeResult(id, outcome) {
+  const req = otpNativeReq;
+  if (!req || typeof id !== "string" || id !== req.id) return;
+  otpNativeReq = null;
+  if (otpUi.sheet !== "export" || otpUi.state.export !== "ready" || !otpExportFile) {
+    if (otpUi.sheet === "export") renderOtpExport();
+    return;
+  }
+  const want = req.kind === "share" ? "shared" : "saved";
+  if (outcome === want) {
+    otpExportDelivered = true;
+    otpExportResult = outcome;
+    otpSheetStatus("export", "");
+    otpSetState("export", "done");
+    els.otpExportDone.focus();
+  } else if (outcome === "cancelled") {
+    otpSheetStatus("export", req.kind === "share" ? "Not shared." : "Not saved.", "note");
+    renderOtpExport();
+  } else {
+    otpSheetStatus("export", req.kind === "share" ? "Could not share the file." : "Could not save the file.", "err");
+    renderOtpExport();
+  }
+}
+// "Send it again" hands out the SAME held text — no new export, no new latch.
+function otpSendAgain() {
+  if (otpUi.sheet !== "export" || otpUi.state.export !== "done" || !otpExportFile) return;
+  if (FILES_BRIDGE) {
+    otpSheetStatus("export", "");
+    otpSetState("export", "ready");
+    els.otpShare.focus();
+    return;
+  }
+  downloadText(otpExportFile.name, otpExportFile.text);
+}
+
+// ---- open / close -------------------------------------------------------------
+function otpSheetShow(kind) {
+  otpUi.sheet = kind;
+  resetOtpSheet(kind);
+  if (kind === "export") {
+    const id = els.otpSelect.value;
+    const meta = id ? otp.padMeta(id) : null;
+    otpExportPad = meta ? { label: meta.label, regionSize: meta.regionSize, exportedBefore: !!meta.exported } : null;
+    renderOtpExport();
+  }
+  if (kind === "new") syncOtpSizeHint();
+  OTP_SHEETS[kind].sheet.hidden = false;
+  els.otpScrim.hidden = false;
+  otpUi.shownAt = performance.now();
+  applyModal();
+  // A phone keyboard must not cover the steps before they are seen.
+  const first = OTP_SHEETS[kind].first();
+  if (otpPointerFine() && first) first.focus();
+  else OTP_SHEETS[kind].sheet.focus();
+}
+// The history entry is pushed synchronously inside the click that opens the
+// sheet: Chromium's Back skips entries a page added without a user gesture.
+function openOtpSheet(kind, opener, { pushed = false } = {}) {
+  if (otpUi.sheet) return;
+  otpUi.opener = opener;
+  if (!pushed) otpHistPush();
+  otpSheetShow(kind);
+}
+// New pad → "Export to your contact": one sheet for the other, the scrim and
+// the history entry stay.
+function otpSwapToExport() {
+  if (otpUi.sheet !== "new") return;
+  resetOtpSheet("new");
+  els.otpNewSheet.hidden = true;
+  otpSheetShow("export");
+}
+const OTP_CLOSE_UNSHARED =
+  "The file has not been shared or saved yet. Close anyway? This pad now counts as exported — exporting it again will ask you to confirm.";
+const otpNeedsCloseConfirm = () =>
+  otpUi.sheet === "export" && !!FILES_BRIDGE && !!otpExportFile && !otpExportDelivered;
+// Close by the × rules. `fromHistory`: the history entry is already gone (Back).
+// `force`: a view switch — no question, the pad is exported either way.
+function closeOtpSheet({ restoreFocus = true, fromHistory = false, force = false } = {}) {
+  const kind = otpUi.sheet;
+  if (!kind) return true;
+  if (otpSheetWorking()) return false;
+  if (!force && otpNeedsCloseConfirm() && !confirm(OTP_CLOSE_UNSHARED)) return false;
+  resetOtpSheet(kind);
+  OTP_SHEETS[kind].sheet.hidden = true;
+  els.otpScrim.hidden = true;
+  otpUi.sheet = null;
+  applyModal();
+  if (!fromHistory) otpHistDrop();
+  const opener = otpUi.opener;
+  otpUi.opener = null;
+  if (restoreFocus) {
+    const target = opener && !opener.hidden && !els.otpPanel.hidden ? opener
+      : !els.otpPadRow.hidden ? els.otpSelect : els.otpNewOpen;
+    target.focus();
+  }
+  return true;
+}
+// Everything a sheet collected is dropped when it closes: the inputs, the
+// status and warn lines, the marks, the held file texts, the re-export latch.
+// #otpPass is never touched here.
+function resetOtpSheet(kind) {
+  const S = OTP_SHEETS[kind];
+  for (const i of S.inputs) { i.value = ""; otpClearMark(i); }
+  for (const w of S.warns) w.textContent = "";
+  otpSheetStatus(kind, "");
+  for (const d of S.sheet.querySelectorAll("details")) d.open = false;
+  if (kind === "new") otpNewInfo = null;
+  if (kind === "export") {
+    otpExportFile = null;
+    otpExportResult = null;
+    otpExportDelivered = false;
+    otpNativeReq = null; // a late result for it is ignored (id mismatch)
+    pendingReexportId = null;
+  }
+  if (kind === "import") {
+    otpImportFile = null;
+    otpImportErr = null;
+    otpImportInfo = null;
+  }
+  otpSetState(kind, "form");
+}
+
+// Back (Android system back, browser back) acts as × (design round 2, N-M2):
+// opening a sheet pushes one history entry; Back pops it and closes the sheet
+// by the × rules; any other close drops the entry itself, and the popstate
+// that causes is ignored. While working, and before an Android file was
+// shared or saved, Back puts the entry back (and in the second case asks).
+let otpHistEntry = false;
+let otpHistIgnore = 0;
+function otpHistPush() {
+  try {
+    history.pushState({ otpSheet: 1 }, "");
+    otpHistEntry = true;
+  } catch { /* no history API (tests): Back simply does not reach the sheet */ }
+}
+function otpHistDrop() {
+  if (!otpHistEntry) return;
+  otpHistEntry = false;
+  otpHistIgnore++;
+  try { history.back(); } catch { otpHistIgnore--; }
+}
+function otpOnPopState() {
+  if (otpHistIgnore > 0) { otpHistIgnore--; return; }
+  if (!otpUi.sheet) return;
+  otpHistEntry = false; // Back took it
+  if (otpSheetWorking()) { otpHistPush(); return; }
+  if (otpNeedsCloseConfirm()) {
+    otpHistPush();
+    closeOtpSheet(); // asks; on OK it closes and drops the entry again
+    return;
+  }
+  closeOtpSheet({ fromHistory: true });
+}
+
+// The entry buttons. Export first unlocks the selected pad in the panel —
+// the pad passphrase field sits right above it — then opens the sheet.
+async function otpExportOpenClick() {
+  if (otpUi.sheet || els.otpExportOpen.getAttribute("aria-busy") === "true") return;
+  const id = els.otpSelect.value;
+  if (!id) { otpStatusMsg("Select a pad to export.", true); els.otpSelect.focus(); return; }
+  const meta = otp.padMeta(id);
+  if (meta && meta.role === 1) {
+    // Only reachable through a stale index; otp.exportPad refuses it anyway.
+    otpStatusMsg("You received this pad — only the person who made it can export it.", true);
+    return;
+  }
+  if (!(otpPanel && otpPanel.padId === id)) {
+    if (!els.otpPass.value) { otpStatusMsg("Enter this pad's passphrase to unlock it.", true); els.otpPass.focus(); return; }
+    // The label stays "Export" (it must fit 360px); a spinner and aria-busy say it works.
+    els.otpExportOpen.setAttribute("aria-busy", "true");
+    els.otpExportOpen.disabled = true;
+    otpHistPush(); // now, inside the click (see openOtpSheet); dropped again if the unlock fails
+    let ok = false;
+    try {
+      await ensureUnlocked(id);
+      ok = els.otpSelect.value === id; // another pad chosen meanwhile: no sheet
+    } catch (e) {
+      otpStatusMsg("Export failed: " + e.message, true);
+    } finally {
+      els.otpExportOpen.removeAttribute("aria-busy");
+      els.otpExportOpen.disabled = false;
+    }
+    if (!ok || otpUi.sheet) { otpHistDrop(); return; }
+    otpStatusMsg("");
+    openOtpSheet("export", els.otpExportOpen, { pushed: true });
+    return;
+  }
+  otpStatusMsg("");
+  openOtpSheet("export", els.otpExportOpen);
+}
+function otpLockPanel() {
+  otpPanel = null; // the panel's cache only — a live session's pad is its own (otpRecord)
+  els.otpPass.value = "";
+  refreshOtpPanel();
+  els.otpPass.focus();
+}
+
+// Live weak-passphrase line under a new passphrase: warn, never block.
+function otpWeakLive(input, out) {
+  const why = input.value ? passphraseWeakness(input.value) : null;
+  out.textContent = why ? `Weak: ${why}. Use ${PASSPHRASE_MIN_CHARS} or more characters, e.g. four random words.` : "";
+}
+
+// Tab stays inside the open sheet (the rest of the page is inert).
+function otpTabWrap(sheet, e) {
+  if (e.key !== "Tab") return;
+  const stops = [...sheet.querySelectorAll("button, summary, input, select, [tabindex]")]
+    .filter((el) => !el.disabled && el.tabIndex >= 0 && el.offsetParent !== null);
+  if (!stops.length) return;
+  const first = stops[0], last = stops[stops.length - 1];
+  const at = document.activeElement;
+  if (e.shiftKey ? at === first || at === sheet : at === last) {
+    e.preventDefault();
+    (e.shiftKey ? last : first).focus();
+  }
+}
+
+// Bottom-row clicks right after a sheet appeared are ignored (the guard).
+const otpGuarded = (fn) => (e) => (otpTooSoon(e) ? undefined : fn(e));
 
 // ---- wiring ---------------------------------------------------------------
 
@@ -5389,6 +6169,7 @@ function syncAlgUI() {
   els.passRow.hidden = alg !== "AES256";
   els.contactRow.hidden = !algNeedsIdentity(alg); // lookup only aids DHKE/PQKEM
   els.otpPanel.hidden = alg !== "OTP";
+  refreshOtpPanel(); // Connect's aria-disabled / emphasis follow the OTP card
   els.algSummary.textContent = "Security options — currently: " + (ALG_LABELS[alg] || alg);
   // A non-default choice needs the panel to stay open, or the setting becomes
   // invisible the moment the user looks away.
@@ -5539,12 +6320,52 @@ els.copyRoom.addEventListener("click", async () => {
 });
 
 // one-time pad controls
-els.otpSelect.addEventListener("change", syncOtpSelection);
-els.otpGenerate.addEventListener("click", otpGenerate);
-els.otpExport.addEventListener("click", otpExport);
-els.otpImport.addEventListener("click", otpImportClick);
+els.otpSelect.addEventListener("change", otpSelectChanged);
+els.otpGenerate.addEventListener("click", otpGuarded(otpGenerate));
+els.otpExport.addEventListener("click", otpGuarded(otpExport));
+els.otpImport.addEventListener("click", otpGuarded(otpImportClick));
 els.otpFile.addEventListener("change", otpFileChosen);
 els.otpForget.addEventListener("click", otpForgetSelected);
+els.otpLock.addEventListener("click", otpLockPanel);
+els.otpNewOpen.addEventListener("click", () => openOtpSheet("new", els.otpNewOpen));
+els.otpImportOpen.addEventListener("click", () => openOtpSheet("import", els.otpImportOpen));
+els.otpExportOpen.addEventListener("click", otpExportOpenClick);
+els.otpNewToExport.addEventListener("click", otpGuarded(otpSwapToExport));
+els.otpNewLater.addEventListener("click", otpGuarded(() => closeOtpSheet()));
+els.otpExportCancel.addEventListener("click", otpGuarded(() => closeOtpSheet()));
+els.otpShare.addEventListener("click", otpGuarded(() => otpNativeSend("share")));
+els.otpSave.addEventListener("click", otpGuarded(() => otpNativeSend("save")));
+els.otpExportDone.addEventListener("click", otpGuarded(() => closeOtpSheet()));
+els.otpSendAgain.addEventListener("click", otpGuarded(otpSendAgain));
+els.otpImportRetry.addEventListener("click", otpGuarded(otpRunImport));
+els.otpImportDone.addEventListener("click", otpGuarded(() => closeOtpSheet()));
+els.otpSize.addEventListener("change", syncOtpSizeHint);
+for (const [input, out] of [[els.otpNewPass, els.otpNewPassWarn], [els.otpXferPass, els.otpXferWarn],
+  [els.otpImportPass, els.otpImportPassWarn]]) {
+  input.addEventListener("input", () => otpWeakLive(input, out));
+}
+for (const input of [els.otpNewPass, els.otpXferPass, els.otpImportXfer, els.otpImportPass]) {
+  input.addEventListener("input", () => {
+    otpClearMark(input);
+    if (input === els.otpImportXfer && otpImportErr === "pass") otpImportErr = "retry";
+    if (otpUi.sheet === "export" || otpUi.sheet === "import") otpRender(otpUi.sheet); // the current step follows
+  });
+}
+for (const [kind, S] of Object.entries(OTP_SHEETS)) {
+  S.close.addEventListener("click", () => closeOtpSheet());
+  S.sheet.addEventListener("keydown", (e) => otpTabWrap(S.sheet, e));
+  void kind;
+}
+// A press on the scrim must not blur the sheet first (focus return), and the
+// second half of the opening tap must not close it (the guard).
+els.otpScrim.addEventListener("mousedown", (e) => e.preventDefault());
+els.otpScrim.addEventListener("click", (e) => { if (!otpTooSoon(e)) closeOtpSheet(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape" || !otpUi.sheet) return;
+  e.preventDefault();
+  closeOtpSheet();
+});
+addEventListener("popstate", otpOnPopState);
 populateOtpSizes();
 setupEntropyCanvas();
 refreshOtpPads();

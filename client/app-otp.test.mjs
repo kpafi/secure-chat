@@ -174,7 +174,7 @@ async function otpConnect(padId = pad.padId) {
   const WEAK = /Weak passphrase: .*offline.*A warning only/;
   // Generate with a weak pad passphrase: the pad is made, and the status says why the passphrase is weak.
   const before = otp.listPads().length;
-  dom.el("otpPass").value = "1234";
+  dom.el("otpNewPass").value = "1234"; // OTP sheets: New pad reads its own field
   dom.el("otpLabel").value = "weakpad";
   dom.el("otpSize").value = "8192";
   await dom.el("otpGenerate").click();
@@ -195,15 +195,15 @@ async function otpConnect(padId = pad.padId) {
   // Import a pad under a weak pad passphrase: imported, with the warning.
   const foreign = await otp.generatePad({ label: "imported-weak", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
   const file = await otp.exportPad(foreign, "transfer passphrase");
-  dom.el("otpXferPass").value = "transfer passphrase";
-  dom.el("otpPass").value = "aaaaaaaaaaaaaaaa";
+  dom.el("otpImportXfer").value = "transfer passphrase";
+  dom.el("otpImportPass").value = "aaaaaaaaaaaaaaaa";
   dom.el("otpFile").files = [{ text: async () => file }];
   await dom.el("otpFile").dispatch("change");
   await settle(10);
   assert.match(st.textContent, /^Imported \+ encrypted pad "imported-weak".*Pad passphrase — Weak passphrase: it is one character repeated/,
     "a weak pad passphrase on import is accepted and warned about: " + st.textContent);
   // Control: strong passphrases, no warning.
-  dom.el("otpPass").value = PAD_PASS;
+  dom.el("otpNewPass").value = PAD_PASS;
   dom.el("otpLabel").value = "strongpad";
   await dom.el("otpGenerate").click();
   await settle(10);
@@ -259,7 +259,7 @@ async function otpConnect(padId = pad.padId) {
   assert.strictEqual(dom.el("otpExport").disabled, false, "…and the button is usable again afterwards");
   // (b) this page unlocks (and caches) a pad; "another tab" exports it.
   // Generate fills this page's unlock cache with the new pad (exported: false).
-  dom.el("otpPass").value = PAD_PASS;
+  dom.el("otpNewPass").value = PAD_PASS;
   dom.el("otpLabel").value = "two-tabs";
   await dom.el("otpGenerate").click();
   await settle(10);
@@ -317,6 +317,7 @@ async function otpConnect(padId = pad.padId) {
       return other.padId;
     },
     async generate() {
+      dom.el("otpNewPass").value = PAD_PASS;
       dom.el("otpLabel").value = "made-during-connect";
       await dom.el("otpGenerate").click();
       await settle(10);
@@ -325,7 +326,8 @@ async function otpConnect(padId = pad.padId) {
     async import() {
       const foreign = await otp.generatePad({ label: "imported-during-connect", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
       const file = await otp.exportPad(foreign, "transfer passphrase");
-      dom.el("otpXferPass").value = "transfer passphrase";
+      dom.el("otpImportXfer").value = "transfer passphrase";
+      dom.el("otpImportPass").value = PAD_PASS;
       dom.el("otpFile").files = [{ text: async () => file }];
       await dom.el("otpFile").dispatch("change");
       await settle(10);
@@ -374,7 +376,7 @@ async function otpConnect(padId = pad.padId) {
 // then uses it (offset advanced and saved). Connecting here must start from
 // the stored offset, not the cache's 0 — that would reuse spent keystream.
 {
-  dom.el("otpPass").value = PAD_PASS;
+  dom.el("otpNewPass").value = PAD_PASS;
   dom.el("otpLabel").value = "used-elsewhere";
   await dom.el("otpGenerate").click();
   await settle(10);
@@ -797,8 +799,8 @@ async function otpConnect(padId = pad.padId) {
     const bSaving = otpB.saveNewPad(recB, "tab B pad passphrase").then(() => "saved", (e) => e.message);
     await waitFor(() => hB.entered);                                       // …and sits in its KDF
     assert.ok(hB.entered, "fixture: tab B's import is inside its KDF");
-    dom.el("otpXferPass").value = "transfer passphrase";
-    dom.el("otpPass").value = PAD_PASS;
+    dom.el("otpImportXfer").value = "transfer passphrase";
+    dom.el("otpImportPass").value = PAD_PASS;
     dom.el("otpFile").files = [{ text: async () => file }];
     await dom.el("otpFile").dispatch("change");
     await settle(10);
@@ -986,7 +988,7 @@ async function otpConnect(padId = pad.padId) {
   // (7) F3: a cached key the pad no longer matches (it was saved again under a
   //     new key elsewhere) is dropped, and the passphrase unlocks it again.
   {
-    dom.el("otpPass").value = PAD_PASS;
+    dom.el("otpNewPass").value = PAD_PASS;
     dom.el("otpLabel").value = "rekeyed";
     await dom.el("otpGenerate").click();
     await settle(10);
@@ -1051,8 +1053,8 @@ async function otpConnect(padId = pad.padId) {
   {
     const src = await otp.generatePad({ label: "twice-here", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
     const file = await otp.exportPad(src, "transfer passphrase");
-    dom.el("otpXferPass").value = "transfer passphrase";
-    dom.el("otpPass").value = PAD_PASS;
+    dom.el("otpImportXfer").value = "transfer passphrase";
+    dom.el("otpImportPass").value = PAD_PASS;
     dom.el("otpFile").files = [{ text: async () => file }];
     await dom.el("otpFile").dispatch("change");
     await settle(10);

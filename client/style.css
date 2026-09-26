@@ -136,6 +136,17 @@
   --i-copy: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='5.5' y='5.5' width='8' height='8' rx='1.6'/%3E%3Cpath d='M10.5 5.5V4a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 4v5A1.5 1.5 0 0 0 4 10.5h1.5'/%3E%3C/svg%3E");
   --i-leave: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6.5 2.5H3.8a1.3 1.3 0 0 0-1.3 1.3v8.4a1.3 1.3 0 0 0 1.3 1.3h2.7'/%3E%3Cpath d='M10.5 5 13.5 8l-3 3M13.3 8H6.5'/%3E%3C/svg%3E");
   --i-send: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 13V3.6M3.9 7.6 8 3.5l4.1 4.1'/%3E%3C/svg%3E");
+  /* One-time pad sheets: entries, the two passphrase tokens, the pad, results. */
+  --i-plus: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 3v10M3 8h10'/%3E%3C/svg%3E");
+  --i-tray-out: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2.5 10v2.2a1.3 1.3 0 0 0 1.3 1.3h8.4a1.3 1.3 0 0 0 1.3-1.3V10'/%3E%3Cpath d='M8 10V2.5M5 5.5l3-3 3 3'/%3E%3C/svg%3E");
+  --i-tray-in: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2.5 10v2.2a1.3 1.3 0 0 0 1.3 1.3h8.4a1.3 1.3 0 0 0 1.3-1.3V10'/%3E%3Cpath d='M8 2.5V10M5 7l3 3 3-3'/%3E%3C/svg%3E");
+  --i-person: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='8' cy='5.2' r='2.7'/%3E%3Cpath d='M2.9 13.4c.7-2.5 2.8-3.9 5.1-3.9s4.4 1.4 5.1 3.9'/%3E%3C/svg%3E");
+  --i-file: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9.2 1.8H4.3a1.3 1.3 0 0 0-1.3 1.3v9.8a1.3 1.3 0 0 0 1.3 1.3h7.4a1.3 1.3 0 0 0 1.3-1.3V5.6z'/%3E%3Cpath d='M9.2 1.8v3.8H13'/%3E%3C/svg%3E");
+  --i-share: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 9.5V2.5M5.5 5 8 2.5 10.5 5'/%3E%3Cpath d='M5.5 7.5H4.3A1.3 1.3 0 0 0 3 8.8v3.9A1.3 1.3 0 0 0 4.3 14h7.4a1.3 1.3 0 0 0 1.3-1.3V8.8a1.3 1.3 0 0 0-1.3-1.3h-1.2'/%3E%3C/svg%3E");
+  --i-download: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 2.5v8M5 7.5l3 3 3-3M3 13.5h10'/%3E%3C/svg%3E");
+  --i-info: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='8' cy='8' r='6'/%3E%3Cpath d='M8 7.2v3.6M8 5.2v.1'/%3E%3C/svg%3E");
+  --i-pad: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='2.5' width='10' height='11' rx='1.4'/%3E%3Cpath d='M3 5.5h10' stroke-dasharray='1.2 1.4'/%3E%3Cpath d='M5.5 8.5h5M5.5 11h3.5'/%3E%3C/svg%3E");
+  --i-spinner: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 2.5a5.5 5.5 0 1 1-5.5 5.5'/%3E%3C/svg%3E");
   --i-dots: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 4' fill='none' stroke='black' stroke-width='0' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='2' cy='2' r='2' fill='black' stroke='none'/%3E%3Ccircle cx='8' cy='2' r='2' fill='black' stroke='none'/%3E%3Ccircle cx='14' cy='2' r='2' fill='black' stroke='none'/%3E%3C/svg%3E");
 }
 
@@ -1895,25 +1906,460 @@ button.peer-open:disabled:hover { opacity: 1; cursor: default; background: trans
 }
 #otpPanel { --gap: var(--sp-4); }
 #otpPanel > .hint:not(:empty) { margin-top: calc(var(--sp-2) - var(--gap)); }
-#otpTools > summary { min-height: var(--control-h); font-size: var(--fs-2); }
-.otp-sub {
+
+/* 5.8c One-time pad (otp-transfer-brief.md § 1–10). The panel keeps what a
+   chat needs; New pad, Export and Import each open a sheet. Icons are the
+   shared mask plumbing (currentColor through --icon). */
+.otp-actions > button::before,
+.otp-note::before,
+.otp-token::before,
+.otp-field::before,
+.otp-unlocked::before,
+.otp-disc::after,
+.otp-done-disc::before,
+.otp-theirs-list > li::before,
+.otp-warn:not(:empty)::before,
+.otp-weak::before,
+.otp-status.err::before,
+.otp-bar > .otp-export-icon::before,
+.otp-bar > .otp-share-icon::before,
+.otp-bar > .otp-save-icon::before {
+  content: "";
+  flex: none;
+  background: currentColor;
+  -webkit-mask: var(--icon) center / contain no-repeat;
+  mask: var(--icon) center / contain no-repeat;
+}
+
+/* The pad glyph in a 40px tile (the empty card, every pad card). */
+.otp-tile {
+  position: relative;
+  flex: none;
+  width: 40px;
+  height: 40px;
+  color: var(--fg);
+  background: var(--panel-2);
+  border-radius: var(--r-s);
+}
+.otp-tile::after {
+  content: "";
+  position: absolute;
+  inset: 10px;
+  background: currentColor;
+  -webkit-mask: var(--i-pad) center / contain no-repeat;
+  mask: var(--i-pad) center / contain no-repeat;
+}
+
+/* No pad yet: one card holds the explanation and both entries, New pad and
+   Import at equal weight (design round 2, minor 1 — the receiver must not be
+   pulled into making a second pad). Connect is aria-disabled below. */
+.otp-empty {
   display: flex;
   flex-direction: column;
-  gap: var(--sp-3);
+  gap: var(--sp-4);
   padding: var(--sp-4);
+  background: var(--panel);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-m);
+  box-shadow: var(--shadow-1);
 }
-.otp-sub + .otp-sub { border-top: 1px solid var(--border-soft); }
-.otp-sub > label { margin-bottom: calc(var(--sp-2) - var(--sp-3)); }
+.otp-empty-head { display: flex; align-items: center; gap: var(--sp-3); }
+.otp-empty-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.otp-empty-title { font-size: var(--fs-3); font-weight: 600; line-height: 1.35; }
+.otp-caption { font-size: var(--fs-2); line-height: 1.5; color: var(--muted); }
+
+/* The entry row: three equal cells (two when Export is not offered). Labels
+   never wrap; below 380px the icons go so "New pad" fits (round 2, minor 9). */
+.otp-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--sp-2);
+}
+.otp-actions.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.otp-actions > button { min-width: 0; padding: 0 var(--sp-2); white-space: nowrap; }
+.otp-actions > button::before { width: 16px; height: 16px; }
+#otpNewOpen { --icon: var(--i-plus); }
+#otpExportOpen { --icon: var(--i-tray-out); }
+#otpImportOpen { --icon: var(--i-tray-in); }
+#otpExportOpen[aria-busy="true"] { --icon: var(--i-spinner); opacity: 1; }
+@media (prefers-reduced-motion: no-preference) {
+  #otpExportOpen[aria-busy="true"]::before { animation: otp-spin 0.9s linear infinite; }
+}
+@keyframes otp-spin { to { transform: rotate(360deg); } }
+@media (max-width: 379px) {
+  .otp-actions > button::before { display: none; }
+}
+.otp-note { --icon: var(--i-info); display: flex; gap: var(--sp-2); margin-top: calc(var(--sp-2) - var(--gap)); }
+.otp-note::before { width: 16px; height: 16px; margin-top: 2px; }
+
+/* Connect while there is no pad: still clickable (it says why it cannot
+   connect), but it looks like what it is — not the thing to press now. */
+#connect[aria-disabled="true"],
+#connect[aria-disabled="true"]:hover {
+  color: var(--muted);
+  background: transparent;
+  border-color: var(--border-soft);
+  box-shadow: none;
+  font-weight: 500;
+  cursor: not-allowed;
+}
+
+/* A passphrase field row: label and token on one line, the field under
+   them (the `.why-row` layout; the "?" beside the label). */
+.otp-fieldrow.why-row > .otp-token { order: 0; flex: none; margin-left: auto; }
+.otp-fieldrow > .otp-warn,
+.otp-fieldrow > .otp-field-err,
+.otp-fieldrow > .otp-unlocked { flex: 1 1 100%; }
+.otp-fieldrow > label { margin: 0; }
+/* Who knows it: two people (transfer) or one person (pad). Shape and words,
+   never colour, tell them apart; the same token wherever it appears. */
+.otp-token {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  height: 20px;
+  padding: 0 var(--sp-2);
+  font-size: var(--fs-1);
+  font-weight: 500;
+  line-height: 1;
+  color: var(--muted);
+  white-space: nowrap;
+  border: 1px solid rgba(139, 148, 158, 0.3);
+  border-radius: var(--r-pill);
+}
+.otp-token::before { width: 12px; height: 12px; }
+.otp-me { --icon: var(--i-person); }
+.otp-both { --icon: var(--i-people); }
+.otp-field { position: relative; }
+.otp-field:has(> input[hidden]) { display: none; }
+.otp-field::before {
+  position: absolute;
+  left: var(--sp-3);
+  top: calc(50% - 8px);
+  width: 16px;
+  height: 16px;
+  color: var(--muted);
+  pointer-events: none;
+  z-index: 2;
+}
+.otp-field > input { padding-left: 40px; }
+/* A field the refusal is about: 2px border, the icon turns into the alert
+   triangle (shape first, colour only reinforces), the label follows. */
+.otp-field:has(> input[aria-invalid="true"]) { --icon: var(--i-alert); }
+.otp-field:has(> input[aria-invalid="true"])::before { color: var(--err); }
+.otp-field > input[aria-invalid="true"] { border: 2px solid var(--err); }
+.otp-fieldrow:has(input[aria-invalid="true"]) > label { color: var(--err-fg); }
+.otp-field-err { font-size: var(--fs-2); color: var(--err-fg); }
+/* The live weak line: warn colour and triangle, one sentence. */
+.otp-warn { display: flex; gap: var(--sp-2); font-size: var(--fs-2); line-height: 1.5; color: var(--warn-fg); }
+.otp-warn:empty { display: none; }
+.otp-warn::before { --icon: var(--i-alert); width: 14px; height: 14px; margin-top: 3px; }
+
+/* Unlocked for this session: a 44px row in the field's well. */
+.otp-unlocked {
+  --icon: var(--i-check);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: var(--control-h);
+  padding: 0 var(--sp-1) 0 var(--sp-3);
+  background: var(--inset);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-s);
+}
+.otp-unlocked::before { width: 16px; height: 16px; color: var(--ok); }
+.otp-unlocked-text { flex: 1 1 auto; font-size: var(--fs-3); }
+#otpLock { flex: none; padding: 0 var(--sp-3); }
+
+/* The drawing box: optional, full width, the drawn line is the feedback. */
 .otp-entropy {
   display: block;
   width: 100%;
-  max-width: 340px;
-  height: 90px;
-  background: var(--panel);
+  height: 96px;
+  background: var(--inset);
   border: 1px dashed var(--border);
   border-radius: var(--r-s);
   touch-action: none;
   cursor: crosshair;
+}
+
+/* ---- the sheets ---- */
+.otp-sheet { padding-bottom: 0; scroll-padding-bottom: 10rem; }
+.otp-sheet:focus { outline: none; }
+.otp-sheet:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.otp-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: var(--sp-3);
+}
+.otp-head-text { min-width: 0; display: flex; flex-direction: column; gap: var(--sp-1); }
+.otp-title { font-size: var(--fs-5); font-weight: 650; line-height: 1.25; letter-spacing: -0.02em; }
+.otp-lede { font-size: var(--fs-2); line-height: 1.5; color: var(--muted); }
+.otp-close {
+  width: var(--control-h);
+  margin: calc(-1 * var(--sp-2)) calc(-1 * var(--sp-2)) 0 0;
+  padding: 0;
+  font-size: var(--fs-6);
+  font-weight: 400;
+}
+.otp-form { display: flex; flex-direction: column; gap: var(--sp-4); }
+
+/* The pad card: tile, name, meta. */
+.otp-padcard {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-m);
+  box-shadow: var(--shadow-1);
+}
+.otp-padcard-text { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.otp-padcard-label { font-size: var(--fs-3); font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; }
+.otp-padcard-meta { font-size: var(--fs-2); line-height: 1.4; color: var(--muted); }
+.otp-meta-warn { color: var(--warn-fg); white-space: nowrap; }
+
+/* Numbered steps: a 24px disc, the title, the controls indented under it, a
+   hairline joining the discs. Current: accent ring. Done: ok tint + check.
+   Upcoming titles are muted (Export, Import); New pad is a plain form. */
+.otp-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.otp-step {
+  position: relative;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  column-gap: var(--sp-3);
+  padding-bottom: 20px;
+}
+.otp-step:last-child { padding-bottom: 0; }
+.otp-step:not(:last-child)::before {
+  content: "";
+  position: absolute;
+  left: 11px;
+  top: 30px;
+  bottom: 6px;
+  width: 1px;
+  background: var(--border-soft);
+}
+.otp-disc {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  font-size: var(--fs-2);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  border: 1.5px solid var(--border);
+  border-radius: 50%;
+}
+.otp-step-title { align-self: center; font-size: var(--fs-3); font-weight: 600; line-height: 1.35; color: var(--muted); }
+.otp-plain .otp-step-title { color: var(--fg); }
+.otp-step-body { grid-column: 2; display: flex; flex-direction: column; gap: var(--sp-2); margin-top: var(--sp-3); }
+.otp-step-body:not(:has(> :not([hidden]))) { display: none; }
+.otp-step-body > .otp-caption:first-child { margin-top: calc(var(--sp-1) - var(--sp-3)); }
+.otp-step.is-current .otp-disc { color: var(--accent-2); border-color: var(--accent); }
+.otp-step.is-current .otp-step-title,
+.otp-step.is-done .otp-step-title { color: var(--fg); }
+.otp-step.is-done .otp-disc {
+  --icon: var(--i-check);
+  color: transparent;
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+  border-color: color-mix(in srgb, var(--ok) 50%, transparent);
+}
+.otp-step.is-done .otp-disc::after { position: absolute; inset: 5px; color: var(--ok); background: var(--ok); }
+.otp-step:not(.is-done) .otp-vh-done { display: none; }
+.otp-name-size { display: grid; grid-template-columns: minmax(0, 1fr) 112px; gap: var(--sp-2); }
+.otp-name-size label { margin-bottom: var(--sp-2); }
+.otp-name-size select { padding-right: var(--sp-6); }
+.otp-size-hint { text-align: right; }
+.otp-file-caption { overflow-wrap: anywhere; }
+
+.otp-draw {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--border-soft);
+}
+.otp-draw-title { font-size: var(--fs-3); font-weight: 600; line-height: 1.35; }
+.otp-muted { font-weight: 400; color: var(--muted); }
+
+/* While a KDF runs: an inset well, a 4px track with a sliding segment, the
+   sentence, and "Keep this open". No percentage. */
+.otp-progress {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  background: var(--inset);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-s);
+}
+.otp-progress:focus { outline: none; }
+.otp-progress:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.otp-track {
+  position: relative;
+  display: block;
+  height: 4px;
+  overflow: hidden;
+  background: var(--track);
+  border-radius: 2px;
+}
+.otp-track::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 40%;
+  width: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .otp-track::after { left: -32%; width: 32%; animation: otp-slide 1.2s linear infinite; }
+}
+@keyframes otp-slide { to { left: 100%; } }
+.otp-progress-text { font-size: var(--fs-3); line-height: 1.4; }
+
+/* The sheet's status, directly above the bottom row: errors (the admission
+   sheet's alert box) and the neutral Android "Not shared." line. */
+.otp-status:empty { display: none; }
+.otp-status { font-size: var(--fs-2); color: var(--muted); }
+.otp-status:focus { outline: none; }
+.otp-status:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.otp-status.err {
+  --icon: var(--i-alert);
+  display: flex;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  font-size: var(--fs-3);
+  line-height: 1.45;
+  color: var(--err-fg);
+  background: color-mix(in srgb, var(--err) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--err) 40%, transparent);
+  border-radius: var(--r-s);
+}
+.otp-status.err::before { width: 16px; height: 16px; margin-top: 3px; }
+
+/* Done: disc + title (+ line), the pad card, what comes next. */
+.otp-done { display: flex; flex-direction: column; gap: var(--sp-4); }
+.otp-done-head { display: flex; align-items: flex-start; gap: var(--sp-3); }
+.otp-done-text { min-width: 0; display: flex; flex-direction: column; gap: var(--sp-1); }
+.otp-done-title { align-self: center; font-size: var(--fs-4); font-weight: 600; line-height: 1.3; }
+.otp-done-text > .otp-done-title { align-self: auto; }
+.otp-done-head:has(> p.otp-done-title) { align-items: center; }
+.otp-file-name { font-size: var(--fs-2); line-height: 1.5; overflow-wrap: anywhere; }
+.otp-done-disc {
+  --icon: var(--i-download);
+  position: relative;
+  flex: none;
+  width: 40px;
+  height: 40px;
+  color: var(--fg);
+  background: var(--panel-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 50%;
+}
+.otp-done-disc::before { position: absolute; inset: 10px; }
+.otp-done-disc.ok {
+  --icon: var(--i-check);
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+  border-color: color-mix(in srgb, var(--ok) 40%, transparent);
+}
+.otp-done-disc.share { --icon: var(--i-share); }
+.otp-weak {
+  --icon: var(--i-alert);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  font-size: var(--fs-2);
+  line-height: 1.5;
+  color: var(--warn-fg);
+}
+.otp-weak::before { width: 14px; height: 14px; margin-right: var(--sp-2); }
+.otp-weak > .why { display: contents; }
+.otp-weak > .why > summary { margin-left: var(--sp-2); }
+.otp-weak > .why::details-content { flex-basis: 100%; }
+.otp-weak > .why > :not(summary) { flex: 1 1 100%; }
+.otp-theirs {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--border-soft);
+}
+.otp-theirs-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-2); }
+.otp-theirs-list > li { display: flex; align-items: center; gap: var(--sp-3); font-size: var(--fs-3); line-height: 1.4; }
+.otp-theirs-list > li.otp-file { --icon: var(--i-file); }
+.otp-theirs-list > li::before {
+  width: 28px;
+  height: 28px;
+  -webkit-mask: none;
+  mask: none;
+  background:
+    var(--panel-2);
+  border-radius: 6px;
+  box-shadow: none;
+}
+.otp-theirs-list > li { position: relative; }
+.otp-theirs-list > li::after {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: calc(50% - 8px);
+  width: 16px;
+  height: 16px;
+  background: currentColor;
+  -webkit-mask: var(--icon) center / contain no-repeat;
+  mask: var(--icon) center / contain no-repeat;
+}
+
+/* The bottom row: every action of the state, stacked full width on a phone
+   and pinned to the sheet's bottom while it scrolls, so a keyboard never
+   hides it. */
+.otp-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin: 0 calc(-1 * var(--gutter));
+  padding: var(--sp-3) var(--gutter) var(--sp-4);
+  background: var(--panel);
+  border-top: 1px solid var(--border-soft);
+}
+.otp-bar > button { width: 100%; white-space: normal; }
+.otp-bar > button + button:not(.ghost) { margin-top: var(--sp-1); }
+.otp-bar > .otp-export-icon { --icon: var(--i-tray-out); }
+.otp-bar > .otp-share-icon { --icon: var(--i-share); }
+.otp-bar > .otp-save-icon { --icon: var(--i-download); }
+.otp-bar > .otp-export-icon::before,
+.otp-bar > .otp-share-icon::before,
+.otp-bar > .otp-save-icon::before { width: 16px; height: 16px; }
+.otp-bar > .otp-again { font-size: var(--fs-3); }
+
+/* Wider: the centred 480px dialog; the actions sit in one row at its
+   bottom right, "again" as a quiet link on the left of Done. */
+@media (min-width: 601px) {
+  .sheet.otp-sheet { max-height: min(704px, calc(var(--vh) - 96px)); padding-bottom: 0; }
+  .otp-bar {
+    flex-direction: row;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: var(--sp-2);
+    margin: 0 calc(-1 * var(--sp-5));
+    padding: var(--sp-3) var(--sp-5) var(--sp-5);
+    border-top: 0;
+  }
+  .otp-bar > button { width: auto; min-width: 120px; }
+  .otp-bar > button + button:not(.ghost) { margin-top: 0; }
+  .otp-bar > .otp-again { order: -1; min-width: 0; margin-right: auto; padding: 0 var(--sp-3); }
+  .otp-entropy { height: 120px; }
 }
 
 /* Live room, step 3: the chat window. On a phone its bar is ONE row: the
