@@ -51,7 +51,11 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   fake caddy/systemctl/install); 46 hand-run mutants red, one equivalent
   (dropping `-type l`: `-perm /022` already matches a symlink).
   deploy/README.md "One Caddy, several services". Commit `5595cf0`
-  (branch claude/quirky-curie-d6221f, not merged, not pushed).
+  (branch claude/quirky-curie-d6221f, not merged, not pushed). Owner
+  (2026-09-26): no tag; it goes live with the next secure-chat deploy from
+  master. Kiosk must not switch to sites.d before that (its site would not
+  be imported) - its deploy should switch only once the live Caddyfile has
+  the `import /etc/caddy/sites.d/*.caddy` line.
   Follow-ups: (1) the new Caddyfile goes live with the next secure-chat
   deploy (or a Caddy-only run, owner's call); (2) in nachrichtenapp, Kiosk's
   deploy should write `/etc/caddy/sites.d/kiosk.caddy` and remove its marker
