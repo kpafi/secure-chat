@@ -243,7 +243,7 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
     it timed out on c225278 too).
 
   **Owed:** merge on the owner's word.
-- **Next:** merge package 6, then release 0.4.0 (no wire change beyond the
+- **Next (package 6 merged 2026-09-26):** release 0.4.0 (no wire change beyond the
   additive `?by=`; release notes: IndexedDB migration, no downgrade, reload
   open tabs, OTP needs IndexedDB, RSA removed, guest approval, one active
   tab, package 6's three new messages), deploy incl. deploy/README.md
