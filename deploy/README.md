@@ -8,7 +8,8 @@ live setup instead of approximating it.
 |---|---|---|
 | `secure-chat.service` | `/etc/systemd/system/` | the relay unit (uvicorn, loopback only) |
 | `torrc.secure-chat` | appended to `/etc/tor/torrc` | the v3 onion service |
-| `Caddyfile` | `/etc/caddy/` | clearnet TLS front end |
+| `Caddyfile` | `/etc/caddy/` | clearnet TLS front end (shared, see "One Caddy, several services") |
+| `caddy-compose.py` | staged by the deploy | keeps other services' blocks in the shared Caddyfile |
 
 Layout on the box: `/opt/secure-chat/{backend,client,venv}`, running as the
 no-login system user `securechat`.
@@ -70,6 +71,77 @@ second instance would split-brain them — two people who picked the same room i
 would land in different rooms, one per front end, and never see each other.
 
 The cost of sharing is the rate-limit keying below.
+
+## One Caddy, several services
+
+`/etc/caddy/Caddyfile` is **not ours alone**: the box also serves the Kiosk
+news app (`kiosk.138-199-144-35.sslip.io` → `127.0.0.1:8100`, deployed from
+its own repository). The 0.4.0 deploy installed `deploy/Caddyfile` over the
+shared file wholesale and so removed Kiosk's site block; `kiosk.…` was down
+from 2026-09-26 20:13 UTC until Kiosk's next deploy put the block back at
+20:27. From then on:
+
+- **`/etc/caddy/sites.d/*.caddy` is where other services put their sites**,
+  one file each (`sites.d/kiosk.caddy`). `deploy/Caddyfile` ends with
+  `import /etc/caddy/sites.d/*.caddy`, after the global options block and our
+  own site; the path is absolute so that `caddy validate` of the staged copy
+  checks it together with those files. The deploy creates the directory
+  (root, 0755) if it is missing and otherwise **never touches it or its
+  files**. A glob that matches nothing is fine for Caddy (a warning only;
+  not tried against a real Caddy here — were it an error, step 4's validate
+  would stop the deploy before anything is installed).
+- **Marker blocks are carried over.** A service that still keeps its site in
+  the shared file between `# >>> name …` and `# <<< name` (Kiosk's deploy does
+  this today) keeps it: the deploy installs `deploy/Caddyfile` followed by
+  every marker block of the live file, verbatim (`caddy-compose.py`). A
+  broken marker (begin without end, nested, duplicate, a near-miss like
+  `# >>>kiosk`) stops the deploy before anything is changed — a human
+  decides; a dropped block is a site down.
+- **Nothing outside a marker block is dropped silently.** Everything in the
+  live file outside the marker blocks must also be in `deploy/Caddyfile`
+  (the global options, our site, the import); anything else — say another
+  service's site without markers — stops the deploy before anything is
+  changed. So does anything there the check cannot parse safely (a
+  heredoc, a quote open across lines, a line ending other than LF/CRLF).
+  The flip side: if a release removes or renames a top-level entry of
+  `deploy/Caddyfile`, the deploy refuses until the old one is removed from
+  the live file by hand. Only top-level entries are compared: anything
+  another service put INSIDE our site or the global options block is not
+  kept — those two blocks are ours, never edit them for another service.
+- **Their content must not name our site address.** A carried block or a
+  `sites.d/*.caddy` file that mentions `138-199-144-35.sslip.io` as a whole
+  address, in any letter case (e.g. `log { hostnames 138-199-144-35.sslip.io
+  … }`, which would log our traffic, or a second site for our host) stops
+  the deploy. `kiosk.138-199-144-35.sslip.io` is a different address and
+  fine. It is a check against mistakes, not a sandbox: a wildcard like
+  `*.sslip.io`, an `{$ENV}` placeholder or a nested import get past it, and
+  whoever writes `sites.d` is root anyway.
+- **`sites.d` must be root's alone:** the deploy refuses (and changes
+  nothing) if the directory or a file in it has a non-root owner, is group- or
+  other-writable, or is a symlink — whatever is in there becomes part of the
+  front end of secure-chat.
+- Our global options apply to their sites too, but only the default logger
+  (discarded box-wide); an access log they configure for their own site is
+  theirs.
+- Step 4 re-checks the live file just before installing and refuses if
+  another service's deploy replaced it meanwhile; on a failed reload it
+  restores the file as it was at the start of step 4 (unless someone else's
+  file is there by then: left alone, reported) and reloads it only if it
+  validates. It never restarts Caddy: a failed reload keeps the last good
+  config running, a failed restart would take every site down.
+
+So the live file is `deploy/Caddyfile` plus other services' marker blocks,
+not a byte copy of it; step 5 of the deploy checks exactly that (and that
+the marker blocks before and after are the same). **Never** put a marker
+block into `deploy/Caddyfile` (a test refuses it), and never hand-edit
+someone else's block or file here.
+
+Other services: prefer a file in `sites.d/` over a marker block. For Kiosk
+that is a follow-up in its repository (write `/etc/caddy/sites.d/kiosk.caddy`
+and remove its marker block from the shared file in the same step, or the
+site is defined twice and Caddy refuses the config). Test a new
+`sites.d/` file with `caddy validate --config /etc/caddy/Caddyfile --adapter
+caddyfile` before `systemctl reload caddy`.
 
 ## `SECURE_CHAT_TRUSTED_PROXIES` must stay UNSET
 
@@ -302,9 +374,12 @@ stays 0.3.1 until the owner runs it.
    secure-chat` is printed in step 5 (want about 1.1). A login + a sealed
    message from a phone stays a manual check (the sandbox's first run on the
    real box; see "The unit's sandbox").
-5. Caddy: backs up `/etc/caddy/Caddyfile`, runs `caddy validate` on the staged
-   copy **before** installing it and again in place, then `systemctl reload
-   caddy`; a failed validate or reload restores the backup. The `/ios/` block
+5. Caddy: backs up `/etc/caddy/Caddyfile`, creates `/etc/caddy/sites.d` if
+   missing, composes `deploy/Caddyfile` + the live file's marker blocks (see
+   "One Caddy, several services"; added after the 0.4.0 run took the Kiosk
+   site down), runs `caddy validate` on that **before** installing it and
+   again in place, then `systemctl reload caddy`; a failed validate or reload
+   restores the file as it was just before this step. The `/ios/` block
    goes live with it and answers 404 until an IPA is published (see "iOS app
    downloads"). After some traffic, `journalctl -u caddy --since <reload>`
    must hold no client IP (with the default logger discarded it should hold

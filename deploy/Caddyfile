@@ -38,3 +38,10 @@
 		output discard
 	}
 }
+
+# Other services on this box put their site in a file of their own here
+# (e.g. sites.d/kiosk.caddy). The deploy creates the directory if it is
+# missing and never touches its files. Absolute on purpose: `caddy validate`
+# of the staged copy then checks it together with them. The global block
+# above covers their sites too (default logger discarded).
+import /etc/caddy/sites.d/*.caddy
