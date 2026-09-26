@@ -3,8 +3,40 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ CURRENT STATE (2026-09-25) — fixing the old pentest findings on master
+## ⮕ CURRENT STATE (2026-09-26) — release 0.4.0 prepared on `release-0.4.0`, NOT deployed
 
+- **Release 0.4.0 (2026-09-26), branch `release-0.4.0` off `master` 6a512f7,
+  not merged, not pushed, not tagged, not deployed.** Three commits:
+  - version bump: VERSION 0.4.0, Android versionCode 5 / 0.4.0, iOS
+    MARKETING_VERSION 0.4.0 / build 4 (consistent with the tag job: no
+    `ios-v*` tag exists yet), README status;
+  - `deploy/deploy-2026-09-26-v0.4.0.sh`, which also carries out package
+    5's "Pending on the box" (deploy/README.md now "Done by …"):
+    - staged unit/Caddyfile;
+    - backups of the DB, unit, Caddyfile and code tarball in
+      `/root/secure-chat-0.4.0-<stamp>/` (first run also
+      `/root/secure-chat-pre-0.4.0`);
+    - the rsync without `--delete`, plus stale files removed by name (1b);
+    - root ownership;
+    - the sandboxed unit with AUTOMATIC rollback (unit, then code) if the
+      relay does not come up;
+    - Caddy validate-before-reload with restore;
+    - the `/ios/` block deployed (404 until an IPA exists);
+    - loopback + public checks;
+  - `deploy/release-2026-09-26-v0.4.0.md`.
+
+  Checked on the branch:
+  - backend 302, `npm test`, ios dist;
+  - gradle assembleDebug + 12 unit tests (APK versionCode 5 / 0.4.0, 30
+    web files);
+  - `bash -n`, test_ship_list + test_service_unit hold the new script
+    (a `--delete` mutant goes red);
+  - step 5's relay checks against a scratch relay on 8071 all passed;
+  - DB 0.3.1 → 0.4.0 → 0.3.1 → 0.4.0: counters exact.
+
+  **Next, on the owner's word:** merge + tag `v0.4.0`, run the script from a
+  detached checkout of the tag, then the phone APK (assembleDebug, `install
+  -r`) and the on-device checks (release notes §5), archive `phase7-local`.
 - **Goal (owner, 2026-09-24):** every still-open pentest finding fixed on `master`,
   then GitHub holds only `master` (+ `ci/ios-shots`, which iOS CI recreates).
   The old unpushed Phase 1–7 line is preserved as branch `phase7-local`
@@ -17,7 +49,8 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   package 2 (web client vs a hostile relay), package 5 (ops: Caddy default
   logger discarded, systemd second-tier sandboxing — exposure 7.7 → 1.1, one
   ship list for relay/rsync/APK/iOS, code root-owned on deploy). The 0.4.0
-  deploy has extra steps on the box: `deploy/README.md`, "Pending on the box".
+  deploy's extra box steps are in `deploy-2026-09-26-v0.4.0.sh` (deploy/README.md,
+  "Done by deploy-2026-09-26-v0.4.0.sh").
 - **Merged, NOT deployed (2026-09-25):** package 3 (at-rest + Android): OTP
   derived floor slots armed and checked (item 13, incl. older blob copies),
   every native-floor write checked + Kotlin COMMIT_FAILED latch, floor 0 no
@@ -243,11 +276,9 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
     it timed out on c225278 too).
 
   **Owed:** merge on the owner's word.
-- **Next (package 6 merged 2026-09-26):** release 0.4.0 (no wire change beyond the
-  additive `?by=`; release notes: IndexedDB migration, no downgrade, reload
-  open tabs, OTP needs IndexedDB, RSA removed, guest approval, one active
-  tab, package 6's three new messages), deploy incl. deploy/README.md
-  "Pending on the box", phone APK, archive `phase7-local`.
+- **Next (package 6 merged 2026-09-26):** release 0.4.0 — PREPARED on
+  `release-0.4.0` (see the top bullet); deploy, phone APK and archiving
+  `phase7-local` still open.
 - **Relay deployed:** still 0.3.1 (`v0.3.1`).
 - The full itemised 2026-08-07 list (all 47, incl. 18 Low / 15 Info) lives
   outside the repo at `~/secure-chat-pentest/state/findings/INDEX.md`.

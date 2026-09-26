@@ -5,7 +5,7 @@ A deliberately tiny, security-first text chat. ASCII only. The server is a
 forwards opaque ciphertext between two parties in a room. The server never
 holds keys, never decrypts, and never stores or logs message content.
 
-> **Status (v0.3.1):** relay + web client deployed on clearnet and as a
+> **Status (v0.4.0):** relay + web client deployed on clearnet and as a
 > **Tor v3 onion service**; Android app and iOS app (sideloaded) ship the same
 > client. Four encryption modes for the live room (DHKE, AES-256, PQKEM, OTP;
 > RSA was removed in package 4 — see below), plus persistent one-to-one chats
