@@ -224,7 +224,25 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
     15/15, no-dead-ends 17/17, all-modes 28/28, contact-profile 67/67,
     durable-crash passed
 
-  **Owed:** a re-review of round 4, merge on the owner's word.
+  **Final round (2026-09-26, sweep of c225278: no Critical/High/Medium):**
+  fixed in `46126f0`.
+  - Low: the shared pad index lost entries across tabs. It is now only a
+    render cache; listPads/padMeta read the stored blobs.
+  - Low: a hung save blocked every Connect. The wait now runs before
+    `connecting` is set, only for the same OTP pad, and for at most 10 s.
+  - Info: a Disconnect during a receive's save is said.
+  - Mutants Ma/Mb/Mf bound. Ma needed the receive path to capture its
+    session.
+
+  Re-checked:
+  - backend 302, `npm test` (all files), ios dist
+  - gradle + 12 unit tests
+  - e2e on 8061: hostile-relay 24/24, two-user-flow 15/15, no-dead-ends
+    17/17, all-modes 28/28, contact-profile 67/67, durable-crash passed;
+    room-admission 49/49 once Chromium's TMPDIR was moved off /tmp (at 99 %,
+    it timed out on c225278 too).
+
+  **Owed:** merge on the owner's word.
 - **Next:** merge package 6, then release 0.4.0 (no wire change beyond the
   additive `?by=`; release notes: IndexedDB migration, no downgrade, reload
   open tabs, OTP needs IndexedDB, RSA removed, guest approval, one active
