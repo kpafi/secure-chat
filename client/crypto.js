@@ -255,6 +255,35 @@ class RatchetChannel {
     this.lastSkipped = steps - 1;
     return this._finish(pt);
   }
+  // Package 6 fix round (F-CRYPTO-001, the masking residual): which of `frames`
+  // — peer frames the app held UNREAD before its in-person gate passed —
+  // really were the peer's. Each is opened on a SCRATCH walk from the current
+  // receive head and nothing is committed or returned but the sequence
+  // numbers that authenticated (distinct, so a replayed frame counts once).
+  // The plaintext is discarded unread. Bounded by the caller (≤ 64 frames)
+  // and by RATCHET_MAX_SKIP per frame; run once per connection by the app.
+  countAuthentic(frames) {
+    return this._q.run(async () => {
+      const seen = new Set();
+      for (const b64 of frames) {
+        let m;
+        try { m = unpackMsg(b64); } catch { continue; }
+        if (!Number.isInteger(m.n) || m.n <= this.recvSeq || seen.has(m.n)) continue;
+        const steps = m.n - this.recvSeq;
+        if (steps > RATCHET_MAX_SKIP) continue;
+        try {
+          const step = await chainAdvance(this.recvChain, steps, "decrypt");
+          await crypto.subtle.decrypt(
+            { name: "AES-GCM", iv: new Uint8Array(b64ToBuf(m.iv)), additionalData: this._ad(m.n) },
+            step.msgKey,
+            b64ToBuf(m.ct),
+          );
+          seen.add(m.n);
+        } catch { /* not the peer's: a relay's frame */ }
+      }
+      return [...seen];
+    });
+  }
   _finish(pt) {
     const text = dec.decode(pt);
     // Pentest 2026-07-26 P-18: enforce the project's printable-ASCII invariant
@@ -367,6 +396,7 @@ class AesPassphrase {
     return this.chan.decrypt(b64);
   }  // F-CRYPTO-001: frames the last decrypted frame stepped over (see RatchetChannel).
   get lastSkipped() { return this.chan ? this.chan.lastSkipped : 0; }
+  countAuthentic(frames) { return this.chan ? this.chan.countAuthentic(frames) : Promise.resolve([]); }
 }
 
 // ---- DHKE: ephemeral ECDH (P-256) -> forward-secret symmetric ratchet ------
@@ -469,6 +499,7 @@ class Dhke {
     return this.chan.decrypt(b64);
   }  // F-CRYPTO-001: frames the last decrypted frame stepped over (see RatchetChannel).
   get lastSkipped() { return this.chan ? this.chan.lastSkipped : 0; }
+  countAuthentic(frames) { return this.chan ? this.chan.countAuthentic(frames) : Promise.resolve([]); }
 }
 
 // ---- shared byte helpers (DHKE + PQKEM) ------------------------------------
@@ -683,6 +714,7 @@ class Pqkem {
     return pt;
   }  // F-CRYPTO-001: frames the last decrypted frame stepped over (see RatchetChannel).
   get lastSkipped() { return this.chan ? this.chan.lastSkipped : 0; }
+  countAuthentic(frames) { return this.chan ? this.chan.countAuthentic(frames) : Promise.resolve([]); }
 }
 
 // ---- OTP: pre-shared one-time pad (true XOR) --------------------------------

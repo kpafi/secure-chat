@@ -204,11 +204,21 @@ let otpAtRest = null;      // cached at-rest key {key,salt,iters} for cheap re-s
 let otpLockRelease = null; // releases this pad's exclusive same-origin lock
 let joined = false;
 let verified = false; // in-person gate passed; gates RECEIVING as well as sending
-// F-CRYPTO-001: peer frames this connection dropped UNREAD because the gate
-// was still up. The peer's side can pass its gate first and send; those frames
-// never reach the cipher, so the next frame we do decrypt steps over them. They
-// are ours, not the relay's — the gap notice subtracts them (see `case "msg"`).
-let droppedBeforeVerify = 0;
+// F-CRYPTO-001: in DHKE/PQKEM each side passes its in-person gate on its own;
+// the peer may confirm first and write while we still drop its frames UNREAD.
+// They never reach the chain, so the next frame we do decrypt steps over them —
+// ours, not the relay's. The dropped frames are HELD (at most HELD_MAX, as
+// received) and, at the first frame after our gate, opened on a scratch walk
+// of the chain (cipher.countAuthentic): only those that authenticate are
+// subtracted from the gap. A relay's junk never authenticates, so it can no
+// longer hide a drop by injecting frames before the gate (the package-6
+// review's Low). `heldAuthentic` caches that answer until a frame commits (the
+// head does not move before, so it cannot change; recomputing per junk frame
+// would be a relay-driven cost). AES256/OTP hold nothing: no honest frame can
+// precede our key confirmation there (the peer's confirm tag comes first).
+const HELD_MAX = 64; // = RATCHET_MAX_SKIP: a larger gap ends the session anyway
+let heldBeforeVerify = [];
+let heldAuthentic = null;
 let sessionPassWarning = null; // package 6: a weak AES256 shared passphrase, said at join
 // Pentest 2026-07-26 P-19: the room id and algorithm this session actually
 // negotiated, captured once at connect(). The send path used to re-read
@@ -3181,7 +3191,8 @@ async function connectInner() {
   peerBundle = null;
   verified = false;
   els.chatVerified.hidden = true; // B2: nobody is verified on a new connection
-  droppedBeforeVerify = 0; // F-CRYPTO-001: a new connection, a new chain
+  heldBeforeVerify = []; // F-CRYPTO-001: a new connection, a new chain
+  heldAuthentic = null;
   myNonce = freshNonce();
   peerNonce = null;
   helloAnswered = false;
@@ -4297,11 +4308,20 @@ async function handleMessage(room, raw, sock) {
       // sends before the user confirms the safety number would render as a
       // trusted "peer" line. Drop such frames — never decrypt or display them.
       if (!verified) {
-        droppedBeforeVerify += 1; // F-CRYPTO-001: a gap we caused, not the relay
-        addLine("sys", "", "[message arrived before you verified the safety number — dropped]");
+        if (cipher && cipher.needsHandshake) {
+          // F-CRYPTO-001: held unread, for the gap count only (see HELD_MAX).
+          if (heldBeforeVerify.length < HELD_MAX && typeof m.payload === "string") heldBeforeVerify.push(m.payload);
+          addLine("sys", "", "[message arrived before you verified the safety number — dropped]");
+        } else {
+          addLine("sys", "", "[message arrived before the secure channel was ready — dropped]");
+        }
         break;
       }
       try {
+        if (heldBeforeVerify.length && heldAuthentic === null) {
+          heldAuthentic = await cipher.countAuthentic(heldBeforeVerify);
+          if (!live()) return;
+        }
         const text = await cipher.decrypt(m.payload);
         // F-CRYPTO-001: read at once — msgChain serializes handleMessage, so
         // this is the value for THIS frame.
@@ -4337,13 +4357,19 @@ async function handleMessage(room, raw, sock) {
         // most one notice per real message, and it is a narration (folds by
         // membership, evicted before the record — package 2's addLine).
         // A pad frame reports -1: bytes were skipped, the count is unknown.
+        // Held frames count only if they authenticated AND lie inside this
+        // gap (their sequence numbers are bound by the AEAD; this frame's `n`
+        // is too, now that it decrypted).
+        let ours = 0;
+        if (heldAuthentic && skipped > 0) {
+          const n = frameSeq(m.payload);
+          ours = heldAuthentic.filter((h) => h < n && h >= n - skipped).length;
+        }
+        heldBeforeVerify = [];
+        heldAuthentic = null;
         if (skipped !== 0) {
-          const ours = Math.min(droppedBeforeVerify, skipped < 0 ? 0 : skipped);
-          droppedBeforeVerify = 0;
           const lost = skipped < 0 ? -1 : skipped - ours;
           if (lost !== 0) addLine("sys", "", gapNotice(lost));
-        } else {
-          droppedBeforeVerify = 0;
         }
         addLine("peer", "peer", text);
       } catch {
@@ -4364,6 +4390,9 @@ async function handleMessage(room, raw, sock) {
 
 // F-CRYPTO-001: the gap notice. `lost` > 0 is a count; -1 is a pad gap of
 // unknown size.
+function frameSeq(payload) {
+  try { return JSON.parse(new TextDecoder().decode(b64ToBuf(payload))).n; } catch { return 0; }
+}
 function gapNotice(lost) {
   const what = lost < 0 ? "Earlier message(s)" : lost === 1 ? "1 message" : `${lost} messages`;
   return `[${what} from your contact never arrived — the relay may have dropped them]`;

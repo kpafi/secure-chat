@@ -232,7 +232,7 @@ const junk = (i) => ({ type: "msg", room: ROOM, alg: "AES256", payload: Buffer.f
   const sessions = count(/joined room/);
   for (let i = 0; i < 600; i++) await ws.deliver(junk(i));
   assert.strictEqual(count(/joined room/), sessions, "M-5: a junk flood does not evict the session line");
-  const repeated = lines().filter((l) => /arrived before you verified/.test(l));
+  const repeated = lines().filter((l) => /arrived before the secure channel was ready/.test(l));
   assert.strictEqual(repeated.length, 1, `600 identical narrations are ONE line (got ${repeated.length})`);
   assert.match(repeated[0], /×\s*\d+/, "...carrying its count");
   assert.ok(lines().length <= 500, "...and the transcript stays bounded");
@@ -287,7 +287,7 @@ const junk = (i) => ({ type: "msg", room: ROOM, alg: "AES256", payload: Buffer.f
   assert.strictEqual(count(/joined room/), sessions, "...and the session line is untouched");
   const isKept = (re) => log().filter((c) => re.test(c.textContent)).every((c) => c.dataset.keep === "1");
   assert.ok(isKept(/joined room/) && isKept(/you created this chat/), "the session lines carry the `keep` marker");
-  assert.ok(log().some((c) => /arrived before you verified/.test(c.textContent) && !c.dataset.keep), "...a junk refusal does not");
+  assert.ok(log().some((c) => /arrived before the secure channel was ready/.test(c.textContent) && !c.dataset.keep), "...a junk refusal does not");
   console.log("OK  item 2: repeated `joined` is free; 2 800 interleaved frames cost at most three lines (executed)");
 }
 {
@@ -297,9 +297,9 @@ const junk = (i) => ({ type: "msg", room: ROOM, alg: "AES256", payload: Buffer.f
   await ws.deliver(junk(9000));
   await ws.deliver({ type: "denied" });
   await ws.deliver(junk(9001));
-  assert.strictEqual(count(/arrived before you verified/), 1,
+  assert.strictEqual(count(/arrived before the secure channel was ready/), 1,
     "an identical narration anywhere in the transcript is folded, not appended");
-  assert.match(lines()[lines().length - 1], /arrived before you verified.*×\s*\d+/, "...and moved to the end with its count");
+  assert.match(lines()[lines().length - 1], /arrived before the secure channel was ready.*×\s*\d+/, "...and moved to the end with its count");
   assert.strictEqual(count(/did not let you in/), 0, "an owner is never `denied` — the frame is dropped");
   const ws2 = await connect();
   await ws2.deliver({ type: "pending" });
@@ -1285,7 +1285,7 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
   }
   assert.strictEqual(lines().length, 500, "tier 1: the transcript is capped at 500");
   assert.ok(!lines().includes("mem0") && lines().includes("mem599"), "tier 1: the OLDEST conversation lines go");
-  assert.ok(said(/undecryptable message/) && said(/arrived before you verified/), "tier 1: no narration goes while conversation remains");
+  assert.ok(said(/undecryptable message/) && said(/arrived before the secure channel was ready/), "tier 1: no narration goes while conversation remains");
   const subtle = crypto.subtle;
   const origDerive = subtle.deriveBits;
   subtle.deriveBits = function (alg, key, len) {
@@ -1875,6 +1875,13 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
   const peerNonce = freshNonce();
   await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: pack({ hello: true, n: peerNonce, reply: true }) });
   await peer.setNonces(peerNonce, hello.n);
+  // Fix round (review Low): junk BEFORE key confirmation. No honest AES256
+  // frame can come before the peer's confirm tag, so these are not counted as
+  // ours — they used to be, and hid the same number of real drops below.
+  await ws.deliver(junk(9200));
+  await ws.deliver(junk(9201));
+  await until(() => said(/arrived before the secure channel was ready — dropped/), "the pre-confirmation narration");
+  assert.ok(!said(/before you verified the safety number/), "AES256 has no safety number: the narration does not mention one");
   await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: pack({ confirm: peer.confirmation.mine }) });
   assert.strictEqual(dom.el("text").disabled, false, "fixture: the AES256 session is confirmed");
   const before = gapLines().length;
@@ -1928,7 +1935,54 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
   assert.match(lines()[lines().indexOf("peerafter-43") - 1], ONE,
     "...but a gap after that is ");
   await dom.el("disconnect").click();
-  console.log("OK  F-CRYPTO-001: a skipped gap shows one line with its count; our own pre-verification drops are not blamed on the relay (executed)");
+
+  // (c) fix round: the relay drops the peer's LAST pre-verification frame and
+  //     injects junk plus a replay before our gate. Only frames that
+  //     authenticate against the chain are ours; the drop is still reported.
+  {
+    const gil = await Identity.generate();
+    const { ws: w3, pc: p3 } = await handshakeToConfirm(gil);
+    await w3.deliver(confirmFrame(p3));
+    await until(() => !dom.el("verify").hidden, "Gil's gate");
+    const early = [];
+    for (let i = 1; i <= 5; i++) early.push(await p3.encrypt("c-early-" + i));
+    for (const f of early.slice(0, 4)) await w3.deliver({ type: "msg", room: ROOM, alg: "DHKE", payload: f });
+    await w3.deliver({ type: "msg", room: ROOM, alg: "DHKE", payload: early[0] }); // a replay of an honest frame
+    for (let i = 0; i < 3; i++) await w3.deliver(Object.assign(junk(9300 + i), { alg: "DHKE" }));
+    // early[4] is dropped by the relay
+    await settle(10);
+    await dom.el("verifyOk").click();
+    await until(() => dom.el("text").disabled === false, "Gil's session to unlock");
+    await deliverMsg(w3, "DHKE", p3, "c-after-6");
+    assert.match(lines()[lines().indexOf("peerc-after-6") - 1], ONE,
+      "fix round: junk and a replay injected before the gate do not hide a dropped frame — 1 is reported");
+    await dom.el("disconnect").click();
+  }
+
+  // (d) fix round (coverage): what was held on one connection is gone on the
+  //     next. Connection 1 fills the hold with junk and ends unverified;
+  //     on connection 2 the peer's honest pre-verification frames must count.
+  {
+    const w4a = await connect("DHKE");
+    await w4a.deliver({ type: "joined", role: "owner" });
+    for (let i = 0; i < 64; i++) await w4a.deliver(Object.assign(junk(9400 + i), { alg: "DHKE" }));
+    await settle(10);
+    await dom.el("disconnect").click();
+    const hal2 = await Identity.generate();
+    const { ws: w4, pc: p4 } = await handshakeToConfirm(hal2);
+    await w4.deliver(confirmFrame(p4));
+    await until(() => !dom.el("verify").hidden, "Hal's gate");
+    for (let i = 1; i <= 2; i++) await w4.deliver({ type: "msg", room: ROOM, alg: "DHKE", payload: await p4.encrypt("d-early-" + i) });
+    await settle(10);
+    const g1 = gapLines().length;
+    await dom.el("verifyOk").click();
+    await until(() => dom.el("text").disabled === false, "Hal's session to unlock");
+    await deliverMsg(w4, "DHKE", p4, "d-after-3");
+    assert.ok(gapLines().length === g1 && !GAP.test(lines()[lines().indexOf("peerd-after-3") - 1]),
+      "fix round: a new connection starts with nothing held — the last connection's junk does not crowd out this one's frames");
+    await dom.el("disconnect").click();
+  }
+  console.log("OK  F-CRYPTO-001: a skipped gap shows one line with its count; only frames that authenticate as the peer's are subtracted — junk, replays and a previous connection hide nothing (executed)");
 }
 
 // ==== package 6, F-PROTO-006 + F-PROTO-007: vouch marks age out; the lookup asks by verified contacts ====

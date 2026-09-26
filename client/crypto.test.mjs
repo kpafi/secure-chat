@@ -704,6 +704,20 @@ async function gapReportChecks() {
     await b.decrypt(await a.encrypt("5"));
     assert.strictEqual(b.lastSkipped, 0, `${alg}: ...and the next in-order frame 0 again`);
   }
+  // Fix round: countAuthentic names the held frames that are really the peer's,
+  // on a scratch walk — distinct, junk and replays excluded, nothing committed.
+  for (const alg of ["AES256", "DHKE", "PQKEM"]) {
+    const [a, b] = await pair(alg);
+    const f1 = await a.encrypt("h1");
+    const f2 = await a.encrypt("h2");
+    await a.encrypt("h3 (dropped)");
+    // junk claiming the DROPPED frame's number: only the AEAD can tell it apart
+    const junkFrame = Buffer.from(JSON.stringify({ iv: "AAAAAAAAAAAAAAAA", ct: "AAAA", n: 3 })).toString("base64");
+    const got = await b.countAuthentic([f1, junkFrame, f2, f1, "not base64 !"]);
+    assert.deepStrictEqual(got.sort(), [1, 2], `${alg}: the two genuine frames, once each; junk at a real n and a replay excluded`);
+    assert.strictEqual(await b.decrypt(f1), "h1", `${alg}: nothing was committed — the first frame still decrypts`);
+    assert.deepStrictEqual(await b.countAuthentic([f1]), [], `${alg}: a frame at or below the head is not counted`);
+  }
   const [a, b] = otpPeers();
   await b.decrypt(await a.encrypt("1"));
   assert.strictEqual(b.lastSkipped, 0, "OTP: an in-order frame skipped nothing");
