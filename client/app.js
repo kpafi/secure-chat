@@ -3082,7 +3082,34 @@ function stopMailboxPolling() {
 let connecting = false;
 const MAX_WS_FRAME_CHARS = 64 * 1024; // = the relay's MAX_FRAME_BYTES; frames are ASCII
 
+// Final round (Low, new in round 4): the wait for the previous session's save
+// used to run INSIDE the connect, with no limit, while `connecting` was set —
+// a save that never settles (a hung IndexedDB transaction) blocked every
+// Connect in the tab, AES256 too, until a reload. It now runs before
+// `connecting` is set, only for an OTP connect to that same pad, and for at
+// most FINISH_WAIT_MS; then the connect is refused with what to do.
+const FINISH_WAIT_MS = 10000;
 async function connect() {
+  if (connecting) return;
+  if (algValue() === "OTP") {
+    const finishing = closingPadLocks.get(els.otpSelect.value);
+    if (finishing) {
+      const gen0 = sessionGen;
+      setStatus("finishing the previous session's save…");
+      let timer;
+      const settled = await Promise.race([
+        finishing.then(() => true),
+        new Promise((r) => { timer = setTimeout(() => r(false), FINISH_WAIT_MS); }),
+      ]);
+      clearTimeout(timer);
+      if (sessionGen !== gen0) return; // another connect ran meanwhile: it wins
+      if (!settled) {
+        setStatus("disconnected", "err");
+        hint("This pad's previous session is still saving its progress. Try again in a moment — if it does not finish, reload the page.", true);
+        return;
+      }
+    }
+  }
   if (connecting) return;
   connecting = true;
   els.connect.disabled = true;
@@ -3163,13 +3190,8 @@ async function connectInner() {
       hint("Choose a one-time pad first, under Security options \u2192 Generate / share a pad.", true);
       return;
     }
-    // Round 4 (F3): the previous session on this pad may still be saving; its
-    // lock goes when that settles. Wait for it instead of calling it "another tab".
-    const finishing = closingPadLocks.get(padId);
-    if (finishing) {
-      setStatus("finishing the previous session's save…");
-      await finishing;
-    }
+    // Round 4 (F3): the wait for the previous session's save happens in
+    // connect(), before `connecting` is set, with a time limit (final round).
     // Exclusive same-origin lock: a pad must be live in only ONE tab/window at a
     // time, or two sessions would draw the same keystream (two-time pad).
     const got = await acquirePadLock(padId);
@@ -4345,6 +4367,10 @@ async function handleMessage(room, raw, sock) {
         }
         break;
       }
+      // Final round: the session this frame belongs to, captured before any
+      // await (as sendText does), so its save is judged against THIS
+      // session's lock — held, or closing, or gone — never a later global.
+      const recvSess = otpSession();
       try {
         if (heldBeforeVerify.length && heldAuthentic === null) {
           heldAuthentic = await cipher.countAuthentic(heldBeforeVerify);
@@ -4368,7 +4394,7 @@ async function handleMessage(room, raw, sock) {
         // undelivered, which is the honest state. Same rule as sending
         // (persist before transmit).
         try {
-          await persistOtpProgress();
+          await persistOtpProgress(recvSess);
         } catch (err) {
           if (err.code === "LOCK_GONE") {
             // Round 4: the connection closed while this frame was being read.
@@ -4379,7 +4405,13 @@ async function handleMessage(room, raw, sock) {
           otpPersistFailed(err);
           return;
         }
-        if (!live()) return;
+        // Final round (Info): the user's own Disconnect while this frame's
+        // receipt was being saved — recorded as received, so say that it was
+        // not shown (it used to vanish without a word).
+        if (!live()) {
+          addLine("sys", "", "[a message arrived as the connection closed — not shown (its receipt could not be saved)]");
+          return;
+        }
         // Pentest 2026-08-07 F-CRYPTO-001 (Low): the ratchet fast-forwards
         // over a gap and destroys the skipped keys — correctly, for forward
         // secrecy — but it used to do so SILENTLY, so a relay that dropped

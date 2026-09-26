@@ -600,12 +600,41 @@ function writeIndexEntry(record, extra = {}) {
   localStorage.setItem(LS_INDEX, JSON.stringify(idx));
 }
 
+// Package 6 final round (Low, pre-existing): the index is ONE localStorage key
+// shared by every pad, read-modified-written by whichever tab saves any pad —
+// and each tab holds only its own pad's lock. Two tabs saving different pads
+// lost each other's entries (Chromium's localStorage is only eventually
+// consistent across tabs): a pad stored but missing from the index was not
+// listed, while padWasUsed() still said "used" and refused its re-import — an
+// unused in-person pad silently lost. The index is now a render cache and
+// never the source of truth: a pad exists iff its blob exists. listPads() and
+// padMeta() list every blob, take the cached metadata where present and a
+// placeholder where not (the blob keeps label/role inside its AEAD; the next
+// save of that pad rewrites its entry). Forget removes the blob, and the
+// listing follows; a stale index entry without a blob is not listed.
+const PAD_KEY_PREFIX = "sc.otp.pad.v1.";
+function storedPadIds() {
+  const ids = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (typeof k === "string" && k.startsWith(PAD_KEY_PREFIX)) {
+      const id = k.slice(PAD_KEY_PREFIX.length);
+      if (PAD_ID_RE.test(id)) ids.push(id);
+    }
+  }
+  return ids;
+}
+function metaFor(id, cached) {
+  return cached.get(id) || { padId: id, label: "pad " + id.slice(0, 8), createdAt: 0, rebuilt: true };
+}
 // List pad metadata (no bytes / no secrets) for the selector, newest first.
 export function listPads() {
-  return readIndex().slice().sort((a, b) => b.createdAt - a.createdAt);
+  const cached = new Map(readIndex().map((e) => [e.padId, e]));
+  return storedPadIds().map((id) => metaFor(id, cached)).sort((a, b) => b.createdAt - a.createdAt);
 }
 export function padMeta(padId) {
-  return readIndex().find((e) => e.padId === padId) || null;
+  if (typeof padId !== "string" || !PAD_ID_RE.test(padId) || localStorage.getItem(padKey(padId)) === null) return null;
+  return metaFor(padId, new Map(readIndex().map((e) => [e.padId, e])));
 }
 
 // Stored-blob format version. v1 kept padId/label/regionSize/role OUTSIDE the

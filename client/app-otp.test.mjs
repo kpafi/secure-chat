@@ -99,6 +99,7 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
 const settle = async (n = 40) => { for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 5)); };
 const lines = () => dom.lines();
 const said = (re) => lines().some((l) => re.test(l));
+const count = (re) => lines().filter((l) => re.test(l)).length;
 const anyHint = (re) => ["hint", "roomHint", "idHint"].some((id) => re.test(dom.el(id).textContent));
 const pack = (o) => bufToB64(new TextEncoder().encode(JSON.stringify(o)));
 
@@ -1002,6 +1003,179 @@ async function otpConnect(padId = pad.padId) {
     await dom.el("disconnect").click();
   }
   console.log("OK  package 6 round 4: a pad file imported in two tabs is refused after the KDF; imports/forgets hold the pad lock; no save under a foreign key; no save starts after a close and all in-flight saves hold the lock; reconnect waits; a stale cached key is dropped (executed, separate otp.js instances)");
+}
+
+// ==== package 6 final round ====================================================
+{
+  const st = dom.el("otpStatus");
+  const waitFor = async (cond, n = 400) => { for (let i = 0; i < n && !cond(); i++) await new Promise((r) => setTimeout(r, 5)); };
+
+  // (1) Low: the shared index is a render cache. Tab B's pad lands in the
+  //     index; tab A's next index write works from a view taken BEFORE that
+  //     (cross-tab localStorage is only eventually consistent) and drops it.
+  //     The pad must still be listed and usable.
+  {
+    const IDX = "sc.otp.index.v1";
+    const before = localStorage.getItem(IDX);
+    const y = await otpB.generatePad({ label: "tab-B-pad", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    await otpB.saveNewPad(y, PAD_PASS);                                    // tab B: pad Y, index has Y
+    const realGet = globalThis.localStorage.getItem;
+    globalThis.localStorage.getItem = (k) => (k === IDX ? before : realGet(k)); // tab A's stale view
+    let x;
+    try {
+      x = await otp.generatePad({ label: "tab-A-pad", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+      await otp.saveNewPad(x, PAD_PASS);                                   // tab A writes the index without Y
+    } finally {
+      globalThis.localStorage.getItem = realGet;
+    }
+    assert.ok(!JSON.parse(localStorage.getItem(IDX)).some((e) => e.padId === y.padId), "fixture: the index lost tab B's entry");
+    const listed = otp.listPads().map((m) => m.padId);
+    assert.ok(listed.includes(y.padId) && listed.includes(x.padId), "final round: both pads are still listed (the blob is the source of truth)");
+    assert.ok(otp.padMeta(y.padId), "…and the lost one has metadata (for the import duplicate check and the selector)");
+    assert.ok((await otp.unlockPad(y.padId, PAD_PASS)).record, "…and it is usable");
+    // Forget removes the blob; the listing follows, whatever the index says.
+    otp.forgetPad(x.padId);
+    assert.ok(!otp.listPads().some((m) => m.padId === x.padId), "a forgotten pad is not listed");
+    // …even when another tab's stale index write puts its entry back.
+    const idx = JSON.parse(localStorage.getItem(IDX));
+    idx.push({ padId: x.padId, label: "tab-A-pad", regionSize: 4096, role: 0, createdAt: Date.now(), exported: false });
+    localStorage.setItem(IDX, JSON.stringify(idx));
+    assert.ok(!otp.listPads().some((m) => m.padId === x.padId) && otp.padMeta(x.padId) === null,
+      "final round: an index entry without a stored pad is not listed (the blob decides)");
+  }
+
+  // (2) Mf: the "you already have this pad" check inside the import lock.
+  //     Normally importPad's used-check refuses first; the lock-held check is
+  //     what stands when the deletable used-markers are gone but the pad's blob
+  //     is still here — it keeps a second import from replacing that blob.
+  {
+    const src = await otp.generatePad({ label: "twice-here", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    const file = await otp.exportPad(src, "transfer passphrase");
+    dom.el("otpXferPass").value = "transfer passphrase";
+    dom.el("otpPass").value = PAD_PASS;
+    dom.el("otpFile").files = [{ text: async () => file }];
+    await dom.el("otpFile").dispatch("change");
+    await settle(10);
+    assert.match(st.textContent, /^Imported/, "fixture: first import");
+    const blob = localStorage.getItem("sc.otp.pad.v1." + src.padId);
+    for (const k of ["sc.otp.wm.v1.", "sc.otp.used.v1."]) localStorage.removeItem(k + src.padId);
+    dom.el("otpFile").files = [{ text: async () => file }];
+    await dom.el("otpFile").dispatch("change");
+    await settle(10);
+    assert.match(st.textContent, /You already have this pad on this device/,
+      "final round (Mf): with the used-markers gone, a second import is still refused as a duplicate: " + st.textContent);
+    assert.strictEqual(localStorage.getItem("sc.otp.pad.v1." + src.padId), blob, "…and the stored pad is not replaced");
+  }
+
+  // (3) Mb: FOREIGN_RECORD also guards the durable record alone.
+  {
+    const p = await otp.generatePad({ label: "dur-foreign", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    const atRest = await otp.saveNewPad(p, PAD_PASS);
+    const u = await otpB.unlockPad(p.padId, PAD_PASS);
+    const k = "sc.otp.dur.v1." + p.padId;
+    fakeIdb.setItem(k, JSON.stringify({ ...JSON.parse(fakeIdb.getItem(k)), ct: "AAAAAAAAAAAAAAAAAAAAAAA=" }));
+    await assert.rejects(otpB.savePadProgress(u.record, u.atRest), /written under another key/,
+      "final round (Mb): a durable record unreadable under this key is not overwritten (watermark readable)");
+    void atRest;
+  }
+
+  // (4) Ma: a save that would START during the close window (the lock is
+  //     closing because an earlier save still holds it) is not made. A send
+  //     is held in its save; a receive is held inside its HMAC verify (it
+  //     passed the gate before the close); the relay closes; the receive then
+  //     completes — its save must not start on the closing lock.
+  {
+    const p = await otp.generatePad({ label: "closing-window", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    await otp.saveNewPad(p, PAD_PASS);
+    const peerC = makeCipher("OTP", ROOM, { pad: { bytes: p.bytes.slice(), role: 1, regionSize: p.regionSize, sendOffset: 0, recvHighWater: 0 } });
+    const ws = await otpConnect(p.padId);
+    fakeIdb.hold();
+    dom.el("text").value = "first save";
+    const sending = dom.el("sendForm").dispatch("submit");
+    await settle(10);
+    const subtle = crypto.subtle;
+    const realVerify = subtle.verify;
+    let gate;
+    const mayGo = new Promise((r) => { gate = r; });
+    let inside = false;
+    subtle.verify = function (...a) { subtle.verify = realVerify; inside = true; return mayGo.then(() => realVerify.apply(this, a)); };
+    ws.onmessage({ data: JSON.stringify({ type: "msg", room: ROOM, alg: "OTP", payload: await peerC.encrypt("during close") }) });
+    await waitFor(() => inside);
+    assert.ok(inside, "fixture: the receive is inside its verify");
+    ws.close();                                   // lock closing: the send's save still holds it
+    await settle(5);
+    gate();                                       // the receive completes during the close window
+    await settle(20);
+    fakeIdb.release();
+    await sending;
+    await settle(20);
+    assert.ok(!said(/during close$/), "final round (Ma): a frame whose save would start while the lock is closing is not shown");
+    assert.strictEqual((await otpB.unlockPad(p.padId, PAD_PASS)).record.recvHighWater, 0,
+      "…and its save was never started (only the send's save, begun before the close, is recorded)");
+  }
+
+  // (5) Info: the user's own Disconnect while a receipt is being saved.
+  {
+    const p = await otp.generatePad({ label: "disconnect-mid-save", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    await otp.saveNewPad(p, PAD_PASS);
+    const peerC = makeCipher("OTP", ROOM, { pad: { bytes: p.bytes.slice(), role: 1, regionSize: p.regionSize, sendOffset: 0, recvHighWater: 0 } });
+    await otpConnect(p.padId);
+    // (a narration: an identical line folds, "(×n)", so the fold count is what moves)
+    const tally = () => lines().filter((l) => /arrived as the connection closed — not shown/.test(l))
+      .reduce((n, l) => n + (+(/\(×(\d+)\)$/.exec(l) || [0, 1])[1]), 0);
+    const n0 = tally();
+    fakeIdb.hold();
+    const delivered = current.deliver({ type: "msg", room: ROOM, alg: "OTP", payload: await peerC.encrypt("mid save") });
+    await settle(10);
+    await dom.el("disconnect").click();
+    fakeIdb.release();
+    await delivered;
+    await settle(20);
+    assert.ok(!said(/mid save$/), "fixture: not shown");
+    assert.strictEqual(tally(), n0 + 1,
+      "final round (Info): a receipt saved as the user disconnected is said, not silently dropped");
+  }
+
+  // (6) Low: a save that never settles does not block Connect for the tab.
+  {
+    const p = await otp.generatePad({ label: "hung-save", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    await otp.saveNewPad(p, PAD_PASS);
+    const ws = await otpConnect(p.padId);
+    fakeIdb.hold();                               // the save hangs
+    dom.el("text").value = "hangs";
+    const sending = dom.el("sendForm").dispatch("submit");
+    await settle(10);
+    ws.close();
+    await settle(5);
+    // an AES256 connect meanwhile is not blocked
+    const otpWaiting = (async () => {
+      const room = dom.el("room"); room.value = ROOM; await room.dispatch("input");
+      dom.selectAlg("OTP"); dom.el("otpSelect").value = p.padId; dom.el("otpPass").value = PAD_PASS;
+      return dom.el("connect").click();
+    })();
+    await settle(10);
+    const before = dom.socket();
+    dom.el("pass").value = "an AES256 passphrase";
+    dom.selectAlg("AES256");
+    await dom.el("connect").click();
+    assert.ok(dom.socket() && dom.socket() !== before, "final round: an AES256 connect is not blocked by a pending OTP save");
+    dom.socket().open();
+    await tick();
+    await dom.el("disconnect").click();
+    await otpWaiting;                             // (a later connect ran: this one stands down)
+    // the same pad again, alone: refused after the time limit, with what to do
+    dom.selectAlg("OTP"); dom.el("otpSelect").value = p.padId;
+    const t0 = Date.now();
+    const s0 = dom.socket();
+    await dom.el("connect").click();
+    assert.ok(Date.now() - t0 >= 9000, "…the same-pad connect waited for the save (up to the limit)");
+    assert.strictEqual(dom.socket(), s0, "final round: after the limit the same-pad connect is refused (no socket)");
+    assert.ok(anyHint(/still saving its progress/), "…and says what to do");
+    fakeIdb.release();
+    await sending;
+    await settle(20);
+  }
+  console.log("OK  package 6 final round: the pad index is a render cache; duplicate import worded; foreign durable record guarded; no save during the close window; disconnect mid-save said; a hung save blocks no Connect (executed)");
 }
 
 // ---- F-ATREST-002 residual: latch BEFORE download -----------------------------
