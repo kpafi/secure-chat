@@ -61,7 +61,8 @@ critics, a design critic and the pentest agent, as for the contact profile
 Canvas: row "One-time pad transfer" on https://claude.ai/artifact/NhVZuUXfC2FsJf93NBn5H2
 (14 artboards, listed at the end; round 2 after `otp-design-critic-r1.md`, triage in
 `otp-design-fix-round-1.md`). This section is the spec; the canvas illustrates it. Where the
-two disagree, this text wins.
+two disagree, this text wins. **§ 9a (the Android bridge as implemented) and § 12 (design critic
+round 2 and the implementation) amend the sections before them and win where they differ.**
 
 ### 0. The shape in one paragraph
 
@@ -403,7 +404,8 @@ secret and no user text, so native can validate it exactly (8).
   object captured **at document-start**, methods `.bind()`-captured, republished as
   `window.__SECURE_CHAT_FILES__ = Object.freeze({ share, save })` (non-writable,
   non-configurable); absent → the browser path.
-  - `share(name, text)` / `save(name, text)` return a `Promise` settling to `"shared"` /
+  - (Superseded by § 9a: an id now, the result later through a callback.)
+    `share(name, text)` / `save(name, text)` return a `Promise` settling to `"shared"` /
     `"saved"`, `"cancelled"` or `{ error: "<short reason>" }`; never rejects, never hangs past
     the activity result. The way back into the page must not be a writable page-defined global
     (a frozen resolver from the same document-start script, or a `WebMessagePort`).
@@ -449,6 +451,93 @@ succeeds without a re-pick after fixing it; the file name matches the pattern; c
 inputs. `android-source.test.mjs`: the bridge's document-start capture/freeze, the exact name
 pattern, the size cap, `onShowFileChooser`. `screenshots.mjs`: the canvas states at 390×844 and
 1280×800. Pentest the diff (bridge, held file texts, dismissal, the role fix).
+
+### 9a. Android bridge contract (as implemented — supersedes the Promise shape in § 9)
+
+The page cannot receive a Promise across `@JavascriptInterface`, so the round trip is an id and a
+callback:
+
+- `window.__SECURE_CHAT_FILES__` is captured at document-start by the shell and republished as a
+  **frozen** object on a **non-writable, non-configurable** property. app.js reads it ONCE, at
+  module start, and accepts it only in exactly that shape (`FILES_BRIDGE`); anything else is "no
+  bridge" (on Android the shell then refuses to run the app at all).
+- `share(name, text)` / `save(name, text)` are synchronous and return at once: a request id (16
+  lowercase hex), `"busy"` (a request is open) or `"invalid"` (name or text refused). The page
+  passes `exportPad()`'s string unmodified (the shell checks the canonical envelope — `fmt`, `v`,
+  `kdf{salt,iters}`, `iv`, `ct` in that order — and ≤ 4 MiB) and the neutral name
+  (`^secure-chat-pad-\d{4}-\d{2}-\d{2}-\d{4}\.json$`, § 7).
+- The outcome arrives later as `window.__SECURE_CHAT_FILES_RESULT__(id, outcome)`, outcome one of
+  `"shared"`, `"saved"`, `"cancelled"`, `"error"`. app.js defines this callback at module start
+  with `Object.defineProperty` (non-writable, non-configurable), so no other script can take the
+  name first. It is the page's own code receiving a result about its own request; no secret flows
+  back. It acts only on the id of the request in flight, and only on the success that request can
+  have (`share` → `"shared"`, `save` → `"saved"`; anything else is an error line).
+- `"shared"` means the chooser reported a target; `"cancelled"` means none was reported (Quick
+  Share on Android 14 may not report one), so it reads softly — "Not shared." / "Not saved.", with
+  Share and Save available again — and re-arms nothing: the pad stays latched as exported.
+
+### 12. Amendments from design critic round 2 and the implementation (binding; they supersede the text above where the two differ)
+
+Critic round 2: `otp-design-critic-r2.md`. Pentest lead F7: `otp-pentest-android-r1.md`.
+
+- **Empty panel (r2 minor 1):** New pad and Import have equal weight — both secondary. The empty
+  state has no `.primary` at all; Connect is `aria-disabled` with a `--border-soft` outline (r2
+  nit 6) and still gives its refusal on a tap.
+- **Emphasis after "Later" (r2 minor 6):** while the selected pad is this device's own (`role 0`)
+  and the index says it was never exported, `#otpExportOpen` is the `.primary` and Connect is not
+  (Connect stays enabled). Once exported, Connect is the primary again.
+- **Received-pad note (r2 nit 7):** "Received pad — only its maker can export it."
+- **Entry row (r2 minor 9):** labels never wrap; below 380px the leading icons are hidden. The
+  Export entry keeps its label while it unlocks: `aria-busy="true"`, disabled, the icon becomes a
+  spinner (no "Unlocking…" text).
+- **Carried passphrase (r2 minor 5):** a `change` of `#otpSelect` to a pad other than
+  `otpPanel.padId` empties `#otpPass`.
+- **Back (r2 N-M2):** Android system back and browser back act as ×. Opening a sheet pushes one
+  history entry — synchronously inside the opening click (Chromium's Back skips entries added
+  without a user gesture; the Export entry pushes before its unlock and drops the entry again if
+  the unlock fails). New pad → Export reuses the entry. On `popstate` while a sheet is open:
+  working → push again, nothing else; Android file-ready before `shared`/`saved` → push again and
+  ask the close confirm (§ 5), closing only on OK; otherwise close by the × rules. Every other close
+  (×, Escape, scrim, Done, Later, Don't export, a view switch) calls `history.back()` once and
+  ignores the `popstate` that causes.
+- **Which errors mark a field (r2 minor 7):** the wrong-transfer-passphrase import error gets the
+  full mark (triangle icon, 2px `--err` border, `aria-invalid`, the "Check this one" line, label
+  in `--err-fg`). The two must-differ refusals mark the field they focus (icon, border,
+  `aria-invalid`, label colour) without a line — the status sentence names it. Empty-field refusals
+  only focus. A mark goes on the field's next `input`.
+- **The current step (r2 minor 8):** Import — the first step whose input is empty, else step 3; a
+  wrong transfer passphrase makes step 1 current again. Export — step 1 in the form (its field is
+  the sheet's only input; steps 2–3 are what the bottom-row action does), step 2 while working or
+  confirming, step 3 in Android file-ready. Titles of upcoming steps are `--muted` in Export and
+  Import. New pad: idle discs, titles always `--fg`.
+- **Export copy (r2 N-M1, minors 2–4, nits 5 and 8):** step 3 in the form: "Give it to them face to
+  face."; Android file-ready: "Quick Share or Bluetooth, face to face. Or save it and copy it to a
+  USB stick." Done titles and lines: `shared` "File shared" / "Keep this open until it has
+  arrived."; `saved` "File saved" + the file name on its own line (UI font) + "Now give it to them
+  in person — USB stick, Bluetooth or Quick Share."; iOS "Share sheet opened" / "AirDrop it to
+  them, face to face. Keep this open until it has arrived."; browser unchanged ("File downloaded",
+  the name in mono, "Now give it to them in person — USB stick or Bluetooth."). Step 1's done
+  caption is gone; the warning moved into the done list that every platform shows: its first row
+  is "the transfer passphrase — tell them, never send it", under the overline "On their device:
+  One-time pad → Import". § 7's "both can read it off the sheet" now holds for the browser and for
+  Android file-ready and `saved`.
+- **Import placeholder (r2 nit 9):** `#otpImportPass` — "a new one — not the one above".
+- **Desktop bottom row (r2 nit 3):** the "again" link stays in the bottom row at every width; in
+  the desktop dialog it sits at the row's left, Done at its right.
+- **Pad card meta:** the size is per side, as the pad selector says ("128 KiB per side" for the
+  256 KiB pad; the canvas's "256 KiB per side" was the total). "· exported before" never breaks
+  inside itself (r2 nit 1).
+- **The working state is bounded:** a pad file's KDF cost is fixed — `importPad` accepts only
+  `kdf.iters === 600000` (what every export has written) and refuses anything else before any KDF
+  with "this pad file asks for unsupported encryption settings" (pentest F7 lead; a file-level
+  error in the sheet). Export's wait for another tab's export lock is bounded at 30 s ("Export
+  failed: another tab or window is still exporting this pad — finish or close it there, then try
+  again"). What is not bounded by the page: a hung IndexedDB write inside a save; a reload (or,
+  on Android, closing the app) is the way out, as for a live session.
+- **Import file picker:** `accept="application/json,.json,.txt,application/octet-stream,text/plain"`
+  (Quick Share delivers octet-stream); `importPad` decides what the file is.
+- **Held texts only while a sheet is open:** a handler driven with no sheet open (the unit tests)
+  hands a browser file out at once and holds nothing.
 
 ### Canvas artboards (row "One-time pad transfer")
 
