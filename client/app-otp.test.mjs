@@ -294,6 +294,207 @@ async function otpConnect(padId = pad.padId) {
   console.log("OK  package 6 fix round: an OTP pad is exported once — a double click, a click during the export and a second tab's stale cache all hand out no second file (executed)");
 }
 
+// ---- package 6 round 2 (MEDIUM, pre-existing): the OTP panel cannot redirect the live pad's saves ----
+// Between Connect and the relay's `joined` (which a relay can stall for as long
+// as it likes) the OTP panel stays usable. Exporting, generating or importing
+// ANOTHER pad there used to overwrite the variables the live session saves
+// through: the live pad stopped recording its progress (a two-time pad after a
+// reload) and the other pad was saved with the live pad's offsets.
+{
+  const mkPad = async (label) => {
+    const p = await otp.generatePad({ label, totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    await otp.saveNewPad(p, PAD_PASS);
+    return p;
+  };
+  const stored = async (id) => (await otp.unlockPad(id, PAD_PASS)).record;
+  const cases = {
+    async export(other) {
+      dom.el("otpSelect").value = other.padId;
+      dom.el("otpXferPass").value = "transfer passphrase";
+      await dom.el("otpExport").click();
+      return other.padId;
+    },
+    async generate() {
+      dom.el("otpLabel").value = "made-during-connect";
+      await dom.el("otpGenerate").click();
+      await settle(10);
+      return otp.listPads().find((m) => m.label === "made-during-connect").padId;
+    },
+    async import() {
+      const foreign = await otp.generatePad({ label: "imported-during-connect", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+      const file = await otp.exportPad(foreign, "transfer passphrase");
+      dom.el("otpXferPass").value = "transfer passphrase";
+      dom.el("otpFile").files = [{ text: async () => file }];
+      await dom.el("otpFile").dispatch("change");
+      await settle(10);
+      return foreign.padId;
+    },
+  };
+  for (const [what, act] of Object.entries(cases)) {
+    const live = await mkPad("live-" + what);
+    const other = await mkPad("other-" + what);
+    if (current && current.readyState === 1) await dom.el("disconnect").click();
+    const room = dom.el("room");
+    room.value = ROOM;
+    await room.dispatch("input");
+    dom.selectAlg("OTP");
+    dom.el("otpSelect").value = live.padId;
+    dom.el("otpPass").value = PAD_PASS;
+    await dom.el("connect").click();
+    const ws = dom.socket();
+    ws.open();
+    await tick();
+    // … the relay stalls `joined`; meanwhile the user works in the OTP panel.
+    const otherId = await act(other);
+    await ws.deliver({ type: "joined", role: "owner" });
+    await ws.deliver({ type: "key", room: ROOM, alg: "OTP", payload: pack({ hello: true, n: freshNonce(), reply: false }) });
+    await settle(10);
+    current = ws;
+    assert.ok(anyHint(/one-time-pad encrypted/), `fixture (${what}): the live OTP session is ready`);
+    for (const t of ["round2 one", "round2 two"]) {
+      dom.el("text").value = t;
+      await dom.el("sendForm").dispatch("submit");
+      await settle(5);
+    }
+    assert.strictEqual(ws.sent.filter((f) => f.type === "msg").length, 2, `fixture (${what}): two messages sent`);
+    const liveRec = await stored(live.padId);
+    assert.ok(liveRec.sendOffset > 0,
+      `round 2 (${what} during connect): the LIVE pad's progress is saved (send offset ${liveRec.sendOffset}) — else it reopens at spent keystream`);
+    const otherRec = await stored(otherId);
+    assert.strictEqual(otherRec.sendOffset, 0, `round 2 (${what} during connect): the other pad is untouched (send offset ${otherRec.sendOffset})`);
+    await dom.el("disconnect").click();
+  }
+  console.log("OK  package 6 round 2: exporting, generating or importing another pad while a connection opens does not redirect the live pad's saves (executed)");
+}
+
+// ---- package 6 round 2: the session reads its pad fresh, not from the panel's cache ----
+// This page generates a pad (the panel caches it at offset 0); "another tab"
+// then uses it (offset advanced and saved). Connecting here must start from
+// the stored offset, not the cache's 0 — that would reuse spent keystream.
+{
+  dom.el("otpPass").value = PAD_PASS;
+  dom.el("otpLabel").value = "used-elsewhere";
+  await dom.el("otpGenerate").click();
+  await settle(10);
+  const id = otp.listPads().find((m) => m.label === "used-elsewhere").padId;
+  const b = await otp.unlockPad(id, PAD_PASS);                 // tab B
+  const bc = makeCipher("OTP", ROOM, { pad: b.record });
+  await bc.encrypt("sent from the other tab");
+  b.record.sendOffset = bc.sendOffset;
+  await otp.savePadProgress(b.record, b.atRest);
+  const spent = b.record.sendOffset;
+  assert.ok(spent > 0, "fixture: the other tab spent pad bytes");
+  const ws = await otpConnect(id);
+  assert.ok(ws, "fixture: the session opened");
+  dom.el("text").value = "after the other tab";
+  await dom.el("sendForm").dispatch("submit");
+  await settle(5);
+  const frame = JSON.parse(Buffer.from(ws.sent.filter((f) => f.type === "msg").at(-1).payload, "base64").toString());
+  assert.ok(frame.o >= spent, `round 2: the session starts at the stored offset (${frame.o} ≥ ${spent}), not the panel cache's 0`);
+  await dom.el("disconnect").click();
+  console.log("OK  package 6 round 2: a session re-reads its pad from storage under the pad lock (executed)");
+}
+
+// ---- package 6 round 2 (F2): the export Web Lock is HELD for the whole export ----
+// A lock stub that really serialises per name (and answers query()). "Another
+// tab" holds the pad's export lock mid-export; this page's Export must wait
+// for it (saying so), then see the other tab's export and hand out nothing.
+{
+  const queues = new Map();
+  const heldNow = new Set();
+  const queued = {
+    request(name, opts, fn) {
+      if (typeof opts === "function") { fn = opts; opts = {}; }
+      if (opts && opts.ifAvailable && heldNow.has(name)) return Promise.resolve(fn(null));
+      const run = (queues.get(name) || Promise.resolve()).then(async () => {
+        heldNow.add(name);
+        try { return await fn({ name }); } finally { heldNow.delete(name); }
+      });
+      queues.set(name, run.catch(() => {}));
+      return run;
+    },
+    query: async () => ({ held: [...heldNow].map((name) => ({ name })) }),
+  };
+  const saved = globalThis.navigator.locks;
+  setLocks(queued);
+  try {
+    const p = await otp.generatePad({ label: "two-tab-race", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    await otp.saveNewPad(p, PAD_PASS);
+    dom.el("otpSelect").value = p.padId;
+    dom.el("otpPass").value = PAD_PASS;
+    dom.el("otpXferPass").value = "transfer passphrase";
+    let finishB;
+    const bMayFinish = new Promise((r) => { finishB = r; });
+    let bEntered;
+    const bInside = new Promise((r) => { bEntered = r; });
+    const tabB = navigator.locks.request("sc.otp.export.v1." + p.padId, { mode: "exclusive" }, async () => {
+      const u = await otp.unlockPad(p.padId, PAD_PASS);
+      await otp.exportPad(u.record, "tab b transfer");
+      bEntered();
+      await bMayFinish;                       // tab B is mid-export (e.g. sitting in a confirm())
+      await otp.markExported(u.record, u.atRest);
+    });
+    await bInside;
+    const d0 = downloads;
+    const mine = dom.el("otpExport").click();
+    await settle(20);
+    assert.strictEqual(downloads, d0, "F2: while another tab holds the pad's export lock, this page hands out nothing");
+    assert.match(dom.el("otpStatus").textContent, /Waiting for this pad's export in another tab/,
+      "F3: …and says it is waiting for the other tab (not just a disabled button)");
+    finishB();
+    await tabB;
+    await mine;
+    await settle(10);
+    assert.strictEqual(downloads, d0, "F2: after the other tab's export, this page sees it and hands out no second file");
+    assert.match(dom.el("otpStatus").textContent, /already exported/, "…and shows the re-export warning");
+
+    // The other order: THIS page is mid-export (held inside its first KDF,
+    // i.e. inside the lock), and the other tab starts its export. It must wait
+    // for this page to finish, then see the export — one file in total. (A lock
+    // taken and released at once, before the export, lets the other tab in.)
+    const q = await otp.generatePad({ label: "two-tab-race-2", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    await otp.saveNewPad(q, PAD_PASS);
+    dom.el("otpSelect").value = q.padId;
+    // Held at its TRANSFER-passphrase KDF — after the page's own re-read, so
+    // only the lock can keep the other tab out.
+    const subtle = crypto.subtle;
+    const realImport = subtle.importKey;
+    let pageGate;
+    const pageMayGo = new Promise((r) => { pageGate = r; });
+    let pageInside = false;
+    subtle.importKey = function (fmt, raw, ...rest) {
+      if (fmt === "raw" && raw instanceof Uint8Array && new TextDecoder().decode(raw) === "transfer passphrase") {
+        subtle.importKey = realImport;
+        pageInside = true;
+        return pageMayGo.then(() => realImport.call(this, fmt, raw, ...rest));
+      }
+      return realImport.call(this, fmt, raw, ...rest);
+    };
+    const d1 = downloads;
+    const mine2 = dom.el("otpExport").click();
+    for (let i = 0; i < 200 && !pageInside; i++) await new Promise((r) => setTimeout(r, 5));
+    assert.ok(pageInside, "fixture: this page's export is running (held in its transfer KDF)");
+    let otherFiles = 0;
+    const tabB2 = navigator.locks.request("sc.otp.export.v1." + q.padId, { mode: "exclusive" }, async () => {
+      const u = await otp.unlockPad(q.padId, PAD_PASS);
+      if (u.record.exported) return;       // tab B's own guard: it sees the export and stops
+      await otp.exportPad(u.record, "tab b transfer");
+      await otp.markExported(u.record, u.atRest);
+      otherFiles++;
+    });
+    await settle(20);
+    pageGate();
+    await mine2;
+    await tabB2;
+    await settle(10);
+    assert.strictEqual((downloads - d1) + otherFiles, 1,
+      `F2: two tabs exporting one pad at once hand out ONE file in total (this page ${downloads - d1}, the other ${otherFiles}) — the lock is held for the whole export`);
+  } finally {
+    setLocks(saved);
+  }
+  console.log("OK  package 6 round 2: the export lock is held for the whole export — a concurrent export in another tab yields one file (executed)");
+}
+
 // ---- F-ATREST-002 residual: latch BEFORE download -----------------------------
 {
   const p2 = await otp.generatePad({ label: "to-export", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
