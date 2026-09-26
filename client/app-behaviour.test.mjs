@@ -1696,6 +1696,14 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
     // Kim's keys claimed with a signature that does not verify: not kept either
     // — and (fix round I-3) a burst of such claims buys ONE verify, not one each.
     const forged = pack({ idb: kb, sig: await signKnock(extra, ROOM) });
+    // Final round (review of a5ac006): this used the wall clock, so on a loaded
+    // machine the ten deliveries could span the 500 ms gap and buy a second
+    // verify — a flaky assertion (it also made unrelated mutants look killed
+    // once). The page's clock is now frozen for the burst and advanced past
+    // the gap by hand before the genuine knock.
+    const realPerf = globalThis.performance;
+    let clock = realPerf.now();
+    Object.defineProperty(globalThis, "performance", { value: { ...realPerf, now: () => clock }, configurable: true, writable: true });
     verifies = 0;
     subtle.verify = function (...a) { verifies++; return origVerify.apply(this, a); };
     try {
@@ -1703,12 +1711,14 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
         await ws.deliver({ type: "knock", room: ROOM, jid: (0x250 + i).toString(16).padStart(16, "0"), payload: forged });
       }
       await settle(5);
+      subtle.verify = origVerify;
+      assert.strictEqual(verifies, 1, `fix round I-3: ten forged claims of the expected key cost ONE verify (${verifies} subtle.verify calls)`);
+      clock += 600; // past the gap: the genuine knock is verified
+      await knock(kim, 0x300);     // the expected peer: kept
     } finally {
       subtle.verify = origVerify;
+      Object.defineProperty(globalThis, "performance", { value: realPerf, configurable: true, writable: true });
     }
-    assert.ok(verifies >= 1 && verifies <= 2, `fix round I-3: ten forged claims of the expected key cost one verify (${verifies} subtle.verify calls)`);
-    await new Promise((r) => setTimeout(r, 600)); // past the gap: the genuine knock is verified
-    await knock(kim, 0x300);     // the expected peer: kept
     await settle(10);
     const fpOf = async (who) => Identity.fingerprintOf(who.publicBundle());
     const [fpHead, fpKim, fpExtra] = [await fpOf(flood[0]), await fpOf(kim), await fpOf(extra)];
@@ -1826,6 +1836,31 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
   }
   await nav("live");
   console.log("OK  decision 3: contacts+chats live in one tab — a second tab does not open them; Use here takes over and the other tab locks and says why; no Web Locks falls back to 3b (executed)");
+}
+
+// ==== final round, Info-4: Forget while the stores are opening is not "another tab" ====
+// The L-2 re-check locked the stores and said "opened in another tab" whenever
+// the lock this unlock took was no longer held — also when THIS tab let it go
+// (Forget identity). Nobody else has them then; nothing about another tab.
+{
+  await nav("users");
+  const before = count(/your contacts and chats were opened in another tab/);
+  const h = holdSubtle("deriveKey", (a) => algName(a) === "PBKDF2");
+  // (the other "tab" of block (e) still holds the lock: take it with Use here)
+  dom.el("usersUnlockPass").value = PASS;
+  const unlocking = dom.el("usersTakeover").click();
+  await until(h.entered, "the store unlock to be deriving its key");
+  const forgetting = dom.el("idForget").click();
+  await settle(20);
+  h.release();
+  await unlocking;
+  await forgetting;
+  await settle(20);
+  assert.ok(!contacts.isUnlocked() && !chats.isUnlocked(), "final round Info-4: the stores end locked");
+  assert.strictEqual(count(/your contacts and chats were opened in another tab/), before,
+    "final round Info-4: Forget during the unlock is not narrated as another tab taking the stores");
+  assert.strictEqual(dom.el("usersTakeover").hidden, true, "...and no Use here is offered");
+  console.log("OK  final round Info-4: a Forget during the store unlock locks the stores without blaming another tab (executed)");
 }
 
 console.log("\nAll app.js behavioural checks passed.");

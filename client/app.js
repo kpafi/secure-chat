@@ -179,6 +179,19 @@ const identityFloor = captureNativeFloor();
 // missing or older (a lost write), the durable one is used and put back.
 // localStorage stays the everyday copy (read synchronously by the UI, export).
 const IDB_IDENTITY = "sc.identity.v1";
+// Final round, Info-1: every write of the identity's durable copy, and Forget's
+// deletion of both copies, run under ONE exclusive Web Lock shared by all tabs
+// of the origin. Inside it a writer re-checks that the copy it is about to make
+// durable is still the one localStorage holds — Forget removes that first, so
+// an unlock racing a Forget (in this or another tab) cannot put the identity
+// back. Without Web Locks the section just runs (best effort; no browser this
+// app supports lacks them).
+const IDENTITY_LOCK = "sc.identity.lock.v1";
+function withIdentityLock(fn) {
+  const locks = typeof navigator !== "undefined" ? navigator.locks : null;
+  if (!locks || typeof locks.request !== "function") return Promise.resolve().then(fn);
+  return locks.request(IDENTITY_LOCK, { mode: "exclusive" }, () => fn());
+}
 const LS_PINS = "sc.pins.v1";
 const LS_USERNAME = "sc.username.v1";
 const LS_LOOKUP_TOKEN = "sc.lookuptoken.v1"; // our directory lookup token
@@ -877,16 +890,22 @@ const NEW_KEYS_MISSING_Q =
 // and neither can lock the user out.
 async function raiseIdentityFloorSaid(id, blob) {
   let durableOk = false;
+  let forgotten = false;
   if (durable.available()) {
     try {
-      const have = await durable.get(IDB_IDENTITY);
-      if (have !== blob) await durable.put(IDB_IDENTITY, blob);
-      durableOk = true;
+      await withIdentityLock(async () => {
+        // Info-1: Forget ran meanwhile (it removes the localStorage copy under
+        // this lock): write nothing, raise nothing.
+        if (localStorage.getItem(LS_IDENTITY) !== blob) { forgotten = true; return; }
+        const have = await durable.get(IDB_IDENTITY);
+        if (have !== blob) await durable.put(IDB_IDENTITY, blob);
+        durableOk = true;
+      });
     } catch {
       durableOk = false;
     }
   }
-  if (!identityFloor) return;
+  if (forgotten || !identityFloor) return;
   if (!durableOk) {
     addLine("sys", "", "[your identity could not be saved to the device's durable storage — its rollback record was not advanced; retried at the next unlock]", true);
     return;
@@ -909,6 +928,16 @@ async function durableIdentityBlob() {
     return null;
   }
 }
+// Info-3: a localStorage copy that is not even an identity envelope (damaged)
+// must not hide a durable copy that opens.
+function envelopeParses(blob) {
+  try {
+    const o = JSON.parse(blob);
+    return !!o && typeof o === "object" && typeof o.salt === "string" && typeof o.iv === "string" && typeof o.ct === "string";
+  } catch {
+    return false;
+  }
+}
 const sameEdRaw = (a, b) => !!a && !!b && a.length === b.length && a.every((x, i) => x === b[i]);
 async function tryImport(blob, pass) {
   try {
@@ -925,7 +954,7 @@ async function tryImport(blob, pass) {
 async function pickIdentityBlob(pass) {
   const ls = localStorage.getItem(LS_IDENTITY);
   const idb = await durableIdentityBlob();
-  const a = ls ? await tryImport(ls, pass) : null;
+  const a = ls && envelopeParses(ls) ? await tryImport(ls, pass) : null;
   const b = idb && idb !== ls ? await tryImport(idb, pass) : null;
   if (b && b.id) {
     const aEd = a ? (a.id ? a.id.edPubRaw : a.err && a.err.edPubRaw) : null;
@@ -933,10 +962,25 @@ async function pickIdentityBlob(pass) {
     const newer = !a || (sameEdRaw(aEd, b.id.edPubRaw) && typeof aGen === "number" &&
       (b.id.storedGen > aGen || (a.err && a.err.code === "IDENTITY_NEEDS_NEW_KEYS")));
     if (newer) {
-      localStorage.setItem(LS_IDENTITY, b.blob);
+      // Info-1: only if Forget has not deleted the durable copy meanwhile.
+      let restored = false;
+      await withIdentityLock(async () => {
+        if ((await durableIdentityBlob()) !== b.blob) return;
+        localStorage.setItem(LS_IDENTITY, b.blob);
+        restored = true;
+      });
+      if (!restored) return null;
       addLine("sys", "", "[your identity was taken from the device's durable copy — the last save had not reached the disk]", true);
       return b;
     }
+  }
+  // Info-2: nothing usable in localStorage, and the durable copy did not open
+  // with this passphrase — that is a wrong passphrase, not "nothing to unlock".
+  if (!a && b) return b;
+  if (!a && !b && ls) {
+    // A damaged localStorage copy and no durable one: the old answer stands.
+    const err = new Error("the saved identity is damaged");
+    return { blob: ls, err };
   }
   return a;
 }
@@ -1072,14 +1116,19 @@ async function forgetIdentity() {
 
   // Fix round L-1: the durable copy goes FIRST (awaited) — the other order
   // could leave a copy that the next unlock would put back.
-  if (durable.available()) {
-    try {
-      await durable.del(IDB_IDENTITY);
-    } catch {
-      addLine("sys", "", "[could not delete the durable copy of your identity from this device's database — reload and Forget again]", true);
+  // Info-1: both copies go under the identity lock, so a durable write of an
+  // unlock in flight (this or another tab) either finished before — and is
+  // deleted here — or re-checks after and finds the localStorage copy gone.
+  await withIdentityLock(async () => {
+    if (durable.available()) {
+      try {
+        await durable.del(IDB_IDENTITY);
+      } catch {
+        addLine("sys", "", "[could not delete the durable copy of your identity from this device's database — reload and Forget again]", true);
+      }
     }
-  }
-  localStorage.removeItem(LS_IDENTITY);
+    localStorage.removeItem(LS_IDENTITY);
+  }).catch(() => { localStorage.removeItem(LS_IDENTITY); });
   closeContact(false); // it shows a record that is about to be gone
   retractPending.clear(); // they belonged to this identity's account
   retractInflight.clear();
@@ -1310,6 +1359,7 @@ async function holdStoreLock(floorId, takeover) {
 function releaseStoreLock() {
   const l = storeLock;
   storeLock = null;
+  if (l) l.released = true; // final round Info-4: let go by this tab (Forget), not taken
   if (l && l.release) l.release();
 }
 // Another tab pressed "Use here". Its copy is authoritative from now on, so
@@ -1435,7 +1485,16 @@ async function unlockContacts(pass, opts = {}) {
   // the stores opened here anyway — BOTH tabs held them, and this one's pins
   // no longer saw the other's Unverify / Remove. The lock this call took must
   // still be ours when the stores are open, or they are locked again at once.
-  if (myLock && (myLock.lost || storeLock !== myLock)) {
+  if (myLock && myLock.released && !myLock.lost) {
+    // Final round Info-4: this tab let the lock go itself (Forget identity ran
+    // while the stores were opening). Nobody else has them: lock, say nothing
+    // about another tab.
+    closeContact(false);
+    if (contacts.isUnlocked()) contacts.lock();
+    if (chats.isUnlocked()) chats.lock();
+    refreshUsers();
+    refreshChats();
+  } else if (myLock && (myLock.lost || storeLock !== myLock)) {
     const saidAlready = storesTakenOver;
     if (storeLock === myLock) storeLock = null;
     storesTakenOver = true;
@@ -5085,12 +5144,13 @@ refreshIdentityUI();
 // identity only in the durable copy — put it back, so the page offers Unlock
 // (not Create, which would replace it).
 if (!localStorage.getItem(LS_IDENTITY)) {
-  durableIdentityBlob().then((b) => {
+  withIdentityLock(async () => {
+    const b = await durableIdentityBlob();
     if (b && !localStorage.getItem(LS_IDENTITY) && !identity) {
       localStorage.setItem(LS_IDENTITY, b);
       refreshIdentityUI();
     }
-  });
+  }).catch(() => {});
 }
 
 // Start with a chat code already in the box. Pressing Connect on an empty field

@@ -476,6 +476,96 @@ async function resealPad(padId, mutate) {
   await unlock();
   assert.doesNotMatch(dom.el("idStatus").textContent, /Not unlocked|Wrong passphrase|Nothing to unlock/, `fix round L-1: a created identity whose localStorage write was lost still unlocks: ${dom.el("idStatus").textContent}`);
   assert.strictEqual(stored(), created, "...from the durable copy, which is put back");
+
+  // ---- final round (review of a5ac006) ------------------------------------------
+  const durableNow = () => fakeIdb.getItem("sc.identity.v1");
+  // (8) M1: the durable write FAILS -> the floor does not move, and it is said.
+  const idF = await Identity.generate();
+  const blobF = await idF.export(PASS);
+  const keyF = await identityFloorId(idF.edPubRaw);
+  store.set("sc.identity.v1", blobF);
+  fakeIdb.removeItem("sc.identity.v1");
+  fakeIdb.failWrites((k) => k === "sc.identity.v1", "QuotaExceeded");
+  try {
+    await unlock();
+  } finally {
+    fakeIdb.failWrites(null);
+  }
+  assert.ok(!floors.has(keyF), "final round M1: a failed durable write leaves the identity floor where it was");
+  assert.ok(lines().some((l) => /could not be saved to the device's durable storage — its rollback record was not advanced/.test(l)), "...and says so");
+  await unlock();
+  assert.strictEqual(floors.get(keyF), 1, "...and the next unlock (durable write OK) raises it");
+
+  // (9) M4: Create refuses while a durable copy exists (the localStorage one lost).
+  store.delete("sc.identity.v1");
+  assert.strictEqual(durableNow(), blobF, "fixture: only the durable copy is left");
+  dom.el("idPass").value = PASS;
+  await dom.el("idCreate").click();
+  await settle(10);
+  assert.match(dom.el("idStatus").textContent, /An identity already exists here/, "final round M4: Create refuses while a durable copy exists");
+  assert.strictEqual(durableNow(), blobF, "...and does not replace it");
+  // (10) Info-2: only the durable copy, and a WRONG passphrase: say so.
+  dom.el("idPass").value = "not the passphrase";
+  await dom.el("idUnlock").click();
+  await settle(20);
+  assert.strictEqual(dom.el("idStatus").textContent, "Wrong passphrase or corrupted identity.",
+    "final round Info-2: a wrong passphrase against the durable copy is a wrong passphrase, not 'nothing to unlock'");
+  // (11) Info-3: a DAMAGED localStorage copy does not hide a durable copy that opens.
+  store.set("sc.identity.v1", "{not an identity");
+  await unlock();
+  assert.doesNotMatch(dom.el("idStatus").textContent, /Wrong passphrase|Not unlocked|Nothing/, `final round Info-3: the durable copy opens: ${dom.el("idStatus").textContent}`);
+  assert.strictEqual(stored(), blobF, "...and replaces the damaged one");
+
+  // (12) Info-1: Forget while an unlock is in flight — the unlock must not put
+  //      the durable copy back afterwards (it would resurrect on reload).
+  {
+    const subtle = crypto.subtle, orig = subtle.deriveKey;
+    let release, entered = false;
+    const gate = new Promise((r) => { release = r; });
+    subtle.deriveKey = function (alg, ...rest) {
+      if (!entered && alg && alg.name === "PBKDF2") { entered = true; subtle.deriveKey = orig; return gate.then(() => orig.call(this, alg, ...rest)); }
+      return orig.call(this, alg, ...rest);
+    };
+    try {
+      dom.el("idPass").value = PASS;
+      const unlocking = dom.el("idUnlock").click();
+      const t0 = Date.now();
+      while (!entered && Date.now() - t0 < 5000) await new Promise((r) => setTimeout(r, 5));
+      assert.ok(entered, "fixture: the unlock is deriving its key");
+      globalThis.confirm = () => true;
+      await dom.el("idForget").click(); // (the handler does not return forgetIdentity's promise)
+      await settle(40);
+      assert.ok(stored() === undefined && durableNow() === null, "fixture: Forget removed both copies");
+      release();
+      await unlocking;
+      await settle(20);
+      assert.strictEqual(durableNow(), null, "final round Info-1: an unlock racing Forget does not put the durable copy back");
+      assert.strictEqual(stored(), undefined, "...nor the localStorage one");
+    } finally {
+      subtle.deriveKey = orig;
+      if (release) release();
+    }
+  }
+
+  // (13) M3: Forget removes BOTH copies, and nothing comes back on a reload
+  //      (a fresh instance of app.js runs the page-load restore again).
+  store.set("sc.identity.v1", blobF);
+  fakeIdb.setItem("sc.identity.v1", blobF);
+  await unlock();
+  globalThis.confirm = () => true;
+  await dom.el("idForget").click();
+  await settle(40);
+  assert.strictEqual(stored(), undefined, "final round M3: Forget removes the localStorage copy");
+  assert.strictEqual(durableNow(), null, "final round M3: ...AND the durable copy");
+  await import("./app.js?reload=1");
+  await settle(20);
+  assert.strictEqual(stored(), undefined, "final round M3: ...and nothing comes back on a reload");
+  // (14) M5: the page-load restore of a durable-only copy (a create whose
+  //      localStorage write was lost) — a reload puts it back.
+  fakeIdb.setItem("sc.identity.v1", blobF);
+  await import("./app.js?reload=2");
+  await settle(20);
+  assert.strictEqual(stored(), blobF, "final round M5: a reload puts a durable-only identity back into localStorage");
   globalThis.confirm = () => true;
   void b64;
   console.log("OK  F-ATREST-008: a keyless identity blob is never silently re-keyed; an older copy is refused on a floored device; the floor follows the stored blob (executed)");
