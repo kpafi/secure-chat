@@ -2366,8 +2366,8 @@ async function refreshVouchMarks() {
           }),
           { ed: v.sig, mldsa: v.mldsa_sig },
         ).catch(() => false);
-        // once each: a relay older than 0.4.0 ignores `by` and answers every
-        // chunk with the same newest list
+        // once each: a relay without package 6 (0.3.1 and earlier) ignores
+        // `by` and answers every chunk with the same newest list
         if (ok && !names.includes(v.voucher)) names.push(v.voucher);
       }
       // F-PROTO-005: `c` is the snapshot the signatures were checked against;

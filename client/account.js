@@ -329,9 +329,10 @@ export async function unvouch(base, sessionToken, targetUsername, signal = undef
 //
 // `by` (package 6, F-PROTO-007): the voucher names to ask about — at most
 // VOUCHES_BY_MAX (the relay's MAX_VOUCHES_BY). Without it the relay answers
-// its newest 50, which a flood of throwaway vouches can fill. A relay older
-// than 0.4.0 ignores the parameter and answers the newest 50 as before; the
-// caller filters by its own verified contacts either way.
+// its newest 50, which a flood of throwaway vouches can fill. A relay
+// without package 6 (0.3.1 and earlier) ignores the parameter and answers
+// the newest 50 as before; the caller filters by its own verified contacts
+// either way.
 export const VOUCHES_BY_MAX = 50;
 export async function fetchVouches(base, handle, by = null) {
   const parsed = parseHandle(handle);

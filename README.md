@@ -335,15 +335,18 @@ says what an attacker needs, what they get, and why it stays.
 - **Metadata.** The relay sees room ids, when each frame is sent and how big
   it is (no padding), which handles you look up and whom you mail. It cannot
   read or forge content. Routing needs this much; hiding it needs a mixnet.
-- **It can drop messages — now visibly.** A relay that drops frames in a live
-  chat produces "N message(s) from your contact never arrived" (F-CRYPTO-001).
-  It can still hide up to as many dropped frames as it injected junk frames
-  before your safety-number check (each of those junk frames is shown as
-  "arrived before you verified — dropped"). A gap of more than 64 frames
-  (for example 65+ messages sent before the other side verified) ends that
-  session: every later frame is undecryptable, a reconnect fixes it. The
-  window stays 64: lowering it would make this happen sooner in honest use
-  (F-CRYPTO-002, reasoning in `client/crypto.js`).
+- **It can drop messages — visibly, once a later message arrives.** A relay
+  that drops frames in a live chat produces "N message(s) from your contact
+  never arrived" (F-CRYPTO-001) — but only above the next genuine message
+  that does arrive: the notice needs a later frame to measure the gap by, so
+  dropping the LAST messages of a chat (or dropping and then closing the
+  connection) leaves no notice. Frames injected before your check do not hide
+  drops: only the peer's own frames, checked against the key, count as
+  "yours". A gap of 64 or more frames (for example 64+ messages sent while
+  the other side had not yet verified) ends that session: every later frame
+  is undecryptable, a reconnect fixes it. The window stays 64: lowering it
+  would make this happen sooner in honest use (F-CRYPTO-002, reasoning in
+  `client/crypto.js`).
 - **Rooms: the first joiner owns the room, and the waiting queue can be
   filled (P-08).** Anyone holding a room code can join first and become its
   owner, or fill its few waiting slots with knocks. They get availability only:
@@ -375,8 +378,14 @@ says what an attacker needs, what they get, and why it stays.
   name, on each re-check. The global vouch table has no eviction: filling it
   (1000 accounts × 200 vouches) stops new vouches relay-wide until an
   operator clears it. A 🟡 counts for 7 days after the last successful check
-  (F-PROTO-006): a relay that answers every re-check with an error can keep a
-  retracted vouch on screen for at most that long.
+  (F-PROTO-006), so a relay that answers every re-check with an ERROR can keep
+  a retracted vouch on screen for at most that long. A hostile relay can do
+  more: a vouch is a signature with no time or version in it, and a
+  retraction only deletes the relay's row — so a relay that kept the old
+  signature can keep serving it as a valid answer, and the 🟡 stays for as
+  long as you still have the voucher verified. Closing that needs a time or
+  epoch inside the signed vouch (a wire change); until then, un-verifying the
+  voucher is what removes the mark reliably.
 
 **Cryptography, by design**
 - **An AES256 room's key-confirmation tag is an offline passphrase verifier

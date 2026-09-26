@@ -75,13 +75,17 @@ recents (blank card), and with `adb shell screencap` (refused or black).
 The native OTP/store floor is reached through ONE `addJavascriptInterface`
 bridge, `SecureChatPadFloor`. Android exposes such a bridge to **every frame**
 of the WebView, of any origin — so the bridge is only as narrow as the set of
-frames the WebView can ever load. The app has none, and since package 6 that is
-a pinned invariant rather than an accident: the CSP stamped on `index.html`
-(`MainActivity.csp`) says `frame-src 'none'; child-src 'none'` explicitly (not
-only through the `default-src 'none'` fallback, which a later edit could
-widen), the web relay's CSP says the same (`backend/main.py`), and both are
-pinned line for line (`client/android-source.test.mjs`,
-`backend/tests/test_static_hardening.py`). What the bridge accepts is small
+frames the WebView can ever load. The app loads no framed content, and since
+package 6 that is a pinned invariant rather than an accident: the CSP stamped
+on `index.html` (`MainActivity.csp`) says `frame-src 'none'; child-src 'none'`
+(and `worker-src 'none'`) explicitly (not only through the `default-src 'none'`
+fallback, which a later edit could widen), the web relay's and the iOS shell's
+CSPs say the same, and all three are pinned (`client/android-source.test.mjs`,
+`backend/tests/test_static_hardening.py`, `backend/tests/test_csp_hash.py`).
+Honest limit: `frame-src` cannot stop an `about:blank` or `srcdoc` frame (there
+is no URL to fetch). Such a frame inherits the page's CSP, so no script runs in
+it — the bridge is still visible there, but nothing can call it — and the
+client creates none. What the bridge accepts is small
 anyway (read/bump of integer floors under an app-private HMAC, see
 `PadFloor.kt`).
 
@@ -91,7 +95,7 @@ client's floor check runs synchronously inside unlock/persist decisions
 (`nativefloor.js`: "is this copy older than the floor?" must be answered
 before the next statement runs). Moving to it means reworking every floor call
 site into an async round trip with its own failure and ordering cases, a
-larger change than the risk it removes while no frame can load. Revisit if the
+larger change than the risk it removes while no framed content loads. Revisit if the
 app ever needs a frame.
 
 ## SafeBrowsing is off (F-P7-24)
