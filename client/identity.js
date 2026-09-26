@@ -532,6 +532,44 @@ export function canonicalPublicBundle(b) {
 
 export { b64, unb64, concat };
 
+// ---- passphrase strength: a warning, never a gate (package 6) ----------------
+// Pentest 2026-07-26 (Info): nothing told a user that "1234" protects their
+// identity, their contacts, a pad or a pad file. Every one of those is a
+// PBKDF2-SHA256 (600k) blob that whoever copies it can attack OFFLINE, at their
+// own pace — the iteration count slows each guess, it does not make a short or
+// common passphrase safe. The owner never decided a hard policy, so this only
+// WARNS: it returns one sentence naming what is weak, or null. It is a cheap
+// screen for the obvious cases, not an entropy estimate: a long passphrase it
+// does not flag can still be guessable (a famous quote, a name and a year).
+export const PASSPHRASE_MIN_CHARS = 12;
+const COMMON_PASSPHRASE_WORDS = new Set([
+  "password", "passwort", "passwd", "qwerty", "qwertz", "qwertyuiop", "asdf", "asdfgh", "letmein", "iloveyou",
+  "secret", "geheim", "admin", "welcome", "hello", "hallo", "monkey", "dragon", "abc", "abcdef",
+  "securechat", "secure", "chat", "test", "changeme",
+]);
+export function passphraseWarning(pass) {
+  const p = String(pass ?? "");
+  if (!p) return null; // "empty" is refused by every caller with its own sentence
+  let why = null;
+  if (/^(.)\1*$/su.test(p)) why = "it is one character repeated";
+  else if (/^\d+$/.test(p)) why = "it is only digits";
+  else if (isSequence(p)) why = "it is a simple sequence";
+  else if (COMMON_PASSPHRASE_WORDS.has(p.toLowerCase().replace(/[^a-z]/g, ""))) {
+    why = "it is a common password with a few characters added";
+  } else if ([...p].length < PASSPHRASE_MIN_CHARS) why = `it is shorter than ${PASSPHRASE_MIN_CHARS} characters`;
+  if (!why) return null;
+  return `Weak passphrase: ${why}. Anyone who copies the encrypted data can try guesses offline, ` +
+    `at their own pace — use ${PASSPHRASE_MIN_CHARS} or more characters, e.g. four or more random words. ` +
+    "(A warning only: it was accepted.)";
+}
+function isSequence(p) {
+  if (p.length < 3) return false;
+  const d = p.charCodeAt(1) - p.charCodeAt(0);
+  if (d !== 1 && d !== -1) return false;
+  for (let i = 2; i < p.length; i++) if (p.charCodeAt(i) - p.charCodeAt(i - 1) !== d) return false;
+  return true;
+}
+
 // ---- package 4 (F-ATREST-008): the identity blob's native floor ---------------
 // On Android the blob's generation is held to a floor the page cannot lower
 // (PadFloor.kt, id `identity:<sha256(ed25519 public key) hex>`, the same hash

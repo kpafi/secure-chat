@@ -2067,5 +2067,44 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
   console.log("OK  final round Info-4: a Forget during the store unlock locks the stores without blaming another tab (executed)");
 }
 
+// ==== package 6 (2026-07-26 Info): weak passphrases are warned about, never refused ====
+// (The block above forgot the identity, so a new one can be created here.)
+{
+  assert.strictEqual(dom.el("idCreate").hidden, false, "fixture: no identity, Create is offered");
+  dom.el("idPass").value = "hunter2";
+  await dom.el("idCreate").click();
+  await until(() => /Weak passphrase/.test(dom.el("idStatus").textContent) || /Could not create/.test(dom.el("idStatus").textContent), "the identity to be created");
+  assert.match(dom.el("idStatus").textContent, /^Identity created\. Weak passphrase: it is shorter than 12 characters\. .*offline/,
+    "a weak identity passphrase is accepted and warned about: " + dom.el("idStatus").textContent);
+  assert.match(dom.el("idStatus").className, /\berr\b/, "…as a warning");
+  assert.strictEqual(dom.el("idFingerprint").hidden, false, "…and the identity exists (not blocked)");
+
+  // The Live room's AES256 shared passphrase: said once the room is joined.
+  const joinWith = async (pass) => {
+    if (current && current.readyState === 1) await dom.el("disconnect").click();
+    await nav("live");
+    const room = dom.el("room");
+    room.value = ROOM;
+    await room.dispatch("input");
+    dom.el("pass").value = pass;
+    dom.selectAlg("AES256");
+    await dom.el("connect").click();
+    const ws = dom.socket();
+    ws.open();
+    await tick();
+    await ws.deliver({ type: "joined", role: "owner" });
+    current = ws;
+    const L = lines();
+    return L.slice(L.lastIndexOf("joined room — encryption: AES256"));
+  };
+  const weakLive = await joinWith("letmein2024");
+  assert.ok(weakLive.some((l) => /^\[Weak passphrase: it is a common password with a few characters added\. .*offline/.test(l)),
+    "a weak AES256 shared passphrase is said in the transcript at join: " + JSON.stringify(weakLive));
+  const strongLive = await joinWith(PASS);
+  assert.ok(!strongLive.some((l) => /Weak passphrase/.test(l)), "control: a strong shared passphrase draws no warning");
+  await dom.el("disconnect").click();
+  console.log("OK  package 6: a weak identity or AES256 shared passphrase is accepted with a warning; a strong one draws none (executed)");
+}
+
 console.log("\nAll app.js behavioural checks passed.");
 process.exit(0); // key confirmation's deadline timer would otherwise hold the process open

@@ -21,6 +21,7 @@
 import { makeCipher, isAscii, bufToB64, b64ToBuf, REMOVED_ALGS } from "./crypto.js";
 import {
   Identity, canonicalPublicBundle, checkIdentityGeneration, raiseIdentityFloor, identityFloorId,
+  passphraseWarning,
 } from "./identity.js";
 import { captureNativeFloor } from "./nativefloor.js";
 import * as durable from "./durable.js";
@@ -208,6 +209,7 @@ let verified = false; // in-person gate passed; gates RECEIVING as well as sendi
 // never reach the cipher, so the next frame we do decrypt steps over them. They
 // are ours, not the relay's — the gap notice subtracts them (see `case "msg"`).
 let droppedBeforeVerify = 0;
+let sessionPassWarning = null; // package 6: a weak AES256 shared passphrase, said at join
 // Pentest 2026-07-26 P-19: the room id and algorithm this session actually
 // negotiated, captured once at connect(). The send path used to re-read
 // roomCode()/algValue() from the live DOM, so any later UI change would have
@@ -860,6 +862,9 @@ async function createIdentity() {
     await unlockContacts(pass, { expectStore: false }); // contact store shares the identity passphrase
     els.idPass.value = "";
     await showIdentityUnlocked();
+    // Package 6 (2026-07-26 Info): warn, never block — see passphraseWarning.
+    const weak = passphraseWarning(pass);
+    if (weak) setIdentityStatus("Identity created. " + weak, "err");
   } catch (e) {
     identity = null;
     setIdentityStatus("Could not create identity: " + e.message, "err");
@@ -3125,6 +3130,10 @@ async function connectInner() {
   otpRecord = null;
   otpAtRest = null;
   const opts = { passphrase: els.pass.value };
+  // Package 6: a weak shared passphrase is said once the room is joined (the
+  // relay can test guesses offline against the session's confirmation tag,
+  // F-CRYPTO-004). Captured here, like the rest of the session's settings.
+  sessionPassWarning = alg === "AES256" ? passphraseWarning(els.pass.value) : null;
   if (alg === "OTP") {
     const padId = els.otpSelect.value;
     if (!padId) {
@@ -4001,6 +4010,7 @@ async function handleMessage(room, raw, sock) {
       showScreen("chat");
       setStatus("connected", "ok");
       addLine("sys", "", `joined room — encryption: ${sessionAlg}`, true);
+      if (sessionPassWarning) addLine("sys", "", `[${sessionPassWarning}]`);
       if (roomRole === "owner") {
         addLine("sys", "", "you created this chat — you decide who is let in", true);
       }
@@ -4846,7 +4856,9 @@ async function otpGenerate() {
     clearEntropy();
     els.otpLabel.value = "";
     refreshOtpPads(rec.padId);
-    otpStatusMsg(`Generated + encrypted pad "${rec.label}". Now Export it and give the file to your contact in person.`);
+    const weak = passphraseWarning(els.otpPass.value); // package 6: warn, never block
+    otpStatusMsg(`Generated + encrypted pad "${rec.label}". Now Export it and give the file to your contact in person.` +
+      (weak ? " Pad passphrase — " + weak : ""), !!weak);
   } catch (e) {
     otpStatusMsg("Generation failed: " + e.message, true);
   }
@@ -4899,7 +4911,9 @@ async function otpExport() {
     // (latched, then the download is lost) only costs a confirm on re-export.
     await otp.markExported(record, atRest);
     downloadText(`secure-chat-pad-${record.label || record.padId}.json`, text);
-    otpStatusMsg("Exported. Give the file to your contact in person; they Import it with the same TRANSFER passphrase.");
+    const weak = passphraseWarning(els.otpXferPass.value); // package 6: warn, never block
+    otpStatusMsg("Exported. Give the file to your contact in person; they Import it with the same TRANSFER passphrase." +
+      (weak ? " Transfer passphrase — " + weak : ""), !!weak);
   } catch (e) {
     otpStatusMsg("Export failed: " + e.message, true);
   }
@@ -4945,7 +4959,9 @@ async function otpFileChosen() {
     otpRecord = rec;
     otpUnlockedId = rec.padId;
     refreshOtpPads(rec.padId);
-    otpStatusMsg(`Imported + encrypted pad "${rec.label}". Select it, use the same room id as your contact, and Connect.`);
+    const weak = passphraseWarning(els.otpPass.value); // package 6: warn, never block
+    otpStatusMsg(`Imported + encrypted pad "${rec.label}". Select it, use the same room id as your contact, and Connect.` +
+      (weak ? " Pad passphrase — " + weak : ""), !!weak);
   } catch (e) {
     otpStatusMsg("Import failed: " + e.message, true);
   }

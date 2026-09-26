@@ -167,6 +167,49 @@ async function otpConnect(padId = pad.padId) {
   console.log("OK  ROUND-3 F-2: an OTP message is displayed only after its receipt is persisted (executed)");
 }
 
+// ---- package 6 (2026-07-26 Info): weak pad / transfer passphrases are warned about, never refused ----
+{
+  const WEAK = /Weak passphrase: .*offline.*A warning only/;
+  // Generate with a weak pad passphrase: the pad is made, and the status says why the passphrase is weak.
+  const before = otp.listPads().length;
+  dom.el("otpPass").value = "1234";
+  dom.el("otpLabel").value = "weakpad";
+  dom.el("otpSize").value = "8192";
+  await dom.el("otpGenerate").click();
+  await settle(10);
+  const st = dom.el("otpStatus");
+  assert.match(st.textContent, /^Generated \+ encrypted pad "weakpad"/, "a weak pad passphrase does not block generation: " + st.textContent);
+  assert.match(st.textContent, /Pad passphrase — Weak passphrase: it is only digits/, "…and the status says the pad passphrase is weak");
+  assert.ok(WEAK.test(st.textContent) && /\berr\b/.test(st.className), "…as a warning");
+  assert.ok(otp.listPads().some((m) => m.label === "weakpad"), "…and the pad exists " + before + " " + JSON.stringify(otp.listPads().map((m) => m.label)));
+  // Export it under a weak TRANSFER passphrase: the file is handed out, with the warning.
+  const weakId = otp.listPads().find((m) => m.label === "weakpad").padId;
+  dom.el("otpSelect").value = weakId;
+  dom.el("otpXferPass").value = "hunter2";
+  const d0 = downloads;
+  await dom.el("otpExport").click();
+  assert.strictEqual(downloads, d0 + 1, "a weak transfer passphrase does not block the export (one file is handed out)");
+  assert.match(st.textContent, /^Exported\. .*Transfer passphrase — Weak passphrase: it is shorter than 12 characters/, "…and says so: " + st.textContent);
+  // Import a pad under a weak pad passphrase: imported, with the warning.
+  const foreign = await otp.generatePad({ label: "imported-weak", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const file = await otp.exportPad(foreign, "transfer passphrase");
+  dom.el("otpXferPass").value = "transfer passphrase";
+  dom.el("otpPass").value = "aaaaaaaaaaaaaaaa";
+  dom.el("otpFile").files = [{ text: async () => file }];
+  await dom.el("otpFile").dispatch("change");
+  await settle(10);
+  assert.match(st.textContent, /^Imported \+ encrypted pad "imported-weak".*Pad passphrase — Weak passphrase: it is one character repeated/,
+    "a weak pad passphrase on import is accepted and warned about: " + st.textContent);
+  // Control: strong passphrases, no warning.
+  dom.el("otpPass").value = PAD_PASS;
+  dom.el("otpLabel").value = "strongpad";
+  await dom.el("otpGenerate").click();
+  await settle(10);
+  assert.match(st.textContent, /^Generated \+ encrypted pad "strongpad"/);
+  assert.ok(!/Weak passphrase/.test(st.textContent) && !/\berr\b/.test(st.className), "control: a strong pad passphrase draws no warning");
+  console.log("OK  package 6: weak pad and transfer passphrases are accepted with a warning; strong ones draw none (executed)");
+}
+
 // ---- F-ATREST-002 residual: latch BEFORE download -----------------------------
 {
   const p2 = await otp.generatePad({ label: "to-export", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
