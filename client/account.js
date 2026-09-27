@@ -149,11 +149,14 @@ export async function register(base, identity, username) {
 // Fetch a peer's public identity bundle from a `username#token` handle. Returns
 // null when the handle is unknown OR the token is wrong (the server makes the
 // two indistinguishable, so callers just see "no such contact").
-export async function fetchBundle(base, handle) {
+// `signal` (optional) bounds the lookup, body included: a directory that never
+// answers must not hold a Connect forever (pentest r6 R6-1).
+export async function fetchBundle(base, handle, signal = undefined) {
   const parsed = parseHandle(handle);
   if (!parsed) throw new Error("expected a contact handle of the form username#token");
   const res = await fetch(
     base + "/api/users/" + encodeURIComponent(parsed.username) + "?t=" + encodeURIComponent(parsed.token),
+    { signal },
   );
   if (res.status === 404) return null;
   if (!res.ok) throw new Error("lookup failed: " + (await asError(res)));

@@ -3,7 +3,58 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ CURRENT STATE (2026-09-27) — OTP transfer sheets on `feat/otp-transfer-sheets`, not merged, not pushed
+## ⮕ CURRENT STATE (2026-09-27) — connect join timeout + Cancel on `claude/charming-northcutt-3850fa` (on top of `feat/otp-transfer-sheets`), neither merged nor pushed
+
+- **Task:** the pre-existing gap from the OTP sheets' pentest r6 R6-1 / r7
+  R7-3 — a relay that accepts the WebSocket and never answers `join`
+  (hostile, or half-open), or a directory lookup that never answers, left
+  the user on the room screen with Connect disabled, no Disconnect and an
+  OTP pad locked until a reload.
+- **Branch `claude/charming-northcutt-3850fa`**, worktree
+  `.claude/worktrees/charming-northcutt-3850fa`, based on
+  `feat/otp-transfer-sheets` 203806a because that branch is not merged yet
+  (it touches the same code; merge it first, then this one — no conflicts
+  expected). Not merged, not pushed. Commits: 86a8b03 (the change), 0e31034
+  / 40d4077 / bee68f2 (fix rounds 1–3), reports 93ffe24 / 88d54ce / 308de58.
+- **What it does (client/app.js, index.html, account.js):**
+  - join deadline 30 s from the socket's CONSTRUCTION to the relay's
+    answer (`pending` or `joined`), then a byte-stable sentence;
+    deliberately NOT the wait for admission: a queued guest is on the chat
+    screen with Disconnect, the relay has its own 120 s approval deadline;
+  - lookup deadline 20 s (`fetchBundle(…, signal)`), byte-stable sentence;
+  - `#connectCancel` beside Connect, shown only while a connect is in
+    flight and unanswered; before the socket it aborts the attempt (a
+    `stopped()` check after every await releases a pad lock it took), with
+    the socket it ends it;
+  - `endUnanswered(sock, refusal)` (fix rounds 1–2): the deadline, Cancel
+    and the four refusals of the relay's answer to `join` end the attempt
+    AT ONCE — a retired socket keeps its own reason, its onclose runs
+    immediately and detached — instead of waiting up to 60 s for Chromium's
+    closing handshake against a peer that never answers the Close frame.
+- **Reviewed:** `pentest-new-code` ×3 (reports + triage
+  `design/research/reviews/connect-cancel-{pentest-r1..r3,fix-round-1..3}.md`).
+  r1: 2 Low (the closing window: the deadline relabelled a refusal; Cancel
+  60 s / deadline 90 s) → fixed; r2: 1 Low (answer refusals still waited)
+  → fixed; r3: Info only. Nothing Low+ open. 44 hand-run mutants, all RED
+  (M1–M30 without M24, F1–F11, H1–H4); the e2e shown to bind too (red
+  against each earlier commit and against three mutants).
+- **Checked (2026-09-27):** `npm test` green (new
+  `client/app-connect-cancel.test.mjs`); e2e on a scratch relay: new
+  `e2e/hung-relay.mjs` 20/20 (~2.5 min; incl. a raw-socket peer that never
+  answers Close), hostile-relay 24/24, otp-held-join 10/10, no-dead-ends
+  17/17, room-admission 49/49, all-modes 28/28, two-user-flow 15/15,
+  otp-transfer 196/196. Backend untouched (not re-run). No APK built.
+- **Residuals:** the OTP save wait before `connecting` is set (≤ 10 s) shows
+  no Cancel; a Cancel cannot interrupt a step with no signal (pad KDF,
+  IndexedDB, key setup — r1 C1-4); after a Cancel whose Close was lost an
+  immediate creator reconnect meets the relay's leftover seat for ~40 s and
+  is shown the F-PROTO-001 sentence (r2 C2-2, fails closed); the Users
+  view's Add-contact lookup has no deadline; Disconnect of an ANSWERED
+  session still waits for the browser's close (pre-existing).
+- **Flagged as a separate task:** r3 C3-2 (pre-existing lead, stub only): a
+  `joined` handled after the relay's own close can leave stale state.
+
+## (2026-09-27) — OTP transfer sheets on `feat/otp-transfer-sheets`, not merged, not pushed
 
 - **Owner's ask (2026-09-26, after testing 0.4.0 on the APK):** generating and
   sharing a one-time pad was badly explained, "Export" only said a file was
@@ -58,7 +109,8 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
 - **Deferred by the owner / separate tasks:** pad-mismatch detection at
   connect (both people on different pads see "Ready" but get undecryptable
   messages); a join timeout + Cancel on the room screen (pre-existing: a relay
-  that never answers `join` leaves Connect stuck until reload, pentest r6 R6-1).
+  that never answers `join` leaves Connect stuck until reload, pentest r6 R6-1) — done on
+  `claude/charming-northcutt-3850fa`, see the entry above).
 
 ## (2026-09-26) — release 0.4.0 merged, tagged and DEPLOYED; phone APK still owed
 
