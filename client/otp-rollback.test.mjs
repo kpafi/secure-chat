@@ -1749,6 +1749,11 @@ console.log("OK  MA-1: a pad still stored here is PAD_PRESENT; a forgotten one s
     "\u{1F468}\u200D\u{1F469}\u200D\u{1F467} \u2764\uFE0F 1\uFE0F\u20E3", "R6-4: emoji sequences, VS16 and keycaps stay whole");
   assert.strictEqual(cleaned("a\uE000b"), "a b", "R6-4: private-use characters (Co) are stripped");
   assert.strictEqual(cleaned("a\u0378b"), "a\u0378b", "R6-4: unassigned code points (Cn, engine-dependent) are left alone");
+  // Fix round 6 (pentest r7 QVIS_S/P/N): labels of only emoji, only
+  // punctuation or only digits are visible names, not "nothing".
+  assert.strictEqual(cleaned("\u{1F389}"), "\u{1F389}", "QVIS_S: an emoji-only label stays");
+  assert.strictEqual(cleaned("!?"), "!?", "QVIS_P: a punctuation-only label stays");
+  assert.strictEqual(cleaned("2026"), "2026", "QVIS_N: a digits-only label stays");
   assert.strictEqual(cleaned("\u0301\u0302"), "", "R6-4: only combining marks — nothing visible — is empty");
   assert.strictEqual(cleaned("a".repeat(59) + " bc"), "a".repeat(59), "R6-4: no trailing space after the cap");
   const g3 = await otp.generatePad({ label: "x", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
