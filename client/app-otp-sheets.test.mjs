@@ -1131,7 +1131,7 @@ const endChat = async () => {
   assert.ok(shown("otpNewSheet") && stateOf("otpNewSheet") === "working", "R5-1: a WORKING sheet is not torn down mid-KDF");
   await gen; await settle(5);
   assert.ok(!shown("otpNewSheet") && !el("viewLive").inert, "…it closes itself once the work ends, the pad made");
-  assert.ok(/^Pad ".*" created — Export it to your contact after this chat\.$/.test(st.textContent) && !/\bvh\b/.test(st.className) &&
+  assert.ok(/^Pad “.*” created — Export it to your contact after this chat\.$/.test(st.textContent) && !/\bvh\b/.test(st.className) &&
     el("hint").textContent === st.textContent,
     "R7-2: what the done block would have said stays, visible, in the chat's hint and the panel: " + JSON.stringify([st.textContent, st.className, el("hint").textContent]));
   await endChat();
@@ -1188,6 +1188,8 @@ const endChat = async () => {
   await exporting; await conn; await settle(5);
   assert.ok(!shown("otpExportSheet") && !el("viewLive").inert,
     "N7/N10: when the Export's work ends (here: the re-export confirm), the sheet closes itself — the room screen is gone");
+  assert.ok(st.textContent === "Export did not finish — open Export again after this chat." && el("hint").textContent === st.textContent,
+    "R8-2/W9: an Export that did not finish says so — never 'downloaded': " + JSON.stringify(st.textContent));
   await endChat();
   console.log("OK  N7/N10: Export closes itself after its work when the chat came up");
 }
@@ -1212,7 +1214,7 @@ const endChat = async () => {
   await importing; await settle(20);
   assert.ok(otp.padMeta(f.padId), "fixture: the import completed");
   assert.ok(!shown("otpImportSheet") && !el("viewLive").inert, "N8: when the Import's work ends, the sheet closes itself");
-  assert.strictEqual(st.textContent, 'Pad "n8" imported. Delete the pad file now.', "R7-2: …and says it was imported, and to delete the file");
+  assert.strictEqual(st.textContent, "Pad “n8” imported. Delete the pad file now.", "R7-2: …and says it was imported, and to delete the file");
   await endChat();
   console.log("OK  N8: Import closes itself after its work when the chat came up");
 }
@@ -1304,6 +1306,58 @@ const endChat = async () => {
     globalThis.confirm = realConfirm;
   }
   console.log("OK  R7-1: an OTP sheet closing re-arms the knock prompt's 500 ms guard");
+}
+
+// ======== fix round 7 (otp-fix-round-1.md, "Round 7") ========
+// ---- W9 / R8-2 / R8-1 / R8-3: what a self-closing Import leaves behind ------
+{
+  // A gate on the KDF keeps the import "working" while the chat comes up.
+  const subtle = globalThis.crypto.subtle;
+  const realDK = subtle.deriveKey;
+  let gate = null;
+  subtle.deriveKey = async function (...a) { if (gate) await gate.p; return realDK.apply(this, a); };
+  const holdKdf = () => { let open; gate = { p: new Promise((r) => { open = r; }) }; return () => { gate = null; open(); }; };
+  const selfClosingImport = async (file, xfer, pass) => {
+    // Connect on our own pad, unlocked first (so the connect needs no KDF of its own).
+    await lockPad(madeId, PADPASS);
+    await openExport(); await el("otpExportClose").click();
+    await settle(5);
+    await el("otpImportOpen").click();
+    await set("otpImportXfer", xfer);
+    await set("otpImportPass", pass);
+    const release = holdKdf();
+    el("otpFile").files = [{ name: "r8.json", size: file.length, text: async () => file }];
+    const importing = el("otpFile").dispatch("change");
+    await until(() => stateOf("otpImportSheet") === "working", "import working");
+    const { ws, connecting } = await startConnect();
+    await ws.deliver({ type: "joined", role: "owner" });
+    await connecting;
+    release();
+    await importing; await settle(20);
+    assert.ok(!shown("otpImportSheet"), "fixture: the Import sheet closed itself");
+    return [st.textContent, st.className, el("hint").textContent];
+  };
+  try {
+    const f = await otp.generatePad({ label: "Café 🎉 \"x\"", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+    const file = await otp.exportPad(f, "agreed words r8");
+    // (1) a wrong transfer passphrase: the import fails while the chat is up.
+    let [text, cls, hintText] = await selfClosingImport(file, "agreed wordz r8", "my own words for r8 import");
+    assert.strictEqual(text, "Import did not finish — open Import again after this chat.",
+      "R8-2: a self-closing Import that failed says so: " + JSON.stringify(text));
+    assert.ok(!/imported|Delete the pad file/.test(text + hintText) && hintText === text && /\berr\b/.test(cls),
+      "W9: …never in the success words ('imported', 'delete the file'), in the chat too, as a warning");
+    assert.strictEqual(otp.padMeta(f.padId), null, "fixture: nothing was imported");
+    await endChat();
+    // (2) the right one, with a weak pad passphrase; the maker's label with an emoji and a quote.
+    [text, cls, hintText] = await selfClosingImport(file, "agreed words r8", "password1");
+    assert.strictEqual(text, "Pad “Café 🎉 \"x\"” imported. Delete the pad file now. Weak pad passphrase — accepted.",
+      "R8-1/R8-3: the done line keeps the weak-passphrase line and the label as written (cleaned, not ASCII-mangled), in “…”: " + JSON.stringify(text));
+    assert.ok(hintText === text && /\berr\b/.test(cls), "…in the chat too, as a warning");
+    await endChat();
+  } finally {
+    subtle.deriveKey = realDK;
+  }
+  console.log("OK  W9/R8-1/R8-2/R8-3: a self-closed Import says what happened — failure, success with its weak line, the label intact");
 }
 
 console.log("\nAll OTP sheet checks passed.");

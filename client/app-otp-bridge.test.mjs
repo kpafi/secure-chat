@@ -35,6 +35,17 @@ if (!variant) {
     assert.strictEqual(line.slice(5), want, `bridge shape "${v}": app.js took the ${line.slice(5)} path, expected ${want}`);
     console.log(`OK  bridge shape ${v}: ${want} path`);
   }
+  // OTP fix round 7 (pentest r8 R8-4): in the iOS shell (no bridge; the
+  // share sheet opens on the download) a self-closed Export says the share
+  // sheet opened — not "downloaded", not "sent".
+  {
+    const r = spawnSync(process.execPath, [SELF, "ios"], { cwd: HERE, encoding: "utf8", timeout: 120000 });
+    const line = (r.stdout || "").split("\n").find((l) => l.startsWith("NOTICE ")) || "";
+    assert.strictEqual(line.slice(7),
+      "Share sheet opened — AirDrop it to them in person; once they've imported it, they delete the file.",
+      `R8-4: the iOS self-close notice (exit ${r.status}): ${line || (r.stderr || "").slice(-400)}`);
+    console.log("OK  R8-4: the iOS shell's self-close notice names the share sheet");
+  }
   console.log("\nAll bridge-shape checks passed.");
 } else {
   await child(variant);
@@ -66,6 +77,7 @@ async function child(v) {
     request(name, opts, fn) { if (typeof opts === "function") fn = opts; return Promise.resolve(fn({ name })); },
   } };
 
+  if (v === "ios") return iosSelfClose(dom, El);
   const methods = { share: () => "0000000000000001", save: () => "0000000000000002" };
   const frozen = Object.freeze({ ...methods });
   const K = "__SECURE_CHAT_FILES__";
@@ -95,5 +107,51 @@ async function child(v) {
   if (dom.el("otpExportSheet").hidden) throw new Error("the Export sheet did not open: " + dom.el("otpStatus").textContent);
   const again = dom.el("otpSendAgain").textContent;
   console.log("PATH " + (/^Didn't arrive/.test(again) ? "android" : /^Download/.test(again) ? "browser" : "? " + again));
+  process.exit(0);
+}
+
+// The iOS shell serves the page from secure-chat:// and has no file bridge.
+// An Export whose KDF ends after the chat came up closes itself, and its
+// notice is printed for the parent.
+async function iosSelfClose(dom, El) {
+  globalThis.location.protocol = "secure-chat:";
+  const subtle = globalThis.crypto.subtle;
+  const realDK = subtle.deriveKey;
+  let gate = null;
+  subtle.deriveKey = async function (...a) { if (gate) await gate; return realDK.apply(this, a); };
+  URL.createObjectURL = () => "blob:stub";
+  await import("./app.js");
+  const otp = await import("./otp.js");
+  const settle = async () => { for (let i = 0; i < 40; i++) await new Promise((r) => setTimeout(r, 5)); };
+  const until = async (c) => { for (let i = 0; i < 2000 && !c(); i++) await new Promise((r) => setTimeout(r, 5)); if (!c()) throw new Error("timeout"); };
+  const PASS = "a pad passphrase for the ios test";
+  const pad = await otp.generatePad({ label: "ios", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  await otp.saveNewPad(pad, PASS);
+  await dom.el("toRoom").click();
+  await dom.el("algCards").dispatch("change");
+  const sel = dom.el("otpSelect");
+  const o = new El("option"); o.value = pad.padId; sel.appendChild(o);
+  sel.value = pad.padId;
+  await sel.dispatch("change");
+  dom.el("otpPass").value = PASS;
+  await dom.el("otpExportOpen").click();
+  dom.el("otpXferPass").value = "a transfer passphrase for ios";
+  let open; gate = new Promise((r) => { open = r; });
+  const exporting = dom.el("otpExport").click();
+  await until(() => dom.el("otpExportSheet").getAttribute("data-state") === "working");
+  dom.selectAlg("AES256");
+  dom.el("pass").value = "a shared passphrase for the ios test";
+  dom.el("room").value = "e".repeat(64);
+  await dom.el("room").dispatch("input");
+  const before = dom.socket();
+  const connecting = dom.el("connect").click();
+  await until(() => dom.socket() !== before);
+  dom.socket().open();
+  await dom.socket().deliver({ type: "joined", role: "owner" });
+  await connecting;
+  gate = null; open();
+  await exporting; await settle();
+  if (!dom.el("otpExportSheet").hidden) throw new Error("the Export sheet did not close itself");
+  console.log("NOTICE " + dom.el("otpStatus").textContent);
   process.exit(0);
 }

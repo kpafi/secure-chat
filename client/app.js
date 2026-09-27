@@ -5894,23 +5894,45 @@ function otpLeftRoom() {
 function otpAfterWork() {
   if (!els.scrRoom.hidden || !otpUi.sheet) return;
   const notice = otpDoneNotice();
-  if (otpLeftRoom() && notice) {
-    otpStatusMsg(notice);
-    hint(notice);
-  }
+  if (otpLeftRoom() && notice) otpNotice(notice.text, notice.warn);
 }
+// Fix round 7 (pentest r8): the line for every outcome, not only "done" —
+// a sheet that did not finish says so (R8-2), never in success words (W9);
+// the done block's weak-passphrase line comes along (R8-1); the iOS wording
+// is the share sheet's (R8-4). The label is the cleaned one, in typographic
+// quotes a label's own `"` cannot close (R8-3).
 function otpDoneNotice() {
   const kind = otpUi.sheet, st = otpUi.state[kind];
-  if (st !== "done") return null;
-  const name = (info) => (info && otp.cleanPadLabel(info.label)) || "pad";
-  if (kind === "new") return `Pad "${name(otpNewInfo)}" created — Export it to your contact after this chat.`;
-  if (kind === "import") return `Pad "${name(otpImportInfo)}" imported. Delete the pad file now.`;
-  if (kind === "export") {
-    return otpExportResult === "shared" || otpExportResult === "ios"
-      ? "Pad file sent — give it to them in person; once they've imported it, they delete the file."
-      : "Pad file downloaded — give it to them in person; once they've imported it, delete the file on both devices.";
+  const what = { new: "New pad", import: "Import", export: "Export" }[kind];
+  if (st !== "done") return { text: `${what} did not finish — open ${what} again after this chat.`, warn: true };
+  const name = (info) => `“${(info && otp.cleanPadLabel(info.label)) || "pad"}”`;
+  const weak = (w, which) => (w ? ` Weak ${which} passphrase — accepted.` : "");
+  if (kind === "new") {
+    return { text: `Pad ${name(otpNewInfo)} created — Export it to your contact after this chat.` + weak(otpNewInfo && otpNewInfo.weak, "pad"),
+      warn: !!(otpNewInfo && otpNewInfo.weak) };
   }
-  return null;
+  if (kind === "import") {
+    return { text: `Pad ${name(otpImportInfo)} imported. Delete the pad file now.` + weak(otpImportInfo && otpImportInfo.weak, "pad"),
+      warn: !!(otpImportInfo && otpImportInfo.weak) };
+  }
+  const w = !!(otpExportFile && otpExportFile.weak);
+  return {
+    text: (otpExportResult === "ios"
+      ? "Share sheet opened — AirDrop it to them in person; once they've imported it, they delete the file."
+      : "Pad file downloaded — give it to them in person; once they've imported it, delete the file on both devices.") +
+      weak(w, "transfer"),
+    warn: w,
+  };
+}
+// The notice goes to the panel (visible after the chat) and to the chat's
+// hint, by textContent: its words are fixed and the label is already
+// cleaned (no hintSafe, which would blank a non-ASCII label — R8-3).
+function otpNotice(text, warn) {
+  for (const el of [els.otpStatus, activeHintEl()]) {
+    el.textContent = text;
+    el.className = "hint" + (warn ? " err" : "");
+  }
+  otpStatusFromSheet = false;
 }
 
 function otpNewFinished(info) {
