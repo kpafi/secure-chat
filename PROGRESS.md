@@ -3,7 +3,7 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ CURRENT STATE (2026-09-27) — C3-2 fix on `claude/dazzling-liskov-726d57` (on top of `claude/charming-northcutt-3850fa` → `feat/otp-transfer-sheets`), not merged, not pushed; PAUSED by the owner during pentest round 2
+## ⮕ CURRENT STATE (2026-09-27) — C3-2 fix on `claude/dazzling-liskov-726d57` (on top of `claude/charming-northcutt-3850fa` → `feat/otp-transfer-sheets`), not merged, not pushed; PAUSED by the owner after pentest round 2 (report committed, not triaged)
 
 - **Task:** the pre-existing lead C3-2 of
   `design/research/reviews/connect-cancel-pentest-r3.md`. The relay's answer to
@@ -43,10 +43,30 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   - Mutants: every one is RED except the layered connectInner reset (M6/R15),
     which binds in combination (R6M5 vs R6M5R15). Lists are in the commit
     messages and `design/research/reviews/connect-cancel-c3-2-fix-round-1.md`.
-- **OPEN — resume here:** pentest round 2 on 9f290f3 was started. Its report
-  goes to `design/research/reviews/connect-cancel-c3-2-pentest-r2.md`: commit
-  it as written if it is there, triage it, and fix round 2 if needed. Then a
-  second PROGRESS update.
+- **OPEN — resume here:** pentest r2 on 9f290f3 is back and committed as written
+  (`design/research/reviews/connect-cancel-c3-2-pentest-r2.md`). Nothing Low or
+  higher in the diff. Still to do: triage, then fix round 2 (tests only unless
+  R2-1 is decided otherwise):
+  - **R2-1 (Info).** On CLOSING, a withheld `pending` turns a queued
+    `joined:guest` into the unqueued-guest refusal. Decide whether to keep
+    that (state it in the comment and bind it, X1) or silence it.
+  - **R2-2.** Loop the "Cancel on a CLOSING socket" block over `pending` too
+    (X4 survives).
+  - **R2-3.** The e2e narration check for `pending` is vacuous: the line folds
+    into "(×2)" after pguest. Compare the log text, or reorder the cases.
+  - **R2-4.** Anchor the `/connected|waiting for approval/` regex; it matches
+    "disconnected".
+  - **R2-5.** Test `pending` → `joined:owner` → the role-change sentence (X13
+    survives).
+  - **e2e fixture.** Assert pguest's knock and "prompt down only after
+    close-event".
+  - **Then:** npm test, the e2e set, pentest round 3, and a PROGRESS update.
+  - **Separate owner decision (pre-existing, Low, in Chromium).** A guest
+    approval prompt raised before any answer to `join` is invisible: `#admit`
+    lives in the hidden chat screen and the tab bar goes inert. Cancel still
+    works. This is the lever behind R1-2. The options: draw the prompt over
+    the room screen, or refuse or defer a handshake that arrives before the
+    answer.
 - **Env note:** a scratch relay on a port other than 8000 needs
   `SECURE_CHAT_EXTRA_ORIGINS=http://127.0.0.1:<port>`; otherwise the
   WebSocket is refused with 403.
