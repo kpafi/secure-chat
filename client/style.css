@@ -2062,6 +2062,15 @@ button.peer-open:disabled:hover { opacity: 1; cursor: default; background: trans
 .otp-warn { display: flex; gap: var(--sp-2); font-size: var(--fs-2); line-height: 1.5; color: var(--warn-fg); }
 .otp-warn:empty { display: none; }
 .otp-warn::before { --icon: var(--i-alert); width: 14px; height: 14px; margin-top: 3px; }
+/* The weak TRANSFER passphrase (owner 2026-09-27, cold r2 MA-4): the same
+   line as a box, at the field and again beside Share / Save — hard to miss,
+   still only a warning. */
+.otp-warn.otp-warn-box:not(:empty):not([hidden]) {
+  padding: var(--sp-2) var(--sp-3);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  border-radius: var(--r-s);
+}
 
 /* Unlocked for this session: a 44px row in the field's well. */
 .otp-unlocked {
@@ -2104,6 +2113,7 @@ button.peer-open:disabled:hover { opacity: 1; cursor: default; background: trans
 .otp-head-text { min-width: 0; display: flex; flex-direction: column; gap: var(--sp-1); }
 .otp-title { font-size: var(--fs-5); font-weight: 650; line-height: 1.25; letter-spacing: -0.02em; }
 .otp-lede { font-size: var(--fs-2); line-height: 1.5; color: var(--muted); text-wrap: pretty; }
+.otp-lede.qline { text-wrap: balance; } /* a lede with its "?" balances, never "device. ?" alone (design r4 nit 1) */
 .otp-close {
   width: var(--control-h);
   margin: calc(-1 * var(--sp-2)) calc(-1 * var(--sp-2)) 0 0;
@@ -2361,6 +2371,8 @@ button.peer-open:disabled:hover { opacity: 1; cursor: default; background: trans
 .otp-bar > .otp-again { font-size: var(--fs-2); }
 /* Working: every action is hidden, so is the bar (design r3 minor 4). */
 .otp-bar:not(:has(> button:not([hidden]))) { display: none; }
+/* …and the sheet keeps its bottom padding without it (design r4 minor 3). */
+.otp-sheet[data-state="working"] { padding-bottom: var(--sp-4); }
 .otp-sheet[data-state="working"] :is(.otp-form, .otp-steps) .otp-field { opacity: 0.6; }
 
 /* Wider: the centred 480px dialog. The actions are laid out as in the
@@ -2380,8 +2392,13 @@ button.peer-open:disabled:hover { opacity: 1; cursor: default; background: trans
   .otp-bar > button { width: auto; flex: 0 1 auto; }
   .otp-bar > :is(.primary, .danger) { flex: 1 1 auto; }
   .otp-bar > .ghost { flex: 1 1 100%; }
+  /* Two choices and no ghost (the re-export confirm, Share / Save): equal
+     halves, as in #admit — the safe one first, the danger no wider than it
+     (design r4 minor 2, nit 6). */
+  .otp-bar:not(:has(> .ghost:not([hidden]))) > button:not([hidden]) { flex: 1 1 0; }
   .otp-bar > button + button:not(.ghost) { margin-top: 0; }
   .otp-entropy { height: 120px; }
+  .sheet.otp-sheet[data-state="working"] { padding-bottom: var(--sp-5); }
 }
 /* A short phone viewport (a keyboard is up): the open sheet may cover the
    tab bar and app bar it has made inert anyway, so its fields and the

@@ -714,7 +714,7 @@
             <div class="row why-row otp-fieldrow">
               <label for="otpNewPass">Pad passphrase</label>
               <span class="otp-token otp-me">only you know it</span>
-              <div class="otp-field otp-me"><input id="otpNewPass" type="password" autocomplete="new-password"
+              <div class="otp-field otp-me"><input id="otpNewPass" type="password" autocomplete="off"
                    placeholder="a passphrase only you know" aria-describedby="otpNewPassWarn" /></div>
               <p class="otp-warn" id="otpNewPassWarn"></p>
             </div>
@@ -792,6 +792,7 @@
           <p class="otp-done-title" id="otpExportDoneTitle"></p>
           <p class="otp-file-name mono" id="otpExportDoneFile" hidden></p>
           <p class="otp-caption" id="otpHanded"></p>
+          <p class="otp-caption otp-delete" id="otpExportDelete">Once they've imported it, delete the file on both devices.</p>
           <div class="otp-weak" id="otpExportWeak" hidden>
             <p>Weak transfer passphrase — accepted.</p>
             <details class="why">
@@ -799,7 +800,6 @@
               <div id="otpExportWeakWhy"></div>
             </details>
           </div>
-          <p class="otp-caption otp-delete">Once they've imported it, delete the file on both devices.</p>
         </div>
       </div>
     </div>
@@ -818,9 +818,9 @@
           <div class="row why-row otp-fieldrow" id="otpXferRow">
             <label for="otpXferPass">Transfer passphrase</label>
             <span class="otp-token otp-both">you both know it</span>
-            <div class="otp-field otp-both"><input id="otpXferPass" type="password" autocomplete="new-password"
+            <div class="otp-field otp-both"><input id="otpXferPass" type="password" autocomplete="off"
                  placeholder="not your pad passphrase" aria-describedby="otpXferWarn" /></div>
-            <p class="otp-warn" id="otpXferWarn"></p>
+            <p class="otp-warn otp-warn-box" id="otpXferWarn"></p>
             <details class="why">
               <summary><span class="vh">What the transfer passphrase does</span></summary>
               <div>The transfer passphrase protects the file: agree on it in person,
@@ -846,6 +846,9 @@
         <p class="otp-step-title"><span>Hand it over</span><span class="vh otp-vh-done"> — done</span></p>
         <div class="otp-step-body">
           <p class="otp-caption" id="otpExportStep3Caption">Give it to them face to face.</p>
+          <!-- Owner (2026-09-27, cold r2 MA-4): a weak transfer passphrase stays
+               warn-never-block, but the warning stands where the file leaves. -->
+          <p class="otp-warn otp-warn-box" id="otpExportReadyWeak" hidden>Weak transfer passphrase: whoever gets a copy of this file can try to guess it. Hand it over face to face — not through a messenger or a cloud drive.</p>
         </div>
       </li>
     </ol>
@@ -907,7 +910,7 @@
           <div class="row why-row otp-fieldrow">
             <label for="otpImportPass">Pad passphrase</label>
             <span class="otp-token otp-me">only you know it</span>
-            <div class="otp-field otp-me"><input id="otpImportPass" type="password" autocomplete="new-password"
+            <div class="otp-field otp-me"><input id="otpImportPass" type="password" autocomplete="off"
                  placeholder="a new one — not the one above" aria-describedby="otpImportPassWarn" /></div>
             <p class="otp-warn" id="otpImportPassWarn"></p>
           </div>
@@ -942,8 +945,8 @@
           <span class="otp-padcard-meta" id="otpImportPadMeta"></span>
         </span>
       </div>
-      <p class="otp-caption">It is selected. Agree on a chat code with your contact, then Connect.</p>
       <p class="otp-caption otp-delete">Delete the pad file now.</p>
+      <p class="otp-caption">It is selected. Agree on a chat code with your contact, then Connect.</p>
       <div class="otp-weak" id="otpImportWeak" hidden>
         <p>Weak pad passphrase — accepted.</p>
         <details class="why">

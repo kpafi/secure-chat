@@ -248,6 +248,7 @@ let madeId;
   assert.strictEqual(downloads, d0, "Android: nothing is downloaded (the WebView would drop it)");
   assert.ok(shown("otpShare") && shown("otpSave") && !shown("otpExport") && !shown("otpExportCancel"),
     "ready: Share… (primary) and Save to device");
+  assert.ok(el("otpExportReadyWeak").hidden, "a strong transfer passphrase: no weak warning beside Share / Save");
   const name = el("otpExportStep2Caption").textContent;
   assert.match(name, NAME_RE, "§ 7: the file name is neutral — the native side's exact pattern: " + name);
   // …and it is the local date and minute of the export (24h, zero-padded).
@@ -296,6 +297,8 @@ let madeId;
   result("req-" + reqN, "saved");
   assert.strictEqual(el("otpExportSheet").getAttribute("data-state"), "done", "saved: done");
   assert.strictEqual(el("otpExportDoneTitle").textContent, "File saved", "round 2 N-M1: 'File saved' (not 'to this device')");
+  assert.strictEqual(el("otpExportDelete").textContent, "Once they've imported it, delete the file on both devices.",
+    "fix round 2: after a save the sender has a copy too — delete it on both devices");
   assert.ok(shown("otpExportDoneFile") && el("otpExportDoneFile").textContent === name, "…with the file name on its own line");
   assert.ok(shown("otpExportDone") && !shown("otpShare") && el("otpSendAgain").textContent === "Share or save the same file again",
     "done: Done is the primary; after a SAVE the link says share or save — the same file (design r3 minor 6, cold MA-3)");
@@ -307,6 +310,8 @@ let madeId;
   assert.strictEqual(calls.length, nBefore + 1);
   result("req-" + reqN, "shared");
   assert.strictEqual(el("otpExportDoneTitle").textContent, "File shared", "shared: 'File shared'");
+  assert.strictEqual(el("otpExportDelete").textContent, "Once they've imported it, they delete the file.",
+    "design r4 minor 1: after a share the sender has no copy to find — only they delete it");
   assert.strictEqual(el("otpSendAgain").textContent, "Didn't arrive? Send the same file again", "…and after a share: 'Didn't arrive?'");
   const b0 = hist.backs;
   await el("otpExportDone").click();
@@ -688,6 +693,198 @@ const stateOf = (id) => el(id).getAttribute("data-state");
   assert.match(st.className, /\bvh\b/, "§ 1.5: 'Generated + encrypted…' is visually hidden in the panel, sheet or not");
   el("otpNewPass").value = "";
   console.log("OK  success sentences are .vh in the panel with no sheet open");
+}
+
+// ======== fix round 2 (otp-fix-round-1.md, "Round 2") ========
+const lockPad = async (id, pass) => {
+  await settle(5);
+  const other = otp.listPads().find((p) => p.padId !== id).padId;
+  el("otpSelect").value = other; await el("otpSelect").dispatch("change");
+  el("otpSelect").value = id; await el("otpSelect").dispatch("change");
+  el("otpPass").value = pass;
+};
+const ALREADY = "You already have this pad on this device — not importing again (a pad must live on exactly one device per side).";
+
+// ---- cold r2 MA-1 + hot r2 N2: the same file twice / the maker's own file ----
+{
+  const foreign = await otp.generatePad({ label: "twice", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const file = await otp.exportPad(foreign, "agreed words twice");
+  const importFile = async (text) => {
+    await el("otpImportOpen").click();
+    await set("otpImportXfer", "agreed words twice");
+    await set("otpImportPass", "my own words for twice");
+    el("otpFile").files = [{ name: "f.json", size: text.length, text: async () => text }];
+    await el("otpFile").dispatch("change");
+    await until(() => stateOf("otpImportSheet") !== "working" && (el("otpImportStatus").textContent || stateOf("otpImportSheet") === "done"), "import settled");
+  };
+  await importFile(file);
+  assert.strictEqual(stateOf("otpImportSheet"), "done", "fixture: the first import works");
+  await el("otpImportDone").click();
+  await lockPad(madeId, PADPASS);
+  await openExport(); await el("otpExportClose").click(); // unlock madeId in the panel
+  assert.ok(shown("otpUnlocked") && el("otpPass").value === PADPASS, "fixture: our pad is unlocked, its passphrase in the field");
+  await importFile(file);
+  assert.strictEqual(el("otpImportStatus").textContent, ALREADY,
+    "cold MA-1: the same file again says 'you already have this pad' — not 'already been used … generate a fresh pad'");
+  assert.strictEqual(el("otpSelect").value, foreign.padId, "…and selects it");
+  assert.ok(el("otpPass").value === "" && !shown("otpUnlocked"),
+    "hot r2 N2: a selection made by the page locks the unlocked pad and empties #otpPass, as a user's change does");
+  await el("otpImportClose").click();
+  // The maker importing their own export.
+  const own = await otp.unlockPad(madeId, PADPASS);
+  const ownFile = await otp.exportPad(own.record, "agreed words twice");
+  own.record.bytes.fill(0);
+  await importFile(ownFile);
+  assert.strictEqual(el("otpImportStatus").textContent, ALREADY, "cold MA-1: the maker's own file: 'you already have this pad'");
+  await el("otpImportClose").click();
+  console.log("OK  cold MA-1 / hot N2: a pad still here is 'already have', and the page's selection locks the panel");
+}
+
+// ---- cold r2 MA-3: Forget asks, naming the pad --------------------------------
+{
+  const doomed = await otp.generatePad({ label: "to forget", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  await otp.saveNewPad(doomed, "forget me passphrase");
+  el("otpSelect").value = doomed.padId; await el("otpSelect").dispatch("change");
+  const realConfirm = globalThis.confirm;
+  let said = null;
+  globalThis.confirm = (m) => { said = m; return false; };
+  await el("otpForget").click();
+  assert.ok(said && /"to forget"/.test(said) && /cannot be imported again/.test(said), "MA-3: Forget asks, naming the pad: " + said);
+  assert.ok(otp.padMeta(doomed.padId), "…Cancel keeps the pad");
+  el("otpPass").value = "typed for the doomed pad";
+  globalThis.confirm = () => true;
+  await el("otpForget").click();
+  globalThis.confirm = realConfirm;
+  assert.strictEqual(otp.padMeta(doomed.padId), null, "…OK deletes it");
+  assert.strictEqual(el("otpPass").value, "", "cold r2 n-2 / hot N2: no passphrase is left in the field after Forget");
+  console.log("OK  cold MA-3: Forget is confirm-gated and names the pad");
+}
+
+// ---- hot r2 N3: a view switch during the Export entry's unlock cancels it ----
+{
+  await lockPad(madeId, PADPASS);
+  const idx0 = hist.idx;
+  const opening = el("otpExportOpen").click();
+  const nav = (v) => dom.body.querySelectorAll(".navitem").find((b) => b.dataset.view === v);
+  const chats = nav("chats");
+  await chats.click();
+  await opening;
+  await settle(5);
+  assert.ok(!shown("otpExportSheet"), "N3: the user went to another view during the unlock — no Export sheet over it");
+  assert.strictEqual(hist.idx, idx0, "…and its history entry is dropped");
+  await nav("live").click();
+  console.log("OK  hot N3: a view switch during the Export entry's unlock cancels it");
+}
+
+// ---- W1 / M19: #otpPass edited during the unlock's KDF ------------------------
+{
+  await lockPad(madeId, PADPASS);
+  const opening = el("otpExportOpen").click();
+  el("otpPass").value = "something typed during the unlock";
+  await opening;
+  assert.ok(shown("otpExportSheet"), "fixture: the Export sheet opened");
+  assert.strictEqual(el("otpPass").value, PADPASS, "W1: the field holds the passphrase that unlocked the pad, not what was typed meanwhile");
+  await set("otpXferPass", PADPASS);
+  await el("otpExport").click();
+  assert.strictEqual(el("otpExportStatus").textContent, "Use a different passphrase for the file — this one is your pad passphrase.",
+    "W1: …so the pad passphrase is still refused as the transfer passphrase");
+  await el("otpExportClose").click();
+  console.log("OK  W1: the unlock writes back its passphrase; must-differ holds after an edit during the KDF");
+}
+
+// ---- W6: no other sheet opens while the Export entry unlocks ------------------
+{
+  await lockPad(madeId, PADPASS);
+  const idx0 = hist.idx;
+  const opening = el("otpExportOpen").click();
+  await el("otpImportOpen").click();
+  assert.ok(!shown("otpImportSheet") && hist.idx === idx0 + 1, "W6: Import tapped during the unlock opens nothing (its entry would sit on ours)");
+  await opening;
+  assert.ok(shown("otpExportSheet"), "…the Export sheet opens as asked");
+  await el("otpExportClose").click();
+  await settle(5);
+  assert.strictEqual(hist.idx, idx0, "…and history is back where it was");
+  console.log("OK  W6: no other sheet during the Export entry's unlock");
+}
+
+// ---- W3+W4: Back during a FAILED unlock, at the first history entry (Android) ----
+{
+  await lockPad(madeId, "not the pad passphrase");
+  hist.entries = [null]; hist.idx = 0; // no earlier page: the app's first entry
+  const b0 = hist.backs;
+  const opening = el("otpExportOpen").click();
+  await userBack();
+  await opening;
+  await settle(5);
+  assert.ok(!shown("otpExportSheet") && /^Could not unlock this pad: /.test(st.textContent), "fixture: the unlock failed, no sheet");
+  assert.strictEqual(hist.backs, b0, "W3+W4: Back took the entry — app.js calls no back() of its own");
+  await el("otpImportOpen").click();
+  assert.ok(shown("otpImportSheet"), "fixture: a later sheet opens");
+  assert.strictEqual(st.textContent, "", "hot r2 N1-nit: the panel's earlier error is cleared when a sheet opens");
+  await userBack();
+  assert.ok(!shown("otpImportSheet"), "W3+W4: …and the next Back closes it (no ignore left stuck)");
+  console.log("OK  W3+W4: Back during a failed unlock leaves history in step");
+}
+
+// ---- cold M4: the on-top check alone ---------------------------------------
+{
+  await settle(5);
+  await el("otpImportOpen").click();
+  // A traversal whose popstate never reached the page (e.g. a shell's own
+  // goBack racing a reload): the entry is gone, the page still thinks it owns one.
+  hist.idx--;
+  const b0 = hist.backs;
+  await el("otpImportClose").click();
+  assert.strictEqual(hist.backs, b0, "cold M4: a close whose entry is no longer on top calls no back() (it would leave the app)");
+  console.log("OK  cold M4: otpHistDrop only goes back from its own entry");
+}
+
+// ---- hot m4: a marked field is described by its sheet's status ----------------
+{
+  el("otpXferPass").setAttribute("aria-describedby", "otpXferWarn"); // as in index.html (the stub reads no attributes)
+  await lockPad(madeId, PADPASS);
+  await openExport();
+  await set("otpXferPass", PADPASS);
+  await el("otpExport").click();
+  assert.strictEqual(el("otpXferPass").getAttribute("aria-describedby"), "otpXferWarn otpExportStatus",
+    "hot m4: the refused field is described by the refusal: " + el("otpXferPass").getAttribute("aria-describedby") + " / " + el("otpExportStatus").textContent);
+  await set("otpXferPass", "x");
+  assert.strictEqual(el("otpXferPass").getAttribute("aria-describedby"), "otpXferWarn", "…and only by its warn line again after input");
+  await el("otpExportClose").click();
+  console.log("OK  hot m4: aria-describedby follows the mark");
+}
+
+// ---- owner (cold r2 MA-4): the weak transfer warning at the field and beside Share / Save ----
+{
+  await lockPad(madeId, PADPASS);
+  const realConfirm = globalThis.confirm;
+  globalThis.confirm = () => true;
+  try {
+    await openExport();
+    await set("otpXferPass", "hunter2");
+    assert.match(el("otpXferWarn").textContent, /^Weak: .*Anyone who gets a copy of the file can try to guess it/,
+      "MA-4: the transfer field's warning says what is at stake");
+    await el("otpExport").click();
+    if (stateOf("otpExportSheet") === "confirm") await el("otpExport").click();
+    await until(() => stateOf("otpExportSheet") === "ready", "ready");
+    assert.ok(!el("otpExportReadyWeak").hidden, "MA-4: …and stands beside Share / Save when the file leaves");
+    await el("otpExportClose").click();
+  } finally {
+    globalThis.confirm = realConfirm;
+  }
+  console.log("OK  MA-4: weak transfer passphrase warned at the field and at Share / Save (still accepted)");
+}
+
+// ---- cold r2 n-1: New pad forgets its name, size and drawing on close ------------
+{
+  await el("otpNewOpen").click();
+  el("otpLabel").value = "left behind";
+  el("otpSize").value = "8192";
+  await el("otpNewClose").click();
+  await el("otpNewOpen").click();
+  assert.ok(el("otpLabel").value === "" && el("otpSize").value === String(otp.PAD_SIZES[1].bytes), "n-1: a reopened New pad starts clean");
+  await el("otpNewClose").click();
+  console.log("OK  cold n-1: New pad resets on close");
 }
 
 console.log("\nAll OTP sheet checks passed.");

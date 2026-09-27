@@ -118,6 +118,7 @@ const els = {
   otpExportDoneDisc: $("otpExportDoneDisc"), otpExportDoneTitle: $("otpExportDoneTitle"),
   otpExportDoneFile: $("otpExportDoneFile"), otpHanded: $("otpHanded"), otpExportTheirs: $("otpExportTheirs"),
   otpExportWeak: $("otpExportWeak"), otpExportWeakWhy: $("otpExportWeakWhy"),
+  otpExportDelete: $("otpExportDelete"), otpExportReadyWeak: $("otpExportReadyWeak"),
   otpExportDone: $("otpExportDone"), otpSendAgain: $("otpSendAgain"),
   // Import sheet
   otpImportSheet: $("otpImportSheet"), otpImportClose: $("otpImportClose"),
@@ -5151,10 +5152,20 @@ function refreshOtpPads(selectId) {
   for (const p of pads) {
     const o = document.createElement("option");
     o.value = p.padId;
-    o.textContent = `${p.label} (${p.role === 0 ? "you generated" : "imported"}, ${fmtBytes(p.regionSize)}/side)`;
+    // Fix round 2 (design r4 nit 5): the words the cards use.
+    o.textContent = `${p.label} (${p.role === 0 ? "you generated" : "from your contact"}, ${fmtBytes(p.regionSize)} each way)`;
     els.otpSelect.appendChild(o);
   }
   if (selectId) els.otpSelect.value = selectId;
+  // Fix round 2 (hot r2 N2): the same rule as a user's change of the pad —
+  // a selection made here (the "you already have this pad" path, Forget)
+  // that is not the unlocked pad locks it and empties #otpPass, so
+  // "unlocked" still always comes with its passphrase in the field. New pad
+  // and Import set otpPanel to the new pad before they call this.
+  if (!otpPanel || otpPanel.padId !== els.otpSelect.value) {
+    otpPanel = null;
+    els.otpPass.value = "";
+  }
   syncOtpSelection();
 }
 
@@ -5175,7 +5186,8 @@ function populateOtpSizes() {
 }
 function syncOtpSizeHint() {
   const size = otp.PAD_SIZES.find((s) => String(s.bytes) === els.otpSize.value) || otp.PAD_SIZES[1];
-  els.otpSizeHint.textContent = (size.label.split(" — ")[1] || "").replace("/side", " each way");
+  // (design r4 nit 4: the label already says "each way")
+  els.otpSizeHint.textContent = (size.label.split(" — ")[1] || "").replace("/side", "");
 }
 
 // Draw-to-generate entropy: capture pointer motion samples to fold into the pad.
@@ -5563,8 +5575,16 @@ async function otpRunImport() {
     outcome = "done";
     done = { label: rec.label, regionSize: rec.regionSize, weak };
   } catch (e) {
-    otpStatusMsg("Import failed: " + e.message, true);
-    outcome = e.message === "wrong passphrase or corrupted pad file" ? "pass" : "file";
+    if (e && e.code === "PAD_PRESENT") {
+      // Fix round 2 (cold MA-1): the same file again, or the maker's own —
+      // the truthful sentence, and the pad is selected, as below.
+      refreshOtpPads(e.padId);
+      otpStatusMsg("You already have this pad on this device — not importing again (a pad must live on exactly one device per side).", true);
+      outcome = "file";
+    } else {
+      otpStatusMsg("Import failed: " + e.message, true);
+      outcome = e.message === "wrong passphrase or corrupted pad file" ? "pass" : "file";
+    }
   } finally {
     otpImporting = false;
     otpImportFinished(outcome, done);
@@ -5574,6 +5594,12 @@ async function otpRunImport() {
 async function otpForgetSelected() {
   const id = els.otpSelect.value;
   if (!id) return;
+  // Fix round 2 (cold r2 MA-3): one tap next to the picker deleted a pad for
+  // good (its watermark then refuses the file again, by design). Ask, and
+  // name it. (On Android the shell shows confirm() through secureShow.)
+  const meta = otp.padMeta(id);
+  if (!confirm(`Delete the pad "${meta ? meta.label : id.slice(0, 8)}" from this device? ` +
+    "It cannot be imported again — you would need to make a new pad and hand it over in person.")) return;
   // Round 4: a writer of the pad's storage — never beside a live chat on it.
   const done = await withPadLock(id, async () => {
     otp.forgetPad(id);
@@ -5750,6 +5776,12 @@ function renderOtpExport() {
     }[r] || ["", ""];
     els.otpExportDoneTitle.textContent = T[0];
     els.otpHanded.textContent = T[1];
+    // Fix round 2 (design r4 minor 1, hot r2 N6): after Android "shared" and
+    // the iOS share sheet the sender has no copy they can find (the app's own
+    // copy ends by itself) — only the receiver has one to delete.
+    els.otpExportDelete.textContent = r === "shared" || r === "ios"
+      ? "Once they've imported it, they delete the file."
+      : "Once they've imported it, delete the file on both devices.";
     els.otpExportDoneDisc.className = "otp-done-disc " + (r === "shared" ? "ok" : r === "ios" ? "share" : "download");
     els.otpExportDoneFile.hidden = !(r === "downloaded" || r === "saved") || !otpExportFile;
     els.otpExportDoneFile.textContent = otpExportFile ? otpExportFile.name : "";
@@ -5763,6 +5795,10 @@ function renderOtpExport() {
   els.otpExport.classList.toggle("primary", st !== "confirm");
   els.otpExport.classList.toggle("danger", st === "confirm");
   els.otpShare.hidden = els.otpSave.hidden = st !== "ready";
+  // Owner (cold r2 MA-4): the weak-passphrase warning stands where the file
+  // leaves — beside Share… / Save to device (the browser downloads at once,
+  // under the field's own warning; its done block repeats it).
+  els.otpExportReadyWeak.hidden = !(st === "ready" && otpExportFile && otpExportFile.weak);
   els.otpShare.disabled = els.otpSave.disabled = !!otpNativeReq;
   els.otpExportDone.hidden = els.otpSendAgain.hidden = st !== "done";
   // Fix round 1 (cold MA-3, design r3 minor 6): a quiet link that says it is
@@ -5785,7 +5821,9 @@ function renderOtpImport() {
     otpStep(li, st === "form" && cur === i + 1 ? "current" : st === "working" && i === 2 ? "current" : "idle");
     li.classList.toggle("is-filled", filled[i]);
   });
-  els.otpImportSteps.inert = st === "working"; // design r3 minor 4
+  // Design r3 minor 4, without hiding the progress (hot r2 N1): the progress
+  // lives in step 3, so only steps 1–2 (the fields) are inert while working.
+  els.otpImportStep1.inert = els.otpImportStep2.inert = st === "working";
   els.otpImportSteps.hidden = st === "done";
   els.otpImportStep3Caption.textContent = otpImportFile && otpImportFile.name
     ? otpImportFile.name + " — chosen" : "Usually in Downloads.";
@@ -5962,6 +6000,9 @@ function otpSendAgain() {
 
 // ---- open / close -------------------------------------------------------------
 function otpSheetShow(kind) {
+  // Hot r2 N1-nit: a panel error from before this sheet opened (a failed
+  // unlock, a refusal) is not left under the sheet and after it.
+  if (els.otpStatus.classList.contains("err")) { els.otpStatus.textContent = ""; els.otpStatus.className = "hint"; }
   otpUi.sheet = kind;
   resetOtpSheet(kind);
   if (kind === "export") {
@@ -6037,7 +6078,14 @@ function resetOtpSheet(kind) {
   for (const w of S.warns) w.textContent = "";
   otpSheetStatus(kind, "");
   for (const d of S.sheet.querySelectorAll("details")) d.open = false;
-  if (kind === "new") otpNewInfo = null;
+  if (kind === "new") {
+    otpNewInfo = null;
+    // Cold r2 n-1: the name, the size and the drawing go with the sheet too.
+    els.otpLabel.value = "";
+    els.otpSize.value = String(otp.PAD_SIZES[1].bytes);
+    syncOtpSizeHint();
+    clearEntropy();
+  }
   if (kind === "export") {
     otpExportFile = null;
     otpExportResult = null;
@@ -6117,7 +6165,9 @@ async function otpExportOpenClick() {
     let ok = false;
     try {
       await ensureUnlocked(id);
-      ok = els.otpSelect.value === id; // another pad chosen meanwhile: no sheet
+      // Another pad chosen meanwhile, or the user went elsewhere (another
+      // view, another security option — hot r2 N3): no sheet, like Back.
+      ok = els.otpSelect.value === id && !els.viewLive.hidden && !els.otpPanel.hidden;
     } catch (e) {
       // Fix round 1 (cold mi-6, hot m3): nothing was exported — say what
       // failed, and put focus back where the fix is (disabling the button
@@ -6150,7 +6200,12 @@ function otpLockPanel() {
 // Live weak-passphrase line under a new passphrase: warn, never block.
 function otpWeakLive(input, out) {
   const why = input.value ? passphraseWeakness(input.value) : null;
-  out.textContent = why ? `Weak: ${why}. Use ${PASSPHRASE_MIN_CHARS} or more characters, e.g. four random words.` : "";
+  // Owner (2026-09-27, cold r2 MA-4): still warn-never-block, but the
+  // transfer passphrase's warning says what is at stake — the file travels.
+  out.textContent = !why ? ""
+    : input === els.otpXferPass
+      ? `Weak: ${why}. Anyone who gets a copy of the file can try to guess it — use ${PASSPHRASE_MIN_CHARS} or more characters, e.g. four random words.`
+      : `Weak: ${why}. Use ${PASSPHRASE_MIN_CHARS} or more characters, e.g. four random words.`;
 }
 
 // Tab stays inside the open sheet (the rest of the page is inert).
