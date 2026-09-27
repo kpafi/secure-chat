@@ -170,6 +170,9 @@ class PadFilesActivityTest {
             Uri.parse("content://0%40${activity.packageName}.files/pad-share/0123456789abcdef/$name"),
             Uri.parse("content://10%40${activity.packageName}.files/x"),
             Uri.parse("content://0%40${activity.packageName}.androidx-startup/x"),
+            // Pentest r4 G5: two `@`s — the resolver strips up to the LAST one.
+            Uri.parse("content://0@1@${activity.packageName}.files/pad-share/0123456789abcdef/$name"),
+            Uri.parse("content://0%401%40${activity.packageName}.files/pad-share/0123456789abcdef/$name"),
         )) {
             val cb = Recorder()
             chooser(cb)

@@ -175,3 +175,12 @@ G-numbers are unit mutants, EG-numbers e2e mutants; each hand-run on its own and
 | Cold r2 n-4 | Kept (round 1's reason) | |
 | Pentest r3 R3-1, R3-2, A-mutants | Android — see "Round 2 — Android" | |
 | Pentest r3 I-1 (entries silent during the unlock), I-4 | Accepted as Info | |
+
+## Round 3 — Android
+
+Pentest r4 gaps G4 and G5: two mutants were caught only by source pins. Now behavioural. `testDebugUnitTest` 50/50, `android-source.test.mjs` 9/9. No production code changed.
+
+| Finding | Fix | Test | Mutant → result |
+| --- | --- | --- | --- |
+| Pentest r4 G4 (A9): the name validator could skip the last template character | refused-list cases: right length with only the LAST character wrong (`…1432.jsoX`), and only the first wrong | `PadFilesTest.refusesEveryOtherName` | G4 (`0 until NAME_TEMPLATE.length - 1`) → JVM red (1 of 10) |
+| Pentest r4 G5 (A2): splitting the authority on the FIRST `@` | refused-list cases `content://0@1@<ours>.files/…` and `content://0%401%40<ours>.files/…` (the resolver strips up to the LAST `@`) | `PadFilesActivityTest.pickerResultsThatAreNotAnotherAppsDocumentAreDropped` | G5 (`substringAfter('@')`) → JVM red (1 of 28) |

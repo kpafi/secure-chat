@@ -53,6 +53,8 @@ class PadFilesTest {
             "secure-chat-pad-2026-09-26-\u0967\u096a\u0969\u0968.json", // Devanagari digits
             "secure-chat-pad-2026-\u06f0\u06f9-26-1432.json", // Extended Arabic-Indic digits
             "secure-chat-pad-2026-09-26-1432.jso",             // one short
+            "secure-chat-pad-2026-09-27-1432.jsoX",            // right length, LAST character wrong (pentest r4 G4)
+            "Xecure-chat-pad-2026-09-27-1432.json",            // right length, first character wrong
             "secure-chat-pad-2026-09-26-1432.jsonx",
             "Secure-chat-pad-2026-09-26-1432.json",
             "secure-chat-pad-Alice-2026-09-26-1432.json",       // a label: brief 7 says neutral
