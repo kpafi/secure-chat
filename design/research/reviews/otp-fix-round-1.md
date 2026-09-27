@@ -311,3 +311,16 @@ otp-held-join 10/10, room-admission 49/49. Mutants hand-run, one at a time, each
 | R8-1: the notice dropped the weak line | **Fixed**: " Weak pad passphrase — accepted." / " Weak transfer passphrase — accepted." appended, as the done block shows it | S3 → "R8-1/R8-3: the done line keeps the weak-passphrase line…" |
 | R8-3: hintSafe blanked non-ASCII labels; a `"` closed the quote | **Fixed**: the notice is written by textContent (fixed words + the cleaned label), the label in “…” | S4 (hintSafe again) → the same check ("Caf    \"x\""); S5 (ASCII quotes) → "R7-2: what the done block would have said…" |
 | R8-4: iOS said "sent" | **Fixed**: "Share sheet opened — AirDrop it to them in person; once they've imported it, they delete the file." (the unreachable "shared" branch removed) | S6 → "R8-4: the iOS self-close notice" (a child process with `location.protocol = "secure-chat:"`) |
+
+## Round 8 — Web client
+
+Review: `otp-pentest-r9.md` (nothing Low or above). Checked: `npm test` green; e2e (:8093,
+killed by PID): otp-transfer 196/196, otp-held-join 10/10. Mutants hand-run, each reverted.
+
+| Finding | Verdict | Bound by (mutant → red check) |
+| --- | --- | --- |
+| M10: a failed New pad could fall through to "created" | **Test added** (a self-closing New pad whose KDF fails) | "M10: a New pad that failed says so — never 'created'" |
+| M8: the New pad weak suffix | **Test added** | "M8: a weak pad passphrase keeps its line in the New pad notice" |
+| M9: the Export weak suffix | **Test added** (the iOS child exports under a weak transfer passphrase) | "R8-4 / M9: the iOS self-close notice, with the weak transfer passphrase line" |
+| Info-1: the notice replaced an error in the chat's `#hint` | **Fixed**: a `#hint` with class `err` is left alone; the panel still gets the notice | "Info-1: an error the chat's hint shows is not replaced" |
+| Info-2: no `aria-live`; the "cannot close" comment | **Fixed**: `aria-live` assertive for a warning, polite otherwise; the comment says `"` does not end the quotes but `”` can (cosmetic, the maker's own ≤ 60 characters) | "Info-2: the warning is announced assertively" |
