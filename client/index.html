@@ -247,8 +247,8 @@
             <label for="otpPass">Pad passphrase</label>
             <span class="otp-token otp-me">only you know it</span>
             <div class="otp-field otp-me"><input id="otpPass" type="password" autocomplete="off" placeholder="unlocks the selected pad" /></div>
-            <div id="otpUnlocked" class="otp-unlocked" role="status" hidden>
-              <span class="otp-unlocked-text">Unlocked for this session</span>
+            <div id="otpUnlocked" class="otp-unlocked" hidden>
+              <span class="otp-unlocked-text" role="status">Unlocked for this session</span>
               <button id="otpLock" type="button" class="ghost">Lock</button>
             </div>
             <details class="why">
@@ -700,7 +700,7 @@
                        spellcheck="false" maxlength="60" placeholder="e.g. Chess club" />
               </div>
               <div>
-                <label for="otpSize">Size</label>
+                <label for="otpSize">Size, each way</label>
                 <select id="otpSize" aria-describedby="otpSizeHint"></select>
               </div>
             </div>
@@ -714,7 +714,7 @@
             <div class="row why-row otp-fieldrow">
               <label for="otpNewPass">Pad passphrase</label>
               <span class="otp-token otp-me">only you know it</span>
-              <div class="otp-field otp-me"><input id="otpNewPass" type="password" autocomplete="off"
+              <div class="otp-field otp-me"><input id="otpNewPass" type="password" autocomplete="new-password"
                    placeholder="a passphrase only you know" aria-describedby="otpNewPassWarn" /></div>
               <p class="otp-warn" id="otpNewPassWarn"></p>
             </div>
@@ -792,6 +792,14 @@
           <p class="otp-done-title" id="otpExportDoneTitle"></p>
           <p class="otp-file-name mono" id="otpExportDoneFile" hidden></p>
           <p class="otp-caption" id="otpHanded"></p>
+          <div class="otp-weak" id="otpExportWeak" hidden>
+            <p>Weak transfer passphrase — accepted.</p>
+            <details class="why">
+              <summary><span class="vh">Why is it weak?</span></summary>
+              <div id="otpExportWeakWhy"></div>
+            </details>
+          </div>
+          <p class="otp-caption otp-delete">Once they've imported it, delete the file on both devices.</p>
         </div>
       </div>
     </div>
@@ -799,7 +807,7 @@
       <span class="otp-tile" aria-hidden="true"></span>
       <span class="otp-padcard-text">
         <span class="otp-padcard-label" id="otpExportPadLabel"></span>
-        <span class="otp-padcard-meta"><span id="otpExportPadMeta"></span><span class="otp-meta-warn" id="otpExportPadWarn" hidden> · exported before</span></span>
+        <span class="otp-padcard-meta"><span id="otpExportPadMeta"></span><span id="otpExportPadWarn" hidden> · <span class="otp-meta-warn">exported before</span></span></span>
       </span>
     </div>
     <ol class="otp-steps" id="otpExportSteps">
@@ -810,7 +818,7 @@
           <div class="row why-row otp-fieldrow" id="otpXferRow">
             <label for="otpXferPass">Transfer passphrase</label>
             <span class="otp-token otp-both">you both know it</span>
-            <div class="otp-field otp-both"><input id="otpXferPass" type="password" autocomplete="off"
+            <div class="otp-field otp-both"><input id="otpXferPass" type="password" autocomplete="new-password"
                  placeholder="not your pad passphrase" aria-describedby="otpXferWarn" /></div>
             <p class="otp-warn" id="otpXferWarn"></p>
             <details class="why">
@@ -848,13 +856,6 @@
         <li class="otp-me">a pad passphrase of their own</li>
         <li class="otp-file">this file</li>
       </ul>
-      <div class="otp-weak" id="otpExportWeak" hidden>
-        <p>Weak transfer passphrase — accepted.</p>
-        <details class="why">
-          <summary><span class="vh">Why is it weak?</span></summary>
-          <div id="otpExportWeakWhy"></div>
-        </details>
-      </div>
     </div>
     <p class="otp-status" id="otpExportStatus" aria-live="polite" tabindex="-1"></p>
     <div class="otp-bar">
@@ -906,7 +907,7 @@
           <div class="row why-row otp-fieldrow">
             <label for="otpImportPass">Pad passphrase</label>
             <span class="otp-token otp-me">only you know it</span>
-            <div class="otp-field otp-me"><input id="otpImportPass" type="password" autocomplete="off"
+            <div class="otp-field otp-me"><input id="otpImportPass" type="password" autocomplete="new-password"
                  placeholder="a new one — not the one above" aria-describedby="otpImportPassWarn" /></div>
             <p class="otp-warn" id="otpImportPassWarn"></p>
           </div>
@@ -942,6 +943,7 @@
         </span>
       </div>
       <p class="otp-caption">It is selected. Agree on a chat code with your contact, then Connect.</p>
+      <p class="otp-caption otp-delete">Delete the pad file now.</p>
       <div class="otp-weak" id="otpImportWeak" hidden>
         <p>Weak pad passphrase — accepted.</p>
         <details class="why">
