@@ -184,3 +184,22 @@ Pentest r4 gaps G4 and G5: two mutants were caught only by source pins. Now beha
 | --- | --- | --- | --- |
 | Pentest r4 G4 (A9): the name validator could skip the last template character | refused-list cases: right length with only the LAST character wrong (`…1432.jsoX`), and only the first wrong | `PadFilesTest.refusesEveryOtherName` | G4 (`0 until NAME_TEMPLATE.length - 1`) → JVM red (1 of 10) |
 | Pentest r4 G5 (A2): splitting the authority on the FIRST `@` | refused-list cases `content://0@1@<ours>.files/…` and `content://0%401%40<ours>.files/…` (the resolver strips up to the LAST `@`) | `PadFilesActivityTest.pickerResultsThatAreNotAnotherAppsDocumentAreDropped` | G5 (`substringAfter('@')`) → JVM red (1 of 28) |
+
+## Round 3 — Web client
+
+Review: `otp-pentest-r4.md` (nothing Critical, High or Medium). Commits 2b51020 (otp.js) and
+3b0bda9 (app.js + unit tests). Checked: `npm test` green; e2e on a scratch relay (:8093, killed
+by PID): otp-transfer 196/196, all-modes 28/28, no-dead-ends 17/17. K-numbers are hand-run
+mutants, one at a time, each reverted (`git diff` clean after each).
+
+| Finding | Verdict | Bound by (mutant → red check) |
+| --- | --- | --- |
+| R4-1 (Low): Connect during the Export entry's unlock leaves the sheet over the live chat | **Fixed**: `connect()` marks a running entry unlock "elsewhere"; the unlock then drops its entry and opens no sheet (focus stays with Connect's flow). The `ok` check also requires `#scrRoom` | K1 (Connect does not mark) and K2 (the mark ignored) → "R4-1: Connect pressed during the unlock wins — no Export sheet" (part a: no relay answer yet, deterministic); part b replays the pentester's PoC (the chat screen comes up) and asserts no sheet whichever KDF ends first |
+| R4-1, the `!els.scrRoom.hidden` term alone | **Equivalent today, kept as defence**: the chat screen appears only through Connect, and a Connect during the unlock is already the "elsewhere" mark; before the unlock started, the Export entry sits in a hidden screen and cannot be tapped | — |
+| G1 / W12: `ok` without the OTP-card check | **Test added** (another security option chosen during the unlock) | K3 → "W12: the OTP card was left during the unlock — no Export sheet" |
+| G2 / W4: the PAD_PRESENT `bytes.fill(0)` | **Subsumed by I-1**: one catch zeroes the bytes for every refusal | K7 below |
+| G3 / W23: `otpHistEntry = false` in `otpOnPopState` | **Test added**: Back during a failed unlock with a stale entry of our own below (hot n2 / J20 leaves one) | K4 → "W23: …no back() from the stale entry below" |
+| I-1: "used" and looksRandom refusals left the decrypted pad unzeroed | **Fixed**: every post-decryption check runs in one `try`; any refusal zeroes `bytes` | K7 → "I-1: PAD_PRESENT: the decrypted pad bytes are zeroed on refusal" (used, looksRandom and recipientRole 0 asserted the same way, by tracking every pad-sized array the call makes) |
+| I-2: the maker's label unvalidated, now in a native confirm | **Fixed**: `cleanPadLabel` — control, bidi-control and line/paragraph-separator characters → spaces, collapsed, ≤ 60 code points (= `#otpLabel`'s maxlength). Applied at import and generate, and at display in the Forget confirm and the pad list (the index is unauthenticated; older imports kept raw labels). The file format is unchanged | K8 (raw label at import), K9 (no cap) → "I-2: an imported label is capped at 60…"; K6 (raw label in the confirm) → "I-2: the confirm names the pad without line breaks, bidi overrides or control characters" |
+| I-3: `otpHistOnTop` could not tell a reloaded page's entry from ours | **Fixed** (small, safe): the entry is `{otpSheet: <per-page random token>}` and the check compares the token. A stale entry of an earlier page is never dropped by us; it costs one extra Back, as before | K5 → "I-3: the entry on top is another page's — no back()" |
+| G4, G5 (Android A9, A2) | Android — commit 12253be | |
