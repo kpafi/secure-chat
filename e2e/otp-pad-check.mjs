@@ -222,6 +222,7 @@ console.log("\n  [4] alice on One-time pad, bob on AES-256");
   await alice.page.click("#gen");
   const code = await alice.page.evaluate(() => document.querySelector("#room").value.trim());
   await alice.page.evaluate(() => { window.__sent = []; });
+  await bob.page.evaluate(() => { window.__sent = []; });
   await sleep(700);
   await alice.page.click("#connect");
   await alice.page.waitForFunction(() => document.querySelector("#chatStatus").textContent.trim().toLowerCase() === "connected", { timeout: 45000 });
@@ -235,12 +236,17 @@ console.log("\n  [4] alice on One-time pad, bob on AES-256");
   await sleep(500);
   const room = await text(alice.page, "#roomHint");
   check("[4] alice: not Ready", !(await ready(alice)));
-  check("[4] alice: the room screen names bob's mode", /^The relay may have altered this connection — or your contact picked AES-256 under Security options, while you picked One-time pad\..*Nothing was sent and no pad was used\./.test(room), room.slice(0, 160));
+  // Exactly (pentest r6 R6-F4): it leads with the relay and never steers.
+  const modeSentence = (theirs, mine, tail) => `The relay may have altered this connection — or your contact picked ${theirs} ` +
+    `under Security options, while you picked ${mine}. Agree with your contact, in person or on a channel you trust, ` +
+    `which option you both use, then connect again. ${tail}`;
+  check("[4] alice: the room screen names bob's mode", room === modeSentence("AES-256", "One-time pad", "Nothing was sent and no pad was used."), room.slice(0, 160));
   check("[4] alice: no \"older version\" line", !/older version/.test(await text(alice.page, "#log")));
   check("[4] alice: Send never unlocked, no message frame went out",
     await alice.page.evaluate(() => document.querySelector("#text").disabled && !window.__sent.includes("msg")));
   const bobRoom = await text(bob.page, "#roomHint");
-  check("[4] bob (AES-256): the room screen names alice's mode", /^The relay may have altered this connection — or your contact picked One-time pad under Security options, while you picked AES-256\..*Nothing was sent\./.test(bobRoom), bobRoom.slice(0, 160));
+  check("[4] bob (AES-256): the room screen names alice's mode", bobRoom === modeSentence("One-time pad", "AES-256", "Nothing was sent."), bobRoom.slice(0, 160));
+  check("[4] bob: no message frame went out", await bob.page.evaluate(() => !window.__sent.includes("msg")));
   check("[4] bob: no \"key confirmation failed\"", !/Key confirmation failed/.test(bobRoom + await text(bob.page, "#hint")));
   await leave(alice, bob);
   await bob.page.evaluate(() => {

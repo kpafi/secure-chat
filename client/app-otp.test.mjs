@@ -196,6 +196,10 @@ async function otpConnect(padId = pad.padId, extra = () => ({})) {
   const onDisk = async () => { const u = await otp.unlockPad(chess.padId, PAD_PASS); return [u.record.sendOffset, u.record.recvHighWater]; };
   const READY = /one-time-pad encrypted/;
   const OLD = /older version and cannot confirm/;
+  // The mode refusal, exactly (pentest r6 R6-F4: no `.*` a steer could hide in).
+  const modeSentence = (theirs) => `The relay may have altered this connection — or your contact picked ${theirs} ` +
+    "under Security options, while you picked One-time pad. Agree with your contact, in person or on a channel you trust, " +
+    "which option you both use, then connect again. Nothing was sent and no pad was used.";
   // Connected, joined as owner (or, role "guest", pending → knock → let in),
   // nothing from a peer yet.
   const bare = async (padId, role = "owner") => {
@@ -450,8 +454,8 @@ async function otpConnect(padId = pad.padId, extra = () => ({})) {
       await ws.deliver({ type: "key", room: ROOM, alg, payload: pack({ hello: true, n: freshNonce(), reply }) });
       await settle(10);
       assert.ok(!anyHint(READY), `MA-2 (m): a ${tag} contact does not make an OTP session Ready`);
-      assert.ok(anyHint(new RegExp(`^The relay may have altered this connection — or your contact picked ${name} under Security options, while you picked One-time pad\\. Agree with your contact.*Nothing was sent and no pad was used`)),
-        `MA-2 (m): …the room screen names both modes (${tag}): ` + dom.el("roomHint").textContent);
+      assert.strictEqual(dom.el("roomHint").textContent, modeSentence(name),
+        `MA-2 (m): …the room screen names both modes, exactly (${tag})`);
       assert.ok(said(new RegExp(`hello says ${name} mode, not One-time pad — refusing`)), `MA-2 (m): …and so does the transcript (${tag})`);
       assert.strictEqual(count(OLD), old0, `MA-2 (m): …never "older version" (${tag})`);
       assert.strictEqual(ws.readyState, 3, `MA-2 (m): …closed (${tag})`);
@@ -465,14 +469,15 @@ async function otpConnect(padId = pad.padId, extra = () => ({})) {
   //      OTP offer has pinned a nonce, a genuine AES-256 hello (the relay
   //      injected the offer first) still gets the mode named — never the
   //      tagless path's "older version" and Ready.
-  {
+  //      An offer or an answer (pentest r6 R6-F3).
+  for (const reply of [false, true]) {
     const old0 = count(OLD);
     const { ws } = await offer(chess.padId);
-    await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: pack({ hello: true, n: freshNonce(), reply: false }) });
+    await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: pack({ hello: true, n: freshNonce(), reply }) });
     await settle(10);
-    assert.ok(!anyHint(READY), "MA-2 (m3): an AES-256 hello after a pinned offer does not unlock");
-    assert.ok(anyHint(/your contact picked AES-256 under Security options, while you picked One-time pad/), "MA-2 (m3): …it is named");
-    assert.strictEqual(count(OLD), old0, "MA-2 (m3): …never \"older version\"");
+    assert.ok(!anyHint(READY), `MA-2 (m3): an AES-256 hello (reply ${reply}) after a pinned offer does not unlock`);
+    assert.strictEqual(dom.el("roomHint").textContent, modeSentence("AES-256"), `MA-2 (m3): …it is named, exactly (reply ${reply})`);
+    assert.strictEqual(count(OLD), old0, `MA-2 (m3): …never "older version" (reply ${reply})`);
   }
 
   // (m4) pentest r5 R5-F4: a REAL guest (pending, knocked, let in) whose
@@ -483,7 +488,7 @@ async function otpConnect(padId = pad.padId, extra = () => ({})) {
     await ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ hello: true, n: freshNonce(), reply: true }) });
     await settle(10);
     assert.ok(!anyHint(READY), "MA-2 (m4): a real guest facing a DHKE owner is not Ready");
-    assert.ok(anyHint(/your contact picked DHKE under Security options, while you picked One-time pad/), "MA-2 (m4): …the owner's mode is named");
+    assert.strictEqual(dom.el("roomHint").textContent, modeSentence("DHKE"), "MA-2 (m4): …the owner's mode is named, exactly");
     assert.strictEqual(ws.readyState, 3, "MA-2 (m4): …closed");
     assert.strictEqual(ws.sent.slice(sent0).filter((f) => f.type === "key").length, 0, "MA-2 (m4): …and an answer is not answered");
   }
@@ -495,9 +500,19 @@ async function otpConnect(padId = pad.padId, extra = () => ({})) {
     const { ws, peerN } = await offer(chess.padId);
     await proofFrom(ws, peerN, peerC.padCheckTag(peerN, myNonceOf(ws)));
     assert.ok(anyHint(READY), "MA-2 (m2): fixture ready");
-    await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: pack({ hello: true, n: freshNonce(), reply: true }) });
-    await settle(5);
-    assert.strictEqual(ws.readyState, 1, "MA-2 (m2): a mode-tagged hello after Ready does not close the session");
+    // Every other tag, offer and answer (pentest r6 R6-F2), one after another.
+    const s0 = ws.sent.length;
+    const named0 = count(/hello says .* mode, not One-time pad — refusing/);
+    for (const alg of ["AES256", "DHKE", "PQKEM"]) {
+      for (const reply of [false, true]) {
+        await ws.deliver({ type: "key", room: ROOM, alg, payload: pack({ hello: true, n: freshNonce(), reply }) });
+        await settle(5);
+        assert.strictEqual(ws.readyState, 1, `MA-2 (m2): a ${alg} hello (reply ${reply}) after Ready does not close the session`);
+      }
+    }
+    assert.ok(anyHint(READY) && dom.el("send").disabled === false, "MA-2 (m2): …Ready and Send stay");
+    assert.strictEqual(count(/hello says .* mode, not One-time pad — refusing/), named0, "MA-2 (m2): …nothing is named");
+    assert.strictEqual(ws.sent.slice(s0).filter((f) => f.type === "key").length, 0, "MA-2 (m2): …and nothing is answered");
     await dom.el("disconnect").click();
     await settle(5);
   }
