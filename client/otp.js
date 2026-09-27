@@ -415,12 +415,19 @@ function missingRecordError() {
 
 // Generate a fresh pristine pad. The generator is always role 0.
 // A pad label as the page may show it: a string of at most PAD_LABEL_MAX code
-// points (= #otpLabel's maxlength), without control characters (line breaks
-// that could phrase a dialog) or bidi controls (that could reorder it).
+// points (= #otpLabel's maxlength; counted in code points, so a surrogate
+// pair is never split), without control or format characters (line breaks
+// that could phrase a dialog, bidi controls that could reorder it, zero-width
+// and tag characters that hide text). Fix round 4 (pentest r5 I-5a): whole
+// categories — Cc, Cf (bidi, zero-width, tags, soft hyphen), Cs (lone
+// surrogates), Co, Cn — plus the separators, the grapheme joiner, variation
+// selectors and the Hangul fillers; a label with nothing visible left is "".
 export const PAD_LABEL_MAX = 60;
-const LABEL_STRIP_RE = /[\p{Cc}\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069\u2028\u2029]/gu;
+const LABEL_STRIP_RE = /[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\u2028\u2029\u034F\uFE00-\uFE0F\u{E0100}-\u{E01EF}\u115F\u1160\u3164\uFFA0]/gu;
 export function cleanPadLabel(label) {
   if (typeof label !== "string") return "";
+  // (Stripped characters become spaces and are trimmed away, so a label with
+  // nothing visible ends as "", and the caller's default name applies.)
   return [...label.replace(LABEL_STRIP_RE, " ").replace(/\s+/g, " ").trim()].slice(0, PAD_LABEL_MAX).join("").trim();
 }
 const localStamp = (d) => {
@@ -536,8 +543,12 @@ export async function importPad(fileText, passphrase) {
   } catch {
     throw new Error("wrong passphrase or corrupted pad file");
   }
-  const o = JSON.parse(decU.decode(plain));
-  plain.fill(0);
+  let o;
+  try {
+    o = JSON.parse(decU.decode(plain));
+  } finally {
+    plain.fill(0); // fix round 4 (pentest r5 I-5d): also when it is not JSON
+  }
   // The id becomes a storage key AND a native-floor key; only randomId()'s
   // shape is acceptable (see PAD_ID_RE).
   if (typeof o.padId !== "string" || !PAD_ID_RE.test(o.padId)) throw new Error("pad file has an invalid pad id");

@@ -1666,6 +1666,16 @@ console.log("OK  MA-1: a pad still stored here is PAD_PRESENT; a forgotten one s
 // zeroes the decrypted pad; the maker's label is capped and cleaned.
 {
   const X = "r3 transfer words";
+  const sealText = async (text) => {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(X), "PBKDF2", false, ["deriveKey"]);
+    const key = await crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: 600000, hash: "SHA-256" },
+      base, { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(text)));
+    const b = (u) => Buffer.from(u).toString("base64");
+    return JSON.stringify({ fmt: "secure-chat-otp-pad", v: 1, kdf: { salt: b(salt), iters: 600000 }, iv: b(iv), ct: b(ct) });
+  };
   const seal = async (plainObj) => {
     const salt = crypto.getRandomValues(new Uint8Array(16));
     const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -1679,10 +1689,10 @@ console.log("OK  MA-1: a pad still stored here is PAD_PRESENT; a forgotten one s
   // Every pad-sized array importPad makes during one call is tracked; after a
   // refusal each must be all zero.
   const RealU8 = globalThis.Uint8Array;
-  const refusedZeroed = async (file, re, what) => {
+  const refusedZeroed = async (file, re, what, len = 8192) => {
     const made = [];
     class TrackedU8 extends RealU8 {
-      constructor(...a) { super(...a); if (this.length === 8192) made.push(this); }
+      constructor(...a) { super(...a); if (this.length === len) made.push(this); }
       static [Symbol.hasInstance](x) { return x instanceof RealU8; }
     }
     globalThis.Uint8Array = TrackedU8;
@@ -1704,6 +1714,12 @@ console.log("OK  MA-1: a pad still stored here is PAD_PRESENT; a forgotten one s
   const flat = await seal({ ...plain(), padId: "ab".repeat(16), bytes: Buffer.alloc(8192, 7).toString("base64") });
   await refusedZeroed(flat, /not random enough/, "looksRandom");
   await refusedZeroed(await seal({ ...plain(), padId: "cd".repeat(16), recipientRole: 0 }), /exported by someone who received/, "recipientRole 0");
+  // Fix round 4 (pentest r5 KC): the length-consistency refusal is inside the zeroing too.
+  await refusedZeroed(await seal({ ...plain(), padId: "ef".repeat(16), bytes: Buffer.from(gen.bytes.subarray(0, 8000)).toString("base64") }),
+    /internally inconsistent/, "length mismatch", 8000);
+  // Fix round 4 (I-5d): an authenticated plaintext that is not JSON — the decrypted buffer is zeroed.
+  const notJson = "x".repeat(1237);
+  await refusedZeroed(await sealText(notJson), /JSON|Unexpected|not valid/i, "non-JSON plaintext", 1237);
 
   // I-2: the maker's label, capped and cleaned (the file format is unchanged).
   const g2 = await otp.generatePad({ label: "x", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
@@ -1713,6 +1729,22 @@ console.log("OK  MA-1: a pad still stored here is PAD_PRESENT; a forgotten one s
   assert.ok(!/[\u0000-\u001f\u007f‪-‮⁦-⁩]/.test(got.label) && [...got.label].length <= 60 && got.label.startsWith("Chess OK only hides it evil"),
     "I-2: an imported label is capped at 60 and has no control or bidi characters: " + JSON.stringify(got.label));
   got.bytes.fill(0);
+  // Fix round 4 (pentest r5 KD, KE, KF, I-5a): every bidi mark and isolate,
+  // zero-width and tag characters, lone surrogates; the cap by code point;
+  // an invisible-only label falls back to the default name.
+  const cleaned = (lbl) => otp.cleanPadLabel(lbl);
+  assert.strictEqual(cleaned("b\u061Cc\u200Ed\u200Fe\u2066f\u2067g\u2068h\u2069i"), "b c d e f g h i",
+    "KD/KE: U+061C, U+200E/F and the isolates U+2066–2069 are stripped");
+  assert.strictEqual(cleaned("Chess\u200B\u2060 \u{E0041}club\u00AD\uD83D"), "Chess club",
+    "I-5a: zero-width, word joiner, tag, soft hyphen and a lone surrogate are stripped");
+  const capped = cleaned("a".repeat(59) + "\u{1F600}x");
+  assert.ok([...capped].length === 60 && capped.endsWith("\u{1F600}") && capped.isWellFormed(),
+    "KF: the 60 cap counts code points — the emoji at the cap stays whole: " + JSON.stringify(capped));
+  const g3 = await otp.generatePad({ label: "x", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const invisible = await otp.importPad(await seal({ padId: g3.padId, label: "\u200B\u2060\u200D", regionSize: g3.regionSize,
+    recipientRole: 1, bytes: Buffer.from(g3.bytes).toString("base64") }), X);
+  assert.strictEqual(invisible.label, "imported pad", "I-5a: a label with nothing visible falls back to the default name");
+  invisible.bytes.fill(0);
 }
 console.log("OK  I-1/I-2: import refusals zero the decrypted pad; labels are capped and cleaned");
 
