@@ -61,7 +61,7 @@ critics, a design critic and the pentest agent, as for the contact profile
 Canvas: row "One-time pad transfer" on https://claude.ai/artifact/NhVZuUXfC2FsJf93NBn5H2
 (14 artboards, listed at the end; round 2 after `otp-design-critic-r1.md`, triage in
 `otp-design-fix-round-1.md`). This section is the spec; the canvas illustrates it. Where the
-two disagree, this text wins. **§ 9a (the Android bridge as implemented), § 13 (fix round 1 of the build) and § 12 (design critic
+two disagree, this text wins. **§ 9a (the Android bridge as implemented), § 13 and § 14 (fix rounds 1 and 2 of the build; triage in `otp-fix-round-1.md`) and § 12 (design critic
 round 2 and the implementation) amend the sections before them and win where they differ.**
 
 ### 0. The shape in one paragraph
@@ -587,6 +587,43 @@ Triage: `otp-fix-round-1.md` (hot critic r1, cold critic r1, design critic r3, p
   marked by a refusal is described by its sheet's status too. `role="status"` is on the
   "Unlocked for this session" text only (hot n6). The three "choose a passphrase" fields are
   `autocomplete="new-password"` (cold n-6).
+
+### 14. Fix round 2 of the build (binding; wins over §§ 1–13 where they differ)
+
+Triage: `otp-fix-round-1.md`, "Round 2" sections (hot r2, cold r2, design r4, pentest r3).
+Owner decisions 2026-09-27: cold r2 MA-2 (different pads on the two phones → a pad-tag check at
+connect) is **deferred** to a separate task; a weak transfer passphrase stays
+**warn-never-block**, but visible where it matters (below).
+
+- **Import of a pad still stored here** (the same file twice, the maker's own export):
+  `importPad` refuses it as `PAD_PRESENT` before the used check; the sheet says "You already
+  have this pad on this device — not importing again (a pad must live on exactly one device per
+  side)." and selects it. A forgotten pad keeps the "already been used" refusal.
+- **Forget asks**, naming the pad: "Delete the pad "…" from this device? It cannot be imported
+  again — you would need to make a new pad and hand it over in person." It stays on the picker's
+  line.
+- **Unlocked ⇔ passphrase in `#otpPass`** holds for every selection the page makes too
+  (`refreshOtpPads`: the already-have path, Forget).
+- **The Export entry's unlock** opens no sheet when the Live room or the OTP card is gone by
+  then (as for Back and a pad switch).
+- **Import working:** only steps 1–2 are inert; the progress keeps focus and is announced.
+- **`autocomplete="off"`** on every pad and transfer passphrase field (§ 13's `new-password` is
+  withdrawn: it invites generated and saved passphrases).
+- **Weak transfer passphrase:** the field's line reads "Weak: <reason>. Anyone who gets a copy of
+  the file can try to guess it — use 12 or more characters, e.g. four random words." in a
+  warn-tinted box; Android file-ready adds, beside Share / Save, "Weak transfer passphrase:
+  whoever gets a copy of this file can try to guess it. Hand it over face to face — not through a
+  messenger or a cloud drive."
+- **Delete line per result:** shared and iOS "Once they've imported it, they delete the file.";
+  downloaded and saved "Once they've imported it, delete the file on both devices." The weak
+  line follows it. Import done: "Delete the pad file now." comes before the Connect line.
+- **Desktop bottom row** (corrects § 13): the primary grows on the left with its secondary
+  beside it and a ghost on its own line below; when a state has two choices and no ghost (the
+  re-export confirm, Share / Save) they are equal halves, the safe one first.
+- **Smaller:** a panel error from before a sheet opened is cleared when it opens; New pad
+  forgets its name, size and drawing on close; the size hint is "~1,400 short messages" (the
+  label says "each way"); the pad list reads "Chess club (from your contact, 128 KiB each way)";
+  the working sheet keeps its bottom padding; the Export lede is balanced.
 
 ### Canvas artboards (row "One-time pad transfer")
 

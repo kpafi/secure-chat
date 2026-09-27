@@ -115,3 +115,63 @@ Commits 84e6bdf (code + tests) and 35ac56d (android/README). Build, `testDebugUn
 | Cold r2 mi-7 / A3: the own-authority refusal was redundant with the PackageManager check in every test | kept, now load-bearing in a test | `ourFileProviderIsRefusedEvenWhenPackageManagerDoesNotKnowIt` (provider removed from `ShadowPackageManager`; plain, `0@`, `0%40` refused) | A3 → red |
 | Hot r2 N8: checklist lacked "Back twice during a KDF" and "Back during the Export entry's unlock" | android/README phone checklist (6), plus (7) Bold text / wallpaper change and (8) a work-profile import | — (device) | — |
 | Hot r2 N11: README said "Send it again" | now "Didn't arrive? Send the same file again" | — (doc) | — |
+
+## Round 2 — Web client
+
+Reviews: `otp-hot-critic-r2.md`, `otp-cold-critic-r2.md`, `otp-design-critic-r4.md`,
+`otp-pentest-r3.md`. Commits b04d61c (otp.js), 58c3860 (app.js / index.html / style.css / unit
+tests), 7723093 (e2e), and this section + brief § 14. Checked: `npm test` green; e2e on a
+scratch relay: otp-transfer 196/196, all-modes 28/28, no-dead-ends 17/17, room-admission 49/49;
+screenshots 37/38 (02 is the old drawer; `git status` clean before and after, no mutant applied).
+G-numbers are unit mutants, EG-numbers e2e mutants; each hand-run on its own and reverted.
+
+### Owner decisions (2026-09-27)
+
+| Finding | Decision | What was done |
+| --- | --- | --- |
+| Cold r2 MA-2: two people on different pads look "Ready", every message fails | **Deferred by the owner** — a pad-tag check at connect is a separate task (protocol) | nothing in this branch |
+| Cold r2 MA-4: a weak transfer passphrase is accepted while Android's primary is the share sheet | **Stays warn-never-block**; the warning must be clearly visible at the field and still visible when the file leaves | The transfer field's live line says what is at stake ("Anyone who gets a copy of the file can try to guess it …") in a warn-tinted box; Android file-ready shows a boxed line beside Share / Save ("…Hand it over face to face — not through a messenger or a cloud drive."). The browser downloads under the field's warning; every done block repeats it. G12, G13 (unit), EG4 (e2e: the box) |
+
+### Must
+
+| Finding | Verdict | Bound by (mutant → red check) |
+| --- | --- | --- |
+| Cold r2 MA-1: the same file twice / the maker's own file says "already been used … generate a fresh pad" | **Fixed** b04d61c + 58c3860: `importPad` refuses a pad still stored here with `PAD_PRESENT` before the used check; the sheet says the pinned "You already have this pad on this device — not importing again …" and selects the pad. A forgotten pad keeps the "used" refusal | G1 → "MA-1: the same file again → PAD_PRESENT" (otp-rollback) and "cold MA-1: … 'you already have this pad'" (sheets); G2 (app does not map the code) → the same sheets check |
+| Cold r2 MA-3: Forget in one tap | **Fixed**: `confirm()` naming the pad and saying it cannot be imported again (Android: through `secureShow`). Forget **stays on the picker's line** — design r3 minor 3 put it there (it had pushed Connect off the first screen); the confirm is the guard against the slip | G4 → "MA-3: Forget asks, naming the pad" |
+| Hot r2 N1: Import's progress inside the inert steps | **Fixed**: only steps 1–2 are inert while working | EG1 → "hot r2 N1: Import working — the progress has focus and is not inert" |
+| Hot r2 N2: `refreshOtpPads` broke "unlocked ⇔ passphrase in the field" | **Fixed**: it ends with `otpSelectChanged`'s rule (also covers cold r2 n-2, the passphrase left after Forget) | G3 → "hot r2 N2: a selection made by the page locks…"; the Forget test asserts the empty field |
+| Hot r2 N3: a view switch during the Export entry's unlock | **Fixed**: no sheet if the Live room or the OTP card is gone meanwhile; the entry is dropped | G5 → "N3: … no Export sheet over it" |
+| Hot r2 N4 = cold r2 mi-4: `autocomplete="new-password"` | **Reverted to `off`**, as every other passphrase field in the app (round-1's cold n-6 change was wrong: it invites generated and saved secrets) | EG3 → "hot r2 N4: …autocomplete=off" |
+| W1 / M19: the passphrase write-back unbound | **Test added**: `#otpPass` edited during the entry's KDF; the pad passphrase is still refused | G6 → "W1: the field holds the passphrase that unlocked the pad" |
+| W3 + W4 (hot H2+H4): Back during a FAILED unlock | **Test added** at the first history entry (Android) | G8 (both guards removed) → "W3+W4: Back took the entry — app.js calls no back()" |
+| W6 (hot H9): no other sheet during the unlock | **Test added** | G7 → "W6: Import tapped during the unlock opens nothing" |
+| Hot m4 (H15): `aria-describedby` of a marked field | **Test added** | G10 → "hot m4: the refused field is described by the refusal" |
+| Cold r2 mi-2 = cold M4: the on-top check alone | **Test added** (a traversal whose popstate never reached the page) — no longer argued equivalent | G9 → "cold M4: a close whose entry is no longer on top calls no back()" |
+| Design r4 minor 1 = hot r2 N6: "delete on both devices" after share / iOS | **Fixed**: shared / iOS "Once they've imported it, they delete the file."; downloaded / saved unchanged | G11 → "design r4 minor 1: …"; e2e "shared: … they delete the file" |
+
+### Should
+
+| Finding | Verdict | Note |
+| --- | --- | --- |
+| Design r4 minor 2 (+ nit 6): the danger widest in the desktop confirm | **Fixed**: two choices with no ghost are equal halves, safe first; § 14 corrects § 13's wording (hot r2 N7) | EG2 → "desktop confirm: … equal halves" (124/298) |
+| Design r4 minor 3: working progress flush on the sheet's edge | **Fixed** (bottom padding while working) | CSS; not mutated |
+| Design r4 minor 4: weak line between the two instructions | **Fixed** (after the delete line). The `<380px` nowrap part **not done**: with the "?" open its explanation needs the wrap | |
+| Design r4 nits 1, 2, 4, 5 | **Fixed** (balanced lede; delete line first on Import done; "~1,400 short messages"; selector "from your contact, … each way") | e2e hint check |
+| Design r4 nit 3 | = minor 4 | |
+| Hot r2 N1-nit: a panel error from before a sheet opened | **Fixed** (cleared on open) | G14 → "hot r2 N1-nit: …" |
+| Hot r2 N5 | = W1, W3+W4, W6, m4 above | |
+| Hot r2 N7 | § 14 wording | |
+| Hot r2 N8, N11 | Android README — done by the Android agent (35ac56d, 32f75a9). PROGRESS.md: not updated here (orchestrator) | |
+| Hot r2 N9: fail-closed sentence points at a field behind the modal | **Not done**: reachable only through N2, now fixed | |
+| Hot r2 N10: New pad / Import silent during the entry's unlock | **Kept** (the Export button shows the spinner) | |
+| Hot r2 N12: round-1 note on n2 too pessimistic | Accepted: in Chromium Back after the close+open case closes the new sheet and stays in the app | |
+| Cold r2 mi-3 / pentest lead: re-push without activation | On-device check (android/README (6), "Back twice during a KDF") | |
+| Cold r2 mi-5: the maker's label | Unchanged from round 1 ("· from your contact"; the selector now says it too) | |
+| Cold r2 mi-6: re-export sentence | **Not done**: both wordings are pinned by the brief's invariants (byte-identical re-export confirm) | |
+| Cold r2 mi-8: developer words in import errors | **Not done**: the sentences are otp.js's, pinned by its tests; the sheet's bottom row gives the next step ("Choose another file") | |
+| Cold r2 n-1: New pad keeps name / size / drawing | **Fixed** | G15 → "n-1: a reopened New pad starts clean" |
+| Cold r2 n-2 | = N2 | |
+| Cold r2 n-3, n-5, n-6 | Not done (pinned sentence; scroll position by focus; one file per download is the browser's) | |
+| Cold r2 n-4 | Kept (round 1's reason) | |
+| Pentest r3 R3-1, R3-2, A-mutants | Android — see "Round 2 — Android" | |
+| Pentest r3 I-1 (entries silent during the unlock), I-4 | Accepted as Info | |
