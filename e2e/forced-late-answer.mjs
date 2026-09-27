@@ -1,31 +1,35 @@
-// The relay's answer to `join` handled AFTER the relay's own close, forced in
-// Chromium (pentest r3 C3-2, made relay-forceable by C3-2 r1 R1-2; the PoC
-// scratchpad e2e/poc-forced-late.mjs of that round).
+// A relay's key exchange before it answered `join`, and its answer handled
+// after its own close, in Chromium.
 //
 //   node e2e/forced-late-answer.mjs            (~40 s; no relay needed)
 //
-// Frames of a socket the RELAY closed are still handled (e2e/hostile-relay.mjs
-// sections 6 and 8), so a hostile relay can park the page's message pump and
-// hang up with its answer queued behind it:
-//   1. before answering `join` it sends a peer hello — the page answers with
-//      its own hello (its session nonce);
-//   2. it sends a handshake signed by its OWN identity over the room and both
-//      nonces; it verifies, and with no role yet the page asks the user
-//      whether to talk to that key (the guest approval prompt) — the pump is
-//      parked on the answer;
-//   3. it sends its answer to `join`, then Close and FIN;
-//   4. onclose settles the prompt as "no", and the pump resumes on a CLOSED
-//      socket, where it meets the answer.
 // Served from this process: client/ as static files and a raw WebSocket relay
-// on /ws. Before the fix (495a12f): `joined:owner` drew "connected" for the
-// dead socket (Disconnect did nothing), `pending` then `joined:guest` accused
-// the relay of seating us unqueued, and a late `pending` sat on "waiting for
-// approval". Each case:
-//   owner     joined:owner  -> the room screen stays, nothing narrated
-//   pguest    pending, then joined:guest -> no false "without approving" refusal
-//   pending   pending       -> no "waiting for approval" chat for the dead socket
-//   roleless  joined (no role) -> its refusal, which reads nothing onclose
-//             reset, still reaches the room screen (as L2 wants)
+// on /ws. Each attempt's relay: on `join` it sends a peer hello (and, per
+// case, first an honest `pending`, or instead of the hello a handshake signed
+// by its own identity); if the page answers the hello it sends that handshake;
+// then, after a pause, its answer to `join`, Close and FIN.
+//
+// Early key (owner decision 2026-09-27, pentest C3-2 r2 "pre-existing lead").
+// With no answer to `join` the page used to answer the hello and raise the
+// guest approval prompt for the relay's handshake inside the hidden chat
+// screen: invisible (0×0), the tab bar inert, the pump parked on it until the
+// close — the lever that forced the relay's answer behind its own close (C3-2
+// r1 R1-2). Now the first `key` frame ends the attempt at once:
+//   owner / pending / roleless   a hello first; then that answer
+//   handshake                    a signed handshake first; then joined:owner
+//     -> the fixed sentence on the room screen before the relay's answer,
+//        nothing of the key exchange sent, no prompt, the tab bar never inert;
+//        the answer and close that follow change nothing
+//
+// Forced late answer (pentest r3 C3-2; C3-2 r1 R1-2), still forceable after
+// an honest `pending` — the prompt is then drawn over the chat screen:
+//   pguest   pending, hello, handshake, then joined:guest behind the prompt
+//     -> the prompt is visible; no false "without approving" refusal; back on
+//        the room screen (before the fix 495a12f: the false refusal)
+//   psecond  pending, hello, handshake, then a second handshake (another
+//            identity) behind the prompt, and the close
+//     -> the frame dispatched after the close is dropped: no prompt on the
+//        room screen (before e919018: 0×0, the tab bar inert)
 import http from "node:http";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -57,11 +61,18 @@ const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64");
 const unb = (s) => JSON.parse(Buffer.from(s, "base64").toString());
 const ANSWERS = {
   owner: [{ type: "joined", role: "owner" }],
-  pguest: [{ type: "joined", role: "guest" }],
   pending: [{ type: "pending" }],
   roleless: [{ type: "joined" }],
+  handshake: [{ type: "joined", role: "owner" }],
+  pguest: [{ type: "joined", role: "guest" }],
+  psecond: [], // a second handshake instead (below)
 };
+const EARLY_KEY =
+  "The relay passed on a key exchange before it had let you into the room \u2014 an honest relay " +
+  "never does that, so this connection attempt was stopped and nothing was exchanged. " +
+  "Press Connect to try again.";
 const relayId = await Identity.generate();
+const relayId2 = await Identity.generate(); // psecond: another identity, queued behind the prompt
 let mode = "owner";
 const seen = []; // what the relay received, per attempt
 const srv = http.createServer((req, res) => {
@@ -80,8 +91,17 @@ srv.on("upgrade", (req, sock) => {
   const acc = crypto.createHash("sha1").update(req.headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
   sock.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + acc + "\r\n\r\n");
   const answer = ANSWERS[mode];
-  const queuedFirst = mode === "pguest"; // an honest `pending` before the prompt
+  const queuedFirst = mode === "pguest" || mode === "psecond"; // an honest `pending` before the key exchange
   let buf = Buffer.alloc(0), room = null, nonce = null, done = false;
+  // The answer, Close and FIN: after the handshake for pguest (the prompt is
+  // up, the pump parked on it), else a fixed pause after the early key frame —
+  // long enough that a page that refuses at once has done so well before.
+  const answerLater = (ms, extra = []) => setTimeout(() => { relay.answeredAt = Date.now(); sock.end(Buffer.concat([...extra, ...answer.map(frame), CLOSE])); }, ms);
+  const handshake = async (peerN, id = relayId) => {
+    const pub = crypto.randomBytes(32).toString("base64");
+    const sig = await signHandshake(id, room, [peerN, nonce], pub);
+    return frame({ type: "key", room, alg: "DHKE", payload: b64({ pub, reply: true, idb: id.publicBundle(), sig }) });
+  };
   sock.on("data", async (d) => {
     buf = Buffer.concat([buf, d]);
     for (;;) {
@@ -101,20 +121,21 @@ srv.on("upgrade", (req, sock) => {
         room = f.room;
         nonce = crypto.randomBytes(32).toString("base64");
         if (queuedFirst) sock.write(frame({ type: "pending" }));
-        sock.write(frame({ type: "key", room, alg: "DHKE", payload: b64({ hello: true, n: nonce, reply: false }) }));
+        if (mode === "handshake") sock.write(await handshake(crypto.randomBytes(32).toString("base64")));
+        else sock.write(frame({ type: "key", room, alg: "DHKE", payload: b64({ hello: true, n: nonce, reply: false }) }));
+        if (!queuedFirst) answerLater(2500);
       } else if (f.type === "key" && !done) {
         const p = unb(f.payload);
         if (!(p.hello && p.reply)) continue;
         done = true;
-        const pub = crypto.randomBytes(32).toString("base64");
-        const sig = await signHandshake(relayId, room, [p.n, nonce], pub);
-        sock.write(frame({ type: "key", room, alg: "DHKE", payload: b64({ pub, reply: true, idb: relayId.publicBundle(), sig }) }));
-        await sleep(800); // the prompt is up; the pump is parked on it
-        sock.end(Buffer.concat([...answer.map(frame), CLOSE]));
+        sock.write(await handshake(p.n)); // the old page raised the prompt for this
+        if (mode === "psecond") answerLater(800, [await handshake(p.n, relayId2)]);
+        else if (queuedFirst) answerLater(800);
       }
     }
   });
 });
+const relay = { answeredAt: 0 };
 await new Promise((r) => srv.listen(PORT, "127.0.0.1", r));
 
 // ---- the page -------------------------------------------------------------------
@@ -156,9 +177,15 @@ await page.evaluate(() => {
   const room = document.querySelector("#room");
   room.value = "5d".repeat(32); // typed over: not a code this page minted
   room.dispatchEvent(new Event("input", { bubbles: true }));
-  // The prompt going up and down, in order with the close event.
+  // The prompt going up (with its size on screen) and down, and the tab bar
+  // going inert, in order with the close event.
   const ad = document.querySelector("#admit");
-  new MutationObserver(() => window.__trail.push("admit.hidden=" + ad.hidden)).observe(ad, { attributes: true, attributeFilter: ["hidden"] });
+  new MutationObserver(() => {
+    window.__trail.push("admit.hidden=" + ad.hidden);
+    if (!ad.hidden) { const r = ad.getBoundingClientRect(); window.__trail.push("admit.box=" + Math.round(r.width) + "x" + Math.round(r.height)); }
+  }).observe(ad, { attributes: true, attributeFilter: ["hidden"] });
+  const tb = document.querySelector("#tabbar");
+  new MutationObserver(() => window.__trail.push("tabbar.inert=" + tb.inert)).observe(tb, { attributes: true, attributeFilter: ["inert"] });
 });
 const state = () => page.evaluate(() => ({
   chat: !document.querySelector("#scrChat").hidden,
@@ -174,12 +201,20 @@ const state = () => page.evaluate(() => ({
 async function attempt(m) {
   mode = m;
   seen.length = 0;
-  // A build that failed a previous case may have left a chat screen up:
-  // ‹ Back to room, so every case starts from Connect.
+  relay.answeredAt = 0;
+  // A build that failed a previous case may have left a chat screen up: the
+  // app bar's #toRoom goes back, so every case starts from Connect.
   await page.evaluate(() => { if (!document.querySelector("#scrChat").hidden) document.querySelector("#toRoom").click(); });
   const logBefore = (await state()).log;
   await page.evaluate(() => { window.__logAtClose = undefined; });
   await page.$eval("#connect", (e) => e.click());
+  let early = null;
+  if (m !== "pguest" && m !== "psecond") {
+    // The refusal, at once: sampled as soon as the sentence is up, before the
+    // relay's answer (2.5 s after its key frame).
+    await page.waitForFunction((t) => document.querySelector("#roomHint").textContent === t, { timeout: 2400 }, EARLY_KEY).catch(() => {});
+    early = { ...(await state()), beforeAnswer: relay.answeredAt === 0 };
+  }
   await page.waitForFunction(() => window.__trail.includes("close-event"), { timeout: 15000 }).catch(() => {});
   await sleep(1000);
   const s = await state();
@@ -188,6 +223,7 @@ async function attempt(m) {
   // line into "(×2)" in place (pentest C3-2 r2 R2-3); compared with the log
   // as the close event found it, so only the late answer's effect counts (r3).
   s.logUnchanged = Array.isArray(s.logAtClose) && JSON.stringify(s.log) === JSON.stringify(s.logAtClose);
+  if (early) { s.early = early; s.trail = [...early.trail, ...s.trail]; return s; }
   // Fixture: the relay really parked the pump before its answer — the prompt
   // went up, and came down only at the close event (onclose settles it).
   const up = s.trail.indexOf("admit.hidden=false"), closed = s.trail.indexOf("close-event");
@@ -198,41 +234,45 @@ async function attempt(m) {
   return s;
 }
 const onRoom = (s) => !s.chat && s.status === "disconnected" && !s.connectDisabled;
-const brief = (s) => JSON.stringify({ chat: s.chat, status: s.status, connectDisabled: s.connectDisabled, roomHint: s.roomHint.slice(0, 70), newLog: s.newLog.map((l) => l.slice(0, 60)) });
+const brief = (s) => JSON.stringify({ chat: s.chat, status: s.status, connectDisabled: s.connectDisabled, roomHint: s.roomHint.slice(0, 70), newLog: (s.newLog || []).map((l) => l.slice(0, 60)) });
 
-console.log(`\n=== the answer to join, handled after the relay's own close (http://127.0.0.1:${PORT}) ===\n`);
+console.log(`\n=== key exchange before the relay answered join (http://127.0.0.1:${PORT}) ===\n`);
 
-console.log("owner: joined:owner behind the prompt");
-{
-  const s = await attempt("owner");
-  check("C3-2: the room screen stays — no 'connected' chat for the dead socket, Connect enabled", onRoom(s), brief(s));
-  check("C3-2: the late seat is not narrated (the log is unchanged)", s.logUnchanged, brief(s));
-  await page.evaluate(() => { const d = document.querySelector("#disconnect"); if (!document.querySelector("#scrChat").hidden) d.click(); });
-  await sleep(300);
-  check("C3-2: ...and it is still the room screen (no chat left whose Disconnect does nothing)", onRoom(await state()));
+for (const m of ["owner", "pending", "roleless", "handshake"]) {
+  console.log(`${m}: ${m === "handshake" ? "a signed handshake" : "a hello"} before the answer${m === "handshake" ? "" : " (" + JSON.stringify(ANSWERS[m][0]) + ")"}`);
+  const s = await attempt(m);
+  const e = s.early;
+  check(`2026-09-27 (${m}): refused at once — the fixed sentence on the room screen, Connect enabled, before the relay's answer`,
+    e.roomHint === EARLY_KEY && onRoom(e) && e.beforeAnswer, brief(e));
+  check(`2026-09-27 (${m}): nothing of the key exchange went back (the relay saw only join)`,
+    JSON.stringify(seen) === '["join"]', JSON.stringify(seen));
+  check(`2026-09-27 (${m}): no approval prompt, and the tab bar never went inert`,
+    !s.trail.some((t) => t === "admit.hidden=false" || t === "tabbar.inert=true"), JSON.stringify(s.trail));
+  check(`2026-09-27 (${m}): the answer and close that follow change nothing (same sentence, no seat, no "joined room")`,
+    s.roomHint === EARLY_KEY && onRoom(s) && !s.log.some((l) => /^joined room/.test(l)), brief(s));
 }
 
-console.log("\npguest: an honest pending, then joined:guest behind the prompt");
+console.log(`\n=== the answer to join, handled after the relay's own close ===\n`);
+console.log("pguest: an honest pending, then joined:guest behind the prompt");
 {
   const s = await attempt("pguest");
+  const box = s.trail.find((t) => t.startsWith("admit.box="));
   check("fixture: the honest pending was handled while the socket was open (its knock reached the relay)", seen.includes("knock"), JSON.stringify(seen));
+  check("2026-09-27: after `pending` the prompt is drawn on screen (not 0×0)",
+    !!box && !/=0x|x0$/.test(box), JSON.stringify(s.trail));
   check("C3-2: no false 'put you in the room without the owner approving you' after an honest pending",
     !/without the owner approving you/.test(s.roomHint) && !s.newLog.some((l) => /without ever asking to be let in/.test(l)), brief(s));
   check("C3-2: back on the room screen, Connect enabled", onRoom(s), brief(s));
+  check("2026-09-27: no prompt after the close", !s.trail.slice(s.trail.indexOf("close-event")).includes("admit.hidden=false"), JSON.stringify(s.trail));
 }
 
-console.log("\npending: pending behind the prompt");
+console.log("\npsecond: a second handshake (another identity) queued behind the prompt, then the close");
 {
-  const s = await attempt("pending");
-  check("C3-2 r1 R1-1: no 'waiting for approval' chat screen for the dead socket", onRoom(s), brief(s));
-  check("C3-2 r1 R1-1: the late pending is not narrated (the log is unchanged, no \"(×2)\" fold either)", s.logUnchanged, brief(s));
-}
-
-console.log("\nroleless: an older relay's bare joined behind the prompt");
-{
-  const s = await attempt("roleless");
-  check("C3-2 r1 R1-4: a refusal that reads nothing onclose reset still reaches the room screen",
-    /^This relay is running an older protocol without the join-approval step/.test(s.roomHint) && onRoom(s), brief(s));
+  const s = await attempt("psecond");
+  const after = s.trail.slice(s.trail.indexOf("close-event"));
+  check("pentest early-key r1 T1: the handshake dispatched after the close raises no prompt on the room screen, nothing goes inert",
+    !after.includes("admit.hidden=false") && !after.includes("tabbar.inert=true") && after.includes("tabbar.inert=false"), JSON.stringify(s.trail));
+  check("pentest early-key r1 T1: back on the room screen, Connect enabled, nothing narrated after the close", onRoom(s) && s.logUnchanged, brief(s));
 }
 
 await browser.close();

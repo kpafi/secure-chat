@@ -402,7 +402,9 @@ const retiredSockets = new WeakSet();
 let sessionGen = 0;
 // Fix round 3 (review of d0c4074, M-1). sessionGen deliberately does NOT move
 // on a relay close — frames the relay sent just before hanging up are still
-// handled (e2e/hostile-relay.mjs sections 6 and 8). But the verification GATE
+// handled (e2e/hostile-relay.mjs sections 6 and 8; a `key` frame only if its
+// handling began before onclose — one dispatched after it is dropped, see the
+// `key` arm). But the verification GATE
 // must never be drawn, or acted on, for a connection that is gone: in Firefox
 // the safety-number digest resolves on a later task, so a gate for Bob could be
 // drawn after the close, survive into the next session, and "It matches" then
@@ -3196,6 +3198,12 @@ const LOOKUP_TIMEOUT_HINT =
   "The directory did not answer within 20 seconds, so the contact lookup was stopped and nothing " +
   "was connected. Press Connect to try again \u2014 or leave the contact field blank and compare a " +
   "safety number instead.";
+// The `key` arm's refusal of key-exchange traffic that arrives before the relay
+// answered `join` (see there). Byte-stable, like the two above.
+const EARLY_KEY_HINT =
+  "The relay passed on a key exchange before it had let you into the room — an honest relay " +
+  "never does that, so this connection attempt was stopped and nothing was exchanged. " +
+  "Press Connect to try again.";
 const LOOKUP_TIMED_OUT = Symbol("lookup-timed-out");
 let joinTimer = null;     // the join deadline of the current socket, or null
 let connectAttempt = null; // AbortController of the latest connect; read only while `connecting`
@@ -4122,8 +4130,10 @@ async function handleMessage(room, raw, sock) {
   // it sent before the close are still its last words and are handled — an
   // `error` naming why ("approval timeout", parked for the room screen), or a
   // forged handshake whose refusal must still reach the room screen (round 3
-  // L2, e2e/hostile-relay.mjs sections 6 and 8). A frame already being handled
-  // when the socket closes finishes either way.
+  // L2, e2e/hostile-relay.mjs sections 6 and 8) — if its handling began before
+  // the close: a `key` frame first dispatched after onclose is dropped by the
+  // `key` arm (2026-09-27). A frame already being handled when the socket
+  // closes finishes either way.
   if (!ws || sock !== ws || retiredSockets.has(sock)) return;
   const gen = sessionGen;
   const live = () => sessionLive(sock, gen); // re-asked after every await below
@@ -4140,7 +4150,13 @@ async function handleMessage(room, raw, sock) {
   switch (m.type) {
     // We are waiting for the room owner to let us in (P-08). Nothing of ours
     // reaches the room until they do — not even the session nonce — so the
-    // only thing to send now is the introduction they will judge us by.
+    // only thing to send now is the introduction they will judge us by. (That
+    // holds for an honest relay, which forwards nothing to a queued guest. A
+    // hostile one can hand us a hello here and gets our nonce, signed key and,
+    // for AES256/OTP, a confirmation tag — no more than seating us would give
+    // it. `pending` counts as an answer on purpose, owner decision 2026-09-27:
+    // the chat screen and Disconnect are up, so the prompt is visible; see the
+    // `key` arm.)
     case "pending": {
       // Write-once, like the peer identity pin: a relay must not be able to
       // re-cast us mid-session (an owner told "you are a guest" would stop
@@ -4248,10 +4264,12 @@ async function handleMessage(room, raw, sock) {
       // Pentest r3 C3-2 (connect-cancel): the relay's answer handled after the
       // relay's own close. Frames of a relay-closed socket are still handled
       // (see the gate at the top), and a relay can force the order: it raises
-      // the guest approval prompt before answering `join` (hello, then a
-      // handshake signed by itself), queues its answer behind the parked pump
-      // and hangs up; onclose settles the prompt and the answer then meets
-      // onclose's reset state (C3-2 r1 R1-2, Chromium). The old code drew
+      // the guest approval prompt (hello, then a handshake signed by itself),
+      // queues its answer behind the parked pump and hangs up; onclose settles
+      // the prompt and the answer then meets onclose's reset state (C3-2 r1
+      // R1-2, Chromium). Since 2026-09-27 only after a `pending` — before any
+      // answer the `key` arm refuses the exchange — so only a `joined` that
+      // follows a `pending` can still be forced behind the close. The old code drew
       // "connected" for the dead socket (Disconnect did nothing) and, after an
       // honest `pending`, accused the relay of seating us unqueued. So: on a
       // CLOSED socket a check runs only if what it reads survives onclose
@@ -4343,6 +4361,33 @@ async function handleMessage(room, raw, sock) {
     }
 
     case "key": {
+      // Owner decision 2026-09-27 (pentest C3-2 r2, "pre-existing lead"): no
+      // key exchange before the relay has answered `join`. An honest relay
+      // forwards nothing to a socket it has not answered (main.py relays only
+      // between seated sockets, and seats a guest with `joined` before it
+      // forwards anything), so a hello or handshake here means the relay is
+      // talking to us as a peer before it told us where we stand. It used to
+      // be handled: our nonce and signed key went back, and a handshake raised
+      // the guest approval prompt inside the hidden chat screen — invisible,
+      // with the tab bar inert, and the message pump parked on it until
+      // Cancel, the relay's close or the join deadline. That park was also the
+      // lever that let a relay force its answer to `join` behind its own close
+      // (C3-2 r1 R1-2). Refused before anything is parsed, answered or awaited.
+      //
+      // Only on an OPEN socket. A CLOSING one (the relay's Close came, its
+      // close event has not) is ending anyway and its onclose shows whatever
+      // reason is still parked (A3 above drops one this frame follows); a
+      // CLOSED one has onclose's reset role, so "no answer" cannot be told
+      // from "the session ended" there — its frames belong to nothing now,
+      // whatever the session had got to (a prompt raised for one would sit on
+      // the room screen, 0×0, the tab bar inert). Either way nothing is sent,
+      // nothing is narrated and nothing reaches the prompt.
+      if (roomRole === null) {
+        if (sock.readyState !== WebSocket.OPEN) break;
+        addLine("sys", "", "[the relay passed on a key exchange before letting us into the room — refusing]", true);
+        endUnanswered(sock, EARLY_KEY_HINT);
+        return;
+      }
       // Package 4, owner decision 1 (F-CRYPTO-009): RSA mode is removed. A
       // contact still running an old build in RSA mode tags every frame
       // alg:"RSA"; its key material is undecodable here, so without this the
@@ -4523,7 +4568,10 @@ async function handleMessage(room, raw, sock) {
         // side that approved nobody — a guest, or anyone the relay has not
         // told it owns the room — asks its user before any key material is
         // touched. Keyed on "not the owner" rather than "guest" so a relay
-        // that withholds `joined` cannot skip it. Awaited in place: the pump
+        // that withholds `joined` cannot skip it (belt and braces since
+        // 2026-09-27: with no answer to `join` at all, the top of this arm
+        // refuses before getting here, so the prompt is only ever raised
+        // over the chat screen). Awaited in place: the pump
         // is serialized, so every later frame (another identity included)
         // waits behind this decision and is judged against it.
         if (roomRole !== "owner" && peerApproved === null) {

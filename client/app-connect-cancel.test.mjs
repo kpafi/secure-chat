@@ -33,6 +33,10 @@ const PAD_PASS = "pad passphrase for the tests";
 const JOIN_SENTENCE =
   "The relay did not answer within 30 seconds, so this connection attempt was stopped — " +
   "nothing reached your contact. Check your connection and press Connect to try again.";
+const EARLY_KEY_SENTENCE =
+  "The relay passed on a key exchange before it had let you into the room \u2014 an honest relay " +
+  "never does that, so this connection attempt was stopped and nothing was exchanged. " +
+  "Press Connect to try again.";
 const LOOKUP_SENTENCE =
   "The directory did not answer within 20 seconds, so the contact lookup was stopped and nothing " +
   "was connected. Press Connect to try again — or leave the contact field blank and compare a " +
@@ -480,9 +484,15 @@ const LOCK = "sc.otp.lock.v1." + pad.padId;
 }
 {
   // C1-1: a client refusal on a socket that stays CLOSING keeps its own words,
-  // whether the deadline or a Cancel comes next. (The removed-mode refusal: a
-  // `key` frame before the relay answered `join`, so roomRole is still null.)
-  const RSA = /^The other side uses RSA mode, which this version no longer supports\./;
+  // whether the deadline or a Cancel comes next. The fixture was the
+  // removed-mode refusal of a `key` frame before the relay answered `join` — a
+  // closeWs, so the attempt waited for its close. Since 2026-09-27 (block E)
+  // any `key` frame before an answer is refused through endUnanswered, at once:
+  // the same frame now binds that the early-key refusal ends the attempt
+  // although the close stalls, and that nothing after it relabels it. (The
+  // refusal clears the deadline and hides Cancel, so neither really runs
+  // here; C1-1's own scenario has no relay trigger left and its guard is
+  // bound directly in block E.)
   for (const next of ["deadline", "cancel"]) {
     const ws = await connectToSocket();
     const t = lastTimer(30000);
@@ -491,13 +501,15 @@ const LOCK = "sc.otp.lock.v1." + pad.padId;
     await ws.deliver({ type: "key", room: ROOM, alg: "RSA", payload: "AAAA" });
     await settle();
     assert.strictEqual(ws.readyState, 2, "fixture: the refusal's close is stalled");
-    assert.ok(el("connect").disabled, "fixture: the refused attempt waits for its close");
-    if (next === "deadline") await fire(t);
-    else { assert.ok(cancelShown(), "fixture: Cancel still offered while the close stalls"); el("connectCancel").click(); await settle(); }
+    assertBackOnRoom("C1-1 / E (" + next + ", at once)");
+    assert.strictEqual(el("roomHint").textContent, EARLY_KEY_SENTENCE,
+      "E: a key frame before any answer is the early-key refusal, not the removed-mode one (" + next + ")");
+    if (next === "deadline") { if (!t.cleared) await fire(t); }
+    else { el("connectCancel").click(); await settle(); }
     assertBackOnRoom("C1-1 (" + next + ")");
-    assert.match(el("roomHint").textContent, RSA, `C1-1: after the ${next}, the room screen keeps the refusal, not the timeout sentence`);
+    assert.strictEqual(el("roomHint").textContent, EARLY_KEY_SENTENCE, `C1-1: after the ${next}, the room screen keeps the refusal, not the timeout sentence`);
   }
-  console.log("OK  C1-1: a refusal whose close stalls keeps its sentence through the deadline and a Cancel (executed)");
+  console.log("OK  C1-1 / E: the early-key refusal ends the attempt at once although its close stalls; nothing after it relabels it (executed)");
 }
 {
   // Fix round 2, C2-1: a refusal of the relay's ANSWER to join comes before the
@@ -539,8 +551,10 @@ const LOCK = "sc.otp.lock.v1." + pad.padId;
 // when the close event ran finds onclose's reset state. The stub forces that
 // order: the frame is queued (onmessage only chains it) and the relay's close
 // runs onclose in the same task, before the chain gets to it. A hostile relay
-// forces the same order in Chromium by parking the pump on the guest approval
-// prompt first (C3-2 r1 R1-2; e2e/forced-late-answer.mjs). Which checks still
+// forced the same order in Chromium by parking the pump on the guest approval
+// prompt first (C3-2 r1 R1-2). Since 2026-09-27 (block E) that works only
+// after a `pending` — before any answer the key exchange is refused — so the
+// `joined:guest` case is still forced there (e2e/forced-late-answer.mjs). Which checks still
 // run after the close is deliberate: those whose inputs survive onclose.
 const logLines = () => dom.el("log").children;
 const disconnectedLines = () => logLines().filter((c) => /^disconnected\b/.test(c.textContent)).length;
@@ -777,6 +791,170 @@ function answerThenRelayClose(ws, frame) {
   await settle();
   assert.strictEqual(disconnectedLines(), before + 1, "control: a seated session's end is narrated");
   console.log("OK  C3-2: a refused answer takes no seat; a seated session's end is still narrated (executed)");
+}
+
+// ---- E: key exchange before any answer to join (owner decision 2026-09-27) ------
+// Pentest C3-2 r2, pre-existing lead: a relay-signed handshake with no role
+// raised the guest approval prompt inside the hidden chat screen — invisible,
+// the tab bar inert, the pump parked on it (and the lever of C3-2 r1 R1-2).
+// An honest relay forwards nothing before it answers `join`, so any `key`
+// frame then is refused at once with a fixed sentence; nothing of ours (nonce,
+// signed key) goes back and no prompt is raised. On a socket that is no longer
+// OPEN it is dropped instead: its close says what ended it.
+const b64json = (o) => Buffer.from(JSON.stringify(o)).toString("base64");
+const promptShown = () => el("admit").hidden === false;
+const frames0 = () => ({ hello: true, n: Buffer.alloc(32, 9).toString("base64"), reply: false }); // a peer hello
+{
+  const frames = {
+    "a peer hello": { hello: true, n: Buffer.alloc(32, 7).toString("base64"), reply: false },
+    "a handshake": { pub: "AAAA", reply: false, idb: { ed: "AAAA" }, sig: { ed: "AAAA" } },
+    "a confirmation tag": { confirm: "AAAA" },
+  };
+  for (const [what, payload] of [...Object.entries(frames), ["an unreadable payload", null]]) {
+    const ws = await connectToSocket();
+    const t = lastTimer(30000);
+    ws.open();
+    await settle();
+    const log0 = logText();
+    await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: payload ? b64json(payload) : "%%" });
+    await settle();
+    assert.strictEqual(ws.readyState, 3, "E: " + what + " before any answer to join closes the socket");
+    assertBackOnRoom("E (" + what + ")");
+    assert.strictEqual(el("roomHint").textContent, EARLY_KEY_SENTENCE, "E: ...with the fixed sentence, byte for byte (" + what + ")");
+    assert.match(el("roomHint").className, /\berr\b/, "E: ...shown as an error (" + what + ")");
+    assert.ok(!ws.sent.some((f) => f.type === "key"), "E: nothing of the key exchange went back (" + what + ")");
+    assert.ok(!promptShown() && el("tabbar").inert !== true, "E: no approval prompt, the tab bar is not inert (" + what + ")");
+    assert.ok(t.cleared, "E: the join deadline ended with the attempt (" + what + ")");
+    // (addLine folds a repeat into "(×2)" in place: the log changed, and its
+    // last line is this one.)
+    assert.ok(logText() !== log0 && logLines().at(-1).textContent.startsWith("[the relay passed on a key exchange before letting us into the room — refusing]"),
+      "E: the transcript says why (" + what + ")");
+  }
+  console.log("OK  E: any key frame before the relay answered join is refused at once with a fixed sentence; nothing sent, no prompt (executed)");
+}
+{
+  // Frames queued behind the refusal belong to a retired socket: the answer the
+  // relay sends after its early key does not seat us.
+  const ws = await connectToSocket();
+  ws.open();
+  ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "AES256", payload: b64json(frames0()) }) });
+  ws.onmessage({ data: JSON.stringify({ type: "joined", role: "owner" }) });
+  await settle();
+  assertBackOnRoom("E (answer behind)");
+  assert.strictEqual(el("roomHint").textContent, EARLY_KEY_SENTENCE, "E: the answer queued behind the refusal changes nothing");
+  assert.ok(!ws.sent.some((f) => f.type === "key"), "E: ...and sends no hello");
+  console.log("OK  E: an answer to join queued behind an early key frame is dropped with its socket (executed)");
+}
+{
+  // Not OPEN. CLOSING: the relay's Close came, its close event has not. Nothing
+  // is sent and nothing is said; the attempt waits for its close, which says
+  // what ended it (here the relay's own reason, parked by the `error` it sent
+  // after the key frame).
+  const ws = await connectToSocket();
+  const t = lastTimer(30000);
+  ws.open();
+  ws.readyState = 2;
+  const hint0 = el("roomHint").textContent;
+  const log0 = logText();
+  await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: b64json(frames0()) });
+  await settle();
+  assert.ok(!ws.sent.some((f) => f.type === "key"), "E (CLOSING): nothing is sent into a closing socket");
+  assert.strictEqual(logText(), log0, "E (CLOSING): nothing is narrated (the whole log, folds included)");
+  assert.strictEqual(el("roomHint").textContent, hint0, "E (CLOSING): no sentence — the close says what ended it");
+  assert.ok(el("connect").disabled && !t.cleared, "E (CLOSING): the attempt waits for its close (the deadline still runs)");
+  await ws.deliver({ type: "error", reason: "join timeout" }); // its last words (A3 drops a reason a later frame follows)
+  ws.close();
+  await settle();
+  assertBackOnRoom("E (CLOSING)");
+  assert.strictEqual(el("roomHint").textContent, "Joining took too long, so the relay closed the connection. Connect again.",
+    "E (CLOSING): the relay's own reason, not the early-key sentence");
+  // CLOSED: the frame is handled after onclose ran (the stub runs it inside
+  // close(), before the chain gets to the frame) — roomRole is onclose's reset.
+  const ws2 = await connectToSocket();
+  ws2.open();
+  await ws2.deliver({ type: "error", reason: "join timeout" });
+  ws2.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "AES256", payload: b64json(frames0()) }) });
+  ws2.close();
+  const log2 = logText(); // onclose ran inside close(); the frame is still queued
+  await settle();
+  assert.strictEqual(logText(), log2, "E (CLOSED): nothing is narrated after the close (the whole log)");
+  assertBackOnRoom("E (CLOSED)");
+  assert.strictEqual(el("roomHint").textContent, "Joining took too long, so the relay closed the connection. Connect again.",
+    "E (CLOSED): a key frame handled after the close does not write over the relay's reason");
+  assert.ok(!ws2.sent.some((f) => f.type === "key"), "E (CLOSED): ...and sends nothing");
+  console.log("OK  E: on a CLOSING or CLOSED socket an early key frame is dropped: nothing sent, the close's own words stay (executed)");
+}
+{
+  // Pentest early-key r1 T1: CLOSED means onclose's reset role whatever the
+  // session had got to — a seated owner past the hello exchange included
+  // (peerNonce set, our hello answered). A key frame the relay queued before
+  // its close and that is dispatched after it is dropped: no "Key exchange
+  // failed" over the close's own words, nothing narrated, nothing sent.
+  // (app-behaviour binds the same for DHKE, where the old handling raised the
+  // approval prompt on the room screen.)
+  const ws = await connectToSocket();
+  ws.open();
+  await ws.deliver({ type: "joined", role: "owner" });
+  await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: b64json(frames0()) });
+  await settle();
+  const sent0 = ws.sent.length;
+  assert.ok(ws.sent.filter((f) => f.type === "key").length >= 2, "fixture: the hello exchange ran (ours, and the answer to theirs)");
+  for (const payload of [{ pub: "AAAA", reply: true, idb: { ed: "AAAA" }, sig: { ed: "AAAA" } }, { confirm: "AAAA" }]) {
+    ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "AES256", payload: b64json(payload) }) });
+  }
+  ws.close(); // the relay's close: onclose runs now, the two frames after it
+  const hint1 = el("roomHint").textContent, log1 = logText();
+  await settle();
+  assertBackOnRoom("E (CLOSED, seated)");
+  assert.strictEqual(el("roomHint").textContent, hint1, "E (CLOSED, seated): a key frame after the close writes nothing over the room screen");
+  assert.strictEqual(logText(), log1, "E (CLOSED, seated): ...narrates nothing");
+  assert.strictEqual(ws.sent.length, sent0, "E (CLOSED, seated): ...and sends nothing");
+  console.log("OK  E: a seated session's key frames dispatched after the relay's close are dropped too (executed)");
+}
+{
+  // Pentest early-key r1 T2: C1-1's guard in endUnanswered (a socket this app
+  // already decided to close keeps its own reason; no second closeWs) has no
+  // relay-driven trigger left before an answer. Bound directly: a closeWs on
+  // an unanswered socket whose close stalls — here Disconnect's, clicked
+  // through the stub (it lives on the hidden chat screen) — then the deadline.
+  const ws = await connectToSocket();
+  const t = lastTimer(30000);
+  ws.open();
+  stallClose(ws);
+  el("disconnect").click();
+  await settle();
+  assert.ok(ws.readyState === 2 && el("connect").disabled, "fixture: the app's own close is stalled, the attempt still in flight");
+  await fire(t);
+  assertBackOnRoom("C1-1 (direct)");
+  assert.notStrictEqual(el("roomHint").textContent, JOIN_SENTENCE,
+    "C1-1 (direct): the deadline ends a socket the app already closed without relabelling it as unanswered");
+  console.log("OK  C1-1: endUnanswered does not close again what the app already closed (direct; no relay trigger left) (executed)");
+}
+{
+  // Controls: `pending` is an answer. A key frame in the admission queue (which
+  // an honest relay does not send either) is judged by the key arm as before —
+  // the chat screen and its Disconnect are up, so a prompt there is visible.
+  // And a seated owner's hello exchange runs.
+  const ws = await connectToSocket();
+  ws.open();
+  await ws.deliver({ type: "pending" });
+  await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: b64json(frames0()) });
+  await settle();
+  assert.notStrictEqual(el("roomHint").textContent, EARLY_KEY_SENTENCE, "E control: after `pending` a key frame is not the early-key refusal");
+  assert.ok(ws.sent.some((f) => f.type === "key"), "E control: ...it is handled (the hello is answered)");
+  el("disconnect").click();
+  await settle();
+  const ws2 = await connectToSocket();
+  ws2.open();
+  await ws2.deliver({ type: "joined", role: "owner" });
+  await ws2.deliver({ type: "key", room: ROOM, alg: "AES256", payload: b64json(frames0()) });
+  await settle();
+  assert.strictEqual(ws2.readyState, 1, "E control: a seated owner's hello exchange runs");
+  assert.ok(ws2.sent.filter((f) => f.type === "key").length >= 2, "E control: ...our hello and the answer to theirs");
+  el("disconnect").click();
+  await settle();
+  assertBackOnRoom("E control");
+  console.log("OK  E: controls — after `pending` or `joined` key frames are handled as before (executed)");
 }
 
 // ---- L: the directory lookup ----------------------------------------------------
