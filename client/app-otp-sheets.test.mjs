@@ -1131,6 +1131,9 @@ const endChat = async () => {
   assert.ok(shown("otpNewSheet") && stateOf("otpNewSheet") === "working", "R5-1: a WORKING sheet is not torn down mid-KDF");
   await gen; await settle(5);
   assert.ok(!shown("otpNewSheet") && !el("viewLive").inert, "…it closes itself once the work ends, the pad made");
+  assert.ok(/^Pad ".*" created — Export it to your contact after this chat\.$/.test(st.textContent) && !/\bvh\b/.test(st.className) &&
+    el("hint").textContent === st.textContent,
+    "R7-2: what the done block would have said stays, visible, in the chat's hint and the panel: " + JSON.stringify([st.textContent, st.className, el("hint").textContent]));
   await endChat();
   console.log("OK  R5-1: showScreen closes an idle sheet; a working one finishes, then closes");
 }
@@ -1209,6 +1212,7 @@ const endChat = async () => {
   await importing; await settle(20);
   assert.ok(otp.padMeta(f.padId), "fixture: the import completed");
   assert.ok(!shown("otpImportSheet") && !el("viewLive").inert, "N8: when the Import's work ends, the sheet closes itself");
+  assert.strictEqual(st.textContent, 'Pad "n8" imported. Delete the pad file now.', "R7-2: …and says it was imported, and to delete the file");
   await endChat();
   console.log("OK  N8: Import closes itself after its work when the chat came up");
 }
@@ -1256,6 +1260,50 @@ const endChat = async () => {
   assert.strictEqual(el("otpExportPadLabel").textContent, "pad", "N11: an invisible-only label shows as 'pad'");
   await el("otpExportClose").click();
   console.log("OK  N11: the card's fallback name");
+}
+
+// ======== fix round 6 (otp-fix-round-1.md, "Round 6") ========
+// ---- pentest r7 R7-1: a knock revealed by an OTP sheet closing gets a fresh guard ----
+{
+  const realConfirm = globalThis.confirm;
+  globalThis.confirm = () => true;
+  try {
+    await lockPad(madeId, PADPASS);
+    await openExport();
+    await set("otpXferPass", "a transfer passphrase for R7-1");
+    await el("otpExport").click();
+    if (stateOf("otpExportSheet") === "confirm") await el("otpExport").click();
+    await until(() => stateOf("otpExportSheet") === "ready", "ready");
+    // The chat comes up under the "ready" Android sheet (a slow `join`).
+    const other = otp.listPads().find((p) => p.label === "double-tap").padId;
+    el("otpSelect").value = other; el("otpPass").value = "a strong enough pad passphrase";
+    dom.selectAlg("OTP"); el("room").value = ROOM; await el("room").dispatch("input");
+    const before = dom.socket();
+    const c = el("connect").click();
+    await until(() => dom.socket() !== before, "the socket");
+    const ws = dom.socket();
+    ws.open();
+    await ws.deliver({ type: "joined", role: "owner" });
+    await c; await settle(5);
+    assert.ok(shown("otpExportSheet") && el("viewLive").inert, "fixture: the unshared Export stands over the chat");
+    // A knock arrives under the sheet; its own 500 ms pass while it is covered.
+    const knock = Buffer.from(JSON.stringify({})).toString("base64");
+    await ws.deliver({ type: "knock", room: ROOM, jid: "0123456789abcdef", payload: knock });
+    await until(() => !el("admit").hidden, "the knock prompt");
+    await new Promise((r) => setTimeout(r, 600));
+    await el("otpExportClose").click(); // asks (unshared), OK
+    assert.ok(!shown("otpExportSheet") && !el("viewLive").inert, "fixture: the sheet is gone, the prompt revealed");
+    const sent0 = ws.sent.length;
+    await el("admitOk").dispatch("click", { timeStamp: performance.now() }); // the second half of the tap that closed it
+    assert.ok(!el("admit").hidden && !ws.sent.slice(sent0).some((f) => f.type === "admit"),
+      "R7-1: a tap within 500 ms of the sheet closing does not let the knocker in");
+    await el("admitOk").dispatch("click", { timeStamp: performance.now() + 600 });
+    assert.ok(ws.sent.slice(sent0).some((f) => f.type === "admit"), "control: a deliberate tap after the guard admits");
+    await endChat();
+  } finally {
+    globalThis.confirm = realConfirm;
+  }
+  console.log("OK  R7-1: an OTP sheet closing re-arms the knock prompt's 500 ms guard");
 }
 
 console.log("\nAll OTP sheet checks passed.");

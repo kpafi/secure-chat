@@ -5884,12 +5884,33 @@ function otpFocusError(kind, field) {
 
 // The room screen is gone (a chat came up): close the sheet if it may close.
 function otpLeftRoom() {
-  if (!otpUi.sheet || otpSheetWorking() || otpNeedsCloseConfirm()) return;
-  closeOtpSheet({ restoreFocus: false });
+  if (!otpUi.sheet || otpSheetWorking() || otpNeedsCloseConfirm()) return false;
+  return closeOtpSheet({ restoreFocus: false });
 }
-// After a sheet's work ends: if the room screen went away meanwhile, go too.
+// After a sheet's work ends: if the room screen went away meanwhile, go too
+// — and keep what the done block would have said (fix round 6, pentest r7
+// R7-2): the user never saw it. One short line, shown in the chat's hint now
+// and left (visible) in the panel for the room screen after the chat.
 function otpAfterWork() {
-  if (els.scrRoom.hidden) otpLeftRoom();
+  if (!els.scrRoom.hidden || !otpUi.sheet) return;
+  const notice = otpDoneNotice();
+  if (otpLeftRoom() && notice) {
+    otpStatusMsg(notice);
+    hint(notice);
+  }
+}
+function otpDoneNotice() {
+  const kind = otpUi.sheet, st = otpUi.state[kind];
+  if (st !== "done") return null;
+  const name = (info) => (info && otp.cleanPadLabel(info.label)) || "pad";
+  if (kind === "new") return `Pad "${name(otpNewInfo)}" created — Export it to your contact after this chat.`;
+  if (kind === "import") return `Pad "${name(otpImportInfo)}" imported. Delete the pad file now.`;
+  if (kind === "export") {
+    return otpExportResult === "shared" || otpExportResult === "ios"
+      ? "Pad file sent — give it to them in person; once they've imported it, they delete the file."
+      : "Pad file downloaded — give it to them in person; once they've imported it, delete the file on both devices.";
+  }
+  return null;
 }
 
 function otpNewFinished(info) {
@@ -6092,6 +6113,16 @@ function closeOtpSheet({ restoreFocus = true, fromHistory = false } = {}) {
   if (!fromHistory) otpHistDrop();
   const opener = otpUi.opener;
   otpUi.opener = null;
+  // Fix round 6 (pentest r7 R7-1): a knock prompt (or the guest's peer
+  // prompt) the sheet covered is revealed now — with a fresh 500 ms guard,
+  // as showView gives one revealed behind another view: the sheet's
+  // Share / Done sits exactly on "Let them in", and the second half of a
+  // double tap must not decide it. The guard's focus (Deny) wins over the
+  // opener's.
+  if (!els.viewLive.hidden && !els.scrChat.hidden && !els.admit.hidden) {
+    armAdmitGuard(admitShownFor);
+    return true;
+  }
   if (restoreFocus) {
     const target = opener && !opener.hidden && !els.otpPanel.hidden ? opener
       : !els.otpPadRow.hidden ? els.otpSelect : els.otpNewOpen;
