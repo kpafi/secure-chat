@@ -3,7 +3,73 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ CURRENT STATE (2026-09-27) — C3-2 fix on `claude/dazzling-liskov-726d57` (on top of `claude/charming-northcutt-3850fa` → `feat/otp-transfer-sheets`), done and reviewed, not merged, not pushed
+## ⮕ CURRENT STATE (2026-09-28) — early-key refusal on `claude/sad-ptolemy-a18bfa` (on top of `claude/dazzling-liskov-726d57` → `claude/charming-northcutt-3850fa` → `feat/otp-transfer-sheets`), done and reviewed, not merged, not pushed
+
+- **Task:** the pre-existing Low that pentest C3-2 r2 left for the owner
+  ("Pre-existing lead" in `connect-cancel-c3-2-pentest-r2.md`). With no
+  answer to `join` yet, the `key` arm answered a relay's hello, and a
+  relay-signed handshake then raised the guest approval prompt inside the
+  hidden chat screen. The prompt was invisible (0×0), the tab bar inert and
+  the pump parked on it. This was also the Chromium lever of C3-2 r1 R1-2.
+- **Owner decision (2026-09-27):** REFUSE, with a sentence. The rejected
+  options were: draw the prompt over the room screen, drop silently, or
+  queue until answered. An honest relay never sends `key` before
+  `pending`/`joined`; the pentest verified this against main.py, relay.py
+  and the oldest relay.
+- **Branch `claude/sad-ptolemy-a18bfa`**, worktree
+  `.claude/worktrees/sad-ptolemy-a18bfa`, stacked on
+  `claude/dazzling-liskov-726d57` 11ea8fe. Merge order: OTP sheets →
+  charming-northcutt → dazzling-liskov → this. Not merged, not pushed.
+- **Commits:**
+  - e919018 (the change);
+  - be629d7 (pentest r1 report, as written);
+  - 016eb5e (fix round 1: comments and tests only;
+    triage `design/research/reviews/early-key-fix-round-1.md`).
+- **What it does (client/app.js, top of the `key` arm, before any
+  parse/answer/await):**
+  - **roomRole null on an OPEN socket:** a transcript line, then
+    `endUnanswered(sock, EARLY_KEY_HINT)`. The attempt ends at once even if
+    the close stalls, the sentence is byte-stable, and frames queued behind
+    it (the relay's answer included) are dropped with the retired socket.
+  - **roomRole null on CLOSING or CLOSED:** `break`. Nothing is sent or
+    narrated, and the close's own words stay. This also drops a key frame
+    dispatched after onclose in a session that had progressed. Before, that
+    frame raised a 0×0 prompt on the room screen and made the tab bar inert.
+  - **`pending` counts as an answer.** A queued guest's key frames are
+    handled as before; the prompt is visible there.
+- **Side effects, stated in e919018:**
+  - The RSA refusal before an answer is unreachable now; after a seat it is
+    unchanged.
+  - A MITM refusal for a key frame dispatched after the relay's close is no
+    longer shown (the frame is relay-authored).
+  - The guest prompt's "not the owner" keying is belt and braces.
+  - The forced late answer is still forceable after `pending`
+    (joined:guest behind a visible prompt), and C3-2's handling of it
+    stays bound.
+- **Reviewed:** `pentest-new-code` r1 found no Critical, High, Medium or Low
+  issues. Its three Info findings and three Info test gaps were all taken in
+  016eb5e. No r2: round 1 was comments and tests only, bound by hand-run
+  mutants (the same precedent as C3-2 r3).
+- **Mutants, hand-run, all RED:**
+  - M1–M11 (e919018);
+  - Y1, Y3, Y4, Z1 (the r1 survivors) → new tests in cc block E,
+    app-behaviour (h2), and e2e `psecond`.
+- **Checked:**
+  - `npm test` green; backend 302 passed (backend untouched).
+  - e2e on a scratch relay :8121 (e919018): hostile-relay 24/24,
+    room-admission 49/49, hung-relay 20/20, no-dead-ends 17/17,
+    all-modes 28/28.
+  - The pentester also ran two-user-flow 15/15.
+  - `e2e/forced-late-answer.mjs` (reworked, no backend): 25/25 on 016eb5e;
+    refusal removed 7/21 (the lead's trail: `admit.box=0x0`,
+    `tabbar.inert=true`); Y3 24/25.
+  - Not run on Safari/WebKit or the Android WebView. No APK built.
+- **Open owner option (not taken):** treat a key frame while queued
+  (`pending`, not yet `joined`) like "no answer" and refuse it too. An honest
+  relay does not send one there either. The cost is that the C3-2
+  forced-late lever would be gone entirely, and so would its e2e fixture.
+
+## (2026-09-27) — C3-2 fix on `claude/dazzling-liskov-726d57` (on top of `claude/charming-northcutt-3850fa` → `feat/otp-transfer-sheets`), done and reviewed, not merged, not pushed
 
 - **Task:** the pre-existing lead C3-2 of
   `design/research/reviews/connect-cancel-pentest-r3.md`. The relay's answer to
@@ -53,12 +119,9 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   - New `e2e/forced-late-answer.mjs` (serves client/ itself, raw relay, no
     backend): 13/13 on f1ede5f; 7/13 on 495a12f, 10/13 on b88afa8.
   - Not run on Safari/WebKit or the Android WebView. No APK built.
-- **Open, owner decision (pre-existing Low, found by C3-2 r2, NOT in this
-  branch):** a guest approval prompt raised before any answer to `join` is
-  invisible, because `#admit` sits in the hidden chat screen, and the tab bar
-  goes inert. Cancel works. The options: draw it over the room screen, or
-  refuse or defer a handshake that arrives before the answer. Offered as a
-  separate task.
+- **Pre-existing Low found by C3-2 r2 (invisible guest prompt before any
+  answer to `join`):** decided 2026-09-27 (refuse, with a sentence), done on
+  `claude/sad-ptolemy-a18bfa`, see the entry above.
 - **Env note:** a scratch relay on a port other than 8000 needs
   `SECURE_CHAT_EXTRA_ORIGINS=http://127.0.0.1:<port>`; otherwise the
   WebSocket is refused with 403.
