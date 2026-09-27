@@ -98,3 +98,20 @@ was hand-run on its own and reverted (`git diff` clean after each). F-numbers ar
 | Pentest R2-4: re-deliveries not re-checked | **Not done** (Info, by design): the text is byte-identical and latched; the link now says "the same file" and each done block says to delete it. Re-checking would mean unlocking (a writer) under the pad lock per tap | |
 | Pentest R2-9: protocol skew (M9 needs both phones on this build) | **Release notes** item, not code | |
 | Pentest lead: re-push from popstate without activation | On-device check (android/README list) | |
+
+## Round 2 — Android
+
+Commits 84e6bdf (code + tests) and 35ac56d (android/README). Build, `testDebugUnitTest`
+(50: PadFilesActivityTest 28, PadFilesTest 10, RelayUrls 11, UnsupportedWebView 1) and
+`node client/android-source.test.mjs` (9/9) green. Each mutant hand-run and reverted.
+
+| Finding | Fix | Test | Mutant → result |
+| --- | --- | --- | --- |
+| Pentest r3 R3-1: `content://0%40<ours>` passed `isForeignDocument` (host splits on `@` before decoding; the resolver strips the user id from the decoded authority) | `uri.authority?.substringAfterLast('@')` — the resolver's own rule (`getAuthorityWithoutUserId`) | `pickerResultsThatAreNotAnotherAppsDocumentAreDropped` + the PoC's forms (`0%40…files`, `10%40…files`, `0%40…androidx-startup`; plain and `0@` already there); `aSaveResultThatIsNotAnotherAppsDocumentIsNotWritten` + two `%40` forms | R3a (host again) → red; R3b (no user-id strip) → red; R3c (strip on the encoded authority) → red |
+| R3-1, the other side: work-profile documents must still pass | a user id on a FOREIGN provider stays allowed | `aWorkProfileDocumentFromAnotherAppStillReachesThePage` (`10@` and `10%40` on externalstorage.documents) | R3d (refuse any user id) → red |
+| Pentest r3 R3-2: Bold text (`fontWeightAdjustment`) recreated the activity | added to `configChanges` (compileSdk 34 builds) | `aConfigurationChangeKeepsTheActivityAndTheShareInFlight` sets `fontWeightAdjustment = 300` | R3e (flag removed) → red |
+| R3-2 lead: overlay / wallpaper-colour change recreates | **Not fixable in the manifest** (`CONFIG_ASSETS_PATHS` is not declarable). README and the manifest comment now list what still reloads the page: process death, a theme/overlay change (Material You wallpaper colours), an app update or force-stop. Robolectric shows the recreation; on the device it is expected, not yet seen — phone checklist (7) | — | — |
+| Cold r2 mi-7 / A1: `\d` for `[0-9]` in the name rule survived the JVM tests (OpenJDK `\d` is ASCII, ICU's is Unicode) | The name is no longer a regex: checked character by character against `secure-chat-pad-####-##-##-####.json`, `#` = `'0'..'9'`, exact length. The same meaning on JVM and device, so a Unicode-digit mistake is visible on the JVM | `refusesEveryOtherName` (Arabic-Indic, extended Arabic-Indic, Devanagari, fullwidth digits; one short, one long) | A1 (`Char.isDigit()`, the JVM equivalent of ICU's `\d`) → red; A1b (length check loosened) → red. The literal `\d` mutant no longer exists (no regex) |
+| Cold r2 mi-7 / A3: the own-authority refusal was redundant with the PackageManager check in every test | kept, now load-bearing in a test | `ourFileProviderIsRefusedEvenWhenPackageManagerDoesNotKnowIt` (provider removed from `ShadowPackageManager`; plain, `0@`, `0%40` refused) | A3 → red |
+| Hot r2 N8: checklist lacked "Back twice during a KDF" and "Back during the Export entry's unlock" | android/README phone checklist (6), plus (7) Bold text / wallpaper change and (8) a work-profile import | — (device) | — |
+| Hot r2 N11: README said "Send it again" | now "Didn't arrive? Send the same file again" | — (doc) | — |
