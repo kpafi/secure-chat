@@ -1644,4 +1644,22 @@ console.log("OK  F7: importPad accepts only the 600k iterations every export wri
 }
 console.log("OK  n-1: an unnamed pad is named by local time");
 
+// Fix round 2 (cold r2 MA-1): a file whose pad is still STORED here is
+// refused as "you already have this pad" (coded PAD_PRESENT), not as "used —
+// generate a fresh pad"; once the pad is forgotten, the watermark's "used"
+// refusal stands.
+{
+  const X = "ma1 transfer";
+  const gen = await otp.generatePad({ label: "ma1", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const file = await otp.exportPad(gen, X);
+  const imp = await otp.importPad(file, X);
+  await otp.saveNewPad(imp, PASS);
+  const e = await otp.importPad(file, X).then(() => null, (x) => x);
+  assert.ok(e && e.code === "PAD_PRESENT" && e.padId === gen.padId && !/already been used/.test(e.message),
+    "MA-1: the same file again → PAD_PRESENT, not 'already been used': " + (e && e.message));
+  otp.forgetPad(gen.padId);
+  await assert.rejects(otp.importPad(file, X), /already been used on this device/, "…after Forget the watermark still refuses it as used");
+}
+console.log("OK  MA-1: a pad still stored here is PAD_PRESENT; a forgotten one stays 'used'");
+
 console.log("\nAll OTP rollback checks passed.");

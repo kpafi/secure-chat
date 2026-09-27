@@ -555,6 +555,20 @@ export async function importPad(fileText, passphrase) {
   // Package 3b: the durable record's `used` hint as well — after a crash it
   // may be the only trace left that this pad ran here (the localStorage
   // markers lost with the rest of an uncommitted batch).
+  // Fix round 2 (cold MA-1): the pad is still stored here (the same file
+  // imported twice, or the maker importing their own export). saveNewPad's
+  // used-marker made the check below answer "already been used … generate a
+  // fresh pad", which is untrue and sends two people back to an in-person
+  // exchange for nothing. Still a refusal; only the sentence changes (the
+  // page says "You already have this pad on this device …"). A pad that was
+  // FORGOTTEN has no blob, so its watermark still gets the "used" refusal.
+  if (localStorage.getItem(padKey(o.padId)) !== null) {
+    bytes.fill(0);
+    const e = new Error("you already have this pad on this device");
+    e.code = "PAD_PRESENT";
+    e.padId = o.padId;
+    throw e;
+  }
   if (padWasUsed(o.padId) || await durablePadUsed(o.padId)) {
     throw new Error(
       "this pad has already been used on this device — importing it again would reuse key material. Generate and exchange a fresh pad in person.",
