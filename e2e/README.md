@@ -17,6 +17,7 @@ node e2e/contact-profile.mjs    #            — a saved user's short profile (s
 node e2e/all-modes.mjs          #            — all four encryption modes, both directions
 node e2e/otp-transfer.mjs       #            — the one-time pad sheets: New pad, Export, Import (+ an Android stand-in)
 node e2e/otp-held-join.mjs      #            — OTP sheets while a (proxied) relay holds the join: knock guard, self-close advice
+node e2e/otp-pad-check.mjs      #            — two people on different pads (or modes) are refused at connect, nothing spent (MA-2)
 node e2e/hung-relay.mjs         #            — a relay / directory that never answers: Cancel, the 30 s / 20 s deadlines (~2 min)
 node e2e/forced-late-answer.mjs #            — a relay's key exchange before it answers join is refused; its answer forced after its own close (own static server + raw relay, no backend)
 node e2e/screenshots.mjs <dir>  #            — every screen at phone + desktop size, for design review

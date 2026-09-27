@@ -2230,5 +2230,140 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
   console.log("OK  OTP fix round 7: the guest's peer prompt revealed by a self-closing OTP sheet gets a fresh guard (executed)");
 }
 
+// ==== OTP pad check rounds 4-6: a contact on ANOTHER MODE, from DHKE / Post-quantum / AES-256 ====
+// A hello tagged with another known mode, before this session has started,
+// is refused in every mode, both modes named; if it was an offer, our plain
+// hello goes out first so the other side can name ours. After the start a
+// mode tag is not judged. Pentest r4-r6 each found the next unpinned case
+// (a role, a reply value, a tag, a phase), so this block walks the whole
+// space instead: my mode × role (owner / a real guest) × their tag × reply
+// × phase (fresh, pinned, started). The sentence is compared EXACTLY — it
+// must lead with the relay and never steer to the named mode (r5 R5-F3,
+// r6 R6-F4).
+{
+  const MODES = ["DHKE", "PQKEM", "AES256"];
+  const NAME = { DHKE: "DHKE", PQKEM: "Post-quantum", AES256: "AES-256", OTP: "One-time pad" };
+  const TAGS = ["DHKE", "PQKEM", "AES256", "OTP"];
+  const sentence = (mine, theirs) => `The relay may have altered this connection — or your contact picked ${NAME[theirs]} ` +
+    `under Security options, while you picked ${NAME[mine]}. Agree with your contact, in person or on a channel you trust, ` +
+    "which option you both use, then connect again. Nothing was sent.";
+  const MODE_LINE = /hello says .* mode, not .* — refusing/;
+  const hello = (alg, n, reply, extra = {}) => ({ type: "key", room: ROOM, alg, payload: pack({ hello: true, n, reply, ...extra }) });
+  const unhello = (f) => unpack(f.payload);
+  const seat = async (alg, role) => {
+    const ws = await connect(alg);
+    if (role === "guest") {
+      await ws.deliver({ type: "pending" });
+      await drain(ws);
+      assert.ok(ws.sent.some((f) => f.type === "knock"), `fixture: ${alg} guest knocked`);
+    }
+    await ws.deliver({ type: "joined", role });
+    await drain(ws);
+    return ws;
+  };
+  const refused = (ws, mine, theirs, s0, n0, reply, what) => {
+    assert.strictEqual(ws.readyState, 3, `${what}: refused (closed)`);
+    assert.strictEqual(dom.el("roomHint").textContent, sentence(mine, theirs), `${what}: the room screen says exactly: ` + dom.el("roomHint").textContent);
+    assert.strictEqual(count(new RegExp(`hello says ${NAME[theirs]} mode, not ${NAME[mine]} — refusing`)), n0 + 1, `${what}: one transcript line`);
+    const out = ws.sent.slice(s0).filter((f) => f.type === "key");
+    if (reply) {
+      assert.strictEqual(out.length, 0, `${what}: an answer is not answered`);
+    } else {
+      assert.ok(out.length === 1 && out[0].alg === mine && unhello(out[0]).hello === true && unhello(out[0]).reply === true && unhello(out[0]).pc === undefined,
+        `${what}: our plain hello went out first, once: ` + JSON.stringify(out.map(unhello)));
+    }
+  };
+
+  // Phase FRESH: nothing from a peer yet.
+  for (const mine of MODES) {
+    for (const role of ["owner", "guest"]) {
+      for (const theirs of TAGS.filter((t) => t !== mine)) {
+        for (const reply of [false, true]) {
+          const what = `fresh ${mine} ${role} vs ${theirs} (reply ${reply})`;
+          const ws = await seat(mine, role);
+          const s0 = ws.sent.length;
+          const n0 = count(new RegExp(`hello says ${NAME[theirs]} mode, not ${NAME[mine]} — refusing`));
+          await ws.deliver(hello(theirs, freshNonce(), reply));
+          await settle(10);
+          refused(ws, mine, theirs, s0, n0, reply, what);
+        }
+      }
+    }
+  }
+
+  // Phase PINNED: a same-mode hello (the relay's) came first and was answered;
+  // the session has not started (DHKE / Post-quantum: no peer key yet). The
+  // genuine contact on another mode is still named — offer or answer.
+  for (const mine of ["DHKE", "PQKEM"]) {
+    for (const role of ["owner", "guest"]) {
+      for (const reply of [false, true]) {
+        const theirs = reply ? "OTP" : "AES256";
+        const what = `pinned ${mine} ${role} vs ${theirs} (reply ${reply})`;
+        const ws = await seat(mine, role);
+        await ws.deliver(hello(mine, freshNonce(), false));
+        await drain(ws);
+        const s0 = ws.sent.length;
+        const n0 = count(new RegExp(`hello says ${NAME[theirs]} mode, not ${NAME[mine]} — refusing`));
+        await ws.deliver(hello(theirs, freshNonce(), reply));
+        await settle(10);
+        assert.strictEqual(ws.readyState, 3, `${what}: refused`);
+        assert.strictEqual(dom.el("roomHint").textContent, sentence(mine, theirs), `${what}: the exact sentence`);
+        assert.strictEqual(count(new RegExp(`hello says ${NAME[theirs]} mode, not ${NAME[mine]} — refusing`)), n0 + 1, `${what}: one line`);
+        // Answered already (helloAnswered): nothing more goes out.
+        assert.strictEqual(ws.sent.slice(s0).filter((f) => f.type === "key").length, 0, `${what}: nothing more sent`);
+      }
+    }
+  }
+
+  // Phase STARTED: every other tag, both reply values, one after another on
+  // one live session — none is judged, none closes it, nothing is sent.
+  const afterStart = async (ws, mine, what) => {
+    const n0 = count(MODE_LINE);
+    const s0 = ws.sent.length;
+    for (const theirs of TAGS.filter((t) => t !== mine)) {
+      for (const reply of [false, true]) {
+        await ws.deliver(hello(theirs, freshNonce(), reply, { chk: 1 }));
+        await settle(5);
+        assert.strictEqual(ws.readyState, 1, `${what}: a ${theirs} hello (reply ${reply}) after the start does not close the session`);
+      }
+    }
+    assert.strictEqual(count(MODE_LINE), n0, `${what}: …names nothing`);
+    assert.strictEqual(ws.sent.slice(s0).filter((f) => f.type === "key" && unpack(f.payload).hello).length, 0, `${what}: …answers nothing`);
+  };
+  // DHKE / Post-quantum: a real guest-side key exchange — the peer's hello and
+  // signed key, the approval, our confirm tag out (the gate is pending).
+  const signedKey = async (peer, pc, nonces, reply, alg) => {
+    const pub = await pc.handshakePayload();
+    const sig = await signHandshake(peer, ROOM, nonces, pub);
+    return { type: "key", room: ROOM, alg, payload: pack({ pub, reply, idb: peer.publicBundle(), sig }) };
+  };
+  for (const mine of ["DHKE", "PQKEM"]) {
+    const ws = await seat(mine, "guest");
+    const myN = ws.sent.map((f) => (f.type === "key" ? unpack(f.payload) : null)).find((q) => q && q.hello).n;
+    const pn = freshNonce();
+    await ws.deliver(hello(mine, pn, false));
+    await drain(ws);
+    const peer = await Identity.generate();
+    const pc = makeCipher(mine, ROOM); await pc.init();
+    ws.onmessage({ data: JSON.stringify(await signedKey(peer, pc, [myN, pn], true, mine)) });
+    await approvePeer();
+    await settle(20);
+    assert.ok(ws.sent.some((f) => f.type === "key" && typeof unpack(f.payload).confirm === "string"), `started ${mine}: fixture: the channel exists (our confirm tag went out)`);
+    await afterStart(ws, mine, `started ${mine}`);
+    await dom.el("disconnect").click();
+  }
+  // AES-256: both nonces known, the channel exists — owner and guest. (The
+  // fixture hello is an offer, so our one answer per connection is spent on
+  // it and "answers nothing" below measures the mode check alone.)
+  for (const role of ["owner", "guest"]) {
+    const ws = await seat("AES256", role);
+    await ws.deliver(hello("AES256", freshNonce(), false));
+    await settle(10);
+    await afterStart(ws, "AES256", `started AES256 ${role}`);
+    await dom.el("disconnect").click();
+  }
+  console.log("OK  mode mix-up: DHKE / Post-quantum / AES-256 × owner / guest × every other tag × reply × fresh / pinned / started — refused with the exact sentence before the start (answering an offer once), never after (executed)");
+}
+
 console.log("\nAll app.js behavioural checks passed.");
 process.exit(0); // key confirmation's deadline timer would otherwise hold the process open

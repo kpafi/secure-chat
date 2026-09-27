@@ -752,6 +752,42 @@ class Pqkem {
 const OTP_MSG_DOMAIN = "secure-chat/otp-msg/v1";
 const OTP_MAC_BYTES = 32;
 
+// The pad check (cold critic r2 MA-2). Two people who picked DIFFERENT pads —
+// both pressed New pad and called it "Chess" — used to see "Ready", and every
+// message then failed its one-time HMAC while each send spent pad bytes. Now,
+// once a side knows the peer's session nonce, it sends a proof
+//
+//   pc = HMAC-SHA256(key = padId,
+//                    domain|room|senderRole|senderNonce|receiverNonce)[0..16]
+//
+// and the receiver recomputes it for the PEER's role over the peer's nonce and
+// ITS OWN current one before anything unlocks. The key is the padId: 128
+// random bits that travel only inside the encrypted pad file and never reach
+// the relay. To the relay a proof is 16 pseudo-random bytes over two fresh
+// nonces: it can neither link sessions nor learn the padId.
+// No pad byte goes into it. Consumed bytes are zeroed, so the two copies of a
+// pad do not stay equal byte for byte, and reserving a slice would change the
+// geometry that pads already exchanged under 0.4.0 are laid out in.
+//
+// The role inside the proof tells a second failure apart: the same pad on
+// BOTH sides with the SAME role (a copy set up twice on one side). Two such
+// devices send from one half of the pad, a two-time pad from the first message.
+//
+// Pad check pentest r1 F1: the first cut covered only the SENDER's nonce, so a
+// relay replaying our own hello from an earlier connection produced exactly
+// "the same half as yours" — a verdict telling people to throw a good pad
+// away. The receiver's nonce is fresh for this connection, so only a device
+// holding the padId, answering THIS connection, can produce any verdict but
+// "mismatch". A mismatch the relay can always fake (16 random bytes); the
+// refusal says so.
+//
+// It is a consistency check, not authentication: the one-time HMAC on each
+// frame still decides what is accepted. A relay that strips the proof gets
+// back the state before this check.
+const OTP_CHECK_DOMAIN = "secure-chat/otp-pad-check/v1";
+const OTP_CHECK_BYTES = 16;
+const PAD_ID_RE = /^[0-9a-f]{32}$/;
+
 // True if every byte in [start, end) is zero — i.e. that pad span has already
 // been consumed and wiped (see the P-01 guard in OtpPad._encrypt).
 function isAllZero(u8, start, end) {
@@ -784,6 +820,13 @@ class OtpPad {
     const inRange = (v) => Number.isInteger(v) && v >= 0 && v <= pad.regionSize;
     if (!inRange(pad.sendOffset)) throw new Error("OTP pad has an invalid send offset");
     if (!inRange(pad.recvHighWater)) throw new Error("OTP pad has an invalid receive high-water mark");
+    // The pad check's key. Optional here because tests build pads from bare
+    // bytes; a cipher without it cannot produce or check a tag (padCheckTag
+    // throws), and app.js always passes the unlocked record, which has one.
+    if (pad.padId !== undefined && (typeof pad.padId !== "string" || !PAD_ID_RE.test(pad.padId))) {
+      throw new Error("OTP pad has an invalid pad id");
+    }
+    this.padId = pad.padId;
     this.roomId = roomId;
     this.pad = pad.bytes;          // shared reference: app.js persists it (zeroed as consumed)
     this.role = pad.role;
@@ -811,6 +854,53 @@ class OtpPad {
 
   // Bytes of send region still usable (each message costs 32 + its length).
   get remainingSend() { return this.regionSize - this.sendOffset; }
+
+  // The pad check (see OTP_CHECK_DOMAIN). Spends no pad bytes.
+  async _checkTag(role, senderNonce, receiverNonce) {
+    if (typeof this.padId !== "string") throw new Error("this pad has no id to check against");
+    const raw = new Uint8Array(16);
+    for (let i = 0; i < 16; i++) raw[i] = parseInt(this.padId.slice(2 * i, 2 * i + 2), 16);
+    const key = await crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    raw.fill(0);
+    const mac = await crypto.subtle.sign(
+      "HMAC", key, enc.encode(`${OTP_CHECK_DOMAIN}|${this.roomId}|${role}|${senderNonce}|${receiverNonce}`),
+    );
+    return new Uint8Array(mac).slice(0, OTP_CHECK_BYTES);
+  }
+
+  // Our proof, for the peer whose session nonce is `peerNonce`.
+  async padCheckTag(myNonce, peerNonce) {
+    if (typeof myNonce !== "string" || typeof peerNonce !== "string") throw new Error("pad check needs both session nonces");
+    // Pentest r2 R2-F1: over equal nonces our proof IS the same-side value
+    // (_checkTag(role, n, n) either way round). app.js refuses a reflected
+    // hello first; this is the second layer, as in AES256's setNonces.
+    if (myNonce === peerNonce) throw new Error("pad check refused: both session nonces are the same (a reflection)");
+    return bufToB64(await this._checkTag(this.role, myNonce, peerNonce));
+  }
+
+  // The peer's proof: "match", "mismatch" (a different pad — or a forgery),
+  // "same-side" (this pad, but the peer holds OUR half) or "malformed". Never
+  // throws on relay input; only a cipher without a padId throws (a caller bug).
+  async checkPeerPadTag(peerNonce, myNonce, tag) {
+    if (typeof this.padId !== "string") throw new Error("this pad has no id to check against");
+    if (typeof peerNonce !== "string" || typeof myNonce !== "string" || typeof tag !== "string" || tag.length !== 24) return "malformed";
+    if (peerNonce === myNonce) return "malformed"; // R2-F1: a reflection, never "same-side"
+    let got;
+    try {
+      got = new Uint8Array(b64ToBuf(tag));
+    } catch {
+      return "malformed";
+    }
+    if (got.length !== OTP_CHECK_BYTES) return "malformed"; // b64ToBuf is canonical-only
+    const same = (a) => {
+      let d = 0;
+      for (let i = 0; i < OTP_CHECK_BYTES; i++) d |= a[i] ^ got[i];
+      return d === 0;
+    };
+    if (same(await this._checkTag(1 - this.role, peerNonce, myNonce))) return "match";
+    if (same(await this._checkTag(this.role, peerNonce, myNonce))) return "same-side";
+    return "mismatch";
+  }
 
   async _mac(keyBytes, role, o, len, ct, usage) {
     const key = await crypto.subtle.importKey(
