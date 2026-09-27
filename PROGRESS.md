@@ -68,10 +68,20 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
 - **Release notes must say:** the pad check works only when both sides run
   this build; with a 0.4.0 contact the app says it cannot check.
 - **Paused here (owner, 2026-09-27).** Pentest round 4 on fix round 3
-  (9c23498) was running at the pause: its report goes to
-  `design/research/reviews/otp-padcheck-pentest-r4.md`. **Resume:** read
-  it, commit it as written if not yet done, triage, and run a fix round +
-  pentest if it finds anything Low+. Then this entry is final.
+  (9c23498) is in: nothing Critical/High/Medium/Low, four Info (report
+  `design/research/reviews/otp-padcheck-pentest-r4.md`, committed as
+  written, NOT yet triaged). **Resume with a small fix round 4:**
+  - R4-F1: add an (m) case where the OTP side is the GUEST and the first
+    hello is an other-mode owner's `reply:true` answer (mutants M1
+    `!p.reply &&` and M2 `otpProofSent &&` survive today);
+  - R4-F3: hedge the mode sentence like the pad one ("… or the relay
+    altered it"), since the relay picks which mode is named;
+  - R4-F4: e2e [4] "spent nothing" is vacuous ([4] never sends) — assert
+    `#text` disabled and no `msg` in `__sent`, as [1] does;
+  - R4-F2: the contact on the OTHER mode is still misled (AES: "key
+    confirmation failed" after 15 s; DHKE: waits forever) — add a mirror
+    check in the other modes, or list it as a residual (owner's call);
+  then the mutants for the new tests, and pentest the fix round.
 - **Next:** owner review; merge `feat/otp-transfer-sheets`, then this branch;
   the phone APK rebuild comes with that merge.
 
