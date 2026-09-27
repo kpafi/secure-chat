@@ -871,6 +871,10 @@ class OtpPad {
   // Our proof, for the peer whose session nonce is `peerNonce`.
   async padCheckTag(myNonce, peerNonce) {
     if (typeof myNonce !== "string" || typeof peerNonce !== "string") throw new Error("pad check needs both session nonces");
+    // Pentest r2 R2-F1: over equal nonces our proof IS the same-side value
+    // (_checkTag(role, n, n) either way round). app.js refuses a reflected
+    // hello first; this is the second layer, as in AES256's setNonces.
+    if (myNonce === peerNonce) throw new Error("pad check refused: both session nonces are the same (a reflection)");
     return bufToB64(await this._checkTag(this.role, myNonce, peerNonce));
   }
 
@@ -880,6 +884,7 @@ class OtpPad {
   async checkPeerPadTag(peerNonce, myNonce, tag) {
     if (typeof this.padId !== "string") throw new Error("this pad has no id to check against");
     if (typeof peerNonce !== "string" || typeof myNonce !== "string" || typeof tag !== "string" || tag.length !== 24) return "malformed";
+    if (peerNonce === myNonce) return "malformed"; // R2-F1: a reflection, never "same-side"
     let got;
     try {
       got = new Uint8Array(b64ToBuf(tag));

@@ -338,7 +338,6 @@ let saidTurnedAway = false;
 let saidDenied = false;
 let saidRemovedAlg = false; // package 4: "the other side uses RSA" is said once per connection
 let otpProofSent = false;   // MA-2: our pad proof went out on this connection
-let otpPeerChecks = false;  // MA-2: the peer offered the pad check on this connection
 let saidNoPadCheck = false; // MA-2: "cannot confirm the same pad" is said once per connection
 // Pentest 2026-08-07 F-PROTO-001: the one fact about room ownership the relay
 // does NOT get to supply. `roomRole` above is whatever the relay answers to
@@ -3339,7 +3338,6 @@ async function connectInner() {
   saidDenied = false;
   saidRemovedAlg = false;
   otpProofSent = false;
-  otpPeerChecks = false;
   saidNoPadCheck = false;
   keyConfirm.reset();
   knockQueue = [];
@@ -4017,13 +4015,14 @@ function helloMsg(room, reply, pc) {
 //
 // A peer on 0.4.0 offers no check (no `chk`). It is let through with one
 // line: the check is a convenience, and the one-time HMAC still refuses every
-// frame from a different pad. A relay that strips `chk` from every hello gets
-// back only the state before this check (said in that line). A relay that
-// strips it from a LATER hello of a peer that offered it gets nothing: that
-// hello is ignored.
+// frame from a different pad. The first hello judged decides, so a relay that
+// strips `chk` from it (or injects a tagless one first) gets back the state
+// before this check, with that line on screen (pentest r2 R2-F3). Fix round
+// 1 ignored a tagless hello after an offer; that stopped nothing (the relay
+// picks the order) and left a side waiting with no word when the relay
+// injected an offer ahead of a 0.4.0 peer's hello (R2-F2), so it is gone.
 async function otpPadCheck(p, room, sock, live) {
   if (p.chk !== 1) {
-    if (otpPeerChecks) return false;
     if (!saidNoPadCheck) {
       saidNoPadCheck = true;
       addLine("sys", "", "[the other side runs an older version and cannot confirm that you both picked the same pad — " +
@@ -4031,7 +4030,6 @@ async function otpPadCheck(p, room, sock, live) {
     }
     return true;
   }
-  otpPeerChecks = true;
   // The peer's answer came before it knew our nonce was needed — or we
   // answered nobody (its hello was an answer): it gets our proof now, once.
   if (!otpProofSent) {

@@ -719,6 +719,11 @@ async function otpPadCheckChecks() {
   assert.strictEqual(await a.checkPeerPadTag(42, nA, genuine), "malformed", "pad check: a non-string peer nonce is malformed");
   assert.strictEqual(await a.checkPeerPadTag(nB, null, genuine), "malformed", "pad check: a missing own nonce is malformed");
   await assert.rejects(() => a.padCheckTag(nA, null), /both session nonces/, "pad check: no proof without the peer's nonce");
+  // Pentest r2 R2-F1: over equal nonces our own proof IS the same-side value.
+  // Neither side of the API accepts them: a reflection is never "same-side".
+  await assert.rejects(() => a.padCheckTag(nA, nA), /same/, "pad check R2-F1: no proof over equal nonces");
+  const selfProof = await expect(padId, ROOM, 0, nA, nA);
+  assert.strictEqual(await a.checkPeerPadTag(nA, nA, selfProof), "malformed", "pad check R2-F1: a proof over equal nonces is malformed, not same-side");
   // No pad byte is drawn: offsets and bytes are untouched.
   const pad = bytes.slice();
   const c = makeCipher("OTP", ROOM, { pad: { padId, bytes: pad, role: 0, regionSize, sendOffset: 0, recvHighWater: 0 } });
