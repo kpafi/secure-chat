@@ -234,3 +234,47 @@ sheet). L4 (the term alone) survives because of the busy check; L3 + L4 together
 | I-5a: a denylist; invisible-only labels | **Fixed**: whole categories Cc, Cf, Cs, Co, Cn plus U+2028/9, U+034F, variation selectors, Hangul fillers; an invisible-only label cleans to "" and the default name applies ("imported pad" at import) | M-I5a (`\p{Cs}` dropped) → red; the fallback asserted. The ZWJ (Cf) goes too: an emoji sequence splits into its emoji — cosmetic, accepted |
 | I-5d: `plain` not zeroed on a non-JSON plaintext | **Fixed** (try/finally around the parse) | M-I5d → "I-1: non-JSON plaintext: … zeroed" |
 | KK: raw label at generate | Covered: `cleanPadLabel` runs at generate too (round 3) | — |
+
+## Round 5 — Web client
+
+Review: `otp-pentest-r6.md` (nothing Critical, High or Medium). Commits f4f0578 (otp.js) and
+211e7e6 (app.js + unit tests). Checked: `npm test` green; e2e on a scratch relay (:8093, killed
+by PID): otp-transfer 196/196, all-modes 28/28, no-dead-ends 17/17, room-admission 49/49. P- and
+Q-numbers are hand-run mutants, one at a time, each reverted.
+
+**Decision (coordinator, round 5):** round 4's "part 1" of R5-1 — refusing the sheets while a
+connect is in flight or the socket is live — is **dropped**. It turned a pre-existing hang
+(a relay that never answers `join`, a directory lookup that never answers: Connect stays
+disabled, no Cancel on the room screen) into a lock on pad management too (R6-1), with a message
+pointing at a Disconnect that is not there (R6-3). What remains: `showScreen` closes an idle sheet
+when the chat screen comes up; a working sheet finishes and then closes itself if the room screen
+is gone; an Android file not yet shared or saved is never closed unasked; the Export entry opens
+no sheet once the room screen is gone (the room-screen term in `ok`); `openOtpSheet` opens only on
+the room screen; an Export during a live session is refused PAD_BUSY by the pad lock.
+
+**Does dropping it reopen something?** One UX state, not a security property: with a connect
+pending, a user can open Export (Android), create the file (latched) and reach "ready"; if the relay
+then answers, the chat screen comes up under that sheet, which stays (by design — closing would
+drop the only copy of a latched file) and keeps the Live room, the tab bar and `#admit` inert until
+Share / Save / ×. That is R6-2's end state, now reachable without the save-wait window. It is
+recoverable (× asks, then closes), costs nothing security-wise (the pad lock refuses any export
+during the session; P-08: a waiting guest costs the room nothing), and needs the user to start an
+Android export after pressing Connect. Accepted.
+
+| Finding | Verdict | Bound by (mutant → red check) |
+| --- | --- | --- |
+| R6-1 (Low): a hung relay / lookup locks New pad, Import and Export until reload | **Fixed** by removing the busy refusal (decision above). The hung Connect itself (no join timeout, no Cancel on the room screen, `account.fetchBundle` without a signal) **predates this branch — a gap left for its own task** | P-R6 (the busy refusal back) → "R6-1: a Connect the relay has not answered does not cancel the Export entry"; the P1 block now asserts each sheet opens while a connect is pending |
+| R6-2 (Info): the R5-1 end state via the save wait (an Android "ready" Export over the chat) | **Documented** (above): narrow, confirm-guarded (× asks), recoverable; no layer closes an unshared latched file unasked, deliberately. Round 4's "needs Connect pressed under a sheet, which the inert page prevents" was wrong: the save wait, and now any pending connect, reach it | N1 below binds the "never unasked" half |
+| R6-3 (Info): the busy line outlives the chat | **Gone** with the busy refusal | — |
+| R6-4 (Info): `cleanPadLabel` too aggressive for real scripts; `\p{Cn}` engine-dependent; invisible-only survivors | **Fixed**: strip Cc, Cf except ZWNJ/ZWJ, Cs, Co, U+2028/9; keep variation selectors, combining marks and unassigned code points; a label with no `\p{L}\p{N}\p{S}\p{P}` left is "" → the default name | Q-ZW → "R6-4: Persian keeps its ZWNJ"; Q-Cf → "I-2: … no control or bidi characters"; Q-Co → "R6-4: private-use characters (Co) are stripped"; Q-VIS → "R6-4: only combining marks — nothing visible — is empty"; Q-TRIM → "R6-4: no trailing space after the cap"; Q-Cn (strip Cn again) → "R6-4: unassigned code points … are left alone". Not stripped any more (so no mutant): CGJ U+034F, the Hangul fillers, the Mongolian selectors, U+2800 (So, counts as visible) — cosmetic |
+| R6-5 (Info): a Connect that refuses after an await still cancelled the Export entry | **No longer applies**: nothing cancels the entry on a pending connect any more; only the room screen being gone does (a Connect that fails returns to the room screen) | — |
+| N1: `otpLeftRoom` without the unshared-file guard | **Test added**: the chat comes up under a "ready" Android Export | P-N1 → "N1: the chat screen does not close — nor ask about — an Android file not yet shared or saved" |
+| N7 / N10: Export's self-close after its work | **Test added** (a gate in the lock stub holds the export "working" while the chat comes up) | P-N7, P-N10 → "N7/N10: when the Export's work ends … the sheet closes itself" |
+| N8: Import's self-close after its work | **Test added** (the gate holds the import's pad lock) | P-N8 → "N8: when the Import's work ends, the sheet closes itself" |
+| N4: `otpChatBusy` without CONNECTING | **Moot**: `otpChatBusy` is gone | — |
+| N11: the card's "pad" fallback | **Test added** | P-N11 → "N11: an invisible-only label shows as 'pad'" |
+| N12: the busy line over "Could not unlock this pad" | **Moot** | — |
+| KJ / L4: the room-screen term | **Load-bearing again** (no busy check covers it) | P-L4 → "…its history entry is dropped" (the P2 block: Connect on A, Export on locked B, `joined` during B's unlock) |
+| (new) `openOtpSheet` only on the room screen | Added with the change: the entries live there, so a sheet cannot open over the chat | P-OS → "…and no sheet opens over the chat screen" |
+| L5: `showScreen` closes nothing | still bound | P-L5 → "R4-1: the Export sheet does not open over the live chat" |
+| CCs / C2028 / L7 / N2 | as the pentester found: CCs bound (Cs still stripped); C2028, L7, N2 equivalent | — |
