@@ -36,13 +36,19 @@ import java.util.concurrent.atomic.AtomicReference
 object PadFileRules {
     /**
      * Brief 7: `secure-chat-pad-YYYY-MM-DD-HHMM.json`, the export's local time.
-     * `[0-9]`, not `\d`: on Android java.util.regex is ICU, where `\d` is any
-     * Unicode decimal digit (Arabic-Indic, Devanagari, …) — "exactly this
-     * pattern" would quietly have admitted names that are not. Matched with
-     * [Regex.matches] (the whole input), so no `^`/`$` subtleties: a trailing
-     * newline, a path separator or a second extension cannot ride along.
+     * Each `#` is one ASCII digit, every other character is itself, and the
+     * length is exact — so no trailing newline, path separator or second
+     * extension can ride along.
+     *
+     * Not a regex (cold critic r2 mi-7). It was one, with `[0-9]` because on
+     * Android java.util.regex is ICU, where `\d` is any Unicode decimal digit
+     * (Arabic-Indic, Devanagari, …). But the JVM tests run OpenJDK's engine,
+     * where `\d` is ASCII-only, so a `\d` slipping back in was invisible to
+     * every test. A character-by-character check means the same thing on both,
+     * and a digit test that admitted Unicode digits (`Char.isDigit()`) fails
+     * PadFilesTest on the JVM too.
      */
-    val NAME = Regex("secure-chat-pad-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}\\.json")
+    const val NAME_TEMPLATE = "secure-chat-pad-####-##-##-####.json"
 
     /**
      * The PBKDF2 iteration count `exportPad()` always writes: KDF_ITERS in
@@ -113,7 +119,15 @@ object PadFileRules {
      */
     const val MAX_BYTES = 4 * 1024 * 1024
 
-    fun validName(name: String?): Boolean = name != null && NAME.matches(name)
+    fun validName(name: String?): Boolean {
+        if (name == null || name.length != NAME_TEMPLATE.length) return false
+        for (i in NAME_TEMPLATE.indices) {
+            val t = NAME_TEMPLATE[i]
+            val c = name[i]
+            if (if (t == '#') c !in '0'..'9' else c != t) return false
+        }
+        return true
+    }
 
     fun validText(text: String?): Boolean {
         if (text == null || text.length > MAX_BYTES) return false

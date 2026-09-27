@@ -438,11 +438,19 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
   const pfLines = codeLines(pf);
   assert.ok(/ICU/.test(padFilesRaw) && !/ICU/.test(pf), "control: PadFiles.kt comments are stripped");
 
-  // (a) the name: brief 7, exactly; [0-9] (ICU's \d is any Unicode digit), whole-input match.
-  assert.ok(pfLines.includes('val NAME = Regex("secure-chat-pad-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}\\\\.json")'),
-    "PadFileRules.NAME is exactly secure-chat-pad-YYYY-MM-DD-HHMM.json with ASCII digits");
-  assert.ok(pfLines.includes("fun validName(name: String?): Boolean = name != null && NAME.matches(name)"),
-    "validName matches the WHOLE name (Regex.matches, not find/containsMatchIn)");
+  // (a) the name: brief 7, exactly, by template (cold critic r2 mi-7: no regex,
+  // whose `\d` means ASCII on the JVM tests but any Unicode digit on ICU).
+  assert.ok(pfLines.includes('const val NAME_TEMPLATE = "secure-chat-pad-####-##-##-####.json"'),
+    "PadFileRules.NAME_TEMPLATE is exactly secure-chat-pad-YYYY-MM-DD-HHMM.json");
+  assert.deepStrictEqual(kotlinFun(/^fun validName\(name: String\?\): Boolean \{$/, "validName", pfLines).slice(1, -1), [
+    "if (name == null || name.length != NAME_TEMPLATE.length) return false",
+    "for (i in NAME_TEMPLATE.indices) {",
+    "val t = NAME_TEMPLATE[i]",
+    "val c = name[i]",
+    "if (if (t == '#') c !in '0'..'9' else c != t) return false",
+    "}",
+    "return true",
+  ], "validName: exact length; '#' = one ASCII digit, every other character itself");
   // (b) the size cap and the text check, in this order (cheap length first).
   assert.ok(pfLines.includes("const val MAX_BYTES = 4 * 1024 * 1024"), "the text cap is 4 MiB, as importPad's");
   assert.deepStrictEqual(kotlinFun(/^fun validText\(text: String\?\): Boolean \{$/, "validText", pfLines).slice(1, -1), [
@@ -451,11 +459,11 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
     "return isEnvelope(text)",
   ], "validText: null / over-length refused, UTF-8 bytes capped, then the WHOLE text must be the envelope");
   // Pentest r1: no regex over the (up to 4 MiB) text — ICU on the device is not
-  // the engine the JVM tests run. The only regexes left are on the name and the id.
+  // the engine the JVM tests run. The only regex left is on our own request id
+  // (explicit ASCII classes, the same on both engines).
   assert.deepStrictEqual(pfLines.filter((l) => /\bRegex\(/.test(l)), [
-    'val NAME = Regex("secure-chat-pad-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}\\\\.json")',
     'private val ID = Regex("[0-9a-f]{16}")',
-  ], "PadFiles.kt: regexes only on the short name and id, never on the file text");
+  ], "PadFiles.kt: the only regex is on the request id — never on the file text, no longer on the name");
   assert.ok(!/\.toRegex\(|Pattern\.|\.matches\(text\)/.test(pf), "…and no other route to a regex over the text");
   assert.ok(pfLines.includes("fun isEnvelope(text: String): Boolean {"), "the envelope is checked by the linear scanner");
   assert.ok(pfLines.includes("fun valid(name: String?, text: String?): Boolean = validName(name) && validText(text)"),
@@ -613,7 +621,7 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
   assert.ok(foreignAt > 0 && foreignAt < save.findIndex((l) => l.startsWith("thread(")), "the save URI is checked before any write");
   assert.deepStrictEqual(kotlinFun(/^private fun isForeignDocument\(uri: Uri\): Boolean \{$/, "isForeignDocument").slice(1, -1), [
     'if (uri.scheme != "content") return false',
-    "val authority = uri.host ?: return false",
+    "val authority = uri.authority?.substringAfterLast('@') ?: return false",
     "if (authority == filesAuthority) return false",
     "return packageManager.resolveContentProvider(authority, 0)?.packageName != packageName",
   ], "isForeignDocument: content:// only, never our FileProvider or any provider of ours");
@@ -633,7 +641,8 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
   assert.deepStrictEqual(/android:configChanges="([^"]*)"/.exec(act[0])[1].split("|").sort(), [
     "orientation", "screenSize", "screenLayout", "smallestScreenSize", "density", "keyboard", "keyboardHidden",
     "navigation", "touchscreen", "uiMode", "locale", "layoutDirection", "fontScale", "colorMode", "mcc", "mnc",
-    "grammaticalGender"].sort(), "MainActivity takes every configuration change in place (no page reload mid-Share/Save)");
+    "grammaticalGender", "fontWeightAdjustment"].sort(),
+    "MainActivity takes every configuration change in place (no page reload mid-Share/Save)");
 
   // (g) the FileProvider: not exported, one authority, one directory.
   const noComments = manifest.replace(/<!--[\s\S]*?-->/g, "");

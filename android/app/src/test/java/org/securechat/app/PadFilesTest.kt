@@ -50,6 +50,10 @@ class PadFilesTest {
             "secure-chat-pad-2026-09-26-1432.json\u0000.png",
             "secure-chat-pad-٢٠٢٦-09-26-1432.json", // Arabic-Indic digits: `\d` on ICU
             "secure-chat-pad-２０２６-09-26-1432.json",          // fullwidth digits
+            "secure-chat-pad-2026-09-26-\u0967\u096a\u0969\u0968.json", // Devanagari digits
+            "secure-chat-pad-2026-\u06f0\u06f9-26-1432.json", // Extended Arabic-Indic digits
+            "secure-chat-pad-2026-09-26-1432.jso",             // one short
+            "secure-chat-pad-2026-09-26-1432.jsonx",
             "Secure-chat-pad-2026-09-26-1432.json",
             "secure-chat-pad-Alice-2026-09-26-1432.json",       // a label: brief 7 says neutral
         )) {

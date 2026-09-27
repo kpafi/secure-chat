@@ -44,13 +44,16 @@
              resources; the page does its own layout), so taking the change in
              place costs only: the native bar's strings and theme follow a
              locale or dark-mode switch at the next start. What still reloads
-             the page: process death (the system reclaiming memory while the
-             share sheet or save dialog is in front) - see android/README.md. -->
+             the page (android/README.md): process death (the system
+             reclaiming memory while the share sheet or save dialog is in
+             front), and changes no manifest flag can take - a system theme
+             or overlay change, such as Material You wallpaper colours
+             (pentest r3 R3-2), and an app update. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:taskAffinity=""
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden|navigation|touchscreen|uiMode|locale|layoutDirection|fontScale|colorMode|mcc|mnc|grammaticalGender">
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden|navigation|touchscreen|uiMode|locale|layoutDirection|fontScale|colorMode|mcc|mnc|grammaticalGender|fontWeightAdjustment">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

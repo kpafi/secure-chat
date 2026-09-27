@@ -481,7 +481,7 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Share: one file in cacheDir/[SHARE_DIR]/<requestId>/, named as validated
-     * (no path can be formed from it — see PadFileRules.NAME), exposed through
+     * (no path can be formed from it — see PadFileRules.NAME_TEMPLATE), exposed through
      * the FileProvider whose paths xml admits that directory ONLY, with a read
      * grant that goes to the target the user picks and nowhere else.
      *
@@ -606,13 +606,15 @@ class MainActivity : AppCompatActivity() {
      */
     private fun isForeignDocument(uri: Uri): Boolean {
         if (uri.scheme != "content") return false
-        // Pentest r2 R2-5: the HOST, not the authority. A user-qualified
-        // `content://0@org.securechat.app.files/…` has the authority
-        // "0@org.securechat.app.files", which names no provider — yet
-        // ContentResolver strips the `<userId>@` and opens OURS. The host is
-        // the authority without it. (A user id on a foreign provider stays
+        // Pentest r2 R2-5 / r3 R3-1: the authority exactly as ContentResolver
+        // routes it — the DECODED authority with everything up to the last
+        // `@` (the user id) removed (ContentProvider.getAuthorityWithoutUserId).
+        // `content://0@org.securechat.app.files/…` and its percent-encoded
+        // twin `content://0%40org.securechat.app.files/…` both open OURS; the
+        // r2 fix used uri.host, which splits on `@` in the ENCODED authority
+        // and so missed the `%40` form. (A user id on a FOREIGN provider stays
         // allowed: that is how a work-profile document comes back.)
-        val authority = uri.host ?: return false
+        val authority = uri.authority?.substringAfterLast('@') ?: return false
         if (authority == filesAuthority) return false
         return packageManager.resolveContentProvider(authority, 0)?.packageName != packageName
     }

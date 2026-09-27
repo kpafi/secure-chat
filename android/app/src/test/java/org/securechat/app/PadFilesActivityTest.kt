@@ -166,11 +166,48 @@ class PadFilesActivityTest {
             // Pentest r2 R2-5: user-qualified forms of our own providers.
             Uri.parse("content://0@${activity.packageName}.files/pad-share/0123456789abcdef/$name"),
             Uri.parse("content://0@${activity.packageName}.androidx-startup/x"),
+            // Pentest r3 R3-1: the percent-encoded `@` (the host check missed it).
+            Uri.parse("content://0%40${activity.packageName}.files/pad-share/0123456789abcdef/$name"),
+            Uri.parse("content://10%40${activity.packageName}.files/x"),
+            Uri.parse("content://0%40${activity.packageName}.androidx-startup/x"),
         )) {
             val cb = Recorder()
             chooser(cb)
             result(nextStarted(), Activity.RESULT_OK, Intent().setData(bad))
             assertEquals("must not reach the page: $bad", listOf<List<Uri>?>(null), cb.answers)
+        }
+    }
+
+    // Pentest r3 R3-1, the other side: a user id on a FOREIGN provider is how a
+    // work-profile document comes back, and must still reach the page.
+    @Test
+    fun aWorkProfileDocumentFromAnotherAppStillReachesThePage() {
+        for (ok in listOf(
+            Uri.parse("content://10@com.android.externalstorage.documents/document/primary%3ADownload%2F$name"),
+            Uri.parse("content://10%40com.android.externalstorage.documents/document/primary%3ADownload%2F$name"),
+        )) {
+            val cb = Recorder()
+            chooser(cb)
+            result(nextStarted(), Activity.RESULT_OK, Intent().setData(ok))
+            assertEquals("must reach the page: $ok", listOf<List<Uri>?>(listOf(ok)), cb.answers)
+        }
+    }
+
+    // Cold critic r2 mi-7 (A3): our FileProvider is refused by its authority
+    // even when PackageManager cannot name its owner — the check that does not
+    // depend on PackageManager is load-bearing on its own.
+    @Test
+    fun ourFileProviderIsRefusedEvenWhenPackageManagerDoesNotKnowIt() {
+        shadowOf(activity.packageManager).removeProvider(
+            android.content.ComponentName(activity.packageName, "androidx.core.content.FileProvider"))
+        assertNull("control: PackageManager no longer resolves it",
+            activity.packageManager.resolveContentProvider("${activity.packageName}.files", 0))
+        for (bad in listOf("", "0@", "0%40")) {
+            val uri = Uri.parse("content://$bad${activity.packageName}.files/pad-share/0123456789abcdef/$name")
+            val cb = Recorder()
+            chooser(cb)
+            result(nextStarted(), Activity.RESULT_OK, Intent().setData(uri))
+            assertEquals("must not reach the page: $uri", listOf<List<Uri>?>(null), cb.answers)
         }
     }
 
@@ -445,6 +482,7 @@ class PadFilesActivityTest {
         c.navigation = android.content.res.Configuration.NAVIGATION_TRACKBALL
         c.keyboard = android.content.res.Configuration.KEYBOARD_QWERTY
         c.mcc = c.mcc + 1
+        c.fontWeightAdjustment = 300                           // Settings > Bold text (pentest r3 R3-2)
         controller.configurationChange(c)
         idle()
         assertTrue("the same activity, not a recreated one", controller.get() === activity)
@@ -534,7 +572,12 @@ class PadFilesActivityTest {
     @Test
     fun aSaveResultThatIsNotAnotherAppsDocumentIsNotWritten() {
         val victim = File(activity.filesDir, "victim.txt").apply { writeText("PRECIOUS") }
-        for (bad in listOf(Uri.fromFile(victim), Uri.parse("content://${activity.packageName}.files/pad-share/x/$name"))) {
+        for (bad in listOf(
+            Uri.fromFile(victim),
+            Uri.parse("content://${activity.packageName}.files/pad-share/x/$name"),
+            Uri.parse("content://0%40${activity.packageName}.files/pad-share/x/$name"),       // R3-1
+            Uri.parse("content://0%40${activity.packageName}.androidx-startup/x"),
+        )) {
             val id = bridge.save(name, text)
             idle()
             result(nextStarted(), Activity.RESULT_OK, Intent().setData(bad))
