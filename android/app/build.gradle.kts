@@ -65,6 +65,10 @@ android {
         // this it runs in legacy mode and AppCompat's own drawables are missing,
         // so MainActivity cannot be started in a unit test (UnsupportedWebViewTest).
         unitTests.isIncludeAndroidResources = true
+        // Robolectric closes a ParcelFileDescriptor by moving FileDescriptor.fd
+        // reflectively, which JDK 17+ refuses unless java.io is opened. Needed
+        // for PadFilesActivityTest's documents provider (Save's "wt" mode).
+        unitTests.all { it.jvmArgs("--add-opens=java.base/java.io=ALL-UNNAMED") }
     }
 }
 

@@ -34,11 +34,23 @@
              launchMode stays the default (standard): a launcher tap still finds
              and resumes the existing task, which Android matches by the root
              activity's component when the task has no affinity. -->
+        <!-- configChanges (OTP transfer sheets fix round 2, cold critic mi-5):
+             every configuration change this single-WebView activity can take
+             in place. Recreating it RELOADS THE PAGE: the unlocked identity,
+             live chats and a pad file waiting in the export sheet are gone
+             (the pad is already latched as exported), and a save dialog open
+             at that moment answers into nothing. Nothing here is
+             layout-inflated per configuration (no -night/-land/-sw
+             resources; the page does its own layout), so taking the change in
+             place costs only: the native bar's strings and theme follow a
+             locale or dark-mode switch at the next start. What still reloads
+             the page: process death (the system reclaiming memory while the
+             share sheet or save dialog is in front) - see android/README.md. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:taskAffinity=""
-            android:configChanges="orientation|screenSize|keyboardHidden">
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden|navigation|touchscreen|uiMode|locale|layoutDirection|fontScale|colorMode|mcc|mnc|grammaticalGender">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

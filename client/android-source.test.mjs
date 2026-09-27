@@ -529,7 +529,7 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
   // the file in cacheDir/pad-share under the validated name.
   const share = kotlinFun(/^private fun startShare\(req: PadFileRequest\) \{$/, "startShare");
   for (const must of [
-    "val root = purgeShares(0)",
+    "val root = File(cacheDir, SHARE_DIR)",
     "val dir = File(root, req.id)",
     "val file = File(dir, req.name)",
     'if (file.parentFile != dir || dir.parentFile != root) throw IOException("share file escapes its directory")',
@@ -539,30 +539,52 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
     "putExtra(Intent.EXTRA_STREAM, uri)",
     "clipData = ClipData.newRawUri(req.name, uri)",
     "addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)",
-    "this, shareRequestCodes.incrementAndGet(),",
-    "Intent(shareChosenAction).setPackage(packageName).putExtra(EXTRA_REQUEST, req.id),",
+    "this, 0,",
+    "Intent(shareChosenAction).setPackage(packageName).setData(Uri.fromParts(SHARE_SCHEME, req.id, null)),",
     "PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE,",
     "shareLauncher.launch(Intent.createChooser(send, getString(R.string.share_pad_title), chosen.intentSender))",
   ]) assert.ok(share.includes(must), `startShare must contain \`${must}\``);
   assert.deepStrictEqual(share.join("\n").match(/putExtra\([^)]*\)/g),
-    ["putExtra(Intent.EXTRA_STREAM, uri)", "putExtra(EXTRA_REQUEST, req.id)"],
-    "the share intent carries EXTRA_STREAM only (plus our own request id on the chooser callback)");
+    ["putExtra(Intent.EXTRA_STREAM, uri)"],
+    "the share intent carries EXTRA_STREAM only (our request id is the chooser callback's DATA)");
+  // Fix round 2 (cold mi-4, pentest R2-7a): a new share ends no earlier share.
+  assert.ok(!share.some((l) => /revokeAndDelete|expireShares|listFiles|\.delete\(/.test(l)),
+    "startShare must not revoke or delete any earlier share (\"Send it again\" would cut off a send in progress)");
   assert.ok(!lines.some((l) => /FLAG_GRANT_(WRITE|PERSISTABLE|PREFIX)_URI_PERMISSION|takePersistableUriPermission/.test(l)),
     "no write, persistable or prefix URI grant anywhere");
   // Pentest r1 F2 / F5: one immutable, one-shot PendingIntent per share —
   // never the app-wide requestCode-0 / UPDATE_CURRENT one, never mutable.
   assert.ok(!lines.some((l) => /FLAG_MUTABLE|FLAG_UPDATE_CURRENT/.test(l)), "no mutable or updatable PendingIntent");
-  assert.ok(lines.includes("private val shareRequestCodes = AtomicInteger()"), "a process-wide requestCode counter");
+  // Pentest r2 R2-6: the id is the callback's DATA (part of a PendingIntent's
+  // identity), not an extra behind a per-process counter that restarts at 1.
+  assert.ok(lines.includes('const val SHARE_SCHEME = "x-secure-chat-share"'), "the chosen-callback data scheme");
+  assert.ok(!lines.some((l) => /AtomicInteger|EXTRA_REQUEST/.test(l)), "no requestCode counter, no id extra");
+  const receiver = lines.slice(lines.indexOf("private val shareChosenReceiver = object : BroadcastReceiver() {"));
+  assert.strictEqual(receiver[3], "if (intent.data?.schemeSpecificPart != p.id) return",
+    "the receiver matches the pick by the id in the intent's data");
   // Pentest r1 F1 / F2: the temp files' life. Every share file is revoked
   // before it is deleted, and nothing else deletes one.
-  assert.deepStrictEqual(kotlinFun(/^private fun purgeShares\(minAgeMs: Long\): File \{$/, "purgeShares").slice(1, -1), [
-    "val root = File(cacheDir, SHARE_DIR)",
+  assert.deepStrictEqual(kotlinFun(/^private fun expireShares\(\) \{$/, "expireShares").slice(1, -1), [
+    "shareTimer.removeCallbacksAndMessages(null)",
     "val now = System.currentTimeMillis()",
-    "root.listFiles()?.forEach { entry ->",
-    "if (minAgeMs == 0L || now - entry.lastModified() >= minAgeMs) revokeAndDelete(entry)",
-    "}",
-    "return root",
-  ], "purgeShares: under cacheDir; all (0) or only entries at least minAgeMs old; always through revokeAndDelete");
+    "val left = File(cacheDir, SHARE_DIR).listFiles()?.filter { entry ->",
+    "val expired = now - entry.lastModified() >= SHARE_TTL_MS",
+    "if (expired) revokeAndDelete(entry)",
+    "!expired",
+    "} ?: return",
+    "val next = left.minOfOrNull { it.lastModified() } ?: return",
+    "val due = (next + SHARE_TTL_MS - now).coerceIn(0, SHARE_TTL_MS)",
+    "shareTimer.postDelayed({ expireShares() }, due + 1000)",
+  ], "expireShares: only entries SHARE_TTL_MS old go, through revokeAndDelete; the timer re-arms for the next one due");
+  assert.deepStrictEqual(lines.filter((l) => /\bexpireShares\(\)|revokeAndDelete\(/.test(l)).sort(), [
+    "expireShares()",
+    "expireShares()",
+    "private fun expireShares() {",
+    "if (expired) revokeAndDelete(entry)",
+    "shareTimer.postDelayed({ expireShares() }, due + 1000)",
+    "private fun revokeAndDelete(entry: File) {",
+    "revokeAndDelete(it.dir)",
+  ].sort(), "expiry is the only way a chooser's file ends; revokeAndDelete is called by expiry and the \"error\" path only");
   const rad = kotlinFun(/^private fun revokeAndDelete\(entry: File\) \{$/, "revokeAndDelete");
   const revokeAt = rad.findIndex((l) => l.startsWith("revokeUriPermission(FileProvider.getUriForFile(this, filesAuthority, f), Intent.FLAG_GRANT_READ_URI_PERMISSION)"));
   assert.ok(revokeAt > 0 && revokeAt < rad.indexOf("f.delete()"), "revokeAndDelete revokes the file's URI BEFORE deleting it");
@@ -571,15 +593,17 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
   assert.ok(lines.includes('const val SHARE_DIR = "pad-share"'), "SHARE_DIR is pad-share");
   assert.ok(lines.includes("const val SHARE_TTL_MS = 10 * 60 * 1000L"), "a shared file lives 10 minutes");
   const onCreate = kotlinFun(/^override fun onCreate\(/, "onCreate");
-  const clearAt = onCreate.indexOf("purgeShares(SHARE_TTL_MS)");
+  const clearAt = onCreate.indexOf("expireShares()");
   assert.ok(clearAt > 0 && clearAt < onCreate.indexOf("configureWebView()"),
-    "expired pad files are removed at every start, before the page can run — and only expired ones (F2)");
-  assert.ok(!onCreate.includes("purgeShares(0)"), "F2: a start never wipes a recent share");
+    "expired pad files are removed at every start, before the page can run — only expired ones (F2), and the rest timed (R2-7b)");
   // Every result is answered at most once, by the bridge's slot (pentest r1 MD).
   const deliver = kotlinFun(/^private fun deliverPadFileResult\(id: String, outcome: String\) \{$/, "deliverPadFileResult");
   assert.strictEqual(deliver[1], "if (!padFiles.finish(id)) return", "deliverPadFileResult answers only the request in flight, once");
-  assert.ok(deliver.includes("binding.root.postDelayed({ purgeShares(SHARE_TTL_MS) }, SHARE_TTL_MS + 1000)"),
-    "after \"shared\" the file is purged once its lifetime is over");
+  // Fix round 2 (cold mi-4): only "error" (the chooser never ran) ends the
+  // file at once; "shared" and "cancelled" both leave it to expiry.
+  const errAt = deliver.indexOf("if (outcome == PadFileOutcome.ERROR) {");
+  assert.ok(errAt > 0 && deliver[errAt + 1] === "revokeAndDelete(it.dir)" && deliver[errAt + 2] === "} else {" &&
+    deliver[errAt + 3] === "expireShares()", "deliverPadFileResult: revoke+delete on \"error\" only, else expiry");
   // Save (pentest r1 F3 / F4).
   const save = kotlinFun(/^private fun onSaveDocument\(uri: Uri\?\) \{$/, "onSaveDocument");
   assert.strictEqual(save[1], "val req = padSave ?: return", "a save result without a request is ignored (nothing deleted)");
@@ -589,7 +613,7 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
   assert.ok(foreignAt > 0 && foreignAt < save.findIndex((l) => l.startsWith("thread(")), "the save URI is checked before any write");
   assert.deepStrictEqual(kotlinFun(/^private fun isForeignDocument\(uri: Uri\): Boolean \{$/, "isForeignDocument").slice(1, -1), [
     'if (uri.scheme != "content") return false',
-    "val authority = uri.authority ?: return false",
+    "val authority = uri.host ?: return false",
     "if (authority == filesAuthority) return false",
     "return packageManager.resolveContentProvider(authority, 0)?.packageName != packageName",
   ], "isForeignDocument: content:// only, never our FileProvider or any provider of ours");
@@ -599,8 +623,17 @@ const secureFlags = (call) => (call.match(/WindowManager\.LayoutParams\.FLAG_SEC
     "return",
     "}",
   ], "a request reaching a finishing activity starts nothing and frees the slot (pentest r1 MH)");
-  assert.ok(callAt(onCreate, onCreate.findIndex((l) => l.startsWith("ContextCompat.registerReceiver(")), "registerReceiver(")
-    .includes("ContextCompat.RECEIVER_NOT_EXPORTED"), "the chooser-callback receiver is NOT exported");
+  const reg = callAt(onCreate, onCreate.findIndex((l) => l.startsWith("ContextCompat.registerReceiver(")), "registerReceiver(");
+  assert.ok(reg.includes("ContextCompat.RECEIVER_NOT_EXPORTED"), "the chooser-callback receiver is NOT exported");
+  assert.ok(reg.includes("IntentFilter(shareChosenAction).apply { addDataScheme(SHARE_SCHEME) },"),
+    "…and filters on the data scheme the id travels in");
+  // Cold critic mi-5: every configuration change this activity can take in
+  // place is taken in place; a recreation reloads the page mid-Share/Save.
+  const act = /<activity\b[^>]*android:name="\.MainActivity"[^>]*>/.exec(manifest.replace(/<!--[\s\S]*?-->/g, ""));
+  assert.deepStrictEqual(/android:configChanges="([^"]*)"/.exec(act[0])[1].split("|").sort(), [
+    "orientation", "screenSize", "screenLayout", "smallestScreenSize", "density", "keyboard", "keyboardHidden",
+    "navigation", "touchscreen", "uiMode", "locale", "layoutDirection", "fontScale", "colorMode", "mcc", "mnc",
+    "grammaticalGender"].sort(), "MainActivity takes every configuration change in place (no page reload mid-Share/Save)");
 
   // (g) the FileProvider: not exported, one authority, one directory.
   const noComments = manifest.replace(/<!--[\s\S]*?-->/g, "");

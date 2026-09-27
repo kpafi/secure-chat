@@ -10,6 +10,8 @@ import android.content.IntentFilter
 import android.app.PendingIntent
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.text.InputType
 import android.view.WindowManager
 import android.webkit.ConsoleMessage
@@ -36,7 +38,6 @@ import org.json.JSONObject
 import org.securechat.app.databinding.ActivityMainBinding
 import java.io.File
 import java.io.IOException
-import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 
 /**
@@ -96,12 +97,15 @@ class MainActivity : AppCompatActivity() {
         const val SHARE_DIR = "pad-share"
 
         /**
-         * How long a shared pad file outlives its share (pentest r1 F2). Long
+         * How long a shared pad file lives (pentest r1 F2, fix round 2). Long
          * enough for a target that reads lazily (Bluetooth sends from a
          * background service after its screen has closed); short enough that
-         * no pad file lies around. Enforced at every start of the activity and
-         * by a timer after "shared"; a NEW share supersedes (revokes and
-         * deletes) every earlier one at once.
+         * no pad file lies around. It is the ONLY way a file that went to the
+         * chooser ends: revoked and deleted by [expireShares], which runs at
+         * every start of the activity and after every share, and re-arms
+         * itself for the next file due. Neither "cancelled" nor a new share
+         * ends an earlier file any more: either can be wrong about a target
+         * that is still reading (cold critic mi-4, pentest r2 R2-7a).
          */
         const val SHARE_TTL_MS = 10 * 60 * 1000L
 
@@ -113,16 +117,18 @@ class MainActivity : AppCompatActivity() {
          */
         const val SHARE_GRACE_MS = 1500L
 
-        private const val EXTRA_REQUEST = "org.securechat.app.extra.PAD_FILE_REQUEST"
-
         /**
-         * Pentest r1 F2: one chosen-target PendingIntent PER SHARE. They used
-         * to share requestCode 0 with FLAG_UPDATE_CURRENT, i.e. one
-         * PendingIntent for the whole app: a share in a second activity
-         * instance rewrote the request id inside the one the first instance's
-         * open chooser held. Process-wide, so two instances never collide.
+         * The chosen-target broadcast carries its request id as its DATA,
+         * `x-secure-chat-share:<requestId>` — one PendingIntent per share.
+         * Pentest r1 F2: one requestCode-0 PendingIntent for the whole app let
+         * a second instance rewrite the id inside the first one's. Pentest r2
+         * R2-6: a per-process requestCode counter restarts at 1, and extras are
+         * not part of a PendingIntent's identity, so a new process could be
+         * handed a still-live PendingIntent carrying an OLD id. Data is part of
+         * the identity (Intent.filterEquals), and the id is 64 random bits, so
+         * no two shares can ever share a PendingIntent.
          */
-        private val shareRequestCodes = AtomicInteger()
+        const val SHARE_SCHEME = "x-secure-chat-share"
     }
 
     // --- OTP pad files: export (share / save) and import (file chooser) -------
@@ -181,7 +187,7 @@ class MainActivity : AppCompatActivity() {
     private val shareChosenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val p = padShare ?: return
-            if (intent.getStringExtra(EXTRA_REQUEST) != p.id) return
+            if (intent.data?.schemeSpecificPart != p.id) return
             p.chosen = true
             if (p.returned) deliverPadFileResult(p.id, PadFileOutcome.SHARED)
         }
@@ -221,14 +227,16 @@ class MainActivity : AppCompatActivity() {
         // Pad files an earlier share left behind are revoked and deleted here,
         // before anything else can run — but only those past SHARE_TTL_MS
         // (pentest r1 F2). A second instance of this activity (another app can
-        // start it into its own task) or a recreation (dark mode, locale, font
-        // scale, a fold) must not delete a file just handed to a target that
-        // has not read it yet. See [purgeShares].
-        purgeShares(SHARE_TTL_MS)
+        // start it into its own task) or a restart must not delete a file just
+        // handed to a target that has not read it yet; the younger ones get a
+        // timer (pentest r2 R2-7b: a restart used to leave them untimed).
+        expireShares()
         // NOT exported: only broadcasts from this app's own uid arrive, which
         // includes the PendingIntent the system chooser sends back on our behalf.
         ContextCompat.registerReceiver(
-            this, shareChosenReceiver, IntentFilter(shareChosenAction), ContextCompat.RECEIVER_NOT_EXPORTED,
+            this, shareChosenReceiver,
+            IntentFilter(shareChosenAction).apply { addDataScheme(SHARE_SCHEME) },
+            ContextCompat.RECEIVER_NOT_EXPORTED,
         )
 
         configureWebView()
@@ -489,14 +497,18 @@ class MainActivity : AppCompatActivity() {
      * [SHARE_GRACE_MS]) is "cancelled".
      */
     private fun startShare(req: PadFileRequest) {
-        // Pentest r1 F1: a share SUPERSEDES every earlier one. Its URI grants
-        // are revoked and its file deleted now, before the new file exists.
-        val root = purgeShares(0)
-        // …and the new URI is unique to this request: content://…/pad-share/
-        // <requestId>/<name>. Android keys a grant by the URI, and the name is
-        // only minute-resolution, so a same-name file at the old path would be
-        // readable through any grant still held on it. The target sees only
-        // the last segment (FileProvider's display name): the neutral name.
+        // Fix round 2 (cold critic mi-4, pentest r2 R2-7a): a new share no
+        // longer revokes and deletes the earlier ones. "Didn't arrive? Send it
+        // again", or a share in a second instance, would cut off a Bluetooth
+        // send still reading the first file. Each share has its own URI (F1,
+        // below), so an old grant reaches only the old file, and every file
+        // ends by the same rule: SHARE_TTL_MS, revoked, then deleted.
+        val root = File(cacheDir, SHARE_DIR)
+        // Pentest r1 F1: the URI is unique to this request: content://…/
+        // pad-share/<requestId>/<name>. Android keys a grant by the URI, and
+        // the name is only minute-resolution, so a same-name file at a shared
+        // path would be readable through any grant still held on it. The
+        // target sees only the last segment (the display name): the neutral name.
         val dir = File(root, req.id)
         if (!dir.isDirectory && !dir.mkdirs()) throw IOException("cannot create the share directory")
         val file = File(dir, req.name)
@@ -515,11 +527,11 @@ class MainActivity : AppCompatActivity() {
         // Pentest r1 F5: IMMUTABLE. The chooser fills EXTRA_CHOSEN_COMPONENT
         // into a mutable PendingIntent only; an immutable one is still SENT on
         // a pick, with the fill-in dropped — and the pick is all we read. Our
-        // own request id rides in the intent itself. Explicit (package set),
-        // a fresh requestCode per share (F2), one shot.
+        // own request id is the intent's data ([SHARE_SCHEME]), so each share
+        // has its own PendingIntent. Explicit (package set), one shot.
         val chosen = PendingIntent.getBroadcast(
-            this, shareRequestCodes.incrementAndGet(),
-            Intent(shareChosenAction).setPackage(packageName).putExtra(EXTRA_REQUEST, req.id),
+            this, 0,
+            Intent(shareChosenAction).setPackage(packageName).setData(Uri.fromParts(SHARE_SCHEME, req.id, null)),
             PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE,
         )
         shareLauncher.launch(Intent.createChooser(send, getString(R.string.share_pad_title), chosen.intentSender))
@@ -594,7 +606,13 @@ class MainActivity : AppCompatActivity() {
      */
     private fun isForeignDocument(uri: Uri): Boolean {
         if (uri.scheme != "content") return false
-        val authority = uri.authority ?: return false
+        // Pentest r2 R2-5: the HOST, not the authority. A user-qualified
+        // `content://0@org.securechat.app.files/…` has the authority
+        // "0@org.securechat.app.files", which names no provider — yet
+        // ContentResolver strips the `<userId>@` and opens OURS. The host is
+        // the authority without it. (A user id on a foreign provider stays
+        // allowed: that is how a work-profile document comes back.)
+        val authority = uri.host ?: return false
         if (authority == filesAuthority) return false
         return packageManager.resolveContentProvider(authority, 0)?.packageName != packageName
     }
@@ -612,14 +630,22 @@ class MainActivity : AppCompatActivity() {
         padShare?.let {
             if (it.id == id) {
                 padShare = null
-                if (outcome == PadFileOutcome.SHARED) {
-                    // The target holds a URI grant and may read later (Bluetooth
-                    // does, from a background service): keep the file for
-                    // SHARE_TTL_MS, then revoke and delete it.
-                    binding.root.postDelayed({ purgeShares(SHARE_TTL_MS) }, SHARE_TTL_MS + 1000)
-                } else {
-                    // Nobody was granted the file: revoke (belt and braces) and delete now.
+                if (outcome == PadFileOutcome.ERROR) {
+                    // The chooser never ran (it failed to start, or the file
+                    // could not be written): nobody can hold a grant. Go now.
                     revokeAndDelete(it.dir)
+                } else {
+                    // "shared" AND "cancelled" (fix round 2, cold critic mi-4):
+                    // "cancelled" only means no pick was reported within
+                    // SHARE_GRACE_MS, and Android may hold that broadcast back,
+                    // so a target may hold a grant and be reading. Revoking or
+                    // deleting now would cut it off. The file lives out
+                    // SHARE_TTL_MS like a shared one. A pick reported after
+                    // "cancelled" is NOT sent to the page as a correction: the
+                    // contract answers each request once, and the page's
+                    // "Not shared." leaves "Share…" there to use again, which
+                    // no longer disturbs this file.
+                    expireShares()
                 }
             }
         }
@@ -630,27 +656,34 @@ class MainActivity : AppCompatActivity() {
     private val filesAuthority by lazy { "$packageName.files" }
 
     /**
-     * Revoke and delete every share in cacheDir/[SHARE_DIR] whose directory is
-     * at least [minAgeMs] old (0 = all of them), and return the directory.
-     *
-     *  * 0 before every new share: a share supersedes all earlier ones (F1).
-     *  * [SHARE_TTL_MS] at every start of the activity and by the timer after
-     *    "shared" (F2): a file handed to a target outlives the share by that
-     *    long, not "until the next share or start", and a second instance or
-     *    a recreation no longer deletes a file a target has yet to read.
+     * Revoke and delete every share in cacheDir/[SHARE_DIR] at least
+     * [SHARE_TTL_MS] old, then arm a timer for when the next one comes due.
+     * Called at every start of the activity and after every share's result;
+     * the timer calls it again. A file a target was handed therefore lives
+     * SHARE_TTL_MS (plus up to a second), whether or not the activity was
+     * recreated or a second instance started meanwhile. Bound, honestly: if
+     * the PROCESS dies, no timer survives it, and a file younger than
+     * SHARE_TTL_MS at that moment goes at the next start of the app (or with
+     * its timer from there) — it stays app-private and un-revoked until then.
      *
      * The file is the transfer-passphrase-encrypted envelope, in app-private
-     * cache, never backed up (allowBackup=false, dataExtractionRules). A file
-     * left by a process that died stays until the next start or share.
+     * cache, never backed up (allowBackup=false, dataExtractionRules).
      */
-    private fun purgeShares(minAgeMs: Long): File {
-        val root = File(cacheDir, SHARE_DIR)
+    private fun expireShares() {
+        shareTimer.removeCallbacksAndMessages(null)
         val now = System.currentTimeMillis()
-        root.listFiles()?.forEach { entry ->
-            if (minAgeMs == 0L || now - entry.lastModified() >= minAgeMs) revokeAndDelete(entry)
-        }
-        return root
+        val left = File(cacheDir, SHARE_DIR).listFiles()?.filter { entry ->
+            val expired = now - entry.lastModified() >= SHARE_TTL_MS
+            if (expired) revokeAndDelete(entry)
+            !expired
+        } ?: return
+        val next = left.minOfOrNull { it.lastModified() } ?: return
+        val due = (next + SHARE_TTL_MS - now).coerceIn(0, SHARE_TTL_MS)
+        shareTimer.postDelayed({ expireShares() }, due + 1000)
     }
+
+    /** The share-expiry timer. Not cleared on destroy: a file handed out must still expire. */
+    private val shareTimer = Handler(Looper.getMainLooper())
 
     /**
      * Pentest r1 F1: every file is un-granted BEFORE it is deleted. Android
