@@ -9,8 +9,19 @@
 #   - box (package 5, deploy/README.md "The unit's sandbox"): the second-tier
 #     sandboxed systemd unit, the Caddyfile whose default logger is discarded,
 #     code root-owned, the dev files the old rsync left behind removed.
+#   - Caddy (fixed after the 0.4.0 run): /etc/caddy/Caddyfile is SHARED with
+#     other services on the box. The 0.4.0 run installed deploy/Caddyfile over
+#     it wholesale and took the Kiosk site down (2026-09-26 20:13 UTC) until
+#     Kiosk's own deploy put its block back. Step 4 now installs deploy/Caddyfile
+#     (which imports /etc/caddy/sites.d/*.caddy) PLUS every `# >>> name` ...
+#     `# <<< name` block of the live file, carried over by
+#     deploy/caddy-compose.py, and never touches /etc/caddy/sites.d/'s files.
 #
-# Run from the repo root, on a clean checkout of v0.4.0:
+# Run from the repo root, on a clean checkout of master at or after the
+# shared-Caddy fix - NOT of the tag v0.4.0: the tag's copy of this script
+# installs deploy/Caddyfile over the shared /etc/caddy/Caddyfile wholesale
+# (that is what took the Kiosk site down). This copy refuses a checkout
+# without deploy/caddy-compose.py, but nothing can stop the tag's own copy.
 #   bash deploy/deploy-2026-09-26-v0.4.0.sh
 #
 # Safe to re-run after a partial failure: every step either checks before it
@@ -28,7 +39,11 @@
 #
 # TEMPLATE FOR THE NEXT RELEASE. This is the newest deploy script, so the next
 # one is a copy of it. backend/tests/test_ship_list.py holds every
-# non-historical deploy-*.sh to the shared lists and to root ownership.
+# non-historical deploy-*.sh to the shared lists and to root ownership, and
+# backend/tests/test_caddy_shared.py runs its Caddy steps. A release that
+# removes or renames a top-level entry of deploy/Caddyfile (a site, a
+# snippet, the import) must say so: step 4 refuses the live file until the
+# old entry is removed from it by hand ("would be dropped").
 set -euo pipefail
 # Deploy of 2026-09-26: the first run stopped in 1b because `comm` ran under
 # the caller's locale (de_DE) while the lists were sorted with LC_ALL=C; the
@@ -50,7 +65,7 @@ on_exit() {
     preflight|stage) echo "   nothing on the box was changed (the relay is running as before)." ;;
     copy|ownership)  echo "   the relay is STOPPED and its code may be half-updated: fix the cause and re-run this script." ;;
     unit)            echo "   see the lines above: step 3 rolled back and says whether the relay is up." ;;
-    caddy)           echo "   the relay runs 0.4.0; Caddy was restored to its previous Caddyfile (see above)." ;;
+    caddy)           echo "   the relay runs 0.4.0; Caddy runs its previous Caddyfile, left as it was or restored (see above)." ;;
     verify)          echo "   everything is deployed but a check failed: read the lines marked FAIL." ;;
   esac
   echo "   backups of this run: $BOX:$W"
@@ -67,14 +82,14 @@ grep -q "\"frame-src 'none'; \"" backend/main.py || { echo "backend/main.py CSP 
 grep -q 'by: str = Query' backend/accounts.py || { echo "backend/accounts.py has no vouches ?by= (package 6)"; exit 1; }
 grep -q '^IPAddressDeny=any' deploy/secure-chat.service || { echo "deploy/secure-chat.service is not the sandboxed unit (package 5)"; exit 1; }
 grep -q 'log default' deploy/Caddyfile || { echo "deploy/Caddyfile does not discard the default logger (package 5)"; exit 1; }
+grep -qx 'import /etc/caddy/sites.d/\*.caddy' deploy/Caddyfile || { echo "deploy/Caddyfile does not import the other services' sites.d"; exit 1; }
+test -f deploy/caddy-compose.py || { echo "no deploy/caddy-compose.py (it keeps the other services' Caddy blocks)"; exit 1; }
 test -f deploy/ship-excludes.txt && test -f deploy/rsync-excludes.txt || { echo "no shared exclude lists"; exit 1; }
 # Whatever is in the working tree ships, so it must be what was reviewed.
 if [ -n "$(git status --porcelain -- backend client deploy)" ]; then
   echo "uncommitted or untracked files under backend/ client/ deploy/:"; git status --short -- backend client deploy; exit 1
 fi
 echo "    checkout: $(git describe --tags --always --dirty) ($(git rev-parse --short HEAD))"
-git describe --exact-match --tags HEAD 2>/dev/null | grep -qx v0.4.0 \
-  || echo "    WARNING: HEAD is not the tag v0.4.0 (fine for a re-run from the release branch; the release is the tag)"
 
 # What the copy in step 1 ships, computed from the same two lists (rsync's
 # rule for a slash-less pattern: it matches any path component). Step 1b
@@ -98,9 +113,10 @@ echo "$SHIPPED" | grep -qx client/durable.js || { echo "the ship list computatio
 PHASE=stage
 echo "==> 0a. stage the new unit and Caddyfile on the box (nothing installed yet)"
 ssh "$BOX" "install -d -m 0700 $W $W/stage"
-scp -q deploy/secure-chat.service deploy/Caddyfile "$BOX:$W/stage/"
+scp -q deploy/secure-chat.service deploy/Caddyfile deploy/caddy-compose.py "$BOX:$W/stage/"
 cmp <(ssh "$BOX" "cat $W/stage/secure-chat.service") deploy/secure-chat.service
 cmp <(ssh "$BOX" "cat $W/stage/Caddyfile") deploy/Caddyfile
+cmp <(ssh "$BOX" "cat $W/stage/caddy-compose.py") deploy/caddy-compose.py
 
 echo "==> 0b. backups, with the relay STOPPED so the WAL is checkpointed first"
 ssh "$BOX" bash -s -- "$W" <<'REMOTE'
@@ -256,29 +272,82 @@ echo "==> 4. Caddy: validate the new Caddyfile BEFORE the reload, restore on any
 # The /ios/ block is deployed with the rest (one Caddyfile, the one the tests
 # hold): /srv/secure-chat-ios does not exist until an IPA is published, so
 # https://$HOST/ios/... answers 404 until then (checked in step 5).
+# /etc/caddy/Caddyfile is shared with other services (deploy/README.md, "One
+# Caddy, several services"): what is installed is deploy/Caddyfile plus the
+# live file's marker blocks, and /etc/caddy/sites.d/ is theirs.
 ssh "$BOX" bash -s -- "$W" <<'REMOTE'
 set -uo pipefail
 W=$1
 NEW=$W/stage/Caddyfile
+OUT=$W/Caddyfile.composed
 LIVE=/etc/caddy/Caddyfile
-if ! caddy validate --config "$NEW" --adapter caddyfile >/dev/null 2>"$W/caddy-validate.err"; then
-  echo "!! the new Caddyfile does not validate; nothing changed:"; sed 's/^/    | /' "$W/caddy-validate.err"; exit 1
+SITES=/etc/caddy/sites.d
+# Created once, if missing; an existing one keeps its owner, mode and files.
+if [ ! -d "$SITES" ]; then
+  install -d -m 0755 -o root -g root "$SITES" || { echo "!! could not create $SITES; nothing changed"; exit 1; }
+  echo "    created $SITES (empty)"
 fi
-if cmp -s "$NEW" "$LIVE"; then
+echo "    other services' files in $SITES: $(ls -A "$SITES" | tr '\n' ' ')"
+# Caddy imports whatever is in there into the front end of secure-chat: it
+# must be root's alone. Not fixed here (never touched), refused.
+BAD=$(find "$SITES" -maxdepth 1 \( ! -user root -o -perm /022 -o -type l \) -printf '%M %u %p\n')
+if [ -n "$BAD" ]; then
+  echo "!! $SITES or a file in it is not root's alone (non-root owner, group/other-writable, or a symlink); nothing changed:"
+  echo "$BAD" | sed 's/^/    | /'; exit 1
+fi
+# The restore point is the file as it is NOW (another service's deploy may
+# have changed it since the backup in 0b).
+cp -a "$LIVE" "$W/Caddyfile.before-step4" || { echo "!! could not back up $LIVE; nothing changed"; exit 1; }
+# deploy/Caddyfile + the marker blocks other services still keep in the live
+# file (Kiosk until it writes sites.d/kiosk.caddy). Refuses on broken markers,
+# on anything unmarked that would be dropped, and on their content naming our
+# own site address.
+if ! python3 "$W/stage/caddy-compose.py" "$NEW" "$W/Caddyfile.before-step4" "$OUT" "$SITES" | sed 's/^/    /'; then
+  echo "!! could not compose the new Caddyfile (see above); nothing changed"; exit 1
+fi
+if ! caddy validate --config "$OUT" --adapter caddyfile >/dev/null 2>"$W/caddy-validate.err"; then
+  echo "!! the new Caddyfile does not validate; nothing changed (the error may also be in $SITES or a carried block):"
+  sed 's/^/    | /' "$W/caddy-validate.err"; exit 1
+fi
+# Another service's deploy may have replaced the file meanwhile (Kiosk's
+# mv): installing now would undo its change.
+if ! cmp -s "$LIVE" "$W/Caddyfile.before-step4"; then
+  echo "!! $LIVE changed while this step ran (another service's deploy?); nothing changed, re-run"; exit 1
+fi
+if cmp -s "$OUT" "$LIVE"; then
   echo "    /etc/caddy/Caddyfile is already the new one (re-run); reloading anyway"
-else
-  install -m 0644 -o root -g root "$NEW" "$LIVE"
+elif ! install -m 0644 -o root -g root "$OUT" "$LIVE"; then
+  echo "!! could not install $OUT; restoring $W/Caddyfile.before-step4"
+  cp -a "$W/Caddyfile.before-step4" "$LIVE" || echo "!! restore failed too: by hand, cp -a $W/Caddyfile.before-step4 $LIVE"
+  exit 1
 fi
 if caddy validate --config "$LIVE" --adapter caddyfile >/dev/null 2>"$W/caddy-validate.err" \
    && systemctl reload caddy && systemctl is-active --quiet caddy; then
   date -u +%Y-%m-%dT%H:%M:%SZ > "$W/caddy-reloaded-at"
   echo "    caddy: $(systemctl is-active caddy), new Caddyfile live"
 else
-  echo "!! validate or reload failed; restoring $W/Caddyfile:"
   sed 's/^/    | /' "$W/caddy-validate.err"
-  cp -a "$W/Caddyfile" "$LIVE"
-  systemctl reload caddy || systemctl restart caddy
-  echo "    caddy: $(systemctl is-active caddy) on the previous Caddyfile"
+  if ! cmp -s "$OUT" "$LIVE"; then
+    # Not what this step installed: someone else's newer file, theirs to fix.
+    echo "!! validate or reload failed, and $LIVE is no longer the file this step installed; left as it is"
+    echo "!! (this step's starting point: $W/Caddyfile.before-step4)"
+    exit 1
+  fi
+  echo "!! validate or reload failed; restoring $W/Caddyfile.before-step4:"
+  if ! cp -a "$W/Caddyfile.before-step4" "$LIVE"; then
+    echo "!! restore failed: by hand, cp -a $W/Caddyfile.before-step4 $LIVE && systemctl reload caddy"; exit 1
+  fi
+  # Reload only a file that validates (it imports sites.d, so it is not
+  # known-good by itself), and never restart: a failed reload leaves Caddy
+  # on its last good config, a failed restart leaves every site down.
+  if caddy validate --config "$LIVE" --adapter caddyfile >/dev/null 2>"$W/caddy-validate.err" \
+     && systemctl reload caddy; then
+    echo "    caddy: $(systemctl is-active caddy) on the previous Caddyfile"
+  else
+    sed 's/^/    | /' "$W/caddy-validate.err"
+    echo "!! the previous Caddyfile does not load either (a file in $SITES?): not reloaded."
+    echo "!! Caddy keeps running its last good config; $LIVE is back to its state before step 4. Do not restart Caddy before fixing it."
+  fi
   exit 1
 fi
 REMOTE
@@ -324,7 +393,18 @@ want "--no-proxy-headers" 1 "$(tr '\0' '\n' < "/proc/$PID/cmdline" 2>/dev/null |
 want "listens on :8000" "127.0.0.1:8000" "$(ss -ltnH 'sport = :8000' | awk '{print $4}' | sort -u | tr '\n' ' ' | sed 's/ $//')"
 want "files owned by securechat" 0 "$(find /opt/secure-chat -user securechat 2>&1 | wc -l)"
 want "installed unit = the new one" same "$(cmp -s "$W/stage/secure-chat.service" /etc/systemd/system/secure-chat.service && echo same || echo differs)"
-want "Caddyfile = the new one" same "$(cmp -s "$W/stage/Caddyfile" /etc/caddy/Caddyfile && echo same || echo differs)"
+want "Caddyfile = the one step 4 composed" same "$(cmp -s "$W/Caddyfile.composed" /etc/caddy/Caddyfile && echo same || echo differs)"
+# ...which begins with deploy/Caddyfile byte for byte (the discarded default
+# logger, our site, the sites.d import), whatever follows it:
+want "Caddyfile begins with deploy/Caddyfile" same "$(cmp -s -n "$(stat -c %s "$W/stage/Caddyfile")" "$W/stage/Caddyfile" /etc/caddy/Caddyfile && echo same || echo differs)"
+# ...and holds the marker blocks it held before step 4, byte for byte:
+want "other services' marker blocks kept" same "$(python3 -c '
+import importlib.util as u, sys
+spec = u.spec_from_file_location("cc", sys.argv[3]); cc = u.module_from_spec(spec); spec.loader.exec_module(cc)
+rd = lambda p: open(p, encoding="utf-8", newline="").read()
+print("same" if cc.marker_blocks(rd(sys.argv[1])) == cc.marker_blocks(rd(sys.argv[2])) else "differs")
+' "$W/Caddyfile.before-step4" /etc/caddy/Caddyfile "$W/stage/caddy-compose.py" 2>&1)"
+want "/etc/caddy/sites.d" directory "$( [ -d /etc/caddy/sites.d ] && echo directory || echo missing)"
 echo "    sandbox: $(systemd-analyze security secure-chat --no-pager 2>/dev/null | tail -1)   (want about 1.1 OK)"
 echo "    /var/lib/secure-chat: $(stat -c '%U:%G %a' /var/lib/secure-chat) (want securechat:securechat 700)"
 [ "$FAILS" -eq 0 ] || { echo "!! $FAILS check(s) failed"; exit 1; }
@@ -347,5 +427,7 @@ echo "    real traffic)."
 echo "  - after that traffic, on the box:"
 echo "      journalctl -u caddy --since \"\$(cat $W/caddy-reloaded-at)\" --no-pager"
 echo "    must hold no client IP (with the default logger discarded: ACME lines only)."
+echo "  - the other services' sites on this box still answer (kiosk.$HOST: its login"
+echo "    page); step 4 listed what it carried over and what is in /etc/caddy/sites.d."
 echo "  - backups of this run: $BOX:$W ; pre-0.4.0 state: $BOX:/root/secure-chat-pre-0.4.0"
 echo

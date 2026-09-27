@@ -355,6 +355,47 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   `/root/secure-chat-0.4.0-2026-09-26-221305`. Left on the box, not shipped,
   decide by hand: `/opt/secure-chat/backend/.venv` (60 MB, June, unused — the
   unit runs `/opt/secure-chat/venv`) and `/opt/secure-chat/backend/tests`.
+- **Caddy is shared — the 0.4.0 deploy took the Kiosk site down** (Caddy
+  reload 20:13:23 UTC installed deploy/Caddyfile wholesale over
+  /etc/caddy/Caddyfile, dropping Kiosk's `# >>> kiosk … # <<< kiosk` block;
+  back at 20:27 with Kiosk's next deploy). Fixed in the repo, **not on the
+  box yet**: deploy/Caddyfile now ends with `import
+  /etc/caddy/sites.d/*.caddy`; deploy step 4 creates sites.d if missing (never
+  touches its files), installs deploy/Caddyfile + the live file's marker
+  blocks (`deploy/caddy-compose.py`, refuses broken markers), keeps
+  validate-before-install and restore; step 5 checks the composed file and
+  the marker blocks. pentest-new-code round 1 (2 Medium, 5 Low, 1 Info, 1
+  lead), all addressed: compose refuses unmarked content it would drop and
+  foreign content (carried blocks, sites.d files) naming our site address,
+  keeps bytes (no newline translation); step 4 refuses a sites.d that is not
+  root's alone, re-checks the live file before install (concurrent Kiosk
+  deploy), checks install/cp, and never restores over someone else's newer
+  file; step 5 checks the file begins with deploy/Caddyfile and the marker
+  blocks byte for byte; the release notes say to deploy from master (the
+  tag's copy of the script is the wholesale one, nothing can stop it) and
+  to leave the Caddyfile on rollback. Round 2 (no High; 1 Low-Medium, 2 Low,
+  2 Info), all addressed: only site-block headers count as our addresses
+  (not the `import` line), host check case-insensitive; the parser refuses
+  what it cannot model (heredoc, quote open across lines, CR-only/odd line
+  endings) instead of possibly dropping a site behind a hidden brace; the
+  restore reloads only a file that validates and never restarts Caddy; the
+  unreachable tag refusal removed. Residual (README): only top-level entries
+  are compared (foreign content inside OUR site/global block is not kept),
+  and the host check is against mistakes, not a sandbox (`*.sslip.io`,
+  `{$ENV}`, nested imports pass). Tests: `backend/tests/test_caddy_shared.py`
+  (runs step 4's and step 5's own remote code against a temp /etc/caddy,
+  fake caddy/systemctl/install); 46 hand-run mutants red, one equivalent
+  (dropping `-type l`: `-perm /022` already matches a symlink).
+  deploy/README.md "One Caddy, several services". Commit `5595cf0`
+  (branch claude/quirky-curie-d6221f, not merged, not pushed). Owner
+  (2026-09-26): no tag; it goes live with the next secure-chat deploy from
+  master. Kiosk must not switch to sites.d before that (its site would not
+  be imported) - its deploy should switch only once the live Caddyfile has
+  the `import /etc/caddy/sites.d/*.caddy` line.
+  Follow-ups: (1) the new Caddyfile goes live with the next secure-chat
+  deploy (or a Caddy-only run, owner's call); (2) in nachrichtenapp, Kiosk's
+  deploy should write `/etc/caddy/sites.d/kiosk.caddy` and remove its marker
+  block in the same step — only after (1).
 - **Phone:** the 0.4.0 debug APK (versionCode 5) is built
   (`~/secure-chat-apk/secure-chat-0.4.0-debug.apk`) but NOT installed — the
   phone was not connected. Then: login + a sealed message (release notes
