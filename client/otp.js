@@ -414,13 +414,18 @@ function missingRecordError() {
 // ---- generation ------------------------------------------------------------
 
 // Generate a fresh pristine pad. The generator is always role 0.
+const localStamp = (d) => {
+  const z = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}:${z(d.getMinutes())}`;
+};
 export async function generatePad({ label, totalBytes, fingerBytes }) {
   if (!Number.isInteger(totalBytes) || totalBytes < 128 || totalBytes % 2 !== 0) {
     throw new Error("pad size must be an even number of bytes");
   }
   return {
     padId: randomId(),
-    label: label || "pad " + new Date().toISOString().slice(0, 16).replace("T", " "),
+    // Local time, like the export file's name (fix round 1, cold n-1: this was UTC).
+    label: label || "pad " + localStamp(new Date()),
     regionSize: totalBytes / 2,
     role: 0,
     createdAt: Date.now(),

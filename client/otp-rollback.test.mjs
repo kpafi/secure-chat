@@ -1629,4 +1629,19 @@ console.log("OK  fix round 2: FULL fails closed; re-import advice only where a f
 console.log("OK  M9: exportPad refuses a received pad; importPad refuses recipientRole 0 (exact sentences)");
 console.log("OK  F7: importPad accepts only the 600k iterations every export writes — refused before any KDF");
 
+// Fix round 1 (cold n-1): an unnamed pad is named by LOCAL time, like the
+// export file's name (it was UTC). Compared with the local fields of the
+// same instant (under TZ=UTC the two would agree — the mutant below is run
+// with a non-UTC TZ).
+{
+  const t0 = new Date();
+  const p = await otp.generatePad({ label: "", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const z = (n) => String(n).padStart(2, "0");
+  const at = (d) => `pad ${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}:${z(d.getMinutes())}`;
+  const t1 = new Date();
+  assert.ok(p.label === at(t0) || p.label === at(t1), `n-1: the default label is local time (${p.label})`);
+  p.bytes.fill(0);
+}
+console.log("OK  n-1: an unnamed pad is named by local time");
+
 console.log("\nAll OTP rollback checks passed.");
