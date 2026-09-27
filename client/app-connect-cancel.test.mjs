@@ -660,7 +660,7 @@ function answerThenRelayClose(ws, frame) {
     await ws.deliver(frame);
     await settle();
     assert.strictEqual(el("scrChat").hidden, true, "C3-2: " + what + " on a CLOSING socket draws no chat screen");
-    assert.ok(!/connected|waiting for approval/.test(el("status").textContent), "C3-2: ...and says neither 'connected' nor 'waiting' (" + what + ")");
+    assert.ok(!/^(connected|waiting for approval)$/.test(el("status").textContent), "C3-2: ...and says neither 'connected' nor 'waiting' (" + what + ")");
     assert.ok(!ws.sent.some((f) => f.type === "key" || f.type === "knock"), "C3-2: ...and sends no hello or knock (" + what + ")");
     assert.ok(cancelShown(), "C3-2: Cancel stays offered on the CLOSING socket (" + what + ")");
     await ws.deliver({ type: "error", reason: "room closed" }); // the relay's reason, parked for the close
@@ -674,17 +674,20 @@ function answerThenRelayClose(ws, frame) {
       "R1-3: the relay's own reason is on the room screen, not the join timeout (" + what + ")");
     assert.strictEqual(disconnectedLines(), before, "C3-2: a seat withheld on CLOSING is not narrated as a session end (" + what + ")");
   }
-  {
-    // Cancel on a CLOSING socket whose answer was withheld: back at once.
+  for (const frame of [{ type: "joined", role: "owner" }, { type: "pending" }]) {
+    // Cancel on a CLOSING socket whose answer was withheld: back at once, the
+    // socket still closing (pentest C3-2 r2 R2-2: shown AND working).
+    const what = JSON.stringify(frame);
     const ws = await connectToSocket();
     ws.open();
     stallClose(ws);
     ws.readyState = 2;
-    await ws.deliver({ type: "joined", role: "owner" });
+    await ws.deliver(frame);
     await settle();
     el("connectCancel").click();
     await settle();
-    assertBackOnRoom("C3-2 (Cancel on a CLOSING socket)");
+    assert.strictEqual(ws.readyState, 2, "fixture: the socket is still closing (" + what + ")");
+    assertBackOnRoom("C3-2 (Cancel on a CLOSING socket after " + what + ")");
   }
 
   const ws2 = await connectToSocket();
@@ -696,6 +699,23 @@ function answerThenRelayClose(ws, frame) {
   assertBackOnRoom("C3-2 (unqueued guest on a CLOSING socket)");
   assert.match(el("roomHint").textContent, /^This relay put you in the room without the owner approving you\./,
     "C3-2: a refusal on a CLOSING socket (its onclose has not run) is still said at once");
+  {
+    // Pentest C3-2 r2 R2-1, decided: a `pending` withheld on CLOSING sends no
+    // knock, so a `joined:guest` behind it is a seat no owner could have
+    // approved — the unqueued-guest refusal, at once, over a reason parked later.
+    const ws = await connectToSocket();
+    ws.open();
+    stallClose(ws);
+    ws.readyState = 2;
+    await ws.deliver({ type: "pending" });
+    await ws.deliver({ type: "joined", role: "guest" });
+    await ws.deliver({ type: "error", reason: "room closed" }); // behind the refusal: dropped
+    await settle();
+    assert.ok(!ws.sent.some((f) => f.type === "knock"), "fixture: the withheld pending sent no knock");
+    assertBackOnRoom("R2-1 (pending, joined:guest on a CLOSING socket)");
+    assert.match(el("roomHint").textContent, /^This relay put you in the room without the owner approving you\./,
+      "R2-1: a guest seat after a pending withheld on CLOSING is refused as unqueued (no knock was sent)");
+  }
   console.log("OK  C3-2: on a CLOSING socket no seat is drawn, the deadline ends, Cancel works, a refusal is still said (executed)");
 }
 {
@@ -715,7 +735,18 @@ function answerThenRelayClose(ws, frame) {
   assert.strictEqual(el("roomHint").textContent, "The relay tried to change your role in this room. Disconnected.",
     "role change: a seated guest re-cast as the owner is refused, with its sentence");
   assert.strictEqual(hellos(), 1, "role change: ...and no second hello is sent");
-  console.log("OK  C3-2 r1: a role the relay changes after the seat is refused (executed)");
+  // Before any seat (pentest C3-2 r2 R2-5): `pending` made us a guest, so a
+  // `joined:owner` is the relay re-casting us, refused — not a guest seat.
+  const ws2 = await connectToSocket();
+  ws2.open();
+  await ws2.deliver({ type: "pending" });
+  await ws2.deliver({ type: "joined", role: "owner" });
+  await settle();
+  assertBackOnRoom("role change before the seat");
+  assert.strictEqual(el("roomHint").textContent, "The relay tried to change your role in this room. Disconnected.",
+    "role change: a queued guest told it is the owner is refused, with its sentence");
+  assert.ok(!ws2.sent.some((f) => f.type === "key"), "role change: ...and no hello is sent");
+  console.log("OK  C3-2 r1/r2: a role the relay changes, before or after the seat, is refused (executed)");
 }
 {
   // The refusals of the answer take no seat: `joined` is written after them,

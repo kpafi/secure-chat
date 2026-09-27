@@ -4260,7 +4260,10 @@ async function handleMessage(room, raw, sock) {
       // which does not, and comes after the CLOSED break; the role-change
       // check reads `roomRole`, null after onclose, so it cannot fire there.
       // The seat itself needs an OPEN socket (below). The same shape in
-      // `pending`.
+      // `pending` — whose CLOSING branch sends no knock and leaves `wasPending`
+      // false, so a `joined:guest` behind it is refused as unqueued. That is
+      // true from this page's view (no owner could have approved a knock it
+      // never sent) and deliberate (C3-2 r2 R2-1).
       // An older relay answers `join` with a bare {"joined"} — no role, no
       // admission control. Refusing beats silently running the protocol this
       // fix removed: the room would again be first-come-first-served and the

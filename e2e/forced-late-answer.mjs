@@ -170,17 +170,22 @@ async function attempt(m) {
   // A build that failed a previous case may have left a chat screen up:
   // ‹ Back to room, so every case starts from Connect.
   await page.evaluate(() => { if (!document.querySelector("#scrChat").hidden) document.querySelector("#toRoom").click(); });
-  const logBefore = (await state()).log.length;
+  const logBefore = (await state()).log;
   await page.$eval("#connect", (e) => e.click());
   await page.waitForFunction(() => window.__trail.includes("close-event"), { timeout: 15000 }).catch(() => {});
   await sleep(1000);
   const s = await state();
-  s.newLog = s.log.slice(logBefore);
+  s.newLog = s.log.slice(logBefore.length);
+  // The whole log's text, not just its new lines: addLine folds a repeated
+  // line into "(×2)" in place (pentest C3-2 r2 R2-3).
+  s.logUnchanged = JSON.stringify(s.log) === JSON.stringify(logBefore);
   // Fixture: the relay really parked the pump before its answer — the prompt
-  // went up, and came down only at the close event.
+  // went up, and came down only at the close event (onclose settles it).
   const up = s.trail.indexOf("admit.hidden=false"), closed = s.trail.indexOf("close-event");
-  check(`fixture (${m}): the approval prompt parked the pump, the relay closed with the answer behind it`,
-    up >= 0 && closed > up && s.rs === 3 && seen.includes("key"), JSON.stringify({ trail: s.trail, rs: s.rs, seen }));
+  const downEarly = up >= 0 && closed > up && s.trail.slice(up + 1, closed).includes("admit.hidden=true");
+  check(`fixture (${m}): the approval prompt parked the pump until the relay's close, the answer behind it`,
+    up >= 0 && closed > up && !downEarly && s.trail.slice(closed).includes("admit.hidden=true") && s.rs === 3 && seen.includes("key"),
+    JSON.stringify({ trail: s.trail, rs: s.rs, seen }));
   return s;
 }
 const onRoom = (s) => !s.chat && s.status === "disconnected" && !s.connectDisabled;
@@ -192,7 +197,7 @@ console.log("owner: joined:owner behind the prompt");
 {
   const s = await attempt("owner");
   check("C3-2: the room screen stays — no 'connected' chat for the dead socket, Connect enabled", onRoom(s), brief(s));
-  check("C3-2: the late seat is not narrated", !s.newLog.some((l) => /joined room|you created this chat/.test(l)), brief(s));
+  check("C3-2: the late seat is not narrated (the log is unchanged)", s.logUnchanged, brief(s));
   await page.evaluate(() => { const d = document.querySelector("#disconnect"); if (!document.querySelector("#scrChat").hidden) d.click(); });
   await sleep(300);
   check("C3-2: ...and it is still the room screen (no chat left whose Disconnect does nothing)", onRoom(await state()));
@@ -201,6 +206,7 @@ console.log("owner: joined:owner behind the prompt");
 console.log("\npguest: an honest pending, then joined:guest behind the prompt");
 {
   const s = await attempt("pguest");
+  check("fixture: the honest pending was handled while the socket was open (its knock reached the relay)", seen.includes("knock"), JSON.stringify(seen));
   check("C3-2: no false 'put you in the room without the owner approving you' after an honest pending",
     !/without the owner approving you/.test(s.roomHint) && !s.newLog.some((l) => /without ever asking to be let in/.test(l)), brief(s));
   check("C3-2: back on the room screen, Connect enabled", onRoom(s), brief(s));
@@ -210,7 +216,7 @@ console.log("\npending: pending behind the prompt");
 {
   const s = await attempt("pending");
   check("C3-2 r1 R1-1: no 'waiting for approval' chat screen for the dead socket", onRoom(s), brief(s));
-  check("C3-2 r1 R1-1: the late pending is not narrated", !s.newLog.some((l) => /waiting — the person who created/.test(l)), brief(s));
+  check("C3-2 r1 R1-1: the late pending is not narrated (the log is unchanged, no \"(×2)\" fold either)", s.logUnchanged, brief(s));
 }
 
 console.log("\nroleless: an older relay's bare joined behind the prompt");
