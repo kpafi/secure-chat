@@ -120,6 +120,7 @@ const PLAN = [
   ["34", "otp-panel-imported", "OTP: the panel with a received pad — no Export, the note"],
   ["35", "otp-export-ready-android", "OTP: Android file ready — Share… / Save to device (a stand-in bridge)", "viewport"],
   ["36", "otp-export-shared-android", "OTP: Android — File shared", "viewport"],
+  ["37", "otp-panel-empty", "OTP: no pad on this device yet — New pad = Import, Connect aria-disabled"],
 ].map(([n, id, what, mode]) => ({ n, id, what, fullPage: mode !== "viewport", state: "pending", note: "", files: [] }));
 const byId = Object.fromEntries(PLAN.map((p) => [p.id, p]));
 
@@ -1234,6 +1235,13 @@ let otpMaker = null, otpReceiver = null, otpFile = null;
 await runSetup("otp-agents", async () => {
   otpMaker = await otpAgent("otp-maker");
   otpReceiver = await otpAgent("otp-receiver");
+});
+
+await step("otp-panel-empty", async () => {
+  req("otp-agents");
+  const p = otpMaker.page;
+  await setOptionsOpen(p, false);
+  await capture(p, "otp-panel-empty");
 });
 
 await step("otp-new", async () => {

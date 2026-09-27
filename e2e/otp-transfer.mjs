@@ -160,6 +160,14 @@ async function geometry(page, sheetSel) {
       return at === e || e.contains(at);
     });
     const phone = innerWidth <= 600;
+    // Desktop (design r3 minor 2): the primary/danger is on the first line of
+    // the row, left of any secondary there; ghosts sit on a line below it.
+    const pr = barButtons.find((e) => e.classList.contains("primary") || e.classList.contains("danger"));
+    const desktopOrder = !pr || barButtons.every((e) => {
+      if (e === pr) return true;
+      const q = e.getBoundingClientRect(), p = pr.getBoundingClientRect();
+      return e.classList.contains("ghost") ? q.top >= p.bottom - 1 : Math.abs(q.top - p.top) < 2 && q.left !== p.left;
+    });
     return {
       pageOverflow: document.documentElement.scrollWidth > innerWidth,
       sheetOverflow: sh.scrollWidth > sh.clientWidth + 1,
@@ -168,7 +176,7 @@ async function geometry(page, sheetSel) {
       docked: phone ? Math.abs(r.bottom - tab.top) <= 1
         : Math.abs((r.left + r.right) / 2 - (m.left + m.right) / 2) <= 1 && Math.round(r.width) === 480,
       box: [r.left, r.width, m.left, m.right].map(Math.round).join("/"),
-      small, hit, order: barButtons.map((e) => e.id),
+      small, hit, order: barButtons.map((e) => e.id), desktopOrder,
     };
   }, sheetSel);
 }
@@ -198,8 +206,11 @@ async function panelChecks(page, what) {
         const box = e.getBoundingClientRect(), text = r.getBoundingClientRect();
         return lines > 1 || e.scrollWidth > e.clientWidth + 1 || text.left < box.left - 0.5 || text.right > box.right + 0.5;
       }).map((e) => e.id);
-    return { overflow: document.documentElement.scrollWidth > innerWidth, primaries, small, wraps };
+    const sel = document.querySelector("#otpSelect"), fg = document.querySelector("#otpForget");
+    const oneLine = !window.__shown(fg) || Math.abs(sel.getBoundingClientRect().top - fg.getBoundingClientRect().top) < 2;
+    return { overflow: document.documentElement.scrollWidth > innerWidth, primaries, small, wraps, oneLine };
   });
+  check(`${what}: the pad and Forget share one line (design r3 minor 3)`, g.oneLine);
   check(`${what}: no horizontal overflow`, !g.overflow);
   check(`${what}: 44px targets`, g.small.length === 0, g.small.join(","));
   check(`${what}: entry labels fit on one line`, g.wraps.length === 0, g.wraps.join(","));
@@ -297,6 +308,8 @@ let padFile, fileName;
   await A.type("#otpLabel", "Chess club");
   await A.select("#otpSize", await A.$eval("#otpSize", (s) => s.options[0].value));
   check("the size hint follows the size", (await text(A, "#otpSizeHint")) === "~350 short messages each way", await text(A, "#otpSizeHint"));
+  const picker = await A.evaluate(() => [document.querySelector('label[for="otpSize"]').textContent, document.querySelector("#otpSize").selectedOptions[0].textContent]);
+  check("cold mi-2: the picker says what each side gets (\"Size, each way\": 32 KiB for the 64 KiB pad)", picker.join("|") === "Size, each way|32 KiB", picker.join("|"));
   await A.type("#otpNewPass", "moonlight7");
   check("a weak pad passphrase is warned about live", /^Weak: it is shorter than 12 characters\. Use 12 or more characters, e\.g\. four random words\.$/.test(await text(A, "#otpNewPassWarn")), await text(A, "#otpNewPassWarn"));
   await setValue(A, "#otpNewPass", PAD_A);
@@ -307,6 +320,8 @@ let padFile, fileName;
   await tap(A, "#otpGenerate");
   await waitState(A, "#otpNewSheet", "working", 10000);
   check("working: no ×", !(await shown(A, "#otpNewClose")));
+  check("working: no empty bottom bar, the form is inert (design r3 minor 4)",
+    await A.evaluate(() => !window.__shown(document.querySelector("#otpNewSheet .otp-bar")) && document.querySelector("#otpNewForm").inert));
   check("working: the progress has focus", (await active(A)) === "otpNewProgress", await active(A));
   await A.keyboard.press("Escape");
   await A.mouse.click(195, 20);
@@ -341,13 +356,18 @@ let padFile, fileName;
   check("done: 'File downloaded', the name on its own line", (await text(A, "#otpExportDoneTitle")) === "File downloaded" && (await text(A, "#otpExportDoneFile")) === fileName);
   check("…in mono (they search Downloads for it)", /mono/i.test(await A.$eval("#otpExportDoneFile", (e) => getComputedStyle(e).fontFamily)));
   check("done: the 'On their device' list says never to send the passphrase", /never send it/.test(await text(A, "#otpExportTheirs")));
+  check("done: …and says to delete the file on both devices once imported (cold MA-3)",
+    await A.evaluate(() => [...document.querySelectorAll("#otpExportDoneBlock .otp-delete")].some((e) => window.__shown(e) && /delete the file on both devices/.test(e.textContent))));
+  check("done: the card says each way", (await text(A, "#otpExportPadMeta")) === "32 KiB each way · you generated · exported", await text(A, "#otpExportPadMeta"));
   await checkGeometry(A, "#otpExportSheet", "Export done (phone)");
   await guard();
   await tap(A, "#otpSendAgain");
   await A.waitForFunction(() => window.__files.length === 2);
-  check("'Download it again' hands out the same file", (await A.evaluate(() => window.__files[1].text)) === padFile);
+  check("'Download the same file again' hands out the same file", (await text(A, "#otpSendAgain")) === "Download the same file again" &&
+    (await A.evaluate(() => window.__files[1].text)) === padFile);
   await A.setViewport(DESKTOP);
-  await checkGeometry(A, "#otpExportSheet", "Export done (desktop)");
+  const gd = await checkGeometry(A, "#otpExportSheet", "Export done (desktop)");
+  check("desktop: the primary leads its row, the quiet link on its own line below (design r3 minor 2)", gd.desktopOrder, gd.order.join(","));
   await A.setViewport(PHONE);
   await tap(A, "#otpExportDone");
   await sleep(200);
@@ -375,9 +395,16 @@ console.log("\n  [4] re-export (alice)");
   const g = await checkGeometry(A, "#otpExportSheet", "re-export confirm", { primaries: 0 });
   check("confirm: 'Don't export' comes before 'Export again'", g.order.join(",") === "otpExportCancel,otpExport", g.order.join(","));
   check("confirm: no file yet", (await A.evaluate(() => window.__files.length)) === 2);
+  await A.setViewport(DESKTOP);
+  const gc = await checkGeometry(A, "#otpExportSheet", "re-export confirm (desktop)", { primaries: 0 });
+  check("desktop confirm: 'Don't export' then the growing 'Export again', one line", gc.desktopOrder && gc.order.join(",") === "otpExportCancel,otpExport", gc.order.join(","));
+  await A.setViewport(PHONE);
+  check("design R3-M1: while the sheet is up, the panel does not show its error too",
+    await A.$eval("#otpStatus", (e) => e.classList.contains("vh") || !e.textContent));
   await tap(A, "#otpExportCancel");
   await sleep(200);
   check("'Don't export' closes the sheet", !(await shown(A, "#otpExportSheet")));
+  check("design R3-M1: …and the panel is left without the sheet's error", (await text(A, "#otpStatus")) === "");
   await tap(A, "#otpExportOpen");
   await A.waitForFunction(() => window.__shown(document.querySelector("#otpExportSheet")));
   await setValue(A, "#otpXferPass", "another transfer passphrase e2e");
@@ -387,6 +414,45 @@ console.log("\n  [4] re-export (alice)");
   check("closing disarmed the latch: the warning comes again", /already exported/.test(await text(A, "#otpExportStatus")));
   await A.keyboard.press("Escape");
   await sleep(200);
+}
+
+// ---- 4b. fix round 1: a busy pad; Back during the Export entry's unlock ----
+console.log("\n  [4b] busy pad, Back during the unlock (alice)");
+{
+  // Another tab of the same browser holds the pad (a chat open on it).
+  const id = await A.$eval("#otpSelect", (e) => e.value);
+  const other = await alice.ctx.newPage();
+  await other.goto(APP, { waitUntil: "networkidle0" });
+  await other.evaluate((n) => { window.__held = new Promise((r) => { window.__release = r; }); navigator.locks.request(n, () => window.__held); }, "sc.otp.lock.v1." + id);
+  await A.bringToFront();
+  await tap(A, "#otpExportOpen");
+  await A.waitForFunction(() => window.__shown(document.querySelector("#otpExportSheet")));
+  await setValue(A, "#otpXferPass", "a transfer passphrase while busy");
+  await guard();
+  await tap(A, "#otpExport");
+  await waitState(A, "#otpExportSheet", "form", 20000);
+  check("hot B1 / R2-1: a busy pad returns the sheet to its form, with the reason and a ×",
+    /^This pad is in use/.test(await text(A, "#otpExportStatus")) && (await shown(A, "#otpExportClose")));
+  await A.keyboard.press("Escape");
+  await sleep(200);
+  check("…and it closes: the page is usable", !(await shown(A, "#otpExportSheet")) && !(await A.evaluate(() => document.querySelector("#viewLive").inert)));
+  await other.evaluate(() => window.__release());
+  await other.close();
+  // Back while the Export entry unlocks the pad (hot M1): the app is not left.
+  await tap(A, "#otpLock");
+  await A.type("#otpPass", PAD_A);
+  const url0 = A.url(), len0 = await A.evaluate(() => history.length);
+  await tap(A, "#otpExportOpen");
+  await A.goBack();
+  await sleep(2500); // the unlock's KDF ends
+  check("R2-2: Back during the unlock opens no sheet afterwards", !(await shown(A, "#otpExportSheet")) && A.url() === url0);
+  await tap(A, "#otpImportOpen");
+  await A.waitForFunction(() => window.__shown(document.querySelector("#otpImportSheet")));
+  await guard();
+  await A.click("#otpImportClose");
+  await sleep(500);
+  check("R2-2: …and a later × does not navigate out of the app", A.url() === url0 && (await shown(A, "#otpPanel")), A.url());
+  void len0;
 }
 
 // ---- 5. Import on bob ----------------------------------------------------
@@ -428,6 +494,9 @@ console.log("\n  [5] Import (bob)");
   await tap(B, "#otpImportRetry");
   await waitState(B, "#otpImportSheet", "done");
   check("Try again imports without a second pick", (await text(B, "#otpImportPadLabel")) === "Chess club");
+  check("import done: the card says it came from the contact (cold mi-7)", (await text(B, "#otpImportPadMeta")) === "32 KiB each way · from your contact", await text(B, "#otpImportPadMeta"));
+  check("import done: 'Delete the pad file now.' (cold MA-3)",
+    await B.evaluate(() => [...document.querySelectorAll("#otpImportDoneBlock .otp-delete")].some((e) => window.__shown(e) && e.textContent === "Delete the pad file now.")));
   await checkGeometry(B, "#otpImportSheet", "Import done");
   await tap(B, "#otpImportDone");
   await sleep(200);
@@ -453,7 +522,7 @@ console.log("\n  [6] Connect (alice ↔ bob)");
   const code = await A.$eval("#room", (e) => e.value.trim());
   await A.click("#connect");
   await A.waitForFunction(() => document.querySelector("#chatStatus").textContent.trim().toLowerCase() === "connected", { timeout: 45000 })
-    .catch(async (e) => { console.log("    connect:", await A.evaluate(() => [...document.querySelectorAll("#status, #chatStatus, #roomHint, #idHint, #hint, #otpStatus")].map((x) => x.id + "=" + x.textContent.trim()).join(" | ") + " scrim=" + window.__shown(document.querySelector("#otpScrim")) + " sheets=" + [...document.querySelectorAll(".otp-sheet")].map((x) => x.id + ":" + x.hidden + ":" + x.dataset.state).join(","))); await A.screenshot({ path: "/tmp/claude-1000/-home-kpafi-secure-chat/5f8e00c8-7015-466f-9a96-fa9956db20dc/scratchpad/web/connect-fail.png" }); throw e; });
+    .catch(async (e) => { console.log("    connect:", await A.evaluate(() => [...document.querySelectorAll("#status, #chatStatus, #roomHint, #idHint, #hint, #otpStatus")].map((x) => x.id + "=" + x.textContent.trim()).join(" | ") + " scrim=" + window.__shown(document.querySelector("#otpScrim")) + " sheets=" + [...document.querySelectorAll(".otp-sheet")].map((x) => x.id + ":" + x.hidden + ":" + x.dataset.state).join(","))); throw e; });
   await setValue(B, "#room", code);
   await B.click("#connect");
   await A.waitForFunction(() => !document.querySelector("#admit").hidden, { timeout: 45000 });
