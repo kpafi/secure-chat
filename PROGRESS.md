@@ -3,70 +3,62 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ CURRENT STATE (2026-09-27) — C3-2 fix on `claude/dazzling-liskov-726d57` (on top of `claude/charming-northcutt-3850fa` → `feat/otp-transfer-sheets`), not merged, not pushed; PAUSED by the owner after pentest round 2 (report committed, not triaged)
+## ⮕ CURRENT STATE (2026-09-27) — C3-2 fix on `claude/dazzling-liskov-726d57` (on top of `claude/charming-northcutt-3850fa` → `feat/otp-transfer-sheets`), done and reviewed, not merged, not pushed
 
 - **Task:** the pre-existing lead C3-2 of
   `design/research/reviews/connect-cancel-pentest-r3.md`. The relay's answer to
   `join` (`joined`, and as it turned out `pending`) handled after the relay's
   own close met onclose's reset state. The result was a "connected" or
-  "waiting for approval" chat screen for a dead socket (Disconnect did
-  nothing), a false "put you in the room without the owner approving you"
-  after an honest `pending`, and `joined` left set, which silenced the next
-  session's `denied`.
-- **Pentest C3-2 r1 changed the premise:** a hostile relay FORCES the order in
-  Chromium. It raises the guest approval prompt before answering (a hello,
-  then a handshake signed by itself), queues its answer, and hangs up. So
-  this is a fix of a relay-forceable Low, not only hardening.
+  "waiting for approval" chat for a dead socket (Disconnect did nothing), a
+  false "put you in the room without the owner approving you" after an honest
+  `pending`, and `joined` left set, which silenced the next session's `denied`.
+- **Relay-forceable (pentest C3-2 r1).** In Chromium the relay raises the
+  guest approval prompt before answering (a hello, then a handshake signed by
+  itself), queues its answer and hangs up. In Firefox the hello-signing await
+  is enough (r3). So this fixes a Low, not only hardening.
 - **Branch `claude/dazzling-liskov-726d57`**, worktree
-  `.claude/worktrees/dazzling-liskov-726d57`, based on
-  `claude/charming-northcutt-3850fa` 495a12f (neither that branch nor
-  `feat/otp-transfer-sheets` is merged). Merge order: OTP sheets, then
-  charming-northcutt, then this. Commits: b88afa8 (the change), 7ab1a7d
-  (pentest r1 report), 9f290f3 (fix round 1).
-- **What it does (client/app.js):**
-  - **The seat needs an OPEN socket.** In `joined` and `pending`, the role,
-    `joined`/`wasPending`, the chat screen and the hello/knock are written
-    only after every refusal, and only on an OPEN socket.
-  - **A CLOSING socket.** A seat withheld there clears the join deadline;
-    Cancel stays usable.
-  - **A CLOSED socket.** Only refusals whose inputs survive onclose still run
-    and reach the room screen: role-less, creator-as-guest, `pending` to the
-    creator. The unqueued-guest check (`wasPending`) does not.
+  `.claude/worktrees/dazzling-liskov-726d57`, stacked on
+  `claude/charming-northcutt-3850fa` 495a12f. Merge order: OTP sheets, then
+  charming-northcutt, then this. Not merged, not pushed.
+- **Commits:**
+  - b88afa8 (the change);
+  - 9f290f3, f15825d, f1ede5f (fix rounds 1–3);
+  - reports 7ab1a7d, 0f305d0, 78baf21 (pentest r1–r3);
+  - triage `design/research/reviews/connect-cancel-c3-2-fix-round-{1,2,3}.md`.
+- **What it does (client/app.js, `joined` and `pending`):**
+  - **The seat needs an OPEN socket.** The role, `joined`/`wasPending`, the
+    chat screen and the hello/knock are written after every refusal, and
+    only on an OPEN socket.
+  - **CLOSING.** A seat withheld there clears the join deadline; Cancel stays
+    usable. A `pending` withheld there sends no knock, so a `joined:guest`
+    behind it is refused as unqueued (R2-1, deliberate; true from the page's
+    view).
+  - **CLOSED.** Only refusals whose inputs survive onclose still run: the
+    role-less one, creator-as-guest, and `pending` to the creator.
   - **connectInner** resets `joined`.
-- **Checked (2026-09-27, 9f290f3):**
-  - `npm test` green; backend suite green on b88afa8 (302, untouched since).
-  - e2e on a scratch relay: hostile-relay 24/24 (sections 6 and 8),
-    forced-late-answer 12/12 (new, no backend needed; 6 of 12 fail on
-    495a12f, 2 on b88afa8), hung-relay 20/20, room-admission 49/49,
-    no-dead-ends 17/17, all-modes 28/28. otp-held-join 10/10 and
-    two-user-flow 15/15 were run on b88afa8.
-  - Mutants: every one is RED except the layered connectInner reset (M6/R15),
-    which binds in combination (R6M5 vs R6M5R15). Lists are in the commit
-    messages and `design/research/reviews/connect-cancel-c3-2-fix-round-1.md`.
-- **OPEN — resume here:** pentest r2 on 9f290f3 is back and committed as written
-  (`design/research/reviews/connect-cancel-c3-2-pentest-r2.md`). Nothing Low or
-  higher in the diff. Still to do: triage, then fix round 2 (tests only unless
-  R2-1 is decided otherwise):
-  - **R2-1 (Info).** On CLOSING, a withheld `pending` turns a queued
-    `joined:guest` into the unqueued-guest refusal. Decide whether to keep
-    that (state it in the comment and bind it, X1) or silence it.
-  - **R2-2.** Loop the "Cancel on a CLOSING socket" block over `pending` too
-    (X4 survives).
-  - **R2-3.** The e2e narration check for `pending` is vacuous: the line folds
-    into "(×2)" after pguest. Compare the log text, or reorder the cases.
-  - **R2-4.** Anchor the `/connected|waiting for approval/` regex; it matches
-    "disconnected".
-  - **R2-5.** Test `pending` → `joined:owner` → the role-change sentence (X13
-    survives).
-  - **e2e fixture.** Assert pguest's knock and "prompt down only after
-    close-event".
-  - **Then:** npm test, the e2e set, pentest round 3, and a PROGRESS update.
-  - **Separate owner decision (pre-existing, Low, in Chromium).** A guest
-    approval prompt raised before any answer to `join` is invisible: `#admit`
-    lives in the hidden chat screen and the tab bar goes inert. Cancel still
-    works. This is the lever behind R1-2. The options: draw the prompt over
-    the room screen, or refuse or defer a handshake that arrives before the
-    answer.
+- **Reviewed:** `pentest-new-code` ×3.
+  - r1: 1 Low (`pending` had the same gap) and Infos → fixed.
+  - r2: Infos and test gaps → fixed or bound.
+  - r3: one test gap → bound.
+  - Nothing Low or higher is open in this diff. No r4: round 3 was tests
+    only, bound by hand-run mutants.
+  - Every mutant is RED except the layered connectInner reset, which binds in
+    combination (R6M5 vs R6M5R15).
+- **Checked (2026-09-27):**
+  - `npm test` green; backend suite 302 green (backend untouched).
+  - e2e on a scratch relay (f15825d; round 3 changed only tests):
+    hostile-relay 24/24 (sections 6 and 8), hung-relay 20/20,
+    room-admission 49/49, no-dead-ends 17/17, all-modes 28/28,
+    otp-held-join 10/10, two-user-flow 15/15.
+  - New `e2e/forced-late-answer.mjs` (serves client/ itself, raw relay, no
+    backend): 13/13 on f1ede5f; 7/13 on 495a12f, 10/13 on b88afa8.
+  - Not run on Safari/WebKit or the Android WebView. No APK built.
+- **Open, owner decision (pre-existing Low, found by C3-2 r2, NOT in this
+  branch):** a guest approval prompt raised before any answer to `join` is
+  invisible, because `#admit` sits in the hidden chat screen, and the tab bar
+  goes inert. Cancel works. The options: draw it over the room screen, or
+  refuse or defer a handshake that arrives before the answer. Offered as a
+  separate task.
 - **Env note:** a scratch relay on a port other than 8000 needs
   `SECURE_CHAT_EXTRA_ORIGINS=http://127.0.0.1:<port>`; otherwise the
   WebSocket is refused with 403.
