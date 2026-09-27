@@ -3984,6 +3984,45 @@ async function finishSession(room) {
   }
 }
 
+// Pentest r3 R3-F1, r4 R4-F2: two people who picked DIFFERENT MODES. In OTP
+// the other side's hello (no `chk`) read as a 0.4.0 peer: "older version …
+// different pads", then Ready, and pad bytes spent on frames the other side
+// drops. The other modes fared no better. AES-256 said "key confirmation
+// failed … the relay may be interfering" after 15 s. DHKE and Post-quantum
+// waited forever. Every build, 0.4.0 included, tags its key frames with its
+// mode (`alg`). So a hello tagged with another known mode, before this
+// session has started, is refused and both modes are named. Our own hello goes
+// out first (once, without a pad proof), so a peer on this build names the
+// mismatch too instead of waiting.
+//
+// The tag is relay-writable. That is the same exposure as the RSA refusal
+// above (REMOVED_ALGS), and the relay also picks which mode gets named, so the
+// sentence says the relay may have altered it (r4 R4-F3). After the session
+// has started, a mode tag is not judged: a relay must not close a working
+// session with it.
+const MODE_NAMES = { DHKE: "DHKE", AES256: "AES-256", PQKEM: "Post-quantum", OTP: "One-time pad" };
+function otherMode(alg) {
+  if (typeof alg !== "string" || alg === sessionAlg || !Object.prototype.hasOwnProperty.call(MODE_NAMES, alg)) return null;
+  return MODE_NAMES[alg];
+}
+// OTP's pad is loaded from the start (cipher.ready), so only `verified`
+// (Ready) says it started. The other modes have started once the channel
+// exists.
+function sessionStarted() {
+  return verified || (sessionAlg !== "OTP" && cipher.ready);
+}
+function refuseOtherMode(theirs, p, room, sock) {
+  if (!p.reply && !helloAnswered) {
+    helloAnswered = true;
+    sock.send(helloMsg(room, true, null));
+  }
+  const mine = MODE_NAMES[sessionAlg] || sessionAlg;
+  addLine("sys", "", `[the other side uses ${theirs} mode, not ${mine} — refusing]`, true);
+  closeWs(`Your contact's app says it uses ${theirs}, and you picked ${mine} under Security options. ` +
+    "Both of you must pick the same option, then connect again (if you both did, the relay altered the message). " +
+    (sessionAlg === "OTP" ? "Nothing was sent and no pad was used." : "Nothing was sent."), sock);
+}
+
 // Phase 1's hello. In OTP it also offers the pad check (`chk`) and, once we
 // know the peer's nonce, carries our proof (`pc`) — MA-2, see otpPadCheck.
 function helloMsg(room, reply, pc) {
@@ -4022,23 +4061,8 @@ function helloMsg(room, reply, pc) {
 // Fix round 1 ignored a tagless hello after an offer. That stopped nothing
 // (the relay picks the order) and left a side waiting with no word when the
 // relay injected an offer ahead of a 0.4.0 peer's hello (R2-F2), so it is gone.
-//
-// Pentest r3 R3-F1: a contact on ANOTHER MODE sends no `chk` either, and was
-// told "older version … different pads" while this side went Ready and spent
-// pad bytes on frames the other side drops. Every build, 0.4.0 included, tags
-// its key frames with its mode, so before Ready a hello tagged with another
-// known mode is refused and the mode is named. The tag is relay-writable, like
-// the RSA one (REMOVED_ALGS): the worst a relay does with it is close a
-// connection it could have dropped. After Ready it is not judged (the caller's
-// `!verified`).
-const MODE_NAMES = { DHKE: "DHKE", AES256: "AES-256", PQKEM: "Post-quantum" };
-async function otpPadCheck(p, alg, room, sock, live) {
-  if (typeof alg === "string" && Object.prototype.hasOwnProperty.call(MODE_NAMES, alg)) {
-    addLine("sys", "", `[the other side uses ${MODE_NAMES[alg]} mode, not One-time pad — refusing]`, true);
-    closeWs(`Your contact picked ${MODE_NAMES[alg]} under Security options, and you picked One-time pad. ` +
-      "Both of you must pick the same option, then connect again. Nothing was sent and no pad was used.", sock);
-    return false;
-  }
+// A contact on another MODE never gets here: refuseOtherMode (above).
+async function otpPadCheck(p, room, sock, live) {
   if (p.chk !== 1) {
     if (!saidNoPadCheck) {
       saidNoPadCheck = true;
@@ -4317,6 +4341,13 @@ async function handleMessage(room, raw, sock) {
           if (p.n === myNonce) {
             throw new Error("reflected hello rejected");
           }
+          // Pentest r3 R3-F1 / r4 R4-F2: the contact picked ANOTHER MODE.
+          // See refuseOtherMode. Judged before this hello pins anything.
+          const theirs = otherMode(m.alg);
+          if (theirs && !sessionStarted()) {
+            refuseOtherMode(theirs, p, room, sock);
+            return;
+          }
           if (peerNonce === null) peerNonce = p.n;
           if (!p.reply && !helloAnswered) {
             helloAnswered = true;
@@ -4341,7 +4372,7 @@ async function handleMessage(room, raw, sock) {
             // out-of-band secret (like AES256's passphrase), so seeing the peer
             // join is enough to unlock messaging — once its hello shows that it
             // holds the other half of the same pad (MA-2, otpPadCheck).
-            if (!(await otpPadCheck(p, m.alg, room, sock, live))) return;
+            if (!(await otpPadCheck(p, room, sock, live))) return;
             await onChannelReady(room);
           }
           break;

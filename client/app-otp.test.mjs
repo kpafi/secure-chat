@@ -430,21 +430,45 @@ async function otpConnect(padId = pad.padId, extra = () => ({})) {
 
   // (m) pentest r3 R3-F1: the contact picked ANOTHER MODE. Its hello says
   //     so (every build tags key frames with its mode): refused before Ready,
-  //     the mode named, nothing spent — not "older version … different pads".
+  //     both modes named, nothing spent — not "older version … different pads".
+  //     reply:false = we own the room and answer once (plainly, no proof) so
+  //     the other side can name our mode too; reply:true = we are the guest
+  //     and this is the owner's answer (pentest r4 R4-F1: untested before).
   for (const [alg, name] of [["AES256", "AES-256"], ["DHKE", "DHKE"], ["PQKEM", "Post-quantum"]]) {
-    const before = await onDisk();
-    const old0 = count(OLD);
-    const ws = await bare(chess.padId);
-    await ws.deliver({ type: "key", room: ROOM, alg, payload: pack({ hello: true, n: freshNonce(), reply: false }) });
-    await settle(10);
-    assert.ok(!anyHint(READY), `MA-2 (m): a ${alg} contact does not make an OTP session Ready`);
-    assert.ok(anyHint(new RegExp(`Your contact picked ${name} under Security options, and you picked One-time pad\\..*Nothing was sent and no pad was used`)),
-      `MA-2 (m): …the room screen names the mode (${alg}): ` + dom.el("roomHint").textContent);
-    assert.ok(said(new RegExp(`uses ${name} mode, not One-time pad — refusing`)), `MA-2 (m): …and so does the transcript (${alg})`);
-    assert.strictEqual(count(OLD), old0, `MA-2 (m): …never "older version" (${alg})`);
-    assert.strictEqual(ws.readyState, 3, `MA-2 (m): …closed (${alg})`);
-    assert.deepStrictEqual(await onDisk(), before, `MA-2 (m): …nothing spent (${alg})`);
+    for (const reply of [false, true]) {
+      const tag = `${alg}, reply ${reply}`;
+      const before = await onDisk();
+      const old0 = count(OLD);
+      const ws = await bare(chess.padId);
+      const sent0 = ws.sent.length;
+      await ws.deliver({ type: "key", room: ROOM, alg, payload: pack({ hello: true, n: freshNonce(), reply }) });
+      await settle(10);
+      assert.ok(!anyHint(READY), `MA-2 (m): a ${tag} contact does not make an OTP session Ready`);
+      assert.ok(anyHint(new RegExp(`Your contact's app says it uses ${name}, and you picked One-time pad under Security options\\..*the relay altered the message.*Nothing was sent and no pad was used`)),
+        `MA-2 (m): …the room screen names both modes (${tag}): ` + dom.el("roomHint").textContent);
+      assert.ok(said(new RegExp(`uses ${name} mode, not One-time pad — refusing`)), `MA-2 (m): …and so does the transcript (${tag})`);
+      assert.strictEqual(count(OLD), old0, `MA-2 (m): …never "older version" (${tag})`);
+      assert.strictEqual(ws.readyState, 3, `MA-2 (m): …closed (${tag})`);
+      assert.deepStrictEqual(await onDisk(), before, `MA-2 (m): …nothing spent (${tag})`);
+      const out = ws.sent.slice(sent0).filter((f) => f.type === "key").map(unhello);
+      assert.deepStrictEqual(out.map((h) => [h.reply, h.pc]), reply ? [] : [[true, undefined]],
+        `MA-2 (m): …${reply ? "an answer is not answered" : "our plain answer (no proof) went out first"} (${tag})`);
+    }
   }
+  // (m3) …judged on EVERY hello before Ready, not only the first: after an
+  //      OTP offer has pinned a nonce, a genuine AES-256 hello (the relay
+  //      injected the offer first) still gets the mode named — never the
+  //      tagless path's "older version" and Ready.
+  {
+    const old0 = count(OLD);
+    const { ws } = await offer(chess.padId);
+    await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: pack({ hello: true, n: freshNonce(), reply: false }) });
+    await settle(10);
+    assert.ok(!anyHint(READY), "MA-2 (m3): an AES-256 hello after a pinned offer does not unlock");
+    assert.ok(anyHint(/says it uses AES-256, and you picked One-time pad/), "MA-2 (m3): …it is named");
+    assert.strictEqual(count(OLD), old0, "MA-2 (m3): …never \"older version\"");
+  }
+
   // (m2) …judged only before Ready: a hello tagged with another mode after
   //      Ready (relay-writable) does not close the session.
   {

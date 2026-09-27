@@ -2209,5 +2209,54 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
   console.log("OK  OTP fix round 7: the guest's peer prompt revealed by a self-closing OTP sheet gets a fresh guard (executed)");
 }
 
+// ==== pentest r4 R4-F2 (OTP pad check): a contact on ANOTHER MODE, seen from DHKE / Post-quantum / AES-256 ====
+// A DHKE or Post-quantum user whose contact picked One-time pad waited
+// forever; an AES-256 one got "key confirmation failed … the relay may be
+// interfering" after 15 s. A hello tagged with another known mode, before the
+// session has started, is now refused in every mode, both modes named; our own
+// hello goes out first so the other side can say it too. After the start a
+// mode tag is not judged.
+{
+  const unhello = (f) => unpack(f.payload);
+  for (const alg of ["DHKE", "PQKEM", "AES256"]) {
+    const mine = { DHKE: "DHKE", PQKEM: "Post-quantum", AES256: "AES-256" }[alg];
+    for (const reply of [false, true]) {
+      const ws = await connect(alg);
+      await ws.deliver({ type: "joined", role: "owner" });
+      const sent0 = ws.sent.length;
+      const n0 = count(new RegExp(`uses One-time pad mode, not ${mine} — refusing`));
+      await ws.deliver({ type: "key", room: ROOM, alg: "OTP", payload: pack({ hello: true, n: freshNonce(), reply, chk: 1 }) });
+      await settle(10);
+      assert.strictEqual(count(new RegExp(`uses One-time pad mode, not ${mine} — refusing`)), n0 + 1, `R4-F2: ${alg} (reply ${reply}) names the contact's mode in the transcript`);
+      assert.match(dom.el("roomHint").textContent + " " + dom.el("hint").textContent,
+        new RegExp(`Your contact's app says it uses One-time pad, and you picked ${mine} under Security options\\..*the relay altered the message.*Nothing was sent\\.`),
+        `R4-F2: ${alg} (reply ${reply}): …and on the room screen`);
+      assert.strictEqual(ws.readyState, 3, `R4-F2: ${alg} (reply ${reply}): …closed`);
+      const out = ws.sent.slice(sent0);
+      if (reply) {
+        assert.strictEqual(out.length, 0, `R4-F2: ${alg}: an answer is not answered`);
+      } else {
+        assert.ok(out.length === 1 && out[0].type === "key" && out[0].alg === alg && unhello(out[0]).hello === true && unhello(out[0]).reply === true,
+          `R4-F2: ${alg}: our plain hello went out first, so the OTP side can name ${mine} too: ` + JSON.stringify(out));
+      }
+    }
+  }
+  // After the start (AES-256: both nonces known, the channel exists) a mode
+  // tag is not judged: a relay must not close a working session with it.
+  {
+    const ws = await connect("AES256");
+    await ws.deliver({ type: "joined", role: "owner" });
+    await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: pack({ hello: true, n: freshNonce(), reply: false }) });
+    await settle(10);
+    const n0 = count(/uses One-time pad mode/);
+    await ws.deliver({ type: "key", room: ROOM, alg: "OTP", payload: pack({ hello: true, n: freshNonce(), reply: true }) });
+    await settle(10);
+    assert.strictEqual(ws.readyState, 1, "R4-F2: after the channel exists, a mode-tagged hello does not close the session");
+    assert.strictEqual(count(/uses One-time pad mode/), n0, "R4-F2: …and names nothing");
+    await dom.el("disconnect").click();
+  }
+  console.log("OK  R4-F2: DHKE / Post-quantum / AES-256 name a contact on One-time pad before the session starts (and answer once so it can too); not after (executed)");
+}
+
 console.log("\nAll app.js behavioural checks passed.");
 process.exit(0); // key confirmation's deadline timer would otherwise hold the process open

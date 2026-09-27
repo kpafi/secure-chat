@@ -15,9 +15,11 @@
 //       the pad bob just tried in [1]: Ready with its FULL send budget (so
 //       [1] spent none of it), no new refusal, a message each way.
 //   [3] bob's pad on both sides — the one alice tried in [1]: the same.
-//   [4] alice on One-time pad, bob on AES-256 (pentest r3 R3-F1): alice is
-//       refused before Ready with the mode named — not "older version …
-//       different pads" — and her pad's send budget is untouched.
+//   [4] alice on One-time pad, bob on AES-256 (pentest r3 R3-F1, r4 R4-F2):
+//       BOTH are refused before their session starts, each told the other's
+//       mode — not "older version … different pads" (alice) or "key
+//       confirmation failed" (bob). Alice sent no message and her pad's send
+//       budget is exactly what [2] left.
 import puppeteer from "puppeteer-core";
 import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -219,6 +221,7 @@ console.log("\n  [4] alice on One-time pad, bob on AES-256");
   await setValue(bob.page, "#pass", "an aes passphrase for the mode mix-up e2e");
   await alice.page.click("#gen");
   const code = await alice.page.evaluate(() => document.querySelector("#room").value.trim());
+  await alice.page.evaluate(() => { window.__sent = []; });
   await sleep(700);
   await alice.page.click("#connect");
   await alice.page.waitForFunction(() => document.querySelector("#chatStatus").textContent.trim().toLowerCase() === "connected", { timeout: 45000 });
@@ -227,12 +230,18 @@ console.log("\n  [4] alice on One-time pad, bob on AES-256");
   await alice.page.waitForFunction(() => !document.querySelector("#admit").hidden, { timeout: 45000 });
   await sleep(600);
   await alice.page.click("#admitOk");
-  await alice.page.waitForFunction(() => !document.querySelector("#text").disabled || !document.querySelector("#scrRoom").hidden, { timeout: 60000 });
+  const settled = (p) => p.waitForFunction(() => !document.querySelector("#text").disabled || !document.querySelector("#scrRoom").hidden, { timeout: 60000 });
+  await Promise.all([settled(alice.page), settled(bob.page)]);
   await sleep(500);
   const room = await text(alice.page, "#roomHint");
   check("[4] alice: not Ready", !(await ready(alice)));
-  check("[4] alice: the room screen names bob's mode", /Your contact picked AES-256 under Security options, and you picked One-time pad\..*Nothing was sent and no pad was used\./.test(room), room.slice(0, 140));
+  check("[4] alice: the room screen names bob's mode", /Your contact's app says it uses AES-256, and you picked One-time pad under Security options\..*Nothing was sent and no pad was used\./.test(room), room.slice(0, 160));
   check("[4] alice: no \"older version\" line", !/older version/.test(await text(alice.page, "#log")));
+  check("[4] alice: Send never unlocked, no message frame went out",
+    await alice.page.evaluate(() => document.querySelector("#text").disabled && !window.__sent.includes("msg")));
+  const bobRoom = await text(bob.page, "#roomHint");
+  check("[4] bob (AES-256): the room screen names alice's mode", /Your contact's app says it uses One-time pad, and you picked AES-256 under Security options\..*Nothing was sent\./.test(bobRoom), bobRoom.slice(0, 160));
+  check("[4] bob: no \"key confirmation failed\"", !/Key confirmation failed/.test(bobRoom + await text(bob.page, "#hint")));
   await leave(alice, bob);
   await bob.page.evaluate(() => {
     const r = document.querySelector('input[name="alg"][value="OTP"]');
