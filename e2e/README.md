@@ -18,6 +18,7 @@ node e2e/all-modes.mjs          #            — all four encryption modes, both
 node e2e/otp-transfer.mjs       #            — the one-time pad sheets: New pad, Export, Import (+ an Android stand-in)
 node e2e/otp-held-join.mjs      #            — OTP sheets while a (proxied) relay holds the join: knock guard, self-close advice
 node e2e/hung-relay.mjs         #            — a relay / directory that never answers: Cancel, the 30 s / 20 s deadlines (~2 min)
+node e2e/forced-late-answer.mjs #            — a relay forces its answer to join after its own close (own static server + raw relay, no backend)
 node e2e/screenshots.mjs <dir>  #            — every screen at phone + desktop size, for design review
 node e2e/durable-crash.mjs      #            — SIGKILL after an OTP send; the pad must not reopen at a spent offset (~2 min)
 ```

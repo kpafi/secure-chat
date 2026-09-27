@@ -4146,6 +4146,10 @@ async function handleMessage(room, raw, sock) {
       // re-cast us mid-session (an owner told "you are a guest" would stop
       // being asked to approve anyone).
       if (roomRole !== null) break;
+      // C3-2 r1 R1-1: the same shape as `joined` (see there). The creator's
+      // refusal reads only `sessionRoomMine`, which survives onclose, so it is
+      // said even after the relay's close; the role, the chat screen and the
+      // knock need an OPEN socket.
       if (sessionRoomMine) {
         // F-PROTO-001: we minted this code, so nobody can legitimately own the
         // room before us — "wait for the owner" from the relay means either a
@@ -4157,6 +4161,7 @@ async function handleMessage(room, raw, sock) {
           "Connect first, then send the code — or press New code and connect before sharing it.");
         return;
       }
+      if (sock.readyState !== WebSocket.OPEN) { clearJoinTimer(); break; } // C3-2 r1 R1-1 / R1-3
       roomRole = "guest";
       wasPending = true; // M-2: proof we went through the approval queue
       syncConnectCancel(); // R6-1: answered — the join deadline no longer applies, and Disconnect is on screen
@@ -4240,17 +4245,22 @@ async function handleMessage(room, raw, sock) {
       // hello — two lines per 32-byte frame, which reached any cap with no peer
       // and no user. It is dropped; a CHANGED role still reaches the refusal.
       if (joined && m.role === roomRole) break;
-      // Pentest r3 C3-2 (connect-cancel): a `joined` handled after the relay's
-      // own close — a backlog on msgChain; frames of a relay-closed socket are
-      // still handled, see the gate at the top — found onclose's reset state.
-      // `wasPending` and `roomRole` are gone, so its checks accused an honest
-      // pending guest of never queueing, and the seat drew a chat screen that
-      // said "connected" for a dead socket (Disconnect then did nothing), or
-      // left `joined` set on the room screen, silencing the next session's
-      // `denied`. The checks below read that state: they run only while the
-      // socket's onclose has not (CLOSED is the `error` arm's test too), and
-      // the seat is taken only on an OPEN socket (below).
-      if (sock.readyState === WebSocket.CLOSED) break;
+      // Pentest r3 C3-2 (connect-cancel): the relay's answer handled after the
+      // relay's own close. Frames of a relay-closed socket are still handled
+      // (see the gate at the top), and a relay can force the order: it raises
+      // the guest approval prompt before answering `join` (hello, then a
+      // handshake signed by itself), queues its answer behind the parked pump
+      // and hangs up; onclose settles the prompt and the answer then meets
+      // onclose's reset state (C3-2 r1 R1-2, Chromium). The old code drew
+      // "connected" for the dead socket (Disconnect did nothing) and, after an
+      // honest `pending`, accused the relay of seating us unqueued. So: on a
+      // CLOSED socket a check runs only if what it reads survives onclose
+      // (`m.role`, `sessionRoomMine` — its refusal still reaches the room
+      // screen, as L2 wants); the unqueued-guest check reads `wasPending`,
+      // which does not, and comes after the CLOSED break; the role-change
+      // check reads `roomRole`, null after onclose, so it cannot fire there.
+      // The seat itself needs an OPEN socket (below). The same shape in
+      // `pending`.
       // An older relay answers `join` with a bare {"joined"} — no role, no
       // admission control. Refusing beats silently running the protocol this
       // fix removed: the room would again be first-come-first-served and the
@@ -4289,6 +4299,7 @@ async function handleMessage(room, raw, sock) {
           "The relay tried to seat you as a guest. Connect first, then send the code.");
         return;
       }
+      if (sock.readyState === WebSocket.CLOSED) break; // C3-2: wasPending is onclose's
       if (m.role === "guest" && !wasPending) {
         addLine("sys", "", "[we were seated in this room without ever asking to be let in — refusing]", true);
         endUnanswered(sock, "This relay put you in the room without the owner approving you. Disconnected.");
@@ -4297,9 +4308,12 @@ async function handleMessage(room, raw, sock) {
       // C3-2: the seat, only for a socket that is still open. A CLOSING one
       // (the relay's Close came, its onclose has not run) is not drawn as a
       // chat that is about to vanish; its onclose is on the way and says what
-      // ended it. `joined` and `roomRole` are written here, after every
-      // refusal, so none of them leaves either behind.
-      if (sock.readyState !== WebSocket.OPEN) break;
+      // ended it. The relay did answer, so the join deadline ends here: fired
+      // into the closing socket it would say "did not answer" over a reason
+      // the relay parked (C3-2 r1 R1-3). Cancel stays usable meanwhile.
+      // `joined` and `roomRole` are written here, after every refusal, so none
+      // of them leaves either behind.
+      if (sock.readyState !== WebSocket.OPEN) { clearJoinTimer(); break; }
       if (roomRole === null) {
         roomRole = m.role;
         syncConnectCancel(); // R6-1: answered (see `pending`)

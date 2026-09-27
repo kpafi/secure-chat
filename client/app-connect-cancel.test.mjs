@@ -538,8 +538,10 @@ const LOCK = "sc.otp.lock.v1." + pad.padId;
 // the gate at the top of handleMessage). A `joined` still queued on msgChain
 // when the close event ran finds onclose's reset state. The stub forces that
 // order: the frame is queued (onmessage only chains it) and the relay's close
-// runs onclose in the same task, before the chain gets to it. Pentest r3 C3-2
-// reproduced it only this way (not in Chromium, 20 tries); the hardening is cheap.
+// runs onclose in the same task, before the chain gets to it. A hostile relay
+// forces the same order in Chromium by parking the pump on the guest approval
+// prompt first (C3-2 r1 R1-2; e2e/forced-late-answer.mjs). Which checks still
+// run after the close is deliberate: those whose inputs survive onclose.
 const logLines = () => dom.el("log").children;
 const disconnectedLines = () => logLines().filter((c) => /^disconnected\b/.test(c.textContent)).length;
 function answerThenRelayClose(ws, frame) {
@@ -603,21 +605,87 @@ function answerThenRelayClose(ws, frame) {
   console.log("OK  C3-2: a guest's seat handled after the close is not refused on wiped state, and leaves no seat behind (executed)");
 }
 {
-  // CLOSING: the relay's Close arrived, the close event has not. The refusals
-  // still read live state and are said at once; a seat is not drawn.
+  // Round 1 (R1-1): `pending` handled after the relay's close is not acted on
+  // either — no "waiting for approval" chat for the dead socket, no knock.
   const ws = await connectToSocket();
   ws.open();
-  stallClose(ws);
-  ws.readyState = 2; // the relay's Close frame came in; the browser waits for the TCP close
-  await ws.deliver({ type: "joined", role: "owner" });
+  const lines0 = logLines().length;
+  answerThenRelayClose(ws, { type: "pending" });
   await settle();
-  assert.strictEqual(el("scrChat").hidden, true, "C3-2: a seat on a CLOSING socket draws no chat screen");
-  assert.notStrictEqual(el("status").textContent, "connected", "C3-2: ...and says no 'connected'");
-  assert.ok(!ws.sent.some((f) => f.type === "key"), "C3-2: ...and sends no hello");
-  ws.readyState = 3;
-  ws.onclose({}); // the close event
-  await settle();
-  assertBackOnRoom("C3-2 (seat on a CLOSING socket, then its close)");
+  assertBackOnRoom("R1-1 (pending after the close)");
+  assert.ok(!logLines().slice(lines0).some((c) => /waiting — the person who created/.test(c.textContent)),
+    "R1-1: a pending handled after the close is not narrated");
+  assert.ok(!ws.sent.some((f) => f.type === "knock"), "R1-1: ...and no knock is sent into the dead socket");
+  console.log("OK  C3-2 r1 R1-1: a pending handled after the relay's close draws no waiting chat, sends no knock (executed)");
+}
+{
+  // Round 1 (R1-4): after the relay's close, a refusal that reads only what
+  // onclose leaves (the frame itself, whether this page minted the code) is
+  // still said on the room screen, as the L2 "last words" design wants.
+  const cases = [
+    { what: "joined without a role", mint: false, frame: { type: "joined" }, said: /^This relay is running an older protocol/ },
+    { what: "the creator seated as a guest", mint: true, frame: { type: "joined", role: "guest" }, said: /^You created this code, so you should be the one approving people\. The relay tried to seat you/ },
+    { what: "pending to the creator", mint: true, frame: { type: "pending" }, said: /^You created this code, so you should be the one approving people\. Connect first/ },
+  ];
+  for (const c of cases) {
+    if (c.mint) await el("gen").click();
+    else { el("room").value = ROOM; await el("room").dispatch("input"); }
+    el("pass").value = PASS;
+    dom.selectAlg("AES256");
+    const before = dom.socket();
+    el("connect").click();
+    await until(() => dom.socket() !== before, "the socket (" + c.what + ")");
+    const ws = dom.socket();
+    ws.open();
+    answerThenRelayClose(ws, c.frame);
+    await settle();
+    assertBackOnRoom("R1-4 (" + c.what + " after the close)");
+    assert.match(el("roomHint").textContent, c.said, "R1-4: " + c.what + " after the relay's close is still refused, with its sentence");
+  }
+  el("room").value = ROOM;
+  await el("room").dispatch("input");
+  console.log("OK  C3-2 r1 R1-4: refusals that read nothing onclose reset are still said after the relay's close (executed)");
+}
+{
+  // CLOSING: the relay's Close arrived, the close event has not. The refusals
+  // still read live state and are said at once; a seat is not drawn, and the
+  // relay HAS answered, so the join deadline ends (R1-3) — Cancel stays usable.
+  for (const frame of [{ type: "joined", role: "owner" }, { type: "pending" }]) {
+    const what = JSON.stringify(frame);
+    const ws = await connectToSocket();
+    const t = lastTimer(30000);
+    ws.open();
+    stallClose(ws);
+    ws.readyState = 2; // the relay's Close frame came in; the browser waits for the TCP close
+    await ws.deliver(frame);
+    await settle();
+    assert.strictEqual(el("scrChat").hidden, true, "C3-2: " + what + " on a CLOSING socket draws no chat screen");
+    assert.ok(!/connected|waiting for approval/.test(el("status").textContent), "C3-2: ...and says neither 'connected' nor 'waiting' (" + what + ")");
+    assert.ok(!ws.sent.some((f) => f.type === "key" || f.type === "knock"), "C3-2: ...and sends no hello or knock (" + what + ")");
+    assert.ok(cancelShown(), "C3-2: Cancel stays offered on the CLOSING socket (" + what + ")");
+    await ws.deliver({ type: "error", reason: "room closed" }); // the relay's reason, parked for the close
+    if (!t.cleared) await fire(t); // a deadline left armed fires before the close event comes
+    const before = disconnectedLines();
+    ws.readyState = 3;
+    if (ws.onclose) ws.onclose({}); // the close event (a deadline that fired has run it already)
+    await settle();
+    assertBackOnRoom("C3-2 (" + what + " on a CLOSING socket, then its close)");
+    assert.strictEqual(el("roomHint").textContent, "The person who created this chat left, so the chat was closed.",
+      "R1-3: the relay's own reason is on the room screen, not the join timeout (" + what + ")");
+    assert.strictEqual(disconnectedLines(), before, "C3-2: a seat withheld on CLOSING is not narrated as a session end (" + what + ")");
+  }
+  {
+    // Cancel on a CLOSING socket whose answer was withheld: back at once.
+    const ws = await connectToSocket();
+    ws.open();
+    stallClose(ws);
+    ws.readyState = 2;
+    await ws.deliver({ type: "joined", role: "owner" });
+    await settle();
+    el("connectCancel").click();
+    await settle();
+    assertBackOnRoom("C3-2 (Cancel on a CLOSING socket)");
+  }
 
   const ws2 = await connectToSocket();
   ws2.open();
@@ -628,7 +696,26 @@ function answerThenRelayClose(ws, frame) {
   assertBackOnRoom("C3-2 (unqueued guest on a CLOSING socket)");
   assert.match(el("roomHint").textContent, /^This relay put you in the room without the owner approving you\./,
     "C3-2: a refusal on a CLOSING socket (its onclose has not run) is still said at once");
-  console.log("OK  C3-2: on a CLOSING socket a seat is not drawn and a refusal is still said (executed)");
+  console.log("OK  C3-2: on a CLOSING socket no seat is drawn, the deadline ends, Cancel works, a refusal is still said (executed)");
+}
+{
+  // The role-change refusal (rewritten by C3-2; r1 test gap 1): a guest the
+  // owner let in, re-cast as the owner, is refused — no second session start.
+  const ws = await connectToSocket();
+  ws.open();
+  await ws.deliver({ type: "pending" });
+  await ws.deliver({ type: "joined", role: "guest" });
+  await settle();
+  assert.strictEqual(el("status").textContent, "connected", "fixture: pending, then joined:guest seats the guest");
+  const hellos = () => ws.sent.filter((f) => f.type === "key").length;
+  assert.strictEqual(hellos(), 1, "fixture: one hello");
+  await ws.deliver({ type: "joined", role: "owner" });
+  await settle();
+  assertBackOnRoom("role change");
+  assert.strictEqual(el("roomHint").textContent, "The relay tried to change your role in this room. Disconnected.",
+    "role change: a seated guest re-cast as the owner is refused, with its sentence");
+  assert.strictEqual(hellos(), 1, "role change: ...and no second hello is sent");
+  console.log("OK  C3-2 r1: a role the relay changes after the seat is refused (executed)");
 }
 {
   // The refusals of the answer take no seat: `joined` is written after them,
