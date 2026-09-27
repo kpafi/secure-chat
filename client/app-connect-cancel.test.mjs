@@ -104,6 +104,7 @@ globalThis.navigator = {
 };
 
 // Hold the next call of a crypto.subtle method until the test releases it.
+// `fail(err)` releases it with a rejection instead.
 function gateNext(method) {
   const real = crypto.subtle[method];
   let release;
@@ -112,10 +113,17 @@ function gateNext(method) {
   crypto.subtle[method] = async function (...a) {
     crypto.subtle[method] = real;
     entered = true;
-    await gate;
+    const err = await gate;
+    if (err) throw err;
     return real.apply(this, a);
   };
-  return { release: () => release(), entered: () => entered, restore: () => { crypto.subtle[method] = real; } };
+  return { release: () => release(null), fail: (err) => release(err), entered: () => entered };
+}
+// A peer that never answers the Close frame (a hostile relay, a half-open
+// connection): close() leaves the socket CLOSING and runs no onclose — in a
+// browser that wait is its closing-handshake timeout (60 s in Chromium).
+function stallClose(ws) {
+  ws.close = function () { if (this.readyState < 2) this.readyState = 2; };
 }
 
 await import("./app.js");
@@ -176,7 +184,12 @@ el("connectCancel").hidden = true;
   await settle();
   assert.deepStrictEqual(ws.sent[0], { type: "join", room: ROOM }, "fixture: join was sent");
   assert.ok(cancelShown(), "C: ...and while the relay has not answered join");
+  document.activeElement = el("room"); // the user is typing elsewhere
+  el("connect")._focused = false;
   await fire(t); // the relay never answers
+  assert.strictEqual(el("connect")._focused, false, "C (N1): a Cancel going away does not take the focus from elsewhere");
+  document.activeElement = null;
+  assert.match(el("roomHint").className, /\berr\b/, "J: the sentence is shown as an error (N2)");
   assert.strictEqual(ws.readyState, 3, "J: an unanswered join is closed at the deadline");
   assertBackOnRoom("J");
   assert.strictEqual(el("roomHint").textContent, JOIN_SENTENCE, "J: ...with the fixed sentence, byte for byte");
@@ -259,6 +272,8 @@ el("connectCancel").hidden = true;
   if (!ta.cleared) await fire(ta);
   assert.notStrictEqual(a.readyState, 3, "J: the previous socket's deadline does not fire after a new connect");
   assert.notStrictEqual(el("roomHint").textContent, JOIN_SENTENCE, "J: ...and says nothing");
+  assert.ok(el("status").textContent === "connecting…" && el("connect").disabled && cancelShown(),
+    "J: ...and the new attempt is untouched (still in flight, Cancel offered)");
   await fire(lastTimer(30000));
   assert.strictEqual(b.readyState, 3, "control: the new socket's own deadline fires");
   a.close();
@@ -389,6 +404,107 @@ const LOCK = "sc.otp.lock.v1." + pad.padId;
   assertBackOnRoom("C (key setup)");
   console.log("OK  C: Cancel during the key setup opens no socket (executed)");
 }
+{
+  // Fix round 1, C1-3: a key setup that FAILS after the Cancel is not narrated...
+  const g = gateNext("deriveBits");
+  prepare("AES256");
+  el("connect").click();
+  await until(g.entered, "the key setup to start");
+  el("connectCancel").click();
+  g.fail(new Error("the KDF broke"));
+  await until(() => el("connect").disabled === false, "the cancelled connect to end");
+  assert.strictEqual(el("roomHint").textContent, "", "C1-3: a key setup failing after the Cancel is not narrated");
+  assertBackOnRoom("C1-3 (key setup)");
+  // ...but a pad READ that fails after it still is: it may be the stored pad's
+  // tamper or damage warning, and a Cancel must not silence that.
+  const r = gateNext("decrypt");
+  prepare("OTP", { padId: pad.padId });
+  el("connect").click();
+  await until(r.entered, "the pad read to start");
+  el("connectCancel").click();
+  r.fail(new Error("the stored pad does not decrypt"));
+  await until(() => el("connect").disabled === false, "the cancelled connect to end");
+  assert.notStrictEqual(el("roomHint").textContent, "", "C1-3: a pad read failing after the Cancel is still narrated");
+  assert.ok(!held.has(LOCK), "C1-3: ...and the pad lock is released");
+  console.log("OK  C1-3: after a Cancel a failed key setup is silent, a failed pad read is still said (executed)");
+}
+
+// ---- fix round 1, C1-1 / C1-2: a peer that never answers the Close frame --------
+{
+  // Cancel: back on the room screen at once, not when the browser gives up.
+  const ws = await connectToSocket();
+  ws.open();
+  stallClose(ws);
+  el("connectCancel").click();
+  await settle();
+  assert.strictEqual(ws.readyState, 2, "fixture: the socket is still CLOSING (the peer never answers)");
+  assertBackOnRoom("C1-2 (Cancel)");
+  assert.strictEqual(el("roomHint").textContent, "", "C1-2: ...with no sentence");
+  // The next attempt runs; the old socket's late events must not touch it.
+  const late = { close: ws.onclose, error: ws.onerror };
+  const next = await connectToSocket();
+  next.open();
+  await settle();
+  ws.readyState = 3;
+  if (late.error) late.error({});
+  if (late.close) late.close({});
+  await settle();
+  assert.strictEqual(el("status").textContent, "connecting…", "C1-2: the old socket's late error / close do not reach the next attempt");
+  assert.ok(cancelShown() && el("connect").disabled, "C1-2: ...which is still in flight");
+  el("connectCancel").click();
+  await settle();
+  assertBackOnRoom("fixture (next)");
+  console.log("OK  C1-2: Cancel against a peer that never answers the Close ends the attempt at once; its late events are inert (executed)");
+}
+{
+  // The deadline: the same, with its sentence.
+  const ws = await connectToSocket();
+  ws.open();
+  stallClose(ws);
+  await fire(lastTimer(30000));
+  assert.strictEqual(ws.readyState, 2, "fixture: still CLOSING");
+  assertBackOnRoom("C1-2 (deadline)");
+  assert.strictEqual(el("roomHint").textContent, JOIN_SENTENCE, "C1-2: the deadline's sentence at once");
+  console.log("OK  C1-2: the deadline against a peer that never answers the Close ends the attempt at 30 s (executed)");
+}
+{
+  // OTP: the pad lock comes back at once too.
+  const ws = await connectToSocket("OTP", { padId: pad.padId });
+  ws.open();
+  stallClose(ws);
+  el("connectCancel").click();
+  await until(() => !held.has(LOCK), "the pad lock to be released while the socket is still closing");
+  assert.strictEqual(ws.readyState, 2, "fixture: still CLOSING");
+  assertBackOnRoom("C1-2 (OTP)");
+  console.log("OK  C1-2: an OTP connect's pad lock is released at the Cancel, not at the browser's close (executed)");
+}
+{
+  // C1-1: a client refusal on a socket that stays CLOSING keeps its own words,
+  // whether the deadline or a Cancel comes next.
+  const CREATOR = /^You created this code, so you should be the one approving people\./;
+  for (const next of ["deadline", "cancel"]) {
+    await el("gen").click(); // New code: this page minted the room, so it is its creator (F-PROTO-001)
+    el("pass").value = PASS;
+    dom.selectAlg("AES256");
+    const before = dom.socket();
+    el("connect").click();
+    await until(() => dom.socket() !== before, "the creator's socket");
+    const ws = dom.socket();
+    const t = lastTimer(30000);
+    ws.open();
+    stallClose(ws);
+    await ws.deliver({ type: "pending" }); // the relay demotes the creator: refused, close stalls
+    await settle();
+    assert.strictEqual(ws.readyState, 2, "fixture: the refusal's close is stalled");
+    if (next === "deadline") await fire(t);
+    else { assert.ok(cancelShown(), "fixture: Cancel still offered while the close stalls"); el("connectCancel").click(); await settle(); }
+    assertBackOnRoom("C1-1 (" + next + ")");
+    assert.match(el("roomHint").textContent, CREATOR, `C1-1: after the ${next}, the room screen keeps the refusal, not the timeout sentence`);
+  }
+  el("room").value = ROOM;
+  await el("room").dispatch("input");
+  console.log("OK  C1-1: a refusal whose close stalls keeps its sentence through the deadline and a Cancel (executed)");
+}
 
 // ---- L: the directory lookup ----------------------------------------------------
 el("toIdentity").click();
@@ -414,6 +530,7 @@ const bobAnswer = () => new Response(JSON.stringify({ username: "bob", ed: bb.ed
   assert.strictEqual(dom.socket(), before, "L: a lookup that timed out opens no socket");
   assertBackOnRoom("L");
   assert.strictEqual(el("roomHint").textContent, LOOKUP_SENTENCE, "L: ...and says so with the fixed sentence, byte for byte");
+  assert.match(el("roomHint").className, /\berr\b/, "L (N2): ...shown as an error");
   console.log("OK  L: a directory lookup that never answers ends after 20 s with a fixed sentence and no socket (executed)");
 }
 {

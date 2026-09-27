@@ -15,7 +15,13 @@
 //       fixed sentence
 //   [4] the real relay (no proxy): an owner seated at once shows no Cancel;
 //       a guest waiting in the admission queue is NOT timed out (40 s)
+//   [5] fix round 1 (pentest C1-1, C1-2): a peer that completes the upgrade on
+//       a raw socket and never answers the Close frame (the `ws` proxy above
+//       answers it by itself): Cancel ends the attempt at once, not after
+//       Chromium's 60 s closing timeout; a creator refused (`pending`, then
+//       silence) keeps the refusal's sentence when the deadline comes at 30 s
 import http from "node:http";
+import crypto from "node:crypto";
 import { WebSocketServer } from "ws";
 import puppeteer from "puppeteer-core";
 import { readFileSync } from "node:fs";
@@ -184,6 +190,60 @@ console.log("\n  [4] the real relay: an owner seated, a guest waiting in the que
     g.chat && /waiting for approval/.test(g.status) && g.disconnect && !g.hint.includes("did not answer"), JSON.stringify(g));
   await guest.evaluate(() => document.querySelector("#disconnect").click());
   await owner.evaluate(() => { const d = document.querySelector("#disconnect"); if (d) d.click(); });
+}
+
+// ---- [5] a peer that never answers the Close frame ---------------------------------------------
+console.log("\n  [5] a peer that never answers the Close frame (raw socket)");
+{
+  let firstFrame = null; // what the raw peer sends after the join, if anything
+  const raws = [];
+  const raw = http.createServer((req, res) => {
+    const p = http.request({ ...UP, method: req.method, path: req.url,
+      headers: { ...req.headers, host: APP.host, origin: APP.origin } }, (r) => { res.writeHead(r.statusCode, r.headers); r.pipe(res); });
+    p.on("error", () => { res.writeHead(502); res.end(); });
+    req.pipe(p);
+  });
+  raw.on("upgrade", (req, sock) => {
+    const acc = crypto.createHash("sha1").update(req.headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
+    sock.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + acc + "\r\n\r\n");
+    const h = { sock, bytes: 0 };
+    raws.push(h);
+    sock.on("data", (d) => {
+      if (h.bytes === 0 && firstFrame) { const pl = Buffer.from(JSON.stringify(firstFrame)); sock.write(Buffer.concat([Buffer.from([0x81, pl.length]), pl])); }
+      h.bytes += d.length; // read and never answered — not even a Close
+    });
+    sock.on("error", () => {});
+  });
+  await new Promise((r) => raw.listen(0, "127.0.0.1", r));
+  const p5 = await mkPage(`http://127.0.0.1:${raw.address().port}/`);
+  await setAlg(p5, "AES256");
+  await setVal(p5, "#room", "ef".repeat(32));
+  await setVal(p5, "#pass", PASS);
+  await tap(p5, "#connect");
+  await until(() => raws.length === 1 && raws[0].bytes > 0);
+  await sleep(1000);
+  const t0 = Date.now();
+  await tap(p5, "#connectCancel");
+  const back = await until(async () => !(await state(p5)).connectDisabled, 5000);
+  const a = await state(p5);
+  check("C1-2: Cancel ends the attempt at once although the peer never answers the Close",
+    back && a.room && !a.cancel && a.status === "disconnected" && a.hint === "", `${((Date.now() - t0) / 1000).toFixed(1)} s ${JSON.stringify(a)}`);
+
+  // The creator, demoted by the relay and then met with silence (F-PROTO-001's refusal).
+  firstFrame = { type: "pending" };
+  await p5.evaluate(() => document.querySelector("#gen").click());
+  const t1 = Date.now();
+  await tap(p5, "#connect");
+  await until(() => raws.length === 2 && raws[1].bytes > 0);
+  const done = await until(async () => !(await state(p5)).connectDisabled, 40000);
+  const secs = (Date.now() - t1) / 1000;
+  const b = await state(p5);
+  check("C1-1/C1-2: the refused creator is back on the room screen by the 30 s deadline, not Chromium's 60 s",
+    done && secs >= 28 && secs < 36, `${secs.toFixed(1)} s`);
+  check("C1-1: ...with the refusal's sentence, not the timeout's",
+    /^You created this code, so you should be the one approving people\./.test(b.hint), JSON.stringify(b));
+  for (const h of raws) h.sock.destroy();
+  raw.close();
 }
 
 await browser.close();

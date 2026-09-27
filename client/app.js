@@ -3214,15 +3214,35 @@ function syncConnectCancel() {
   if (!show && document.activeElement === els.connectCancel && !els.connect.disabled) els.connect.focus();
   els.connectCancel.hidden = !show;
 }
+// Fix round 1 (pentest C1-1, C1-2): a socket nobody answered is ended NOW.
+// closeWs() only starts the closing handshake, and everything the user needs
+// back — the room screen, Connect, the pad lock — waited for onclose, which a
+// peer that never answers the Close frame (a hostile relay, a half-open
+// connection) delays by the browser's own closing timeout (60 s in Chromium);
+// meanwhile the deadline fired into the closing socket and overwrote a
+// client refusal (F-PROTO-001's "You created this code…") or a Cancel with
+// the timeout sentence. So: a socket this app already decided to close keeps
+// its own reason (no second closeWs), and its onclose runs at once, exactly
+// once — detached from the socket, so the late close event finds nothing.
+// Frames it may still deliver are dropped (retired at dispatch). The pad lock
+// goes through releaseOtpLockAfterSave() as always: nothing of a session can
+// be in flight before the relay answered, and if it were, the lock would wait.
+function endUnanswered(sock, refusal) {
+  if (!retiredSockets.has(sock)) closeWs(refusal, sock);
+  const done = sock.onclose;
+  if (sock.readyState === WebSocket.CLOSED || !done) return; // onclose already ran
+  sock.onclose = null;
+  sock.onerror = null; // its late "connection error" must not land on the next attempt's status
+  done();
+}
 function cancelConnect() {
   // Before the socket (connect() is still running — it ends in the same task
   // that builds the socket): stop the attempt; connectInner returns at its next
   // check (the lookup's fetch is aborted at once) and releases what it took.
   if (connecting && connectAttempt) { connectAttempt.abort(); return; }
-  // The socket is up (or opening) and unanswered: exactly Disconnect —
-  // onclose does the cleanup, releases the pad lock after its saves, and
-  // returns to the room screen.
-  if (ws && roomRole === null) closeWs();
+  // The socket is up (or opening) and unanswered: Disconnect, without waiting
+  // for the peer's side of the close (endUnanswered).
+  if (ws && roomRole === null) endUnanswered(ws, null);
 }
 
 async function connect() {
@@ -3378,7 +3398,7 @@ async function connectInner() {
       otpAtRest = unlocked.atRest;
     } catch (e) {
       releaseOtpLock();
-      hint(e.message, true);
+      hint(e.message, true); // narrated even after a Cancel (fix round 1, C1-3: see the key-setup catch)
       return;
     }
     if (otpRecord.regionSize - otpRecord.sendOffset < 64) {
@@ -3393,6 +3413,10 @@ async function connectInner() {
     cipher = makeCipher(alg, room, opts);
     await cipher.init();
   } catch (e) {
+    // Fix round 1 (C1-3): after a Cancel a failed key setup is not narrated.
+    // (A failed PAD READ still is, above: it may be the tamper or damage
+    // warning for the stored pad, and a Cancel must not silence that.)
+    if (stopped()) return;
     releaseOtpLock(); // round 3 (I2): no session, no lock
     hint("Could not set up encryption: " + e.message, true);
     return;
@@ -3437,11 +3461,12 @@ async function connectInner() {
     // R6-1: the relay answers `join` within JOIN_TIMEOUT_MS of Connect, or the
     // attempt ends with a sentence (see JOIN_TIMEOUT_MS for what it covers).
     // Cleared by onclose and by the next connectInner, so it only ever fires
-    // for the current socket.
+    // for the current socket — possibly one already closing (C1-1: its own
+    // reason stays; C1-2: it is ended now).
     const opened = ws;
     joinTimer = setTimeout(() => {
       joinTimer = null;
-      if (roomRole === null) closeWs(JOIN_TIMEOUT_HINT, opened);
+      if (roomRole === null) endUnanswered(opened, JOIN_TIMEOUT_HINT);
     }, JOIN_TIMEOUT_MS);
   } catch (e) {
     releaseOtpLock(); // round 3 (I2): no session, no lock
