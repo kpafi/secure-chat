@@ -15,6 +15,9 @@
 //       the pad bob just tried in [1]: Ready with its FULL send budget (so
 //       [1] spent none of it), no new refusal, a message each way.
 //   [3] bob's pad on both sides — the one alice tried in [1]: the same.
+//   [4] alice on One-time pad, bob on AES-256 (pentest r3 R3-F1): alice is
+//       refused before Ready with the mode named — not "older version …
+//       different pads" — and her pad's send budget is untouched.
 import puppeteer from "puppeteer-core";
 import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -183,6 +186,7 @@ console.log("\n  [1] both on the imported Chess — two different pads");
   await leave(alice, bob);
 }
 
+let aMadeBudget = null; // alice's pad after [2]: what [4] must leave unchanged
 for (const [n, aId, bId, whose] of [[2, ids.aMade, ids.bGot, "alice's"], [3, ids.aGot, ids.bMade, "bob's"]]) {
   console.log(`\n  [${n}] ${whose} pad on both sides`);
   await pick(alice, aId);
@@ -194,10 +198,53 @@ for (const [n, aId, bId, whose] of [[2, ids.aMade, ids.bGot, "alice's"], [3, ids
   check(`[${n}] no new refusal line`, (await refusals()) === r0);
   for (const a of [alice, bob]) {
     const st = await text(a.page, "#otpStatus");
-    check(`[${n}] ${a.label}: the pad's full send budget is left`, /^Pad "Chess": 32 KiB left to send/.test(st), st);
+    // KiB are rounded; the message estimate (remaining / 92 bytes) moves with
+    // every short message — 32768 / 92 → ~356 only on an untouched pad.
+    check(`[${n}] ${a.label}: the pad's full send budget is left`, /^Pad "Chess": 32 KiB left to send \(~356 more short messages\)/.test(st), st);
   }
   check(`[${n}] alice -> bob`, await roundTrip(alice, bob, `pad${n}`));
   check(`[${n}] bob -> alice`, await roundTrip(bob, alice, `pad${n}`));
+  if (n === 2) aMadeBudget = await text(alice.page, "#otpStatus");
+  await leave(alice, bob);
+}
+
+console.log("\n  [4] alice on One-time pad, bob on AES-256");
+{
+  await pick(alice, ids.aMade);
+  await bob.page.evaluate(() => {
+    const r = document.querySelector('input[name="alg"][value="AES256"]');
+    r.checked = true;
+    r.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await setValue(bob.page, "#pass", "an aes passphrase for the mode mix-up e2e");
+  await alice.page.click("#gen");
+  const code = await alice.page.evaluate(() => document.querySelector("#room").value.trim());
+  await sleep(700);
+  await alice.page.click("#connect");
+  await alice.page.waitForFunction(() => document.querySelector("#chatStatus").textContent.trim().toLowerCase() === "connected", { timeout: 45000 });
+  await setValue(bob.page, "#room", code);
+  await bob.page.click("#connect");
+  await alice.page.waitForFunction(() => !document.querySelector("#admit").hidden, { timeout: 45000 });
+  await sleep(600);
+  await alice.page.click("#admitOk");
+  await alice.page.waitForFunction(() => !document.querySelector("#text").disabled || !document.querySelector("#scrRoom").hidden, { timeout: 60000 });
+  await sleep(500);
+  const room = await text(alice.page, "#roomHint");
+  check("[4] alice: not Ready", !(await ready(alice)));
+  check("[4] alice: the room screen names bob's mode", /Your contact picked AES-256 under Security options, and you picked One-time pad\..*Nothing was sent and no pad was used\./.test(room), room.slice(0, 140));
+  check("[4] alice: no \"older version\" line", !/older version/.test(await text(alice.page, "#log")));
+  await leave(alice, bob);
+  await bob.page.evaluate(() => {
+    const r = document.querySelector('input[name="alg"][value="OTP"]');
+    r.checked = true;
+    r.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  // alice's pad after [4]: the budget [2] left, to the byte (Ready with bob on it).
+  await pick(alice, ids.aMade);
+  await pick(bob, ids.bGot);
+  await meet(alice, bob);
+  const st = await text(alice.page, "#otpStatus");
+  check("[4] alice's pad: [4] spent nothing (the budget [2] left)", (await ready(alice)) && !!aMadeBudget && st === aMadeBudget, `${st} vs ${aMadeBudget}`);
   await leave(alice, bob);
 }
 

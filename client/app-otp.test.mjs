@@ -196,6 +196,24 @@ async function otpConnect(padId = pad.padId, extra = () => ({})) {
   const onDisk = async () => { const u = await otp.unlockPad(chess.padId, PAD_PASS); return [u.record.sendOffset, u.record.recvHighWater]; };
   const READY = /one-time-pad encrypted/;
   const OLD = /older version and cannot confirm/;
+  // Connected, joined as owner, nothing from a peer yet.
+  const bare = async (padId) => {
+    if (current && current.readyState === 1) await dom.el("disconnect").click();
+    const room = dom.el("room");
+    room.value = ROOM;
+    await room.dispatch("input");
+    dom.selectAlg("OTP");
+    dom.el("otpSelect").value = padId;
+    dom.el("otpPass").value = PAD_PASS;
+    await dom.el("connect").click();
+    const ws = dom.socket();
+    ws.open();
+    await tick();
+    await ws.deliver({ type: "joined", role: "owner" });
+    await settle(5);
+    current = ws;
+    return ws;
+  };
   // The owner's flow: the peer's hello offers the check (we answer with our
   // proof), then the peer's proof arrives as its own answer.
   const proofFrom = async (ws, peerN, proof) => {
@@ -387,6 +405,56 @@ async function otpConnect(padId = pad.padId, extra = () => ({})) {
     assert.ok(anyHint(/reflected hello rejected/), "MA-2 (r): a reflected hello is named as such: " + dom.el("hint").textContent);
     assert.strictEqual(count(/same half of this pad/), sameHalf0, "MA-2 (r): …and never read as the same half");
     assert.ok(!anyHint(READY), "MA-2 (r): …nor as Ready");
+    await dom.el("disconnect").click();
+    await settle(5);
+  }
+
+  // (r2) pentest r3 R3-F2: the owner ALONE — no peer nonce pinned yet —
+  //      gets its own `joined` hello back. Refused as a reflection, and it
+  //      pins nothing: the real peer that arrives next still gets through.
+  {
+    const peerC = view(chess, 1);
+    const ws = await bare(chess.padId);
+    const h0 = ours(ws)[0];
+    await ws.deliver({ type: "key", room: ROOM, alg: "OTP", payload: pack(h0) });
+    await settle(5);
+    assert.ok(anyHint(/reflected hello rejected/), "MA-2 (r2): our own first hello, reflected while alone, is refused");
+    const peerN = freshNonce();
+    await ws.deliver({ type: "key", room: ROOM, alg: "OTP", payload: pack({ hello: true, n: peerN, reply: false, chk: 1 }) });
+    await settle(10);
+    await proofFrom(ws, peerN, peerC.padCheckTag(peerN, myNonceOf(ws)));
+    assert.ok(anyHint(READY), "MA-2 (r2): …and pinned nothing — the real peer gets Ready: " + dom.el("hint").textContent);
+    await dom.el("disconnect").click();
+    await settle(5);
+  }
+
+  // (m) pentest r3 R3-F1: the contact picked ANOTHER MODE. Its hello says
+  //     so (every build tags key frames with its mode): refused before Ready,
+  //     the mode named, nothing spent — not "older version … different pads".
+  for (const [alg, name] of [["AES256", "AES-256"], ["DHKE", "DHKE"], ["PQKEM", "Post-quantum"]]) {
+    const before = await onDisk();
+    const old0 = count(OLD);
+    const ws = await bare(chess.padId);
+    await ws.deliver({ type: "key", room: ROOM, alg, payload: pack({ hello: true, n: freshNonce(), reply: false }) });
+    await settle(10);
+    assert.ok(!anyHint(READY), `MA-2 (m): a ${alg} contact does not make an OTP session Ready`);
+    assert.ok(anyHint(new RegExp(`Your contact picked ${name} under Security options, and you picked One-time pad\\..*Nothing was sent and no pad was used`)),
+      `MA-2 (m): …the room screen names the mode (${alg}): ` + dom.el("roomHint").textContent);
+    assert.ok(said(new RegExp(`uses ${name} mode, not One-time pad — refusing`)), `MA-2 (m): …and so does the transcript (${alg})`);
+    assert.strictEqual(count(OLD), old0, `MA-2 (m): …never "older version" (${alg})`);
+    assert.strictEqual(ws.readyState, 3, `MA-2 (m): …closed (${alg})`);
+    assert.deepStrictEqual(await onDisk(), before, `MA-2 (m): …nothing spent (${alg})`);
+  }
+  // (m2) …judged only before Ready: a hello tagged with another mode after
+  //      Ready (relay-writable) does not close the session.
+  {
+    const peerC = view(chess, 1);
+    const { ws, peerN } = await offer(chess.padId);
+    await proofFrom(ws, peerN, peerC.padCheckTag(peerN, myNonceOf(ws)));
+    assert.ok(anyHint(READY), "MA-2 (m2): fixture ready");
+    await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: pack({ hello: true, n: freshNonce(), reply: true }) });
+    await settle(5);
+    assert.strictEqual(ws.readyState, 1, "MA-2 (m2): a mode-tagged hello after Ready does not close the session");
     await dom.el("disconnect").click();
     await settle(5);
   }

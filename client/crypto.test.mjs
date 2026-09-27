@@ -724,6 +724,9 @@ async function otpPadCheckChecks() {
   await assert.rejects(() => a.padCheckTag(nA, nA), /same/, "pad check R2-F1: no proof over equal nonces");
   const selfProof = await expect(padId, ROOM, 0, nA, nA);
   assert.strictEqual(await a.checkPeerPadTag(nA, nA, selfProof), "malformed", "pad check R2-F1: a proof over equal nonces is malformed, not same-side");
+  // …for role 1 too (pentest r3 T15).
+  await assert.rejects(() => b.padCheckTag(nB, nB), /same/, "pad check R2-F1: no proof over equal nonces (role 1)");
+  assert.strictEqual(await b.checkPeerPadTag(nB, nB, await expect(padId, ROOM, 1, nB, nB)), "malformed", "pad check R2-F1: …malformed for role 1 too");
   // No pad byte is drawn: offsets and bytes are untouched.
   const pad = bytes.slice();
   const c = makeCipher("OTP", ROOM, { pad: { padId, bytes: pad, role: 0, regionSize, sendOffset: 0, recvHighWater: 0 } });

@@ -4015,13 +4015,30 @@ function helloMsg(room, reply, pc) {
 //
 // A peer on 0.4.0 offers no check (no `chk`). It is let through with one
 // line: the check is a convenience, and the one-time HMAC still refuses every
-// frame from a different pad. The first hello judged decides, so a relay that
-// strips `chk` from it (or injects a tagless one first) gets back the state
-// before this check, with that line on screen (pentest r2 R2-F3). Fix round
-// 1 ignored a tagless hello after an offer; that stopped nothing (the relay
-// picks the order) and left a side waiting with no word when the relay
-// injected an offer ahead of a 0.4.0 peer's hello (R2-F2), so it is gone.
-async function otpPadCheck(p, room, sock, live) {
+// frame from a different pad. An offer alone decides nothing; the first hello
+// that is tagless or carries a proof decides. So a relay that strips `chk`, or
+// injects a tagless hello at any point before Ready, gets back the state
+// before this check, with that line on screen (pentest r2 R2-F3, r3 R3-F3).
+// Fix round 1 ignored a tagless hello after an offer. That stopped nothing
+// (the relay picks the order) and left a side waiting with no word when the
+// relay injected an offer ahead of a 0.4.0 peer's hello (R2-F2), so it is gone.
+//
+// Pentest r3 R3-F1: a contact on ANOTHER MODE sends no `chk` either, and was
+// told "older version … different pads" while this side went Ready and spent
+// pad bytes on frames the other side drops. Every build, 0.4.0 included, tags
+// its key frames with its mode, so before Ready a hello tagged with another
+// known mode is refused and the mode is named. The tag is relay-writable, like
+// the RSA one (REMOVED_ALGS): the worst a relay does with it is close a
+// connection it could have dropped. After Ready it is not judged (the caller's
+// `!verified`).
+const MODE_NAMES = { DHKE: "DHKE", AES256: "AES-256", PQKEM: "Post-quantum" };
+async function otpPadCheck(p, alg, room, sock, live) {
+  if (typeof alg === "string" && Object.prototype.hasOwnProperty.call(MODE_NAMES, alg)) {
+    addLine("sys", "", `[the other side uses ${MODE_NAMES[alg]} mode, not One-time pad — refusing]`, true);
+    closeWs(`Your contact picked ${MODE_NAMES[alg]} under Security options, and you picked One-time pad. ` +
+      "Both of you must pick the same option, then connect again. Nothing was sent and no pad was used.", sock);
+    return false;
+  }
   if (p.chk !== 1) {
     if (!saidNoPadCheck) {
       saidNoPadCheck = true;
@@ -4324,7 +4341,7 @@ async function handleMessage(room, raw, sock) {
             // out-of-band secret (like AES256's passphrase), so seeing the peer
             // join is enough to unlock messaging — once its hello shows that it
             // holds the other half of the same pad (MA-2, otpPadCheck).
-            if (!(await otpPadCheck(p, room, sock, live))) return;
+            if (!(await otpPadCheck(p, m.alg, room, sock, live))) return;
             await onChannelReady(room);
           }
           break;
