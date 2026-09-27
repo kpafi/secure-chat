@@ -278,3 +278,20 @@ Android export after pressing Connect. Accepted.
 | (new) `openOtpSheet` only on the room screen | Added with the change: the entries live there, so a sheet cannot open over the chat | P-OS → "…and no sheet opens over the chat screen" |
 | L5: `showScreen` closes nothing | still bound | P-L5 → "R4-1: the Export sheet does not open over the live chat" |
 | CCs / C2028 / L7 / N2 | as the pentester found: CCs bound (Cs still stripped); C2028, L7, N2 equivalent | — |
+
+## Round 6 — Web client
+
+Review: `otp-pentest-r7.md` (nothing Critical, High or Medium; one Low). Commits: the test-only
+QVIS commit on otp-rollback, then app.js + app-otp-sheets + the new `e2e/otp-held-join.mjs`.
+Checked: `npm test` green; e2e on a scratch relay (:8093, killed by PID): otp-transfer 196/196,
+otp-held-join 10/10, all-modes 28/28, no-dead-ends 17/17, room-admission 49/49. Mutants hand-run,
+one at a time, each reverted.
+
+| Finding | Verdict | Bound by (mutant → red check) |
+| --- | --- | --- |
+| R7-1 (Low): a knock (or the guest's peer prompt) revealed by an OTP sheet closing got no 500 ms guard; Share / Done sits on "Let them in" | **Fixed**: `closeOtpSheet` re-arms the guard (`armAdmitGuard(admitShownFor)`, focus on Deny) whenever the Live chat shows `#admit` — every close path (×, Done, scrim, Back, self-close after work) goes through it. The triage line of Round 5 ("costs nothing security-wise") missed this cost; corrected here | R1 (re-arm removed) → unit "R7-1: a tap within 500 ms of the sheet closing does not let the knocker in"; ER1 → e2e `otp-held-join` [1] (the PoC geometry in Chromium: `{"admit":false,"guestStatus":"connected"}`, focus not on Deny) |
+| R7-2 (Info): a self-closed sheet lost its done message | **Fixed**: one short line in the chat's hint and, visible, in `#otpStatus` (per result: created / imported / downloaded or sent — with the hand-over and delete advice) | R2 → unit "R7-2: what the done block would have said stays, visible…" (New pad) and "R7-2: …says it was imported" (Import); R2b (panel only) → the same check; ER2 → e2e [2] (browser Export: the advice in the chat, then in the panel) |
+| R7-3 (Info): a hung OTP connect keeps that pad's lock (PAD_BUSY for Export / Forget of that pad) | **Pre-existing gap** (no join timeout, no Cancel) — left for its own task with R6-1's residual | — |
+| QVIS_S / QVIS_P / QVIS_N | **Tests added** (emoji-, punctuation-, digit-only labels stay) | each red on its assertion |
+| QWFEFF, QW180E, QVISpre | Cosmetic, not taken (an invisible character kept in a label that has a visible one; ZWNJ runs capped at 60) | — |
+| PN2, PL7, PFOC, Q2028 | Equivalent, as the pentester found | — |
