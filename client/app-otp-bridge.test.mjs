@@ -42,8 +42,8 @@ if (!variant) {
     const r = spawnSync(process.execPath, [SELF, "ios"], { cwd: HERE, encoding: "utf8", timeout: 120000 });
     const line = (r.stdout || "").split("\n").find((l) => l.startsWith("NOTICE ")) || "";
     assert.strictEqual(line.slice(7),
-      "Share sheet opened — AirDrop it to them in person; once they've imported it, they delete the file.",
-      `R8-4: the iOS self-close notice (exit ${r.status}): ${line || (r.stderr || "").slice(-400)}`);
+      "Share sheet opened — AirDrop it to them in person; once they've imported it, they delete the file. Weak transfer passphrase — accepted.",
+      `R8-4 / M9: the iOS self-close notice, with the weak transfer passphrase line (exit ${r.status}): ${line || (r.stderr || "").slice(-400)}`);
     console.log("OK  R8-4: the iOS shell's self-close notice names the share sheet");
   }
   console.log("\nAll bridge-shape checks passed.");
@@ -135,7 +135,7 @@ async function iosSelfClose(dom, El) {
   await sel.dispatch("change");
   dom.el("otpPass").value = PASS;
   await dom.el("otpExportOpen").click();
-  dom.el("otpXferPass").value = "a transfer passphrase for ios";
+  dom.el("otpXferPass").value = "hunter2"; // weak: the notice must say so (pentest r9 M9)
   let open; gate = new Promise((r) => { open = r; });
   const exporting = dom.el("otpExport").click();
   await until(() => dom.el("otpExportSheet").getAttribute("data-state") === "working");

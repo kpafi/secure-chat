@@ -5900,7 +5900,9 @@ function otpAfterWork() {
 // a sheet that did not finish says so (R8-2), never in success words (W9);
 // the done block's weak-passphrase line comes along (R8-1); the iOS wording
 // is the share sheet's (R8-4). The label is the cleaned one, in typographic
-// quotes a label's own `"` cannot close (R8-3).
+// quotes (R8-3) — a label's own `"` does not end them; its own `”` still can
+// (cleanPadLabel keeps punctuation), which only rearranges the maker's own
+// ≤ 60 characters, as the pad list shows them anyway (pentest r9 Info-2).
 function otpDoneNotice() {
   const kind = otpUi.sheet, st = otpUi.state[kind];
   const what = { new: "New pad", import: "Import", export: "Export" }[kind];
@@ -5927,10 +5929,18 @@ function otpDoneNotice() {
 // The notice goes to the panel (visible after the chat) and to the chat's
 // hint, by textContent: its words are fixed and the label is already
 // cleaned (no hintSafe, which would blank a non-ASCII label — R8-3).
+// Fix round 8 (pentest r9): an error the chat's hint already shows ("Key
+// exchange failed…", "…it was NOT sent.") is not replaced (Info-1) — the
+// panel still gets the notice; and each target announces it as hint() does
+// (Info-2).
 function otpNotice(text, warn) {
-  for (const el of [els.otpStatus, activeHintEl()]) {
+  const chatHint = activeHintEl();
+  const targets = [els.otpStatus];
+  if (!chatHint.classList.contains("err")) targets.push(chatHint);
+  for (const el of targets) {
     el.textContent = text;
     el.className = "hint" + (warn ? " err" : "");
+    el.setAttribute("aria-live", warn ? "assertive" : "polite");
   }
   otpStatusFromSheet = false;
 }

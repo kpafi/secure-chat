@@ -1360,4 +1360,48 @@ const endChat = async () => {
   console.log("OK  W9/R8-1/R8-2/R8-3: a self-closed Import says what happened — failure, success with its weak line, the label intact");
 }
 
+// ======== fix round 8 (otp-fix-round-1.md, "Round 8") ========
+// ---- M10 / M8 / Info-1: a self-closing New pad — failed, weak, and a chat error it must not hide ----
+{
+  const subtle = globalThis.crypto.subtle;
+  const realDK = subtle.deriveKey;
+  let gate = null;
+  subtle.deriveKey = async function (...a) { if (gate) { const g = gate; await g.p; if (g.fail) throw new Error("the KDF failed (test)"); } return realDK.apply(this, a); };
+  const selfClosingNew = async (pass, { fail = false, chatError = false } = {}) => {
+    await lockPad(madeId, PADPASS);
+    await openExport(); await el("otpExportClose").click(); // unlocked: the connect needs no KDF
+    await settle(5);
+    await el("otpNewOpen").click();
+    await set("otpNewPass", pass);
+    let open; gate = { p: new Promise((r) => { open = r; }), fail };
+    const gen = el("otpGenerate").click();
+    await until(() => stateOf("otpNewSheet") === "working", "new working");
+    const { ws, connecting } = await startConnect();
+    await ws.deliver({ type: "joined", role: "owner" });
+    await connecting;
+    if (chatError) { el("hint").textContent = "Key exchange failed: test"; el("hint").className = "hint err"; }
+    const g = gate; gate = null; open(); void g;
+    await gen; await settle(20);
+    assert.ok(!shown("otpNewSheet"), "fixture: the New pad sheet closed itself");
+    const r = { panel: st.textContent, cls: st.className, hint: el("hint").textContent, live: st.getAttribute("aria-live") };
+    await endChat();
+    return r;
+  };
+  try {
+    let r = await selfClosingNew("a pad passphrase that is strong enough", { fail: true });
+    assert.strictEqual(r.panel, "New pad did not finish — open New pad again after this chat.",
+      "M10: a New pad that failed says so — never 'created': " + JSON.stringify(r.panel));
+    assert.strictEqual(r.live, "assertive", "Info-2: the warning is announced assertively");
+    r = await selfClosingNew("password1");
+    assert.ok(/^Pad “.*” created — Export it to your contact after this chat\. Weak pad passphrase — accepted\.$/.test(r.panel) && /\berr\b/.test(r.cls),
+      "M8: a weak pad passphrase keeps its line in the New pad notice: " + JSON.stringify(r.panel));
+    r = await selfClosingNew("another strong pad passphrase words", { chatError: true });
+    assert.ok(r.hint === "Key exchange failed: test" && /^Pad “.*” created/.test(r.panel),
+      "Info-1: an error the chat's hint shows is not replaced; the panel still gets the notice: " + JSON.stringify(r));
+  } finally {
+    subtle.deriveKey = realDK;
+  }
+  console.log("OK  M10/M8/Info-1/Info-2: New pad self-close — failure, weak line, a chat error kept, announced");
+}
+
 console.log("\nAll OTP sheet checks passed.");
