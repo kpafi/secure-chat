@@ -8,6 +8,9 @@ text. Designed on the Claude Design canvas first, then implemented; reviewed by 
 critics, a design critic and the pentest agent, as for the contact profile
 (`profile-brief.md`). Base: `master` at 7a606b4 (v0.4.0). Branch `feat/otp-transfer-sheets`.
 
+Canvas synced to build at 1c8995b (2026-09-27: the "One-time pad transfer" row matches §§ 12–14;
+added OtpPanelLater, OtpExportSaved, OtpExportAgainDesktop).
+
 ## What is broken today (facts, checked in the code)
 
 1. **Android, Import does nothing.** `MainActivity.kt`'s `WebChromeClient` has no
