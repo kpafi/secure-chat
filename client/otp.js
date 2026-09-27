@@ -414,6 +414,15 @@ function missingRecordError() {
 // ---- generation ------------------------------------------------------------
 
 // Generate a fresh pristine pad. The generator is always role 0.
+// A pad label as the page may show it: a string of at most PAD_LABEL_MAX code
+// points (= #otpLabel's maxlength), without control characters (line breaks
+// that could phrase a dialog) or bidi controls (that could reorder it).
+export const PAD_LABEL_MAX = 60;
+const LABEL_STRIP_RE = /[\p{Cc}\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069\u2028\u2029]/gu;
+export function cleanPadLabel(label) {
+  if (typeof label !== "string") return "";
+  return [...label.replace(LABEL_STRIP_RE, " ").replace(/\s+/g, " ").trim()].slice(0, PAD_LABEL_MAX).join("").trim();
+}
 const localStamp = (d) => {
   const z = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}:${z(d.getMinutes())}`;
@@ -425,7 +434,7 @@ export async function generatePad({ label, totalBytes, fingerBytes }) {
   return {
     padId: randomId(),
     // Local time, like the export file's name (fix round 1, cold n-1: this was UTC).
-    label: label || "pad " + localStamp(new Date()),
+    label: cleanPadLabel(label) || "pad " + localStamp(new Date()),
     regionSize: totalBytes / 2,
     role: 0,
     createdAt: Date.now(),
@@ -533,6 +542,16 @@ export async function importPad(fileText, passphrase) {
   // shape is acceptable (see PAD_ID_RE).
   if (typeof o.padId !== "string" || !PAD_ID_RE.test(o.padId)) throw new Error("pad file has an invalid pad id");
   const bytes = unb64(o.bytes);
+  // Fix round 3 (pentest r4 I-1): every refusal from here on zeroes the
+  // decrypted pad bytes, not only some of them.
+  try {
+    return await importChecked(o, bytes);
+  } catch (e) {
+    bytes.fill(0);
+    throw e;
+  }
+}
+async function importChecked(o, bytes) {
   if (bytes.length !== 2 * o.regionSize) throw new Error("pad file is internally inconsistent");
   if (o.recipientRole !== 0 && o.recipientRole !== 1) throw new Error("pad file has an invalid role");
   // The other half of the M9 fix (see exportPad): a genuine file is written by
@@ -540,7 +559,6 @@ export async function importPad(fileText, passphrase) {
   // only come from a device that re-exported a pad it received (an older
   // client) — its holder and the maker would share the maker's send region.
   if (o.recipientRole !== 1) {
-    bytes.fill(0);
     throw new Error("this file was exported by someone who received the pad, not by its maker — importing it would reuse key material");
   }
   if (!looksRandom(bytes)) {
@@ -563,7 +581,6 @@ export async function importPad(fileText, passphrase) {
   // page says "You already have this pad on this device …"). A pad that was
   // FORGOTTEN has no blob, so its watermark still gets the "used" refusal.
   if (localStorage.getItem(padKey(o.padId)) !== null) {
-    bytes.fill(0);
     const e = new Error("you already have this pad on this device");
     e.code = "PAD_PRESENT";
     e.padId = o.padId;
@@ -576,7 +593,11 @@ export async function importPad(fileText, passphrase) {
   }
   return {
     padId: o.padId,
-    label: o.label || "imported pad",
+    // Fix round 3 (pentest r4 I-2): the label is the maker's text. It is
+    // shown in a native confirm (Forget) and in the pad list, so it is capped
+    // and stripped of control and bidi-override characters here; the file
+    // format is unchanged.
+    label: cleanPadLabel(o.label) || "imported pad",
     regionSize: o.regionSize,
     role: o.recipientRole,
     createdAt: Date.now(),

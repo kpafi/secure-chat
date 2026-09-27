@@ -1662,4 +1662,58 @@ console.log("OK  n-1: an unnamed pad is named by local time");
 }
 console.log("OK  MA-1: a pad still stored here is PAD_PRESENT; a forgotten one stays 'used'");
 
+// Fix round 3 (pentest r4 I-1, I-2): every import refusal after decryption
+// zeroes the decrypted pad; the maker's label is capped and cleaned.
+{
+  const X = "r3 transfer words";
+  const seal = async (plainObj) => {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(X), "PBKDF2", false, ["deriveKey"]);
+    const key = await crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: 600000, hash: "SHA-256" },
+      base, { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(JSON.stringify(plainObj))));
+    const b = (u) => Buffer.from(u).toString("base64");
+    return JSON.stringify({ fmt: "secure-chat-otp-pad", v: 1, kdf: { salt: b(salt), iters: 600000 }, iv: b(iv), ct: b(ct) });
+  };
+  // Every pad-sized array importPad makes during one call is tracked; after a
+  // refusal each must be all zero.
+  const RealU8 = globalThis.Uint8Array;
+  const refusedZeroed = async (file, re, what) => {
+    const made = [];
+    class TrackedU8 extends RealU8 {
+      constructor(...a) { super(...a); if (this.length === 8192) made.push(this); }
+      static [Symbol.hasInstance](x) { return x instanceof RealU8; }
+    }
+    globalThis.Uint8Array = TrackedU8;
+    let err;
+    try { await otp.importPad(file, X); } catch (e) { err = e; } finally { globalThis.Uint8Array = RealU8; }
+    assert.ok(err && re.test(err.message), `${what}: refused (${err && err.message})`);
+    assert.ok(made.length > 0, `${what}: fixture: the decrypted pad was tracked`);
+    assert.ok(made.every((u) => u.every((v) => v === 0)), `I-1: ${what}: the decrypted pad bytes are zeroed on refusal`);
+  };
+  const gen = await otp.generatePad({ label: "r3", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const plain = (extra = {}) => ({ padId: gen.padId, label: gen.label, regionSize: gen.regionSize, recipientRole: 1,
+    bytes: Buffer.from(gen.bytes).toString("base64"), ...extra });
+  const file = await seal(plain());
+  const imp = await otp.importPad(file, X);
+  await otp.saveNewPad(imp, PASS);
+  await refusedZeroed(file, /already have this pad/, "PAD_PRESENT");
+  otp.forgetPad(gen.padId);
+  await refusedZeroed(file, /already been used/, "used");
+  const flat = await seal({ ...plain(), padId: "ab".repeat(16), bytes: Buffer.alloc(8192, 7).toString("base64") });
+  await refusedZeroed(flat, /not random enough/, "looksRandom");
+  await refusedZeroed(await seal({ ...plain(), padId: "cd".repeat(16), recipientRole: 0 }), /exported by someone who received/, "recipientRole 0");
+
+  // I-2: the maker's label, capped and cleaned (the file format is unchanged).
+  const g2 = await otp.generatePad({ label: "x", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const raw = "Chess\n\nOK only hides it‮evil\u0007" + "y".repeat(100);
+  const got = await otp.importPad(await seal({ padId: g2.padId, label: raw, regionSize: g2.regionSize, recipientRole: 1,
+    bytes: Buffer.from(g2.bytes).toString("base64") }), X);
+  assert.ok(!/[\u0000-\u001f\u007f‪-‮⁦-⁩]/.test(got.label) && [...got.label].length <= 60 && got.label.startsWith("Chess OK only hides it evil"),
+    "I-2: an imported label is capped at 60 and has no control or bidi characters: " + JSON.stringify(got.label));
+  got.bytes.fill(0);
+}
+console.log("OK  I-1/I-2: import refusals zero the decrypted pad; labels are capped and cleaned");
+
 console.log("\nAll OTP rollback checks passed.");
