@@ -3227,6 +3227,11 @@ function syncConnectCancel() {
 // Frames it may still deliver are dropped (retired at dispatch). The pad lock
 // goes through releaseOtpLockAfterSave() as always: nothing of a session can
 // be in flight before the relay answered, and if it were, the lock would wait.
+// Fix round 2 (pentest C2-1): the refusals of the relay's ANSWER to `join`
+// (`pending` to the creator; `joined` with no role, or as a guest that never
+// queued) end the same way — they come before the chat screen and its
+// Disconnect, some after roomRole is set, so neither Cancel nor the deadline
+// reached them, and the user sat on "connecting…" for the browser's 60 s.
 function endUnanswered(sock, refusal) {
   if (!retiredSockets.has(sock)) closeWs(refusal, sock);
   const done = sock.onclose;
@@ -4141,8 +4146,8 @@ async function handleMessage(room, raw, sock) {
         // first. Both end the same way: refuse, and let the creator start over
         // in the order the design promises (creator connects, then approves).
         addLine("sys", "", "[we created this chat code but the relay says someone else owns the room — refusing]", true);
-        closeWs("You created this code, so you should be the one approving people. " +
-          "Connect first, then send the code — or press New code and connect before sharing it.", sock);
+        endUnanswered(sock, "You created this code, so you should be the one approving people. " +
+          "Connect first, then send the code — or press New code and connect before sharing it.");
         return;
       }
       roomRole = "guest";
@@ -4237,7 +4242,7 @@ async function handleMessage(room, raw, sock) {
         addLine("sys", "", "[this relay does not support join approval — refusing]", true);
         // Phase 2a, pentest pre-existing (this and the five refusals in `key`):
         // a hint() here was erased by onclose's return to the room screen.
-        closeWs("This relay is running an older protocol without the join-approval step. Update the relay (or your app) before using it.", sock);
+        endUnanswered(sock, "This relay is running an older protocol without the join-approval step. Update the relay (or your app) before using it.");
         return;
       }
       // Write-once (see `pending`). The only legitimate sequence for a guest is
@@ -4264,13 +4269,13 @@ async function handleMessage(room, raw, sock) {
         // the creator straight in as a guest (already refused below via
         // `wasPending`, kept explicit so the invariant survives a refactor).
         addLine("sys", "", "[we created this chat code but the relay seated us as a guest — refusing]", true);
-        closeWs("You created this code, so you should be the one approving people. " +
-          "The relay tried to seat you as a guest. Connect first, then send the code.", sock);
+        endUnanswered(sock, "You created this code, so you should be the one approving people. " +
+          "The relay tried to seat you as a guest. Connect first, then send the code.");
         return;
       }
       if (roomRole === "guest" && !wasPending) {
         addLine("sys", "", "[we were seated in this room without ever asking to be let in — refusing]", true);
-        closeWs("This relay put you in the room without the owner approving you. Disconnected.", sock);
+        endUnanswered(sock, "This relay put you in the room without the owner approving you. Disconnected.");
         return;
       }
       els.roomShort.textContent = room.slice(0, 8) + "…" + room.slice(-8);

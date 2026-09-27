@@ -18,8 +18,9 @@
 //   [5] fix round 1 (pentest C1-1, C1-2): a peer that completes the upgrade on
 //       a raw socket and never answers the Close frame (the `ws` proxy above
 //       answers it by itself): Cancel ends the attempt at once, not after
-//       Chromium's 60 s closing timeout; a creator refused (`pending`, then
-//       silence) keeps the refusal's sentence when the deadline comes at 30 s
+//       Chromium's 60 s closing timeout; fix round 2 (C2-1): a refusal of the
+//       relay's answer (`pending` to the creator; `joined:guest` to someone
+//       who never queued) ends the attempt at once, with its own sentence
 import http from "node:http";
 import crypto from "node:crypto";
 import { WebSocketServer } from "ws";
@@ -238,10 +239,23 @@ console.log("\n  [5] a peer that never answers the Close frame (raw socket)");
   const done = await until(async () => !(await state(p5)).connectDisabled, 40000);
   const secs = (Date.now() - t1) / 1000;
   const b = await state(p5);
-  check("C1-1/C1-2: the refused creator is back on the room screen by the 30 s deadline, not Chromium's 60 s",
-    done && secs >= 28 && secs < 36, `${secs.toFixed(1)} s`);
+  check("C2-1: the refused creator is back on the room screen at once, not at the deadline or Chromium's 60 s",
+    done && secs < 5, `${secs.toFixed(1)} s`);
   check("C1-1: ...with the refusal's sentence, not the timeout's",
     /^You created this code, so you should be the one approving people\./.test(b.hint), JSON.stringify(b));
+
+  // Seated as a guest without ever queueing (roomRole is set before the refusal).
+  firstFrame = { type: "joined", role: "guest" };
+  await setVal(p5, "#room", "01".repeat(32)); // typed over: not a code this page minted
+  const t2 = Date.now();
+  await tap(p5, "#connect");
+  await until(() => raws.length === 3 && raws[2].bytes > 0);
+  const done2 = await until(async () => !(await state(p5)).connectDisabled, 40000);
+  const secs2 = (Date.now() - t2) / 1000;
+  const c = await state(p5);
+  check("C2-1: a guest seated without queueing is refused at once, with its sentence",
+    done2 && secs2 < 5 && c.room && /^This relay put you in the room without the owner approving you\./.test(c.hint),
+    `${secs2.toFixed(1)} s ${JSON.stringify(c)}`);
   for (const h of raws) h.sock.destroy();
   raw.close();
 }

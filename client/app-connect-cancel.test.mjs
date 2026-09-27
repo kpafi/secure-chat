@@ -480,30 +480,58 @@ const LOCK = "sc.otp.lock.v1." + pad.padId;
 }
 {
   // C1-1: a client refusal on a socket that stays CLOSING keeps its own words,
-  // whether the deadline or a Cancel comes next.
-  const CREATOR = /^You created this code, so you should be the one approving people\./;
+  // whether the deadline or a Cancel comes next. (The removed-mode refusal: a
+  // `key` frame before the relay answered `join`, so roomRole is still null.)
+  const RSA = /^The other side uses RSA mode, which this version no longer supports\./;
   for (const next of ["deadline", "cancel"]) {
-    await el("gen").click(); // New code: this page minted the room, so it is its creator (F-PROTO-001)
+    const ws = await connectToSocket();
+    const t = lastTimer(30000);
+    ws.open();
+    stallClose(ws);
+    await ws.deliver({ type: "key", room: ROOM, alg: "RSA", payload: "AAAA" });
+    await settle();
+    assert.strictEqual(ws.readyState, 2, "fixture: the refusal's close is stalled");
+    assert.ok(el("connect").disabled, "fixture: the refused attempt waits for its close");
+    if (next === "deadline") await fire(t);
+    else { assert.ok(cancelShown(), "fixture: Cancel still offered while the close stalls"); el("connectCancel").click(); await settle(); }
+    assertBackOnRoom("C1-1 (" + next + ")");
+    assert.match(el("roomHint").textContent, RSA, `C1-1: after the ${next}, the room screen keeps the refusal, not the timeout sentence`);
+  }
+  console.log("OK  C1-1: a refusal whose close stalls keeps its sentence through the deadline and a Cancel (executed)");
+}
+{
+  // Fix round 2, C2-1: a refusal of the relay's ANSWER to join comes before the
+  // chat screen (no Disconnect), some after roomRole is set (no Cancel, no
+  // deadline): it ends at once, with its sentence, whatever the close does.
+  const cases = [
+    { what: "pending to the creator", mint: true, frame: { type: "pending" }, said: /^You created this code, so you should be the one approving people\. Connect first/ },
+    { what: "joined without a role", mint: false, frame: { type: "joined" }, said: /^This relay is running an older protocol/ },
+    { what: "the creator seated as a guest", mint: true, frame: { type: "joined", role: "guest" }, said: /^You created this code, so you should be the one approving people\. The relay tried to seat you/ },
+    { what: "a guest seated without queueing", mint: false, frame: { type: "joined", role: "guest" }, said: /^This relay put you in the room without the owner approving you\./ },
+  ];
+  for (const c of cases) {
+    if (c.mint) await el("gen").click(); // New code: this page is the room's creator (F-PROTO-001)
+    else { el("room").value = ROOM; await el("room").dispatch("input"); }
     el("pass").value = PASS;
     dom.selectAlg("AES256");
     const before = dom.socket();
     el("connect").click();
-    await until(() => dom.socket() !== before, "the creator's socket");
+    await until(() => dom.socket() !== before, "the socket (" + c.what + ")");
     const ws = dom.socket();
     const t = lastTimer(30000);
     ws.open();
     stallClose(ws);
-    await ws.deliver({ type: "pending" }); // the relay demotes the creator: refused, close stalls
+    await ws.deliver(c.frame);
     await settle();
-    assert.strictEqual(ws.readyState, 2, "fixture: the refusal's close is stalled");
-    if (next === "deadline") await fire(t);
-    else { assert.ok(cancelShown(), "fixture: Cancel still offered while the close stalls"); el("connectCancel").click(); await settle(); }
-    assertBackOnRoom("C1-1 (" + next + ")");
-    assert.match(el("roomHint").textContent, CREATOR, `C1-1: after the ${next}, the room screen keeps the refusal, not the timeout sentence`);
+    assert.strictEqual(ws.readyState, 2, "fixture: the close stalls (" + c.what + ")");
+    assertBackOnRoom("C2-1 (" + c.what + ")");
+    assert.match(el("roomHint").textContent, c.said, "C2-1: " + c.what + " is refused at once, with its sentence");
+    if (!t.cleared) await fire(t);
+    assert.match(el("roomHint").textContent, c.said, "C2-1: ...and the deadline does not relabel it (" + c.what + ")");
   }
   el("room").value = ROOM;
   await el("room").dispatch("input");
-  console.log("OK  C1-1: a refusal whose close stalls keeps its sentence through the deadline and a Cancel (executed)");
+  console.log("OK  C2-1: the four refusals of the relay's answer end at once although the close stalls (executed)");
 }
 
 // ---- L: the directory lookup ----------------------------------------------------
