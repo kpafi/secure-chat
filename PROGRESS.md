@@ -3,7 +3,79 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ CURRENT STATE (2026-09-27) — OTP transfer sheets on `feat/otp-transfer-sheets`, not merged, not pushed
+## ⮕ CURRENT STATE (2026-09-27) — OTP pad check on `fix/otp-pad-match`, not merged, not pushed
+
+- **The task (owner, 2026-09-27; cold critic r2 MA-2, deferred from the
+  sheets work):** two people on DIFFERENT pads (both pressed New pad, both
+  called it "Chess") both saw "Ready", then every message arrived as
+  undecryptable and every send spent pad bytes.
+- **Branch `fix/otp-pad-match`** off `feat/otp-transfer-sheets` 203806a —
+  that branch is NOT merged into master yet, so this one has to follow it
+  (merge the sheets first, then this). Worktree
+  `.claude/worktrees/wonderful-mccarthy-55fcb5`. Not pushed, not deployed.
+- **What it does (client only; no relay, no Android/iOS code change):**
+  - Each OTP hello offers the check (`chk: 1`). Once a side knows the peer's
+    nonce, it sends `pc = HMAC-SHA256(padId, "secure-chat/otp-pad-check/v1|
+    room|senderRole|senderNonce|receiverNonce")[0..16]`, in its answer or
+    in one extra hello. A session unlocks only on the peer's proof, judged
+    over (pinned peer nonce, own nonce).
+  - Different pad → refused before Ready. The message names this device's
+    pad ("Chess" (from your contact)) and says what to check, plus that the
+    relay may have tampered. The same pad with OUR half on the other device
+    → refused as "set up twice on one side, make a fresh pad". A malformed
+    proof → refused. A contact on another MODE (AES-256/DHKE/Post-quantum) →
+    refused with the mode named. Nothing is sent and no pad byte is spent on
+    any refusal.
+  - Why the padId as key: 128 random bits, only ever inside the encrypted
+    pad file, never on the wire. The proof covers both fresh nonces, so the
+    relay can neither link sessions nor learn the padId, and cannot replay a
+    proof. Not a pad slice: used bytes are zeroed and the two copies drift,
+    and a reserved slice would break pads exchanged under 0.4.0.
+  - **0.4.0 peers:** they ignore `chk`/`pc`. A peer that offers no check is
+    let through with one line ("the other side runs an older version and
+    cannot confirm that you both picked the same pad …"). Mixed pairs work
+    in both directions (real Chromium, a 0.4.0 page vs this build, 15/15).
+- **Reviewed:** `pentest-new-code` ×3 (reports
+  `design/research/reviews/otp-padcheck-pentest-r{1,2,3}.md`, each committed
+  as written before its fix round). r1 F1 (Low): the first cut covered only
+  the sender's nonce, so a relay could replay our own old hello as "the same
+  half" → the proof now covers both nonces. r2 R2-F1 (Low): that fix rested on
+  the untested reflection guard → a second layer in crypto.js (no proof over
+  equal nonces), and both layers are tested. r2 R2-F2: a round-1 rule could
+  leave a side waiting silently → removed. r3 R3-F1 (Low): a contact on
+  another mode was told "older version … different pads" → refused with the
+  mode named. Nothing Critical/High/Medium in any round.
+- **Checks (on 9c23498):** every test control bound by a hand-run mutant.
+  On the final tree C1–C15 and A1–A14, A16–A28 are all RED, 42/42; the
+  lists and the first survivors are in the four commit messages. Also
+  `npm test` green, and e2e against a scratch relay: otp-pad-check 23/23
+  (new: the MA-2 walk in two Chromiums, both correct pairings after it with
+  the exact send budget, OTP vs AES-256), otp-held-join 10/10, no-dead-ends
+  17/17, all-modes 28/28, and a 0.4.0-vs-this-build mixed e2e 15/15 (the r2
+  pentester's scratch script, not in the repo), otp-transfer 196/196.
+- **Residuals (documented, not fixed):**
+  - A relay can downgrade one side to "not checked" with ONE frame: strip
+    `chk`, or inject a tagless hello at any point before Ready (an offer
+    alone decides nothing; the first tagless or proof-carrying hello
+    decides). That side shows the older-version line. A loud version needs a per-pad "this peer checks"
+    latch in the sealed pad record (an at-rest format change): **owner to
+    decide.**
+  - A relay that drops the peer's proof leaves a side on "Waiting…". That is
+    the deferred join timeout + Cancel task.
+  - One maker file imported on two devices, each talking to the maker, is
+    not detectable by a two-party check.
+  - The chat bar still does not show the pad name (cold critic's MA-2 extra).
+- **Release notes must say:** the pad check works only when both sides run
+  this build; with a 0.4.0 contact the app says it cannot check.
+- **Paused here (owner, 2026-09-27).** Pentest round 4 on fix round 3
+  (9c23498) was running at the pause: its report goes to
+  `design/research/reviews/otp-padcheck-pentest-r4.md`. **Resume:** read
+  it, commit it as written if not yet done, triage, and run a fix round +
+  pentest if it finds anything Low+. Then this entry is final.
+- **Next:** owner review; merge `feat/otp-transfer-sheets`, then this branch;
+  the phone APK rebuild comes with that merge.
+
+## (2026-09-27) — OTP transfer sheets on `feat/otp-transfer-sheets`, not merged, not pushed
 
 - **Owner's ask (2026-09-26, after testing 0.4.0 on the APK):** generating and
   sharing a one-time pad was badly explained, "Export" only said a file was
@@ -57,7 +129,7 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
   receiver (pentest r2 R2-9; M9 fully holds only with both sides updated).
 - **Deferred by the owner / separate tasks:** pad-mismatch detection at
   connect (both people on different pads see "Ready" but get undecryptable
-  messages); a join timeout + Cancel on the room screen (pre-existing: a relay
+  messages) — done on `fix/otp-pad-match`, see above; a join timeout + Cancel on the room screen (pre-existing: a relay
   that never answers `join` leaves Connect stuck until reload, pentest r6 R6-1).
 
 ## (2026-09-26) — release 0.4.0 merged, tagged and DEPLOYED; phone APK still owed
