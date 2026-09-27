@@ -91,9 +91,15 @@ Object.defineProperty(globalThis, "history", {
 // Web Locks, exclusive per name: `ifAvailable` answers null while the name is
 // held; otherwise the request waits for the release — or for its `signal`.
 const held = new Map(); // name -> promise that resolves on release
+// A gate holds any request for a name (even ifAvailable) until the test
+// opens it — to keep a sheet "working" at a known point (fix round 5).
+const lockGates = new Map(); // name -> { promise, open }
+const gateLock = (name) => { let open; const promise = new Promise((r) => { open = r; }); lockGates.set(name, { promise, open }); return () => { lockGates.delete(name); open(); }; };
 globalThis.navigator = { ...globalThis.navigator, locks: {
   request(name, opts, fn) {
     if (typeof opts === "function") { fn = opts; opts = {}; }
+    const gate = lockGates.get(name);
+    if (gate) return gate.promise.then(() => navigator.locks.request(name, opts, fn));
     const run = () => {
       let rel;
       held.set(name, new Promise((r) => { rel = r; }));
@@ -933,18 +939,18 @@ assert.ok(typeof TOKEN === "string" && TOKEN.length >= 16, "fixture: app.js push
 
 // ---- pentest r4 R4-1: Connect pressed during the Export entry's unlock ------
 {
-  // (a) deterministic: the relay has not answered yet (still the room screen)
-  //     — Connect alone cancels the Export entry.
+  // (a) the relay has not answered (still the room screen): since round 5
+  //     (pentest r6 R6-1) a pending connect locks nothing — the sheet opens;
+  //     a chat coming up later closes it (the R5-1 blocks below).
   await lockPad(madeId, PADPASS);
   dom.selectAlg("OTP");
   const before0 = dom.socket();
-  const idxA = hist.idx;
   const openingA = el("otpExportOpen").click();
   const connectingA = el("connect").click();
   await openingA; await connectingA;
   await settle(5);
-  assert.ok(!shown("otpExportSheet"), "R4-1: Connect pressed during the unlock wins — no Export sheet");
-  assert.strictEqual(hist.idx, idxA, "…and its history entry is dropped");
+  assert.ok(shown("otpExportSheet"), "R6-1: a Connect the relay has not answered does not cancel the Export entry");
+  await el("otpExportClose").click();
   if (dom.socket() !== before0) dom.socket().close();
   await settle(5);
 }
@@ -1012,7 +1018,6 @@ assert.ok(typeof TOKEN === "string" && TOKEN.length >= 16, "fixture: app.js push
 assert.ok(draws8.includes(TOKEN), "KH: the history token is a fresh 64-bit random draw of this page load, not a constant");
 console.log("OK  KH: the per-page history token comes from crypto.getRandomValues");
 
-const OTP_CHAT_BUSY = "A chat is connecting or open — New pad, Export and Import wait until you disconnect.";
 const startConnect = async () => {
   dom.selectAlg("OTP");
   el("room").value = ROOM; await el("room").dispatch("input");
@@ -1030,25 +1035,28 @@ const endChat = async () => {
   if (el("scrRoom").hidden) await el("toRoom").click();
 };
 
-// ---- pentest r5 R5-1 (P1, P1b): Connect first, then a sheet before the relay answers ----
+// ---- pentest r5 R5-1 (P1, P1b) as decided in round 5: Connect first, a sheet
+//      before the relay answers — it opens (R6-1), and the chat closes it ----
 {
   await lockPad(madeId, PADPASS);
   await openExport(); await el("otpExportClose").click(); // unlocked: Export opens at once
   await settle(5);
-  const { ws, connecting } = await startConnect();
   for (const [entry, sheet] of [["otpExportOpen", "otpExportSheet"], ["otpNewOpen", "otpNewSheet"], ["otpImportOpen", "otpImportSheet"]]) {
+    const { ws, connecting } = await startConnect();
     await el(entry).click();
-    assert.ok(!shown(sheet), `R5-1 (P1): ${entry} while a chat is connecting opens nothing`);
-    assert.strictEqual(st.textContent, OTP_CHAT_BUSY, "…and says why");
+    assert.ok(shown(sheet), `R6-1: ${entry} opens while a connect waits for the relay (pad management is not locked)`);
+    await ws.deliver({ type: "joined", role: "owner" });
+    await connecting; await settle(5);
+    assert.ok(!shown(sheet) && !el("scrChat").hidden && !el("viewLive").inert,
+      `R5-1 (P1): the chat screen closes the idle ${sheet}; the chat is usable`);
+    await el(entry).click();
+    assert.ok(!shown(sheet), "…and no sheet opens over the chat screen");
+    await endChat();
   }
-  await ws.deliver({ type: "joined", role: "owner" });
-  await connecting; await settle(5);
-  assert.ok(!el("scrChat").hidden && !el("viewLive").inert, "…the chat screen is up and usable");
-  await endChat();
-  console.log("OK  R5-1 (P1): no sheet opens while a chat is connecting or open");
+  console.log("OK  R5-1/R6-1: sheets open while a connect is pending; the chat screen closes them");
 }
 
-// ---- pentest r5 P2: Connect on pad A, then Export on locked pad B ------------
+// ---- pentest r5 P2 / KJ: Connect on pad A, then Export on locked pad B; joined during B's unlock ----
 {
   const B = await otp.generatePad({ label: "padB", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
   await otp.saveNewPad(B, "pad b passphrase words");
@@ -1057,14 +1065,14 @@ const endChat = async () => {
   el("otpSelect").value = B.padId; await el("otpSelect").dispatch("change");
   el("otpPass").value = "pad b passphrase words";
   const idx0 = hist.idx;
-  await el("otpExportOpen").click();
-  assert.ok(!shown("otpExportSheet") && !shown("otpUnlocked") && hist.idx === idx0,
-    "P2: Export on another pad while a chat is connecting is refused at once — no unlock, no entry");
-  assert.strictEqual(st.textContent, OTP_CHAT_BUSY, "…and says why");
-  await ws.deliver({ type: "joined", role: "owner" });
-  await connecting; await settle(5);
+  const opening = el("otpExportOpen").click();          // B's unlock (a KDF) starts
+  await ws.deliver({ type: "joined", role: "owner" });  // the chat screen comes up meanwhile
+  await opening; await connecting; await settle(5);
+  assert.ok(!shown("otpExportSheet") && !el("scrChat").hidden && !el("viewLive").inert,
+    "P2/KJ: the chat came up during B's unlock — no Export sheet over it (the room-screen term)");
+  assert.strictEqual(hist.idx, idx0, "…its entry dropped");
   await endChat();
-  console.log("OK  P2: the Export entry refuses while a chat is connecting");
+  console.log("OK  P2/KJ: the room-screen term keeps the Export sheet off a chat that came up during the unlock");
 }
 
 // ---- KJ / R4-1: the relay answers during the Export entry's unlock ----------
@@ -1145,6 +1153,109 @@ const endChat = async () => {
   assert.strictEqual(el("otpExportPadLabel").textContent, "Mine x", "I-5b: the Export card shows the cleaned label");
   await el("otpExportClose").click();
   console.log("OK  KG/I-5b: cleaned labels in the pad list and the Export card");
+}
+
+// ======== fix round 5 (otp-fix-round-1.md, "Round 5") ========
+// ---- N7 / N10: an Export working when the chat comes up closes itself after ----
+{
+  await lockPad(madeId, PADPASS);
+  await openExport();
+  await set("otpXferPass", "a transfer passphrase for N7");
+  const openGate = gateLock("sc.otp.export.v1." + madeId); // the export waits here, "working"
+  const exporting = el("otpExport").click();
+  await until(() => stateOf("otpExportSheet") === "working", "export working");
+  // The chat screen comes up under it (the stub lets Connect be pressed; a
+  // browser needs the save-wait window of R6-2). Connect on another pad.
+  // Connect on M10's pad ("double-tap"); the export already read its own id.
+  const other = otp.listPads().find((p) => p.label === "double-tap").padId;
+  el("otpPass").value = "a strong enough pad passphrase";
+  const conn = await (async () => {
+    dom.selectAlg("OTP"); el("room").value = ROOM; await el("room").dispatch("input");
+    el("otpSelect").value = other;
+    const before = dom.socket();
+    const c = el("connect").click();
+    await until(() => dom.socket() !== before, "the socket");
+    dom.socket().open();
+    await dom.socket().deliver({ type: "joined", role: "owner" });
+    return c;
+  })();
+  assert.ok(!el("scrChat").hidden && shown("otpExportSheet") && stateOf("otpExportSheet") === "working",
+    "fixture: the chat is up and the Export sheet still works (never torn down mid-work)");
+  openGate();
+  await exporting; await conn; await settle(5);
+  assert.ok(!shown("otpExportSheet") && !el("viewLive").inert,
+    "N7/N10: when the Export's work ends (here: the re-export confirm), the sheet closes itself — the room screen is gone");
+  await endChat();
+  console.log("OK  N7/N10: Export closes itself after its work when the chat came up");
+}
+
+// ---- N8: an Import working when the chat comes up closes itself after -------
+{
+  const f = await otp.generatePad({ label: "n8", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const file = await otp.exportPad(f, "agreed words n8");
+  await el("otpImportOpen").click();
+  await set("otpImportXfer", "agreed words n8");
+  await set("otpImportPass", "my own words for n8");
+  const openGate = gateLock("sc.otp.lock.v1." + f.padId); // the save waits here, "working"
+  el("otpFile").files = [{ name: "n8.json", size: file.length, text: async () => file }];
+  const importing = el("otpFile").dispatch("change");
+  await until(() => stateOf("otpImportSheet") === "working", "import working");
+  await lockPad(madeId, PADPASS);
+  const { ws, connecting } = await startConnect();
+  await ws.deliver({ type: "joined", role: "owner" });
+  await connecting;
+  assert.ok(!el("scrChat").hidden && shown("otpImportSheet"), "fixture: the chat is up, Import still working");
+  openGate();
+  await importing; await settle(20);
+  assert.ok(otp.padMeta(f.padId), "fixture: the import completed");
+  assert.ok(!shown("otpImportSheet") && !el("viewLive").inert, "N8: when the Import's work ends, the sheet closes itself");
+  await endChat();
+  console.log("OK  N8: Import closes itself after its work when the chat came up");
+}
+
+// ---- N1: an Android file not yet shared or saved is never closed unasked ----
+{
+  const realConfirm = globalThis.confirm;
+  let asked = 0;
+  globalThis.confirm = () => { asked++; return true; };
+  try {
+    await lockPad(madeId, PADPASS);
+    await openExport();
+    await set("otpXferPass", "a transfer passphrase for N1");
+    await el("otpExport").click();
+    if (stateOf("otpExportSheet") === "confirm") await el("otpExport").click();
+    await until(() => stateOf("otpExportSheet") === "ready", "ready");
+    const other = otp.listPads().find((p) => p.label === "double-tap").padId;
+    el("otpSelect").value = other; el("otpPass").value = "a strong enough pad passphrase";
+    dom.selectAlg("OTP"); el("room").value = ROOM; await el("room").dispatch("input");
+    const before = dom.socket();
+    const c = el("connect").click();
+    await until(() => dom.socket() !== before, "the socket");
+    dom.socket().open();
+    await dom.socket().deliver({ type: "joined", role: "owner" });
+    await c; await settle(5);
+    assert.ok(shown("otpExportSheet") && stateOf("otpExportSheet") === "ready" && asked === 0,
+      "N1: the chat screen does not close — nor ask about — an Android file not yet shared or saved");
+    await el("otpExportClose").click();
+    assert.ok(asked === 1 && !shown("otpExportSheet"), "…× asks, and closes on OK");
+    await endChat();
+  } finally {
+    globalThis.confirm = realConfirm;
+  }
+  console.log("OK  N1: an unshared Android file is never closed unasked");
+}
+
+// ---- N11: the Export card falls back to "pad" for an invisible-only label ----
+{
+  const IDX = "sc.otp.index.v1";
+  const idx = JSON.parse(localStorage.getItem(IDX));
+  idx.find((e) => e.padId === madeId).label = "​⁠";
+  localStorage.setItem(IDX, JSON.stringify(idx));
+  await lockPad(madeId, PADPASS);
+  await openExport();
+  assert.strictEqual(el("otpExportPadLabel").textContent, "pad", "N11: an invisible-only label shows as 'pad'");
+  await el("otpExportClose").click();
+  console.log("OK  N11: the card's fallback name");
 }
 
 console.log("\nAll OTP sheet checks passed.");

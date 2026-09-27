@@ -6045,15 +6045,16 @@ function otpSheetShow(kind) {
 }
 // The history entry is pushed synchronously inside the click that opens the
 // sheet: Chromium's Back skips entries a page added without a user gesture.
-// Fix round 4 (pentest r5 R5-1): while a chat is connecting or open, the
-// Live room belongs to it — New pad, Export and Import do not open (their
-// sheet would stay over the chat screen when the relay answers).
-const otpChatBusy = () => connecting ||
-  (!!ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN));
-const OTP_CHAT_BUSY = "A chat is connecting or open — New pad, Export and Import wait until you disconnect.";
+// Fix round 5 (pentest r6 R6-1; coordinator's decision): the sheets are NOT
+// refused while a connect is pending. Round 4 did, and a relay that never
+// answers `join` (or a hung directory lookup) then locked pad management
+// until a reload, with no way to cancel. A sheet opened while a connect is
+// pending is closed by showScreen when the chat screen comes up (idle), or
+// after its work (working); an Android file not yet shared or saved stays,
+// and × asks. An Export during a live session is refused by the pad lock.
 function openOtpSheet(kind, opener, { pushed = false } = {}) {
   if (otpUi.sheet || (otpUi.entryBusy && !pushed)) return;
-  if (!pushed && otpChatBusy()) { otpStatusMsg(OTP_CHAT_BUSY, true); return; }
+  if (els.scrRoom.hidden) return; // a sheet belongs to the room screen (its entries live there)
   otpUi.opener = opener;
   if (!pushed) otpHistPush();
   otpSheetShow(kind);
@@ -6179,7 +6180,6 @@ function otpOnPopState() {
 // the pad passphrase field sits right above it — then opens the sheet.
 async function otpExportOpenClick() {
   if (otpUi.sheet || otpUi.entryBusy) return;
-  if (otpChatBusy()) { otpStatusMsg(OTP_CHAT_BUSY, true); return; } // R5-1
   const id = els.otpSelect.value;
   if (!id) { otpStatusMsg("Select a pad to export.", true); els.otpSelect.focus(); return; }
   const meta = otp.padMeta(id);
@@ -6218,9 +6218,8 @@ async function otpExportOpenClick() {
     // Back pressed during the unlock took the entry: that Back meant "never
     // mind" — the pad stays unlocked (that was wanted), no sheet opens.
     if (ok && otpUi.entryBack) { els.otpExportOpen.focus(); return; }
-    // Fix round 4 (pentest r5, I-5c): a Connect that started meanwhile (and
-    // did not refuse at once) owns the Live room now — no sheet, said why.
-    if (ok && otpChatBusy()) { otpHistDrop(); otpStatusMsg(OTP_CHAT_BUSY, true); return; }
+    // `ok` also needs the room screen: a chat that came up during the unlock
+    // (Connect pressed before or during it) keeps it — no sheet over it.
     if (!ok) { otpHistDrop(); return; }
     otpStatusMsg("");
     openOtpSheet("export", els.otpExportOpen, { pushed: true });
