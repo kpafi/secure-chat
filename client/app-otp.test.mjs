@@ -196,8 +196,9 @@ async function otpConnect(padId = pad.padId, extra = () => ({})) {
   const onDisk = async () => { const u = await otp.unlockPad(chess.padId, PAD_PASS); return [u.record.sendOffset, u.record.recvHighWater]; };
   const READY = /one-time-pad encrypted/;
   const OLD = /older version and cannot confirm/;
-  // Connected, joined as owner, nothing from a peer yet.
-  const bare = async (padId) => {
+  // Connected, joined as owner (or, role "guest", pending → knock → let in),
+  // nothing from a peer yet.
+  const bare = async (padId, role = "owner") => {
     if (current && current.readyState === 1) await dom.el("disconnect").click();
     const room = dom.el("room");
     room.value = ROOM;
@@ -209,7 +210,12 @@ async function otpConnect(padId = pad.padId, extra = () => ({})) {
     const ws = dom.socket();
     ws.open();
     await tick();
-    await ws.deliver({ type: "joined", role: "owner" });
+    if (role === "guest") {
+      await ws.deliver({ type: "pending" });
+      await settle(5);
+      assert.ok(ws.sent.some((f) => f.type === "knock"), "fixture: the guest knocked");
+    }
+    await ws.deliver({ type: "joined", role });
     await settle(5);
     current = ws;
     return ws;
@@ -444,9 +450,9 @@ async function otpConnect(padId = pad.padId, extra = () => ({})) {
       await ws.deliver({ type: "key", room: ROOM, alg, payload: pack({ hello: true, n: freshNonce(), reply }) });
       await settle(10);
       assert.ok(!anyHint(READY), `MA-2 (m): a ${tag} contact does not make an OTP session Ready`);
-      assert.ok(anyHint(new RegExp(`Your contact's app says it uses ${name}, and you picked One-time pad under Security options\\..*the relay altered the message.*Nothing was sent and no pad was used`)),
+      assert.ok(anyHint(new RegExp(`^The relay may have altered this connection — or your contact picked ${name} under Security options, while you picked One-time pad\\. Agree with your contact.*Nothing was sent and no pad was used`)),
         `MA-2 (m): …the room screen names both modes (${tag}): ` + dom.el("roomHint").textContent);
-      assert.ok(said(new RegExp(`uses ${name} mode, not One-time pad — refusing`)), `MA-2 (m): …and so does the transcript (${tag})`);
+      assert.ok(said(new RegExp(`hello says ${name} mode, not One-time pad — refusing`)), `MA-2 (m): …and so does the transcript (${tag})`);
       assert.strictEqual(count(OLD), old0, `MA-2 (m): …never "older version" (${tag})`);
       assert.strictEqual(ws.readyState, 3, `MA-2 (m): …closed (${tag})`);
       assert.deepStrictEqual(await onDisk(), before, `MA-2 (m): …nothing spent (${tag})`);
@@ -465,8 +471,21 @@ async function otpConnect(padId = pad.padId, extra = () => ({})) {
     await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: pack({ hello: true, n: freshNonce(), reply: false }) });
     await settle(10);
     assert.ok(!anyHint(READY), "MA-2 (m3): an AES-256 hello after a pinned offer does not unlock");
-    assert.ok(anyHint(/says it uses AES-256, and you picked One-time pad/), "MA-2 (m3): …it is named");
+    assert.ok(anyHint(/your contact picked AES-256 under Security options, while you picked One-time pad/), "MA-2 (m3): …it is named");
     assert.strictEqual(count(OLD), old0, "MA-2 (m3): …never \"older version\"");
+  }
+
+  // (m4) pentest r5 R5-F4: a REAL guest (pending, knocked, let in) whose
+  //      owner picked another mode: the owner's answer is refused and named.
+  {
+    const ws = await bare(chess.padId, "guest");
+    const sent0 = ws.sent.length;
+    await ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ hello: true, n: freshNonce(), reply: true }) });
+    await settle(10);
+    assert.ok(!anyHint(READY), "MA-2 (m4): a real guest facing a DHKE owner is not Ready");
+    assert.ok(anyHint(/your contact picked DHKE under Security options, while you picked One-time pad/), "MA-2 (m4): …the owner's mode is named");
+    assert.strictEqual(ws.readyState, 3, "MA-2 (m4): …closed");
+    assert.strictEqual(ws.sent.slice(sent0).filter((f) => f.type === "key").length, 0, "MA-2 (m4): …and an answer is not answered");
   }
 
   // (m2) …judged only before Ready: a hello tagged with another mode after

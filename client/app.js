@@ -3996,8 +3996,11 @@ async function finishSession(room) {
 // mismatch too instead of waiting.
 //
 // The tag is relay-writable. That is the same exposure as the RSA refusal
-// above (REMOVED_ALGS), and the relay also picks which mode gets named, so the
-// sentence says the relay may have altered it (r4 R4-F3). After the session
+// above (REMOVED_ALGS), and the relay also picks which mode gets named. So
+// the sentence leads with the relay and asks people to agree on an option
+// with each other rather than to switch to the named one (r4 R4-F3, r5 R5-F3:
+// a relay steering Post-quantum users to DHKE, or DHKE users to a passphrase
+// mode, is exactly the adversary those modes exist for). After the session
 // has started, a mode tag is not judged: a relay must not close a working
 // session with it.
 const MODE_NAMES = { DHKE: "DHKE", AES256: "AES-256", PQKEM: "Post-quantum", OTP: "One-time pad" };
@@ -4017,10 +4020,10 @@ function refuseOtherMode(theirs, p, room, sock) {
     sock.send(helloMsg(room, true, null));
   }
   const mine = MODE_NAMES[sessionAlg] || sessionAlg;
-  addLine("sys", "", `[the other side uses ${theirs} mode, not ${mine} — refusing]`, true);
-  closeWs(`Your contact's app says it uses ${theirs}, and you picked ${mine} under Security options. ` +
-    "Both of you must pick the same option, then connect again (if you both did, the relay altered the message). " +
-    (sessionAlg === "OTP" ? "Nothing was sent and no pad was used." : "Nothing was sent."), sock);
+  addLine("sys", "", `[the other side's hello says ${theirs} mode, not ${mine} — refusing]`, true);
+  closeWs(`The relay may have altered this connection — or your contact picked ${theirs} under Security options, ` +
+    `while you picked ${mine}. Agree with your contact, in person or on a channel you trust, which option you both use, ` +
+    "then connect again. " + (sessionAlg === "OTP" ? "Nothing was sent and no pad was used." : "Nothing was sent."), sock);
 }
 
 // Phase 1's hello. In OTP it also offers the pad check (`chk`) and, once we

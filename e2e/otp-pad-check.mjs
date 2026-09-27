@@ -235,12 +235,12 @@ console.log("\n  [4] alice on One-time pad, bob on AES-256");
   await sleep(500);
   const room = await text(alice.page, "#roomHint");
   check("[4] alice: not Ready", !(await ready(alice)));
-  check("[4] alice: the room screen names bob's mode", /Your contact's app says it uses AES-256, and you picked One-time pad under Security options\..*Nothing was sent and no pad was used\./.test(room), room.slice(0, 160));
+  check("[4] alice: the room screen names bob's mode", /^The relay may have altered this connection — or your contact picked AES-256 under Security options, while you picked One-time pad\..*Nothing was sent and no pad was used\./.test(room), room.slice(0, 160));
   check("[4] alice: no \"older version\" line", !/older version/.test(await text(alice.page, "#log")));
   check("[4] alice: Send never unlocked, no message frame went out",
     await alice.page.evaluate(() => document.querySelector("#text").disabled && !window.__sent.includes("msg")));
   const bobRoom = await text(bob.page, "#roomHint");
-  check("[4] bob (AES-256): the room screen names alice's mode", /Your contact's app says it uses One-time pad, and you picked AES-256 under Security options\..*Nothing was sent\./.test(bobRoom), bobRoom.slice(0, 160));
+  check("[4] bob (AES-256): the room screen names alice's mode", /^The relay may have altered this connection — or your contact picked One-time pad under Security options, while you picked AES-256\..*Nothing was sent\./.test(bobRoom), bobRoom.slice(0, 160));
   check("[4] bob: no \"key confirmation failed\"", !/Key confirmation failed/.test(bobRoom + await text(bob.page, "#hint")));
   await leave(alice, bob);
   await bob.page.evaluate(() => {
