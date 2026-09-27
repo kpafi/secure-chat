@@ -133,7 +133,13 @@ await page.evaluateOnNewDocument(() => {
     constructor(...a) {
       super(...a);
       window.__ws = this;
-      this.addEventListener("close", () => window.__trail.push("close-event"));
+      // The log as the close event found it (pentest C3-2 r3, test gap 2): the
+      // late answer is handled after this, so a change from here on is its own.
+      this.addEventListener("close", () => {
+        window.__trail.push("close-event");
+        const log = document.querySelector("#log");
+        window.__logAtClose = log ? [...log.children].map((e) => e.textContent) : null;
+      });
     }
   };
 });
@@ -162,6 +168,7 @@ const state = () => page.evaluate(() => ({
   roomHint: document.querySelector("#roomHint").textContent,
   log: [...document.querySelectorAll("#log > *")].map((e) => e.textContent),
   trail: window.__trail.splice(0),
+  logAtClose: window.__logAtClose,
 }));
 
 async function attempt(m) {
@@ -171,14 +178,16 @@ async function attempt(m) {
   // ‹ Back to room, so every case starts from Connect.
   await page.evaluate(() => { if (!document.querySelector("#scrChat").hidden) document.querySelector("#toRoom").click(); });
   const logBefore = (await state()).log;
+  await page.evaluate(() => { window.__logAtClose = undefined; });
   await page.$eval("#connect", (e) => e.click());
   await page.waitForFunction(() => window.__trail.includes("close-event"), { timeout: 15000 }).catch(() => {});
   await sleep(1000);
   const s = await state();
   s.newLog = s.log.slice(logBefore.length);
   // The whole log's text, not just its new lines: addLine folds a repeated
-  // line into "(×2)" in place (pentest C3-2 r2 R2-3).
-  s.logUnchanged = JSON.stringify(s.log) === JSON.stringify(logBefore);
+  // line into "(×2)" in place (pentest C3-2 r2 R2-3); compared with the log
+  // as the close event found it, so only the late answer's effect counts (r3).
+  s.logUnchanged = Array.isArray(s.logAtClose) && JSON.stringify(s.log) === JSON.stringify(s.logAtClose);
   // Fixture: the relay really parked the pump before its answer — the prompt
   // went up, and came down only at the close event (onclose settles it).
   const up = s.trail.indexOf("admit.hidden=false"), closed = s.trail.indexOf("close-event");

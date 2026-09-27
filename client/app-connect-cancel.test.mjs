@@ -544,6 +544,9 @@ const LOCK = "sc.otp.lock.v1." + pad.padId;
 // run after the close is deliberate: those whose inputs survive onclose.
 const logLines = () => dom.el("log").children;
 const disconnectedLines = () => logLines().filter((c) => /^disconnected\b/.test(c.textContent)).length;
+// The whole log's text: addLine folds a repeated line into "(×2)" in place or
+// moves it, so counting new lines is not enough (pentest C3-2 r2 R2-3, r3 R3-1).
+const logText = () => JSON.stringify(logLines().map((c) => c.textContent));
 function answerThenRelayClose(ws, frame) {
   ws.onmessage({ data: JSON.stringify(frame) });
   ws.close(); // the relay's close, not closeWs(): the stub runs onclose now
@@ -657,9 +660,11 @@ function answerThenRelayClose(ws, frame) {
     ws.open();
     stallClose(ws);
     ws.readyState = 2; // the relay's Close frame came in; the browser waits for the TCP close
+    const log0 = logText();
     await ws.deliver(frame);
     await settle();
     assert.strictEqual(el("scrChat").hidden, true, "C3-2: " + what + " on a CLOSING socket draws no chat screen");
+    assert.strictEqual(logText(), log0, "C3-2 r3 R3-1: ...and narrates nothing — no session start, no waiting line (" + what + ")");
     assert.ok(!/^(connected|waiting for approval)$/.test(el("status").textContent), "C3-2: ...and says neither 'connected' nor 'waiting' (" + what + ")");
     assert.ok(!ws.sent.some((f) => f.type === "key" || f.type === "knock"), "C3-2: ...and sends no hello or knock (" + what + ")");
     assert.ok(cancelShown(), "C3-2: Cancel stays offered on the CLOSING socket (" + what + ")");
@@ -682,8 +687,10 @@ function answerThenRelayClose(ws, frame) {
     ws.open();
     stallClose(ws);
     ws.readyState = 2;
+    const log0 = logText();
     await ws.deliver(frame);
     await settle();
+    assert.strictEqual(logText(), log0, "C3-2 r3 R3-1: a withheld " + what + " narrates nothing before the Cancel");
     el("connectCancel").click();
     await settle();
     assert.strictEqual(ws.readyState, 2, "fixture: the socket is still closing (" + what + ")");
