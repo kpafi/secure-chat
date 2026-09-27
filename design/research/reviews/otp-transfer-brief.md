@@ -61,7 +61,7 @@ critics, a design critic and the pentest agent, as for the contact profile
 Canvas: row "One-time pad transfer" on https://claude.ai/artifact/NhVZuUXfC2FsJf93NBn5H2
 (14 artboards, listed at the end; round 2 after `otp-design-critic-r1.md`, triage in
 `otp-design-fix-round-1.md`). This section is the spec; the canvas illustrates it. Where the
-two disagree, this text wins. **§ 9a (the Android bridge as implemented) and § 12 (design critic
+two disagree, this text wins. **§ 9a (the Android bridge as implemented), § 13 (fix round 1 of the build) and § 12 (design critic
 round 2 and the implementation) amend the sections before them and win where they differ.**
 
 ### 0. The shape in one paragraph
@@ -522,22 +522,71 @@ Critic round 2: `otp-design-critic-r2.md`. Pentest lead F7: `otp-pentest-android
   One-time pad → Import". § 7's "both can read it off the sheet" now holds for the browser and for
   Android file-ready and `saved`.
 - **Import placeholder (r2 nit 9):** `#otpImportPass` — "a new one — not the one above".
-- **Desktop bottom row (r2 nit 3):** the "again" link stays in the bottom row at every width; in
-  the desktop dialog it sits at the row's left, Done at its right.
+- **Desktop bottom row (r2 nit 3; changed in § 13):** the "again" link stays in the bottom row at
+  every width.
 - **Pad card meta:** the size is per side, as the pad selector says ("128 KiB per side" for the
   256 KiB pad; the canvas's "256 KiB per side" was the total). "· exported before" never breaks
   inside itself (r2 nit 1).
 - **The working state is bounded:** a pad file's KDF cost is fixed — `importPad` accepts only
   `kdf.iters === 600000` (what every export has written) and refuses anything else before any KDF
   with "this pad file asks for unsupported encryption settings" (pentest F7 lead; a file-level
-  error in the sheet). Export's wait for another tab's export lock is bounded at 30 s ("Export
-  failed: another tab or window is still exporting this pad — finish or close it there, then try
-  again"). What is not bounded by the page: a hung IndexedDB write inside a save; a reload (or,
-  on Android, closing the app) is the way out, as for a live session.
+  error in the sheet). A busy pad is refused at once (the pad lock is taken without waiting) and
+  the sheet returns to its form (§ 13). What is not bounded by the page: a hung IndexedDB write
+  inside a save; a reload (or, on Android, closing the app) is the way out, as for a live session.
 - **Import file picker:** `accept="application/json,.json,.txt,application/octet-stream,text/plain"`
   (Quick Share delivers octet-stream); `importPad` decides what the file is.
 - **Held texts only while a sheet is open:** a handler driven with no sheet open (the unit tests)
   hands a browser file out at once and holds nothing.
+
+### 13. Fix round 1 of the build (binding; wins over §§ 1–12 where they differ)
+
+Triage: `otp-fix-round-1.md` (hot critic r1, cold critic r1, design critic r3, pentest r2).
+
+- **Every exit of Export leaves "working"** (hot B1, pentest R2-1): PAD_BUSY, no Web Locks and
+  every error go back to the form with the sentence in the sheet's status and × shown. The 30 s
+  bound on the export-lock wait is **removed**: that wait is only entered while holding the pad's
+  session lock, which every exporter takes first without waiting, so no current client can hold
+  the export lock then (the bound guarded a state only a test could build).
+- **Back during the Export entry's unlock cancels it** (hot M1, cold MA-1, pentest R2-2): no sheet
+  opens afterwards; the pad stays unlocked. No other sheet opens while that unlock runs. A close
+  drops the history entry only while it is still the one on top (`history.state.otpSheet`), so a
+  close never calls `history.back()` past the app's own entry and the ignore counter cannot stick.
+- **Unlocked ⇔ its passphrase is in `#otpPass`** (pentest R2-3, cold MA-2, hot m5): choosing
+  another pad locks the panel's pad and empties the field; an unlock caches only the pad on
+  screen and leaves in the field exactly the passphrase that unlocked it. Export with an empty
+  `#otpPass` fails closed ("Enter this pad's passphrase to unlock it.") instead of skipping the
+  must-differ comparison. Nothing is stored or hashed.
+- **Panel status while a sheet is up** (design R3-M1, hot m2): `#otpStatus` still receives every
+  sentence byte-identical, but as `.vh` while a sheet is open, and a sentence written while a
+  sheet was open is removed from the panel when the sheet closes. The "Choose a one-time pad
+  first …" refusal is removed once a pad exists (cold mi-1).
+- **Delete the file** (cold MA-3): Export done adds "Once they've imported it, delete the file on
+  both devices." (the coordinator's "both phones", said as "devices" because the maker may be on a
+  computer); Import done adds "Delete the pad file now.". The again link is 13px, muted, and says
+  it is the same file: "Download the same file again" / "Share the same file again" (iOS) /
+  Android "Didn't arrive? Send the same file again" after `shared`, "Share or save the same file
+  again" after `saved` (design r3 minor 6).
+- **Sizes** (cold mi-2): the picker's label is "Size, each way" and its options are what each
+  side can send (32 / 128 / 512 KiB); every pad card says "128 KiB each way". A received pad's
+  card says "· from your contact" (cold mi-7; the label is the maker's, the file format is
+  unchanged). An unnamed pad is named by local time (cold n-1).
+- **Unlock failure at the Export entry:** "Could not unlock this pad: …" (cold mi-6; nothing was
+  exported), focus to `#otpPass` (hot m3).
+- **Import:** a file that cannot be read says "Import failed: could not read that file — choose it
+  again." (design r3 minor 5); a later file-level error removes the transfer passphrase's mark
+  (hot m1); filled steps keep `--fg` titles (`is-filled`, design r3 minor 1).
+- **Desktop bottom row** (design r3 minor 2, hot n4): as in the app's other dialogs — the primary
+  (or the danger) grows on the left, its one secondary beside it, a ghost on its own line below.
+- **Layout:** the pad select and Forget share one line (design r3 minor 3); while working the
+  bottom bar is not drawn and the form is inert (minor 4); on a phone viewport under 560px tall
+  an OTP sheet may cover the tab bar and app bar it made inert (minor 7; not the contact or
+  admission sheet); the weak-transfer line sits under the done line, not in "On their device"
+  (minor 8); "· exported" only in done (nit 3); Connect keeps its width when the emphasis moves
+  (nit 2); the current step's ring is 2px (hot n3); `text-wrap: pretty` on captions and ledes.
+- **Assistive tech** (hot m4): an empty sheet status stays in the accessibility tree; a field
+  marked by a refusal is described by its sheet's status too. `role="status"` is on the
+  "Unlocked for this session" text only (hot n6). The three "choose a passphrase" fields are
+  `autocomplete="new-password"` (cold n-6).
 
 ### Canvas artboards (row "One-time pad transfer")
 
