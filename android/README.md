@@ -121,7 +121,9 @@ Spec: `design/research/reviews/otp-transfer-brief.md` 5, 6, 9. Code:
   ICU's, which admits any Unicode digit), the text at most 4 MiB and exactly
   the envelope `exportPad()` writes: the same literals and key order,
   `iters` exactly otp.js's `KDF_ITERS` (600000), salt 16 and iv 12 bytes of
-  btoa base64, `ct` canonical base64. Checked by a single-pass scanner, not a
+  btoa base64, `ct` base64 of btoa's alphabet, length and padding (the tail
+  bits are not checked: AES-GCM authenticates the decoded bytes, pentest r2
+  R2-8). Checked by a single-pass scanner, not a
   regex: on the device `java.util.regex` is ICU, whose backtracking stack is
   limited and is not the engine the JVM tests run (pentest r1). The two ends
   are tied through a committed fixture (real `exportPad()` output) that
@@ -148,21 +150,32 @@ Spec: `design/research/reviews/otp-transfer-brief.md` 5, 6, 9. Code:
   picked = `shared`; none by the time the chooser returns (+1.5 s, the two
   signals travel separately) = `cancelled`. The PendingIntent behind it is
   immutable (the chooser then drops its `EXTRA_CHOSEN_COMPONENT` fill-in,
-  which we never read), one-shot, package-explicit and has its own
-  requestCode per share, so two activity instances cannot swap results
-  (pentest r1 F2, F5). Whether the file reached the other phone Android cannot
-  tell an app; the UI says "File shared", not "handed over".
-- **The share file's life** (pentest r1 F1, F2): every file is un-granted
-  (`revokeUriPermission`) before it is deleted, and nothing deletes it any
-  other way. On `cancelled`/`error` it goes at once. After `shared` it lives
-  **10 minutes** (`SHARE_TTL_MS`: Bluetooth reads it from a background service
-  after its screen has closed), then a timer revokes and deletes it; a new
-  share supersedes every earlier one at once; every start of the activity
-  removes files past their 10 minutes — and only those, so a second instance
-  (another app can start ours into its own task) or a recreation (dark mode,
-  locale, font scale, a fold) no longer deletes a file a target has yet to
-  read. A file whose process died before its timer ran goes at the next start
-  or share.
+  which we never read), one-shot, package-explicit, and carries the request
+  id as its DATA (`x-secure-chat-share:<id>`), which is part of a
+  PendingIntent's identity: no two shares, in two activity instances or two
+  processes, can ever be handed the same one (pentest r1 F2, F5; r2 R2-6 — a
+  per-process requestCode counter restarted at 1). Whether the file reached
+  the other phone Android cannot tell an app; the UI says "File shared", not
+  "handed over". A pick reported AFTER "cancelled" (Android can hold the
+  broadcast back) is not sent to the page as a correction — each request is
+  answered once — but the file stays for its target (below), and "Share…" is
+  still there.
+- **The share file's life** (pentest r1 F1, F2; fix round 2): every file
+  is un-granted (`revokeUriPermission`) before it is deleted, and it is
+  deleted in exactly two ways. (1) At once on `error`, when the chooser never
+  ran, so nobody can hold a grant. (2) Otherwise — `shared` AND `cancelled` —
+  when it is **10 minutes** old (`SHARE_TTL_MS`; Bluetooth reads it from a
+  background service after its screen has closed). "Cancelled" is kept too
+  because it may be wrong (cold critic mi-4: a late pick broadcast), and a
+  new share ("Didn't arrive? Send it again", or a share in a second instance)
+  no longer touches an earlier file (pentest r2 R2-7a): each has its own URI,
+  so an old grant reaches only the old file. Expiry runs at every start of the
+  activity and after every share, and re-arms a timer for the next file due,
+  so a file lives 10 minutes (+1 s) while the process does, across
+  recreations and second instances. **If the process dies**, no timer
+  survives: the file is removed (or timed) at the next start of the app, and
+  until then stays app-private and un-revoked (pentest r2 R2-7b; this README
+  used to say "at the next start or share", which was not a bound).
 - **Save** is `ACTION_CREATE_DOCUMENT` (`application/json`, the name
   suggested); `saved` only after the bytes are written and the stream closed.
   The stream is opened `"wt"` (pentest r1 F3: an existing file the user chose
@@ -176,7 +189,26 @@ Spec: `design/research/reviews/otp-transfer-brief.md` 5, 6, 9. Code:
   only if it is `content://` from another app's provider — never `file://`
   (which `ContentResolver` would open directly, app-private files included),
   never our own `FileProvider`. DocumentsUI only returns such URIs, so this
-  refuses nothing real.
+  refuses nothing real. The check uses the URI's host, not its authority:
+  `content://0@org.securechat.app.files/…` names our provider once
+  `ContentResolver` strips the user id (pentest r2 R2-5); a user id on a
+  FOREIGN provider stays allowed (that is how a work-profile document comes
+  back).
+- **Configuration changes** (cold critic mi-5): a recreated activity reloads
+  the page — the unlocked identity, live chats and a pad file waiting in the
+  export sheet are gone, the pad already latched as exported. So
+  `MainActivity` takes every configuration change it can in place
+  (`configChanges`: orientation, screen size and layout, smallest width,
+  density, keyboard, navigation, touchscreen, uiMode, locale, layout
+  direction, font scale, color mode, mcc/mnc, grammatical gender). Nothing is
+  inflated per configuration (no `-night`/`-land` resources; the page has one
+  theme and does its own layout), so the only cost is that the native bar's
+  two strings follow a locale switch at the next start. **What still reloads
+  the page:** process death — the system reclaiming the app while the share
+  sheet or save dialog is in front. The user then comes back to a fresh start
+  (identity locked); the pad is latched as exported, so the next Export asks
+  the "export again" confirm, and a save dialog that was open may leave an
+  empty file where the user put it (the shell never deletes documents).
 - **Import**: `onShowFileChooser` → `ACTION_OPEN_DOCUMENT`,
   `CATEGORY_OPENABLE`, `*/*` (Quick Share and Bluetooth often deliver a .json
   as `application/octet-stream`), one document, no persisted permission. The
@@ -290,12 +322,17 @@ The bundled web client is **generated at build time** from `../client` by the
   nothing, and a second tap opens the picker again. (4) While the file is
   ready, the close confirm is black in a screen recording (`secureShow`).
   (5) Debug build: after a share, `adb shell run-as org.securechat.app ls -R
-  cache/pad-share` lists one `<id>/secure-chat-pad-….json`; ten minutes after
-  "File shared" (app left open) it is empty; after a force-stop and a restart
-  more than ten minutes later it is empty. A 1 MiB pad exports (Share and
+  cache/pad-share` lists one `<id>/secure-chat-pad-….json` (two after "Send it
+  again"); ten minutes after the share (app left open, shared or cancelled)
+  it is empty; after a force-stop and a restart more than ten minutes later
+  it is empty, and after a restart within the ten minutes it empties when
+  they are up. Switch dark mode and split-screen with the file-ready sheet
+  open: the sheet stays (no reload). A 1 MiB pad exports (Share and
   Save) without "Could not share/save" — the native envelope check is a
-  linear scan, but the largest file has only run on the JVM so far. A
-  recreation right after "File shared" (switch dark mode: the activity is
-  rebuilt) does not break a Bluetooth send still reading the file. (6) Android Back closes an open sheet (the client pushes a history
+  linear scan, but the largest file has only run on the JVM so far. "Send it again" while
+  a Bluetooth send of the first file is still running does not break it.
+  Revocation (`revokeUriPermission` before delete) cannot be observed in the
+  unit tests (Robolectric has no URI-grant model): after a share has expired,
+  the target must no longer be able to open its URI. (6) Android Back closes an open sheet (the client pushes a history
   entry; `onBackPressed` calls `webview.goBack()` while `canGoBack()`)
   instead of leaving the app, and does not dismiss a working sheet.
