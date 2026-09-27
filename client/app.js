@@ -3225,8 +3225,14 @@ function syncConnectCancel() {
 // its own reason (no second closeWs), and its onclose runs at once, exactly
 // once — detached from the socket, so the late close event finds nothing.
 // Frames it may still deliver are dropped (retired at dispatch). The pad lock
-// goes through releaseOtpLockAfterSave() as always: nothing of a session can
-// be in flight before the relay answered, and if it were, the lock would wait.
+// goes through releaseOtpLockAfterSave() as always, and that — not the relay
+// not having answered — is what keeps the pad safe: the lock goes only once
+// every save that started under it has settled, no new save may start once
+// it is closing (persistOtpProgress checks), and the retired socket can no
+// longer deliver, decrypt or send. (Pentest r3 C3-1: one caller, the
+// older-relay refusal below, is also reached by a role-less `joined`
+// injected into a RUNNING session; executed with a save in flight, the lock
+// waited for it and the same pad reconnected cleanly.)
 // Fix round 2 (pentest C2-1): the refusals of the relay's ANSWER to `join`
 // (`pending` to the creator; `joined` with no role, or as a guest that never
 // queued) end the same way — they come before the chat screen and its
