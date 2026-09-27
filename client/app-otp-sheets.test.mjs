@@ -157,6 +157,7 @@ const set = async (id, v) => { el(id).value = v; await el(id).dispatch("input");
 
 // ---- empty panel: no primary, Connect aria-disabled and says why ----------
 {
+  await el("toRoom").click(); // the room screen, where the OTP panel lives (R4-1 checks it)
   el("room").value = ROOM;
   await el("room").dispatch("input");
   dom.selectAlg("OTP");
@@ -885,6 +886,117 @@ const ALREADY = "You already have this pad on this device — not importing agai
   assert.ok(el("otpLabel").value === "" && el("otpSize").value === String(otp.PAD_SIZES[1].bytes), "n-1: a reopened New pad starts clean");
   await el("otpNewClose").click();
   console.log("OK  cold n-1: New pad resets on close");
+}
+
+// ======== fix round 3 (otp-fix-round-1.md, "Round 3") ========
+const TOKEN = (hist.entries.find((e) => e && e.otpSheet) || {}).otpSheet;
+assert.ok(typeof TOKEN === "string" && TOKEN.length >= 16, "fixture: app.js pushes its per-page token (I-3)");
+
+// ---- pentest r4 G3 / W23: Back during a failed unlock over a stale entry of our own ----
+{
+  await lockPad(madeId, "not the pad passphrase");
+  hist.entries = [{ otpSheet: TOKEN }]; hist.idx = 0; // an entry of ours left below (hot n2 / J20)
+  const b0 = hist.backs;
+  const opening = el("otpExportOpen").click();
+  await userBack();
+  await opening;
+  await settle(5);
+  assert.ok(!shown("otpExportSheet"), "fixture: the unlock failed, no sheet");
+  assert.strictEqual(hist.backs, b0,
+    "W23: the Back during the unlock cleared the entry flag — no back() from the stale entry below (it would find nothing, or leave)");
+  await el("otpImportOpen").click();
+  await userBack();
+  assert.ok(!shown("otpImportSheet"), "…and the next Back closes a later sheet");
+  console.log("OK  W23: popstate clears the entry flag even with no sheet up");
+}
+
+// ---- pentest r4 I-3: an entry left by an EARLIER page is never ours ----------
+{
+  await settle(5);
+  hist.entries = [null, { otpSheet: "entry-of-an-earlier-page" }]; hist.idx = 1; // a reload with a sheet up
+  await el("otpImportOpen").click();
+  hist.idx--; // a traversal whose popstate never reached the page (as in cold M4)
+  const b0 = hist.backs;
+  await el("otpImportClose").click();
+  assert.strictEqual(hist.backs, b0, "I-3: the entry on top is another page's — no back() (the token tells them apart)");
+  hist.entries = [null]; hist.idx = 0;
+  console.log("OK  I-3: history entries carry this page's token");
+}
+
+// ---- pentest r4 R4-1: Connect pressed during the Export entry's unlock ------
+{
+  // (a) deterministic: the relay has not answered yet (still the room screen)
+  //     — Connect alone cancels the Export entry.
+  await lockPad(madeId, PADPASS);
+  dom.selectAlg("OTP");
+  const before0 = dom.socket();
+  const idxA = hist.idx;
+  const openingA = el("otpExportOpen").click();
+  const connectingA = el("connect").click();
+  await openingA; await connectingA;
+  await settle(5);
+  assert.ok(!shown("otpExportSheet"), "R4-1: Connect pressed during the unlock wins — no Export sheet");
+  assert.strictEqual(hist.idx, idxA, "…and its history entry is dropped");
+  if (dom.socket() !== before0) dom.socket().close();
+  await settle(5);
+}
+{
+  // (b) the pentester's PoC: the chat screen comes up (whichever KDF ends first).
+  await lockPad(madeId, PADPASS);
+  dom.selectAlg("OTP");
+  const before = dom.socket();
+  const idx0 = hist.idx;
+  const opening = el("otpExportOpen").click();
+  const connecting = el("connect").click();
+  await until(() => dom.socket() !== before, "the socket");
+  const ws = dom.socket();
+  ws.open();
+  await ws.deliver({ type: "joined", role: "owner" });
+  await opening; await connecting;
+  await settle(5);
+  assert.ok(!el("scrChat").hidden, "fixture: the chat screen is up");
+  assert.ok(!shown("otpExportSheet") && !el("viewLive").inert,
+    "R4-1: the Export sheet does not open over the live chat (and the chat is not made inert): " + JSON.stringify({ sheet: shown("otpExportSheet"), inert: el("viewLive").inert, room: el("scrRoom").hidden, st: st.textContent, hint: el("hint").textContent }));
+  assert.strictEqual(hist.idx, idx0, "…its history entry is dropped");
+  await el("disconnect").click();
+  await el("toRoom").click();
+  console.log("OK  R4-1: Connect during the Export entry's unlock cancels the sheet");
+}
+
+// ---- pentest r4 G1 / W12: another security option during the unlock --------
+{
+  await lockPad(madeId, PADPASS);
+  const idx0 = hist.idx;
+  const opening = el("otpExportOpen").click();
+  dom.selectAlg("DHKE");
+  await el("algCards").dispatch("change");
+  await opening;
+  await settle(5);
+  assert.ok(!shown("otpExportSheet"), "W12: the OTP card was left during the unlock — no Export sheet over another option");
+  assert.strictEqual(hist.idx, idx0, "…and its history entry is dropped");
+  dom.selectAlg("OTP");
+  await el("algCards").dispatch("change");
+  console.log("OK  W12: leaving the OTP option during the unlock cancels the sheet");
+}
+
+// ---- pentest r4 I-2: the Forget confirm shows a cleaned label ----------------
+{
+  const odd = await otp.generatePad({ label: "odd", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  await otp.saveNewPad(odd, "odd pad passphrase words");
+  // The index is not authenticated (and older imports kept raw labels).
+  const IDX = "sc.otp.index.v1";
+  const idx = JSON.parse(localStorage.getItem(IDX));
+  idx.find((e) => e.padId === odd.padId).label = "Chess\n\nOK only hides it‮evil\u0007";
+  localStorage.setItem(IDX, JSON.stringify(idx));
+  el("otpSelect").value = odd.padId; await el("otpSelect").dispatch("change");
+  const realConfirm = globalThis.confirm;
+  let said = null;
+  globalThis.confirm = (m) => { said = m; return false; };
+  await el("otpForget").click();
+  globalThis.confirm = realConfirm;
+  assert.ok(said && said.startsWith('Delete the pad "Chess OK only hides it evil" from this device?'),
+    "I-2: the confirm names the pad without line breaks, bidi overrides or control characters: " + JSON.stringify(said));
+  console.log("OK  I-2: the Forget confirm shows the label cleaned");
 }
 
 console.log("\nAll OTP sheet checks passed.");

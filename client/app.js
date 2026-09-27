@@ -3168,6 +3168,9 @@ const MAX_WS_FRAME_CHARS = 64 * 1024; // = the relay's MAX_FRAME_BYTES; frames a
 const FINISH_WAIT_MS = 10000;
 async function connect() {
   if (connecting) return;
+  // Fix round 3 (pentest r4 R4-1): Connect during the Export entry's unlock
+  // wins — the Export sheet must not open over the chat this starts.
+  if (otpUi.entryBusy) otpUi.entryElsewhere = true;
   if (algValue() === "OTP") {
     const finishing = closingPadLocks.get(els.otpSelect.value);
     if (finishing) {
@@ -5153,7 +5156,7 @@ function refreshOtpPads(selectId) {
     const o = document.createElement("option");
     o.value = p.padId;
     // Fix round 2 (design r4 nit 5): the words the cards use.
-    o.textContent = `${p.label} (${p.role === 0 ? "you generated" : "from your contact"}, ${fmtBytes(p.regionSize)} each way)`;
+    o.textContent = `${otp.cleanPadLabel(p.label) || "pad"} (${p.role === 0 ? "you generated" : "from your contact"}, ${fmtBytes(p.regionSize)} each way)`;
     els.otpSelect.appendChild(o);
   }
   if (selectId) els.otpSelect.value = selectId;
@@ -5598,7 +5601,9 @@ async function otpForgetSelected() {
   // good (its watermark then refuses the file again, by design). Ask, and
   // name it. (On Android the shell shows confirm() through secureShow.)
   const meta = otp.padMeta(id);
-  if (!confirm(`Delete the pad "${meta ? meta.label : id.slice(0, 8)}" from this device? ` +
+  // The label is shown cleaned (pentest r4 I-2): the index is not
+  // authenticated, and a pad imported before round 3 kept the maker's raw text.
+  if (!confirm(`Delete the pad "${(meta && otp.cleanPadLabel(meta.label)) || id.slice(0, 8)}" from this device? ` +
     "It cannot be imported again — you would need to make a new pad and hand it over in person.")) return;
   // Round 4: a writer of the pad's storage — never beside a live chat on it.
   const done = await withPadLock(id, async () => {
@@ -5640,6 +5645,7 @@ const otpUi = {
   state: { new: "form", export: "form", import: "form" },
   entryBusy: false, // the Export entry is unlocking (its history entry is pushed)
   entryBack: false, // …and Back was pressed meanwhile
+  entryElsewhere: false, // …or Connect was (the chat screen will take over)
 };
 let otpNewInfo = null;        // { label, regionSize, weak } for New pad's done block
 let otpExportPad = null;      // { label, regionSize, exportedBefore } for the Export pad card
@@ -6110,7 +6116,7 @@ let otpHistEntry = false;
 let otpHistIgnore = 0;
 function otpHistPush() {
   try {
-    history.pushState({ otpSheet: 1 }, "");
+    history.pushState({ otpSheet: OTP_HIST_TOKEN }, "");
     otpHistEntry = true;
   } catch { /* no history API (tests): Back simply does not reach the sheet */ }
 }
@@ -6118,8 +6124,12 @@ function otpHistPush() {
 // is still the one on top. A Back the user already made took it — back()
 // would then leave the app — and at the first entry back() fires no
 // popstate, so the ignore below would stick and swallow a later Back.
+// Fix round 3 (pentest r4 I-3): the entry carries this page's own token, so
+// an entry left by an earlier page (a reload with a sheet up) never counts
+// as ours.
+const OTP_HIST_TOKEN = Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, "0")).join("");
 const otpHistOnTop = () => {
-  try { return !!(history.state && history.state.otpSheet); } catch { return false; }
+  try { return !!history.state && history.state.otpSheet === OTP_HIST_TOKEN; } catch { return false; }
 };
 function otpHistDrop() {
   if (!otpHistEntry) return;
@@ -6161,13 +6171,16 @@ async function otpExportOpenClick() {
     els.otpExportOpen.disabled = true;
     otpUi.entryBusy = true; // no other sheet opens meanwhile (its entry would sit on ours)
     otpUi.entryBack = false;
+    otpUi.entryElsewhere = false;
     otpHistPush(); // now, inside the click (see openOtpSheet); dropped again if the unlock fails
     let ok = false;
     try {
       await ensureUnlocked(id);
       // Another pad chosen meanwhile, or the user went elsewhere (another
       // view, another security option — hot r2 N3): no sheet, like Back.
-      ok = els.otpSelect.value === id && !els.viewLive.hidden && !els.otpPanel.hidden;
+      // Fix round 3 (pentest r4 R4-1): Connect pressed meanwhile moves the
+      // Live room to the chat screen — also "elsewhere".
+      ok = els.otpSelect.value === id && !els.viewLive.hidden && !els.scrRoom.hidden && !els.otpPanel.hidden;
     } catch (e) {
       // Fix round 1 (cold mi-6, hot m3): nothing was exported — say what
       // failed, and put focus back where the fix is (disabling the button
@@ -6182,7 +6195,7 @@ async function otpExportOpenClick() {
     // Back pressed during the unlock took the entry: that Back meant "never
     // mind" — the pad stays unlocked (that was wanted), no sheet opens.
     if (ok && otpUi.entryBack) { els.otpExportOpen.focus(); return; }
-    if (!ok) { otpHistDrop(); return; }
+    if (!ok || otpUi.entryElsewhere) { otpHistDrop(); return; }
     otpStatusMsg("");
     openOtpSheet("export", els.otpExportOpen, { pushed: true });
     return;

@@ -82,6 +82,7 @@ async function child(v) {
   const PASS = "a pad passphrase for the shape test";
   const pad = await otp.generatePad({ label: "shape", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
   await otp.saveNewPad(pad, PASS);
+  await dom.el("toRoom").click(); // the room screen, where the OTP panel lives
   await dom.el("algCards").dispatch("change");
   // The select is filled at load; this pad came later, so refill it the way
   // the page does after a save (a change event re-renders the panel).
