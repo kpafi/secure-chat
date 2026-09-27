@@ -402,7 +402,9 @@ const retiredSockets = new WeakSet();
 let sessionGen = 0;
 // Fix round 3 (review of d0c4074, M-1). sessionGen deliberately does NOT move
 // on a relay close — frames the relay sent just before hanging up are still
-// handled (e2e/hostile-relay.mjs sections 6 and 8). But the verification GATE
+// handled (e2e/hostile-relay.mjs sections 6 and 8; a `key` frame only if its
+// handling began before onclose — one dispatched after it is dropped, see the
+// `key` arm). But the verification GATE
 // must never be drawn, or acted on, for a connection that is gone: in Firefox
 // the safety-number digest resolves on a later task, so a gate for Bob could be
 // drawn after the close, survive into the next session, and "It matches" then
@@ -4128,8 +4130,10 @@ async function handleMessage(room, raw, sock) {
   // it sent before the close are still its last words and are handled — an
   // `error` naming why ("approval timeout", parked for the room screen), or a
   // forged handshake whose refusal must still reach the room screen (round 3
-  // L2, e2e/hostile-relay.mjs sections 6 and 8). A frame already being handled
-  // when the socket closes finishes either way.
+  // L2, e2e/hostile-relay.mjs sections 6 and 8) — if its handling began before
+  // the close: a `key` frame first dispatched after onclose is dropped by the
+  // `key` arm (2026-09-27). A frame already being handled when the socket
+  // closes finishes either way.
   if (!ws || sock !== ws || retiredSockets.has(sock)) return;
   const gen = sessionGen;
   const live = () => sessionLive(sock, gen); // re-asked after every await below
@@ -4146,7 +4150,13 @@ async function handleMessage(room, raw, sock) {
   switch (m.type) {
     // We are waiting for the room owner to let us in (P-08). Nothing of ours
     // reaches the room until they do — not even the session nonce — so the
-    // only thing to send now is the introduction they will judge us by.
+    // only thing to send now is the introduction they will judge us by. (That
+    // holds for an honest relay, which forwards nothing to a queued guest. A
+    // hostile one can hand us a hello here and gets our nonce, signed key and,
+    // for AES256/OTP, a confirmation tag — no more than seating us would give
+    // it. `pending` counts as an answer on purpose, owner decision 2026-09-27:
+    // the chat screen and Disconnect are up, so the prompt is visible; see the
+    // `key` arm.)
     case "pending": {
       // Write-once, like the peer identity pin: a relay must not be able to
       // re-cast us mid-session (an owner told "you are a guest" would stop
@@ -4365,10 +4375,13 @@ async function handleMessage(room, raw, sock) {
       // (C3-2 r1 R1-2). Refused before anything is parsed, answered or awaited.
       //
       // Only on an OPEN socket. A CLOSING one (the relay's Close came, its
-      // close event has not) is ending anyway and its onclose says why; a
+      // close event has not) is ending anyway and its onclose shows whatever
+      // reason is still parked (A3 above drops one this frame follows); a
       // CLOSED one has onclose's reset role, so "no answer" cannot be told
-      // from "the session ended" there — its frames belong to nothing now.
-      // Either way nothing is sent and nothing reaches the prompt.
+      // from "the session ended" there — its frames belong to nothing now,
+      // whatever the session had got to (a prompt raised for one would sit on
+      // the room screen, 0×0, the tab bar inert). Either way nothing is sent,
+      // nothing is narrated and nothing reaches the prompt.
       if (roomRole === null) {
         if (sock.readyState !== WebSocket.OPEN) break;
         addLine("sys", "", "[the relay passed on a key exchange before letting us into the room — refusing]", true);

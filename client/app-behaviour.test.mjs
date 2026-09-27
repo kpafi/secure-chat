@@ -1651,6 +1651,23 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
       "decision 2 (2026-09-27): ...closed, and nothing of the key exchange went back");
   }
 
+  // (h2) pentest early-key r1 T1: a seated guest past the hello exchange, a
+  // relay-signed handshake queued before the relay's close and dispatched
+  // after it (the stub runs onclose inside close()). onclose reset the role;
+  // the old handling judged the frame anyway and raised the approval prompt
+  // on the room screen — 0×0 in a browser, the tab bar inert, nobody to answer
+  // it. Dropped now: no prompt, nothing inert, nothing sent.
+  {
+    const s = await guestAwaitingHandshake("DHKE");
+    const sent0 = s.ws.sent.length;
+    s.ws.onmessage({ data: JSON.stringify(await signedOffer(mallory, s.nonces)) });
+    s.ws.close();
+    await settle(40);
+    assert.ok(!promptUp(), "early-key r1 T1: a handshake dispatched after the relay's close raises no prompt");
+    assert.ok(dom.el("tabbar").inert !== true, "early-key r1 T1: ...the tab bar is not inert");
+    assert.strictEqual(s.ws.sent.length, sent0, "early-key r1 T1: ...and nothing is sent");
+  }
+
   // (g) the OWNER is unchanged: it approved via the knock and is never asked again.
   {
     const ws = await connect("DHKE");

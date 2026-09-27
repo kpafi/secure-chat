@@ -489,7 +489,10 @@ const LOCK = "sc.otp.lock.v1." + pad.padId;
   // closeWs, so the attempt waited for its close. Since 2026-09-27 (block E)
   // any `key` frame before an answer is refused through endUnanswered, at once:
   // the same frame now binds that the early-key refusal ends the attempt
-  // although the close stalls, and that nothing after it relabels it.
+  // although the close stalls, and that nothing after it relabels it. (The
+  // refusal clears the deadline and hides Cancel, so neither really runs
+  // here; C1-1's own scenario has no relay trigger left and its guard is
+  // bound directly in block E.)
   for (const next of ["deadline", "cancel"]) {
     const ws = await connectToSocket();
     const t = lastTimer(30000);
@@ -506,7 +509,7 @@ const LOCK = "sc.otp.lock.v1." + pad.padId;
     assertBackOnRoom("C1-1 (" + next + ")");
     assert.strictEqual(el("roomHint").textContent, EARLY_KEY_SENTENCE, `C1-1: after the ${next}, the room screen keeps the refusal, not the timeout sentence`);
   }
-  console.log("OK  C1-1: a refusal whose close stalls ends at once and keeps its sentence through the deadline and a Cancel (executed)");
+  console.log("OK  C1-1 / E: the early-key refusal ends the attempt at once although its close stalls; nothing after it relabels it (executed)");
 }
 {
   // Fix round 2, C2-1: a refusal of the relay's ANSWER to join comes before the
@@ -852,9 +855,11 @@ const frames0 = () => ({ hello: true, n: Buffer.alloc(32, 9).toString("base64"),
   ws.open();
   ws.readyState = 2;
   const hint0 = el("roomHint").textContent;
+  const log0 = logText();
   await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: b64json(frames0()) });
   await settle();
   assert.ok(!ws.sent.some((f) => f.type === "key"), "E (CLOSING): nothing is sent into a closing socket");
+  assert.strictEqual(logText(), log0, "E (CLOSING): nothing is narrated (the whole log, folds included)");
   assert.strictEqual(el("roomHint").textContent, hint0, "E (CLOSING): no sentence — the close says what ended it");
   assert.ok(el("connect").disabled && !t.cleared, "E (CLOSING): the attempt waits for its close (the deadline still runs)");
   await ws.deliver({ type: "error", reason: "join timeout" }); // its last words (A3 drops a reason a later frame follows)
@@ -870,12 +875,60 @@ const frames0 = () => ({ hello: true, n: Buffer.alloc(32, 9).toString("base64"),
   await ws2.deliver({ type: "error", reason: "join timeout" });
   ws2.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "AES256", payload: b64json(frames0()) }) });
   ws2.close();
+  const log2 = logText(); // onclose ran inside close(); the frame is still queued
   await settle();
+  assert.strictEqual(logText(), log2, "E (CLOSED): nothing is narrated after the close (the whole log)");
   assertBackOnRoom("E (CLOSED)");
   assert.strictEqual(el("roomHint").textContent, "Joining took too long, so the relay closed the connection. Connect again.",
     "E (CLOSED): a key frame handled after the close does not write over the relay's reason");
   assert.ok(!ws2.sent.some((f) => f.type === "key"), "E (CLOSED): ...and sends nothing");
   console.log("OK  E: on a CLOSING or CLOSED socket an early key frame is dropped: nothing sent, the close's own words stay (executed)");
+}
+{
+  // Pentest early-key r1 T1: CLOSED means onclose's reset role whatever the
+  // session had got to — a seated owner past the hello exchange included
+  // (peerNonce set, our hello answered). A key frame the relay queued before
+  // its close and that is dispatched after it is dropped: no "Key exchange
+  // failed" over the close's own words, nothing narrated, nothing sent.
+  // (app-behaviour binds the same for DHKE, where the old handling raised the
+  // approval prompt on the room screen.)
+  const ws = await connectToSocket();
+  ws.open();
+  await ws.deliver({ type: "joined", role: "owner" });
+  await ws.deliver({ type: "key", room: ROOM, alg: "AES256", payload: b64json(frames0()) });
+  await settle();
+  const sent0 = ws.sent.length;
+  assert.ok(ws.sent.filter((f) => f.type === "key").length >= 2, "fixture: the hello exchange ran (ours, and the answer to theirs)");
+  for (const payload of [{ pub: "AAAA", reply: true, idb: { ed: "AAAA" }, sig: { ed: "AAAA" } }, { confirm: "AAAA" }]) {
+    ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "AES256", payload: b64json(payload) }) });
+  }
+  ws.close(); // the relay's close: onclose runs now, the two frames after it
+  const hint1 = el("roomHint").textContent, log1 = logText();
+  await settle();
+  assertBackOnRoom("E (CLOSED, seated)");
+  assert.strictEqual(el("roomHint").textContent, hint1, "E (CLOSED, seated): a key frame after the close writes nothing over the room screen");
+  assert.strictEqual(logText(), log1, "E (CLOSED, seated): ...narrates nothing");
+  assert.strictEqual(ws.sent.length, sent0, "E (CLOSED, seated): ...and sends nothing");
+  console.log("OK  E: a seated session's key frames dispatched after the relay's close are dropped too (executed)");
+}
+{
+  // Pentest early-key r1 T2: C1-1's guard in endUnanswered (a socket this app
+  // already decided to close keeps its own reason; no second closeWs) has no
+  // relay-driven trigger left before an answer. Bound directly: a closeWs on
+  // an unanswered socket whose close stalls — here Disconnect's, clicked
+  // through the stub (it lives on the hidden chat screen) — then the deadline.
+  const ws = await connectToSocket();
+  const t = lastTimer(30000);
+  ws.open();
+  stallClose(ws);
+  el("disconnect").click();
+  await settle();
+  assert.ok(ws.readyState === 2 && el("connect").disabled, "fixture: the app's own close is stalled, the attempt still in flight");
+  await fire(t);
+  assertBackOnRoom("C1-1 (direct)");
+  assert.notStrictEqual(el("roomHint").textContent, JOIN_SENTENCE,
+    "C1-1 (direct): the deadline ends a socket the app already closed without relabelling it as unanswered");
+  console.log("OK  C1-1: endUnanswered does not close again what the app already closed (direct; no relay trigger left) (executed)");
 }
 {
   // Controls: `pending` is an answer. A key frame in the admission queue (which
