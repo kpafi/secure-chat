@@ -533,6 +533,126 @@ const LOCK = "sc.otp.lock.v1." + pad.padId;
   await el("room").dispatch("input");
   console.log("OK  C2-1: the four refusals of the relay's answer end at once although the close stalls (executed)");
 }
+// ---- C3-2: the relay's answer handled after the relay's own close ---------------
+// Frames of a socket the RELAY closed are still handled (its last words, see
+// the gate at the top of handleMessage). A `joined` still queued on msgChain
+// when the close event ran finds onclose's reset state. The stub forces that
+// order: the frame is queued (onmessage only chains it) and the relay's close
+// runs onclose in the same task, before the chain gets to it. Pentest r3 C3-2
+// reproduced it only this way (not in Chromium, 20 tries); the hardening is cheap.
+const logLines = () => dom.el("log").children;
+const disconnectedLines = () => logLines().filter((c) => /^disconnected\b/.test(c.textContent)).length;
+function answerThenRelayClose(ws, frame) {
+  ws.onmessage({ data: JSON.stringify(frame) });
+  ws.close(); // the relay's close, not closeWs(): the stub runs onclose now
+}
+{
+  // An owner's seat handled after the close.
+  const ws = await connectToSocket();
+  ws.open();
+  const lines0 = logLines().length;
+  answerThenRelayClose(ws, { type: "joined", role: "owner" });
+  await settle();
+  assert.strictEqual(ws.readyState, 3, "fixture: the relay closed the socket");
+  assertBackOnRoom("C3-2 (owner seated after the close)");
+  assert.ok(!logLines().slice(lines0).some((c) => /joined room|you created this chat/.test(c.textContent)),
+    "C3-2: a seat handled after the close is not narrated as a session start");
+  assert.ok(!ws.sent.some((f) => f.type === "key"), "C3-2: ...and no hello is sent into the dead socket");
+  // Positive control: the next session is seated as always, and Disconnect ends it.
+  const ws2 = await connectToSocket();
+  ws2.open();
+  await ws2.deliver({ type: "joined", role: "owner" });
+  await settle();
+  assert.strictEqual(el("scrChat").hidden, false, "control: an answer handled while the socket is open seats us");
+  assert.strictEqual(el("status").textContent, "connected", "control: ...connected");
+  el("disconnect").click();
+  await settle();
+  assertBackOnRoom("control (Disconnect after the late seat)");
+  console.log("OK  C3-2: an owner's seat handled after the relay's close draws no chat for the dead socket (executed)");
+}
+{
+  // A guest's seat handled after the close — after an honest `pending`, and
+  // without one. Neither is refused on state onclose already wiped, and
+  // neither leaves the seat behind: the next session's `denied` is said.
+  for (const c of [{ what: "after pending", queued: true }, { what: "without pending", queued: false }]) {
+    const ws = await connectToSocket();
+    ws.open();
+    if (c.queued) {
+      await ws.deliver({ type: "pending" });
+      await settle();
+      assert.strictEqual(el("scrChat").hidden, false, "fixture: pending moves to the chat screen (" + c.what + ")");
+    }
+    answerThenRelayClose(ws, { type: "joined", role: "guest" });
+    await settle();
+    assertBackOnRoom("C3-2 (guest seated after the close, " + c.what + ")");
+    const lateHint = el("roomHint").textContent; // asserted after the next session: each check fails on its own
+    const ws2 = await connectToSocket();
+    ws2.open();
+    await ws2.deliver({ type: "pending" });
+    const lines0 = logLines().length;
+    await ws2.deliver({ type: "denied" });
+    await settle();
+    assert.ok(logLines().slice(lines0).some((l) => /the other person did not let you in/.test(l.textContent)),
+      "C3-2: the next session's `denied` is said (" + c.what + ")");
+    ws2.close(); // the relay closes after denied
+    await settle();
+    assertBackOnRoom("fixture (declined, " + c.what + ")");
+    assert.doesNotMatch(lateHint, /put you in the room without the owner approving/,
+      "C3-2: a guest seat handled after the close is not judged on the wiped queue state (" + c.what + ")");
+  }
+  console.log("OK  C3-2: a guest's seat handled after the close is not refused on wiped state, and leaves no seat behind (executed)");
+}
+{
+  // CLOSING: the relay's Close arrived, the close event has not. The refusals
+  // still read live state and are said at once; a seat is not drawn.
+  const ws = await connectToSocket();
+  ws.open();
+  stallClose(ws);
+  ws.readyState = 2; // the relay's Close frame came in; the browser waits for the TCP close
+  await ws.deliver({ type: "joined", role: "owner" });
+  await settle();
+  assert.strictEqual(el("scrChat").hidden, true, "C3-2: a seat on a CLOSING socket draws no chat screen");
+  assert.notStrictEqual(el("status").textContent, "connected", "C3-2: ...and says no 'connected'");
+  assert.ok(!ws.sent.some((f) => f.type === "key"), "C3-2: ...and sends no hello");
+  ws.readyState = 3;
+  ws.onclose({}); // the close event
+  await settle();
+  assertBackOnRoom("C3-2 (seat on a CLOSING socket, then its close)");
+
+  const ws2 = await connectToSocket();
+  ws2.open();
+  stallClose(ws2);
+  ws2.readyState = 2;
+  await ws2.deliver({ type: "joined", role: "guest" });
+  await settle();
+  assertBackOnRoom("C3-2 (unqueued guest on a CLOSING socket)");
+  assert.match(el("roomHint").textContent, /^This relay put you in the room without the owner approving you\./,
+    "C3-2: a refusal on a CLOSING socket (its onclose has not run) is still said at once");
+  console.log("OK  C3-2: on a CLOSING socket a seat is not drawn and a refusal is still said (executed)");
+}
+{
+  // The refusals of the answer take no seat: `joined` is written after them,
+  // so onclose does not narrate a session end ("disconnected") that never began.
+  for (const frame of [{ type: "joined" }, { type: "joined", role: "guest" }]) {
+    const ws = await connectToSocket();
+    ws.open();
+    const before = disconnectedLines();
+    await ws.deliver(frame);
+    await settle();
+    assertBackOnRoom("C3-2 (refused " + JSON.stringify(frame) + ")");
+    assert.strictEqual(disconnectedLines(), before,
+      "C3-2: a refused answer (" + JSON.stringify(frame) + ") is not narrated as a session that ended");
+  }
+  // Control: a session that was seated IS narrated when it ends.
+  const ws = await connectToSocket();
+  ws.open();
+  await ws.deliver({ type: "joined", role: "owner" });
+  const before = disconnectedLines();
+  ws.close();
+  await settle();
+  assert.strictEqual(disconnectedLines(), before + 1, "control: a seated session's end is narrated");
+  console.log("OK  C3-2: a refused answer takes no seat; a seated session's end is still narrated (executed)");
+}
 
 // ---- L: the directory lookup ----------------------------------------------------
 el("toIdentity").click();

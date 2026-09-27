@@ -3442,6 +3442,7 @@ async function connectInner() {
   myNonce = freshNonce();
   peerNonce = null;
   helloAnswered = false;
+  joined = false; // pentest r3 C3-2: a seat is per connection, like the role
   roomRole = null;
   admittedBundle = null;
   admittedAnon = false;
@@ -4239,7 +4240,17 @@ async function handleMessage(room, raw, sock) {
       // hello — two lines per 32-byte frame, which reached any cap with no peer
       // and no user. It is dropped; a CHANGED role still reaches the refusal.
       if (joined && m.role === roomRole) break;
-      joined = true;
+      // Pentest r3 C3-2 (connect-cancel): a `joined` handled after the relay's
+      // own close — a backlog on msgChain; frames of a relay-closed socket are
+      // still handled, see the gate at the top — found onclose's reset state.
+      // `wasPending` and `roomRole` are gone, so its checks accused an honest
+      // pending guest of never queueing, and the seat drew a chat screen that
+      // said "connected" for a dead socket (Disconnect then did nothing), or
+      // left `joined` set on the room screen, silencing the next session's
+      // `denied`. The checks below read that state: they run only while the
+      // socket's onclose has not (CLOSED is the `error` arm's test too), and
+      // the seat is taken only on an OPEN socket (below).
+      if (sock.readyState === WebSocket.CLOSED) break;
       // An older relay answers `join` with a bare {"joined"} — no role, no
       // admission control. Refusing beats silently running the protocol this
       // fix removed: the room would again be first-come-first-served and the
@@ -4255,11 +4266,10 @@ async function handleMessage(room, raw, sock) {
       // pending -> joined:guest, so a role that CHANGES is the relay re-casting
       // us: a guest told it is the owner would start approving people into a
       // room it does not control, an owner told it is a guest would stop being
-      // asked. Neither is recoverable, so fail closed.
-      if (roomRole === null) {
-        roomRole = m.role;
-        syncConnectCancel(); // R6-1: answered (see `pending`)
-      } else if (roomRole !== m.role) {
+      // asked. Neither is recoverable, so fail closed. (Past this point
+      // m.role is the role: roomRole is null or equal to it. It is written
+      // once the seat is taken, below — C3-2.)
+      if (roomRole !== null && roomRole !== m.role) {
         addLine("sys", "", "[the relay changed our role mid-session — refusing]", true);
         closeWs("The relay tried to change your role in this room. Disconnected.", sock);
         return;
@@ -4270,7 +4280,7 @@ async function handleMessage(room, raw, sock) {
       // one is ever asked to approve anybody. But the only legitimate way to
       // become a guest is pending -> knock -> joined:guest, so a seat handed to
       // us without ever passing through the queue means no owner approved it.
-      if (roomRole === "guest" && sessionRoomMine) {
+      if (m.role === "guest" && sessionRoomMine) {
         // F-PROTO-001, belt and braces: a relay that skips `pending` and seats
         // the creator straight in as a guest (already refused below via
         // `wasPending`, kept explicit so the invariant survives a refactor).
@@ -4279,11 +4289,22 @@ async function handleMessage(room, raw, sock) {
           "The relay tried to seat you as a guest. Connect first, then send the code.");
         return;
       }
-      if (roomRole === "guest" && !wasPending) {
+      if (m.role === "guest" && !wasPending) {
         addLine("sys", "", "[we were seated in this room without ever asking to be let in — refusing]", true);
         endUnanswered(sock, "This relay put you in the room without the owner approving you. Disconnected.");
         return;
       }
+      // C3-2: the seat, only for a socket that is still open. A CLOSING one
+      // (the relay's Close came, its onclose has not run) is not drawn as a
+      // chat that is about to vanish; its onclose is on the way and says what
+      // ended it. `joined` and `roomRole` are written here, after every
+      // refusal, so none of them leaves either behind.
+      if (sock.readyState !== WebSocket.OPEN) break;
+      if (roomRole === null) {
+        roomRole = m.role;
+        syncConnectCancel(); // R6-1: answered (see `pending`)
+      }
+      joined = true;
       els.roomShort.textContent = room.slice(0, 8) + "…" + room.slice(-8);
       showScreen("chat");
       setStatus("connected", "ok");
