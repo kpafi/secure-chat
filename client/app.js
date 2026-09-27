@@ -84,7 +84,7 @@ const els = {
   // setup
   room: $("room"), gen: $("gen"), algCards: $("algCards"), pass: $("pass"),
   passRow: $("passRow"), contactRow: $("contactRow"), contact: $("contact"),
-  connect: $("connect"), status: $("status"), setup: $("setup"),
+  connect: $("connect"), connectCancel: $("connectCancel"), status: $("status"), setup: $("setup"),
   // one-time pad
   otpPanel: $("otpPanel"), otpSelect: $("otpSelect"), otpForget: $("otpForget"),
   otpStatus: $("otpStatus"), otpSize: $("otpSize"), otpLabel: $("otpLabel"),
@@ -3172,6 +3172,59 @@ const MAX_WS_FRAME_CHARS = 64 * 1024; // = the relay's MAX_FRAME_BYTES; frames a
 // `connecting` is set, only for an OTP connect to that same pad, and for at
 // most FINISH_WAIT_MS; then the connect is refused with what to do.
 const FINISH_WAIT_MS = 10000;
+
+// Pentest r6 R6-1 / r7 R7-3 (OTP transfer sheets; the gap itself is older): a
+// relay that accepts the socket and never answers `join` — hostile, or a
+// half-open connection (the client sends no pings) — and a directory lookup
+// that never answers both left the user on the room screen with Connect
+// disabled and no way out but a reload (Disconnect lives on the chat screen;
+// an OTP connect also kept its pad locked). Two deadlines and a Cancel close it.
+//
+// What the join deadline covers: from the socket's construction until the
+// relay answers `join` with `pending` or `joined` (either one sets roomRole and
+// moves to the chat screen, where Disconnect is). NOT the wait for admission:
+// a guest the relay has put in the queue is waiting legitimately, for as long
+// as the owner takes (the relay has its own approval timeout), and can leave
+// with Disconnect. An honest relay answers `join` at once; 30 s leaves room
+// for a slow network or an onion circuit. The sentences are byte-stable.
+const JOIN_TIMEOUT_MS = 30000;
+const LOOKUP_TIMEOUT_MS = 20000;
+const JOIN_TIMEOUT_HINT =
+  "The relay did not answer within 30 seconds, so this connection attempt was stopped \u2014 " +
+  "nothing reached your contact. Check your connection and press Connect to try again.";
+const LOOKUP_TIMEOUT_HINT =
+  "The directory did not answer within 20 seconds, so the contact lookup was stopped and nothing " +
+  "was connected. Press Connect to try again \u2014 or leave the contact field blank and compare a " +
+  "safety number instead.";
+const LOOKUP_TIMED_OUT = Symbol("lookup-timed-out");
+let joinTimer = null;     // the join deadline of the current socket, or null
+let connectAttempt = null; // AbortController of the latest connect; read only while `connecting`
+function clearJoinTimer() {
+  if (joinTimer !== null) { clearTimeout(joinTimer); joinTimer = null; }
+}
+// Cancel is offered exactly while Connect is in flight and nothing has answered:
+// while connect() runs (lookup, pad lock, key setup) and while the socket is
+// open or opening with no role from the relay. Once the relay has answered, the
+// chat screen's Disconnect is the way out (and "Cancel" would be the wrong word
+// on the room screen of a session that runs — ‹ Back to room goes there).
+function syncConnectCancel() {
+  const live = ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN);
+  const show = connecting || (live && roomRole === null);
+  // A Cancel that goes away under the keyboard hands the focus to Connect.
+  if (!show && document.activeElement === els.connectCancel && !els.connect.disabled) els.connect.focus();
+  els.connectCancel.hidden = !show;
+}
+function cancelConnect() {
+  // Before the socket (connect() is still running — it ends in the same task
+  // that builds the socket): stop the attempt; connectInner returns at its next
+  // check (the lookup's fetch is aborted at once) and releases what it took.
+  if (connecting && connectAttempt) { connectAttempt.abort(); return; }
+  // The socket is up (or opening) and unanswered: exactly Disconnect —
+  // onclose does the cleanup, releases the pad lock after its saves, and
+  // returns to the room screen.
+  if (ws && roomRole === null) closeWs();
+}
+
 async function connect() {
   if (connecting) return;
   if (algValue() === "OTP") {
@@ -3196,6 +3249,7 @@ async function connect() {
   if (connecting) return;
   connecting = true;
   els.connect.disabled = true;
+  syncConnectCancel();
   try {
     await connectInner();
   } finally {
@@ -3206,6 +3260,7 @@ async function connect() {
     // test the state rather than mere presence.
     const live = ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN);
     if (!live) els.connect.disabled = false;
+    syncConnectCancel();
   }
 }
 
@@ -3221,6 +3276,20 @@ async function connectInner() {
   gateFor = null;
   currentPinKey = null;
   els.verify.hidden = true;
+  clearJoinTimer();
+  // R6-1: this attempt, until its socket exists. Cancel aborts it; after every
+  // await below, `stopped()` ends the attempt, releases a pad lock it took, and
+  // says why when the lookup timed out (a user's Cancel needs no sentence).
+  const attempt = new AbortController();
+  connectAttempt = attempt;
+  const stopped = () => {
+    if (!attempt.signal.aborted) return false;
+    releaseOtpLock();
+    setStatus("disconnected", "err");
+    clearHints(); // as Disconnect's return to the room screen does
+    if (attempt.signal.reason === LOOKUP_TIMED_OUT) hint(LOOKUP_TIMEOUT_HINT, true);
+    return true;
+  };
   const room = roomCode();
   const alg = algValue();
   if (!ROOM_RE.test(room)) {
@@ -3244,13 +3313,20 @@ async function connectInner() {
       return;
     }
     setStatus("looking up contact…");
+    const lookupTimer = setTimeout(() => attempt.abort(LOOKUP_TIMED_OUT), LOOKUP_TIMEOUT_MS);
+    let bundle;
     try {
-      expectedPeerBundle = await account.fetchBundle(API_BASE, contact);
+      bundle = await account.fetchBundle(API_BASE, contact, attempt.signal);
     } catch (e) {
+      if (stopped()) return;
       hint("Directory lookup failed: " + e.message, true);
       setStatus("disconnected", "err");
       return;
+    } finally {
+      clearTimeout(lookupTimer);
     }
+    if (stopped()) return;
+    expectedPeerBundle = bundle;
     if (!expectedPeerBundle) {
       hint(`No one found for the handle "${parsed.username}#\u2026". Check you pasted it exactly, or leave the field blank and compare a safety number instead.`, true);
       setStatus("disconnected", "err");
@@ -3278,6 +3354,7 @@ async function connectInner() {
     // Exclusive same-origin lock: a pad must be live in only ONE tab/window at a
     // time, or two sessions would draw the same keystream (two-time pad).
     const got = await acquirePadLock(padId);
+    if (attempt.signal.aborted) { if (typeof got === "function") got(); stopped(); return; }
     if (got === NO_WEB_LOCKS) {
       hint("One-time pads are disabled in this browser: it cannot lock a pad to a single tab " +
         "(no Web Locks support), and a pad open twice would reuse key material. Use the app or a current browser.", true);
@@ -3296,6 +3373,7 @@ async function connectInner() {
       // the offset the cache remembers — spent keystream. It is also a record
       // of its own, never shared with the panel.
       const unlocked = await readPadFresh(padId);
+      if (stopped()) return;
       otpRecord = unlocked.record;
       otpAtRest = unlocked.atRest;
     } catch (e) {
@@ -3319,6 +3397,7 @@ async function connectInner() {
     hint("Could not set up encryption: " + e.message, true);
     return;
   }
+  if (stopped()) return;
 
   peerBundle = null;
   verified = false;
@@ -3355,6 +3434,15 @@ async function connectInner() {
     // tries to open an insecure ws:// relay (browser Mixed-Content rule). Catch
     // it so the UI reports the cause instead of hanging on "connecting…".
     ws = new WebSocket(wsUrl());
+    // R6-1: the relay answers `join` within JOIN_TIMEOUT_MS of Connect, or the
+    // attempt ends with a sentence (see JOIN_TIMEOUT_MS for what it covers).
+    // Cleared by onclose and by the next connectInner, so it only ever fires
+    // for the current socket.
+    const opened = ws;
+    joinTimer = setTimeout(() => {
+      joinTimer = null;
+      if (roomRole === null) closeWs(JOIN_TIMEOUT_HINT, opened);
+    }, JOIN_TIMEOUT_MS);
   } catch (e) {
     releaseOtpLock(); // round 3 (I2): no session, no lock
     setStatus("connection blocked", "err");
@@ -3402,6 +3490,7 @@ async function connectInner() {
   };
 
   ws.onclose = () => {
+    clearJoinTimer(); // R6-1: a socket that is gone is not timed out again later
     gateGen += 1; // M-1: a gate still being computed for this connection is never drawn
     gateFor = null;
     setStatus("disconnected", "err");
@@ -3431,6 +3520,7 @@ async function connectInner() {
     clientClosing = false;
     els.connect.disabled = false;
     releaseOtpLockAfterSave();
+    syncConnectCancel();
   };
 
   ws.onerror = () => setStatus("connection error", "err");
@@ -4032,6 +4122,7 @@ async function handleMessage(room, raw, sock) {
       }
       roomRole = "guest";
       wasPending = true; // M-2: proof we went through the approval queue
+      syncConnectCancel(); // R6-1: answered — the join deadline no longer applies, and Disconnect is on screen
       els.roomShort.textContent = room.slice(0, 8) + "…" + room.slice(-8);
       showScreen("chat");
       setStatus("waiting for approval");
@@ -4131,6 +4222,7 @@ async function handleMessage(room, raw, sock) {
       // asked. Neither is recoverable, so fail closed.
       if (roomRole === null) {
         roomRole = m.role;
+        syncConnectCancel(); // R6-1: answered (see `pending`)
       } else if (roomRole !== m.role) {
         addLine("sys", "", "[the relay changed our role mid-session — refusing]", true);
         closeWs("The relay tried to change your role in this room. Disconnected.", sock);
@@ -6560,6 +6652,7 @@ els.chatModeSel.addEventListener("change", () => {
 // screen navigation + chat top bar
 els.toRoom.addEventListener("click", () => showScreen("room"));
 els.toIdentity.addEventListener("click", () => showScreen("identity"));
+els.connectCancel.addEventListener("click", cancelConnect);
 els.disconnect.addEventListener("click", () => {
   closeWs(); // onclose does the cleanup and returns to the room screen
 });
