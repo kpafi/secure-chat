@@ -295,3 +295,19 @@ one at a time, each reverted.
 | QVIS_S / QVIS_P / QVIS_N | **Tests added** (emoji-, punctuation-, digit-only labels stay) | each red on its assertion |
 | QWFEFF, QW180E, QVISpre | Cosmetic, not taken (an invisible character kept in a label that has a visible one; ZWNJ runs capped at 60) | — |
 | PN2, PL7, PFOC, Q2028 | Equivalent, as the pentester found | — |
+
+## Round 7 — Web client
+
+Review: `otp-pentest-r8.md` (R7-1 verified closed; Info items and two test gaps). Commits: the
+app-behaviour test for the guest side, then app.js + app-otp-sheets + app-otp-bridge. Checked:
+`npm test` green; e2e on a scratch relay (:8093, killed by PID): otp-transfer 196/196,
+otp-held-join 10/10, room-admission 49/49. Mutants hand-run, one at a time, each reverted.
+
+| Finding | Verdict | Bound by (mutant → red check) |
+| --- | --- | --- |
+| R3 (test gap): the guest's peer prompt re-arm | **Test added** (the pentester's PoC, in app-behaviour) | S7 (re-arm only for the knock prompt) → "R8: guest peer prompt revealed by a self-closing sheet is guarded" |
+| W9 (test gap): a non-done self-close must never get the success words | **Test added** (Export ending in the re-export confirm; Import with a wrong transfer passphrase) | S1 (the done gate removed) → "R8-2/W9: an Export that did not finish says so — never 'downloaded'" |
+| R8-2: a failed self-closing sheet vanished silently | **Fixed**: "<New pad / Import / Export> did not finish — open … again after this chat." (warning) | S2 (null for non-done) → the same check |
+| R8-1: the notice dropped the weak line | **Fixed**: " Weak pad passphrase — accepted." / " Weak transfer passphrase — accepted." appended, as the done block shows it | S3 → "R8-1/R8-3: the done line keeps the weak-passphrase line…" |
+| R8-3: hintSafe blanked non-ASCII labels; a `"` closed the quote | **Fixed**: the notice is written by textContent (fixed words + the cleaned label), the label in “…” | S4 (hintSafe again) → the same check ("Caf    \"x\""); S5 (ASCII quotes) → "R7-2: what the done block would have said…" |
+| R8-4: iOS said "sent" | **Fixed**: "Share sheet opened — AirDrop it to them in person; once they've imported it, they delete the file." (the unreachable "shared" branch removed) | S6 → "R8-4: the iOS self-close notice" (a child process with `location.protocol = "secure-chat:"`) |
