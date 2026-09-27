@@ -1740,6 +1740,17 @@ console.log("OK  MA-1: a pad still stored here is PAD_PRESENT; a forgotten one s
   const capped = cleaned("a".repeat(59) + "\u{1F600}x");
   assert.ok([...capped].length === 60 && capped.endsWith("\u{1F600}") && capped.isWellFormed(),
     "KF: the 60 cap counts code points — the emoji at the cap stays whole: " + JSON.stringify(capped));
+  // Fix round 5 (pentest r6 R6-4): real scripts and emoji keep their joiners
+  // and selectors; private-use characters go; a label of only combining marks
+  // (nothing visible) is empty; no trailing space after the cap.
+  assert.strictEqual(cleaned("می\u200Cخواهم"), "می\u200Cخواهم", "R6-4: Persian keeps its ZWNJ");
+  assert.strictEqual(cleaned("क्\u200Dष"), "क्\u200Dष", "R6-4: Devanagari keeps its ZWJ");
+  assert.strictEqual(cleaned("\u{1F468}\u200D\u{1F469}\u200D\u{1F467} \u2764\uFE0F 1\uFE0F\u20E3"),
+    "\u{1F468}\u200D\u{1F469}\u200D\u{1F467} \u2764\uFE0F 1\uFE0F\u20E3", "R6-4: emoji sequences, VS16 and keycaps stay whole");
+  assert.strictEqual(cleaned("a\uE000b"), "a b", "R6-4: private-use characters (Co) are stripped");
+  assert.strictEqual(cleaned("a\u0378b"), "a\u0378b", "R6-4: unassigned code points (Cn, engine-dependent) are left alone");
+  assert.strictEqual(cleaned("\u0301\u0302"), "", "R6-4: only combining marks — nothing visible — is empty");
+  assert.strictEqual(cleaned("a".repeat(59) + " bc"), "a".repeat(59), "R6-4: no trailing space after the cap");
   const g3 = await otp.generatePad({ label: "x", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
   const invisible = await otp.importPad(await seal({ padId: g3.padId, label: "\u200B\u2060\u200D", regionSize: g3.regionSize,
     recipientRole: 1, bytes: Buffer.from(g3.bytes).toString("base64") }), X);

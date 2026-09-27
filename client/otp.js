@@ -418,17 +418,21 @@ function missingRecordError() {
 // points (= #otpLabel's maxlength; counted in code points, so a surrogate
 // pair is never split), without control or format characters (line breaks
 // that could phrase a dialog, bidi controls that could reorder it, zero-width
-// and tag characters that hide text). Fix round 4 (pentest r5 I-5a): whole
-// categories — Cc, Cf (bidi, zero-width, tags, soft hyphen), Cs (lone
-// surrogates), Co, Cn — plus the separators, the grapheme joiner, variation
-// selectors and the Hangul fillers; a label with nothing visible left is "".
+// and tag characters that hide text). Fix round 5 (pentest r6 R6-4): the
+// categories Cc, Cf, Cs, Co and the line/paragraph separators — but ZWNJ and
+// ZWJ (U+200C/D) stay: Persian, Urdu and Indic words and emoji sequences need
+// them, and they neither reorder nor hide text. Variation selectors and
+// combining marks are not format characters and stay. Unassigned code points
+// (Cn) stay too: what is unassigned depends on the engine's Unicode version,
+// and in textContent they are harmless. A label with no letter, digit, symbol
+// or punctuation left is "", so the caller's default name applies.
 export const PAD_LABEL_MAX = 60;
-const LABEL_STRIP_RE = /[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\u2028\u2029\u034F\uFE00-\uFE0F\u{E0100}-\u{E01EF}\u115F\u1160\u3164\uFFA0]/gu;
+const LABEL_STRIP_RE = /(?![\u200C\u200D])[\p{Cc}\p{Cf}\p{Cs}\p{Co}\u2028\u2029]/gu;
+const LABEL_VISIBLE_RE = /[\p{L}\p{N}\p{S}\p{P}]/u;
 export function cleanPadLabel(label) {
   if (typeof label !== "string") return "";
-  // (Stripped characters become spaces and are trimmed away, so a label with
-  // nothing visible ends as "", and the caller's default name applies.)
-  return [...label.replace(LABEL_STRIP_RE, " ").replace(/\s+/g, " ").trim()].slice(0, PAD_LABEL_MAX).join("").trim();
+  const s = [...label.replace(LABEL_STRIP_RE, " ").replace(/\s+/g, " ").trim()].slice(0, PAD_LABEL_MAX).join("").trim();
+  return LABEL_VISIBLE_RE.test(s) ? s : "";
 }
 const localStamp = (d) => {
   const z = (n) => String(n).padStart(2, "0");
