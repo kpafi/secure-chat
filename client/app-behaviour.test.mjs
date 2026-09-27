@@ -1632,19 +1632,23 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
     await dom.el("disconnect").click();
   }
 
-  // (h) keyed on "not the owner", not on "guest": a relay that never says
-  // `pending`/`joined` (roomRole still null) cannot skip the question.
+  // (h) a relay that never says `pending`/`joined` (roomRole still null)
+  // cannot skip the question. Until 2026-09-27 it was asked here, invisibly
+  // (the prompt sits in the hidden chat screen); now, owner decision, the key
+  // exchange is refused before it starts — no prompt, and nothing of ours
+  // (no nonce, no signed key) goes back. The "not the owner" keying below the
+  // refusal is belt and braces since; app-connect-cancel.test.mjs binds the
+  // refusal itself.
   {
     const ws = await connect("DHKE");
     const pn = freshNonce();
     await ws.deliver({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ hello: true, n: pn, reply: false }) });
     await settle(20); // (no drain: with no seat there is no chat screen for its marker)
-    const myHello = ws.sent.map((f) => (f.type === "key" ? unpack(f.payload) : null)).find((p) => p && p.hello);
-    ws.onmessage({ data: JSON.stringify(await signedOffer(mallory, [myHello.n, pn])) });
-    await until(promptUp, "a prompt with no role assigned at all");
-    await dom.el("admitNo").click();
-    await settle(5);
-    assert.ok(ws.readyState === 3 && !answered(ws), "decision 2: a session the relay never seated asks too");
+    ws.onmessage({ data: JSON.stringify(await signedOffer(mallory, [freshNonce(), pn])) });
+    await settle(20);
+    assert.ok(!promptUp(), "decision 2 (2026-09-27): a session the relay never seated is not asked — it is refused");
+    assert.ok(ws.readyState === 3 && !ws.sent.some((f) => f.type === "key"),
+      "decision 2 (2026-09-27): ...closed, and nothing of the key exchange went back");
   }
 
   // (g) the OWNER is unchanged: it approved via the knock and is never asked again.
