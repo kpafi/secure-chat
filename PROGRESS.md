@@ -3,7 +3,67 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ CURRENT STATE (2026-09-27) — connect join timeout + Cancel on `claude/charming-northcutt-3850fa` (on top of `feat/otp-transfer-sheets`), neither merged nor pushed
+## ⮕ CURRENT STATE (2026-09-27) — C3-2 fix on `claude/dazzling-liskov-726d57` (on top of `claude/charming-northcutt-3850fa` → `feat/otp-transfer-sheets`), done and reviewed, not merged, not pushed
+
+- **Task:** the pre-existing lead C3-2 of
+  `design/research/reviews/connect-cancel-pentest-r3.md`. The relay's answer to
+  `join` (`joined`, and as it turned out `pending`) handled after the relay's
+  own close met onclose's reset state. The result was a "connected" or
+  "waiting for approval" chat for a dead socket (Disconnect did nothing), a
+  false "put you in the room without the owner approving you" after an honest
+  `pending`, and `joined` left set, which silenced the next session's `denied`.
+- **Relay-forceable (pentest C3-2 r1).** In Chromium the relay raises the
+  guest approval prompt before answering (a hello, then a handshake signed by
+  itself), queues its answer and hangs up. In Firefox the hello-signing await
+  is enough (r3). So this fixes a Low, not only hardening.
+- **Branch `claude/dazzling-liskov-726d57`**, worktree
+  `.claude/worktrees/dazzling-liskov-726d57`, stacked on
+  `claude/charming-northcutt-3850fa` 495a12f. Merge order: OTP sheets, then
+  charming-northcutt, then this. Not merged, not pushed.
+- **Commits:**
+  - b88afa8 (the change);
+  - 9f290f3, f15825d, f1ede5f (fix rounds 1–3);
+  - reports 7ab1a7d, 0f305d0, 78baf21 (pentest r1–r3);
+  - triage `design/research/reviews/connect-cancel-c3-2-fix-round-{1,2,3}.md`.
+- **What it does (client/app.js, `joined` and `pending`):**
+  - **The seat needs an OPEN socket.** The role, `joined`/`wasPending`, the
+    chat screen and the hello/knock are written after every refusal, and
+    only on an OPEN socket.
+  - **CLOSING.** A seat withheld there clears the join deadline; Cancel stays
+    usable. A `pending` withheld there sends no knock, so a `joined:guest`
+    behind it is refused as unqueued (R2-1, deliberate; true from the page's
+    view).
+  - **CLOSED.** Only refusals whose inputs survive onclose still run: the
+    role-less one, creator-as-guest, and `pending` to the creator.
+  - **connectInner** resets `joined`.
+- **Reviewed:** `pentest-new-code` ×3.
+  - r1: 1 Low (`pending` had the same gap) and Infos → fixed.
+  - r2: Infos and test gaps → fixed or bound.
+  - r3: one test gap → bound.
+  - Nothing Low or higher is open in this diff. No r4: round 3 was tests
+    only, bound by hand-run mutants.
+  - Every mutant is RED except the layered connectInner reset, which binds in
+    combination (R6M5 vs R6M5R15).
+- **Checked (2026-09-27):**
+  - `npm test` green; backend suite 302 green (backend untouched).
+  - e2e on a scratch relay (f15825d; round 3 changed only tests):
+    hostile-relay 24/24 (sections 6 and 8), hung-relay 20/20,
+    room-admission 49/49, no-dead-ends 17/17, all-modes 28/28,
+    otp-held-join 10/10, two-user-flow 15/15.
+  - New `e2e/forced-late-answer.mjs` (serves client/ itself, raw relay, no
+    backend): 13/13 on f1ede5f; 7/13 on 495a12f, 10/13 on b88afa8.
+  - Not run on Safari/WebKit or the Android WebView. No APK built.
+- **Open, owner decision (pre-existing Low, found by C3-2 r2, NOT in this
+  branch):** a guest approval prompt raised before any answer to `join` is
+  invisible, because `#admit` sits in the hidden chat screen, and the tab bar
+  goes inert. Cancel works. The options: draw it over the room screen, or
+  refuse or defer a handshake that arrives before the answer. Offered as a
+  separate task.
+- **Env note:** a scratch relay on a port other than 8000 needs
+  `SECURE_CHAT_EXTRA_ORIGINS=http://127.0.0.1:<port>`; otherwise the
+  WebSocket is refused with 403.
+
+## (2026-09-27) — connect join timeout + Cancel on `claude/charming-northcutt-3850fa` (on top of `feat/otp-transfer-sheets`), neither merged nor pushed
 
 - **Task:** the pre-existing gap from the OTP sheets' pentest r6 R6-1 / r7
   R7-3 — a relay that accepts the WebSocket and never answers `join`
