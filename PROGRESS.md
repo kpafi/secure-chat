@@ -3,7 +3,55 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ CURRENT STATE (2026-09-27) — connect join timeout + Cancel on `claude/charming-northcutt-3850fa` (on top of `feat/otp-transfer-sheets`), neither merged nor pushed
+## ⮕ CURRENT STATE (2026-09-27) — C3-2 fix on `claude/dazzling-liskov-726d57` (on top of `claude/charming-northcutt-3850fa` → `feat/otp-transfer-sheets`), not merged, not pushed; PAUSED by the owner during pentest round 2
+
+- **Task:** the pre-existing lead C3-2 of
+  `design/research/reviews/connect-cancel-pentest-r3.md`. The relay's answer to
+  `join` (`joined`, and as it turned out `pending`) handled after the relay's
+  own close met onclose's reset state. The result was a "connected" or
+  "waiting for approval" chat screen for a dead socket (Disconnect did
+  nothing), a false "put you in the room without the owner approving you"
+  after an honest `pending`, and `joined` left set, which silenced the next
+  session's `denied`.
+- **Pentest C3-2 r1 changed the premise:** a hostile relay FORCES the order in
+  Chromium. It raises the guest approval prompt before answering (a hello,
+  then a handshake signed by itself), queues its answer, and hangs up. So
+  this is a fix of a relay-forceable Low, not only hardening.
+- **Branch `claude/dazzling-liskov-726d57`**, worktree
+  `.claude/worktrees/dazzling-liskov-726d57`, based on
+  `claude/charming-northcutt-3850fa` 495a12f (neither that branch nor
+  `feat/otp-transfer-sheets` is merged). Merge order: OTP sheets, then
+  charming-northcutt, then this. Commits: b88afa8 (the change), 7ab1a7d
+  (pentest r1 report), 9f290f3 (fix round 1).
+- **What it does (client/app.js):**
+  - **The seat needs an OPEN socket.** In `joined` and `pending`, the role,
+    `joined`/`wasPending`, the chat screen and the hello/knock are written
+    only after every refusal, and only on an OPEN socket.
+  - **A CLOSING socket.** A seat withheld there clears the join deadline;
+    Cancel stays usable.
+  - **A CLOSED socket.** Only refusals whose inputs survive onclose still run
+    and reach the room screen: role-less, creator-as-guest, `pending` to the
+    creator. The unqueued-guest check (`wasPending`) does not.
+  - **connectInner** resets `joined`.
+- **Checked (2026-09-27, 9f290f3):**
+  - `npm test` green; backend suite green on b88afa8 (302, untouched since).
+  - e2e on a scratch relay: hostile-relay 24/24 (sections 6 and 8),
+    forced-late-answer 12/12 (new, no backend needed; 6 of 12 fail on
+    495a12f, 2 on b88afa8), hung-relay 20/20, room-admission 49/49,
+    no-dead-ends 17/17, all-modes 28/28. otp-held-join 10/10 and
+    two-user-flow 15/15 were run on b88afa8.
+  - Mutants: every one is RED except the layered connectInner reset (M6/R15),
+    which binds in combination (R6M5 vs R6M5R15). Lists are in the commit
+    messages and `design/research/reviews/connect-cancel-c3-2-fix-round-1.md`.
+- **OPEN — resume here:** pentest round 2 on 9f290f3 was started. Its report
+  goes to `design/research/reviews/connect-cancel-c3-2-pentest-r2.md`: commit
+  it as written if it is there, triage it, and fix round 2 if needed. Then a
+  second PROGRESS update.
+- **Env note:** a scratch relay on a port other than 8000 needs
+  `SECURE_CHAT_EXTRA_ORIGINS=http://127.0.0.1:<port>`; otherwise the
+  WebSocket is refused with 403.
+
+## (2026-09-27) — connect join timeout + Cancel on `claude/charming-northcutt-3850fa` (on top of `feat/otp-transfer-sheets`), neither merged nor pushed
 
 - **Task:** the pre-existing gap from the OTP sheets' pentest r6 R6-1 / r7
   R7-3 — a relay that accepts the WebSocket and never answers `join`
