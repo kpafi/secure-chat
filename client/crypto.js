@@ -754,30 +754,36 @@ const OTP_MAC_BYTES = 32;
 
 // The pad check (cold critic r2 MA-2). Two people who picked DIFFERENT pads —
 // both pressed New pad and called it "Chess" — used to see "Ready", and every
-// message then failed its one-time HMAC while each send spent pad bytes. Each
-// side now adds to its OTP hello
+// message then failed its one-time HMAC while each send spent pad bytes. Now,
+// once a side knows the peer's session nonce, it sends a proof
 //
-//   pt = HMAC-SHA256(key = padId, domain|room|senderRole|senderNonce)[0..16]
+//   pc = HMAC-SHA256(key = padId,
+//                    domain|room|senderRole|senderNonce|receiverNonce)[0..16]
 //
-// and the receiver recomputes it for the PEER's role before anything unlocks.
-// The key is the padId: 128 random bits that travel only inside the encrypted
-// pad file and never reach the relay. So the relay sees 16 pseudo-random bytes
-// that change with every room and every connection (the fresh session nonce
-// is inside); it can neither link sessions across rooms nor learn the padId.
-// No pad byte goes into the tag. Consumed bytes are zeroed, so the two copies
-// of a pad do not stay equal byte for byte, and reserving a slice would change
-// the geometry that pads already exchanged under 0.4.0 are laid out in.
+// and the receiver recomputes it for the PEER's role over the peer's nonce and
+// ITS OWN current one before anything unlocks. The key is the padId: 128
+// random bits that travel only inside the encrypted pad file and never reach
+// the relay. To the relay a proof is 16 pseudo-random bytes over two fresh
+// nonces: it can neither link sessions nor learn the padId.
+// No pad byte goes into it. Consumed bytes are zeroed, so the two copies of a
+// pad do not stay equal byte for byte, and reserving a slice would change the
+// geometry that pads already exchanged under 0.4.0 are laid out in.
 //
-// The role inside the tag also tells a second failure apart: the same pad on
+// The role inside the proof tells a second failure apart: the same pad on
 // BOTH sides with the SAME role (a copy set up twice on one side). Two such
 // devices send from one half of the pad, a two-time pad from the first message.
-// Only a holder of the padId can produce that tag. A relay reflecting our own
-// hello is refused earlier, on the nonce.
+//
+// Pad check pentest r1 F1: the first cut covered only the SENDER's nonce, so a
+// relay replaying our own hello from an earlier connection produced exactly
+// "the same half as yours" — a verdict telling people to throw a good pad
+// away. The receiver's nonce is fresh for this connection, so only a device
+// holding the padId, answering THIS connection, can produce any verdict but
+// "mismatch". A mismatch the relay can always fake (16 random bytes); the
+// refusal says so.
 //
 // It is a consistency check, not authentication: the one-time HMAC on each
-// frame still decides what is accepted. A relay that strips or replays the
-// tag gets back the state before this check. A relay that corrupts it closes a
-// connection it could have dropped anyway.
+// frame still decides what is accepted. A relay that strips the proof gets
+// back the state before this check.
 const OTP_CHECK_DOMAIN = "secure-chat/otp-pad-check/v1";
 const OTP_CHECK_BYTES = 16;
 const PAD_ID_RE = /^[0-9a-f]{32}$/;
@@ -850,30 +856,30 @@ class OtpPad {
   get remainingSend() { return this.regionSize - this.sendOffset; }
 
   // The pad check (see OTP_CHECK_DOMAIN). Spends no pad bytes.
-  async _checkTag(role, nonce) {
+  async _checkTag(role, senderNonce, receiverNonce) {
     if (typeof this.padId !== "string") throw new Error("this pad has no id to check against");
-    if (typeof nonce !== "string") throw new Error("pad check needs the session nonce");
     const raw = new Uint8Array(16);
     for (let i = 0; i < 16; i++) raw[i] = parseInt(this.padId.slice(2 * i, 2 * i + 2), 16);
     const key = await crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
     raw.fill(0);
     const mac = await crypto.subtle.sign(
-      "HMAC", key, enc.encode(`${OTP_CHECK_DOMAIN}|${this.roomId}|${role}|${nonce}`),
+      "HMAC", key, enc.encode(`${OTP_CHECK_DOMAIN}|${this.roomId}|${role}|${senderNonce}|${receiverNonce}`),
     );
     return new Uint8Array(mac).slice(0, OTP_CHECK_BYTES);
   }
 
-  // Ours, for the hello that carries `nonce` (our session nonce).
-  async padCheckTag(nonce) {
-    return bufToB64(await this._checkTag(this.role, nonce));
+  // Our proof, for the peer whose session nonce is `peerNonce`.
+  async padCheckTag(myNonce, peerNonce) {
+    if (typeof myNonce !== "string" || typeof peerNonce !== "string") throw new Error("pad check needs both session nonces");
+    return bufToB64(await this._checkTag(this.role, myNonce, peerNonce));
   }
 
-  // The peer's hello: "match", "mismatch" (a different pad), "same-side" (this
-  // pad, but the peer holds OUR half) or "malformed". Never throws on relay
-  // input; only a cipher without a padId throws (a caller bug, not a peer's).
-  async checkPeerPadTag(nonce, tag) {
+  // The peer's proof: "match", "mismatch" (a different pad — or a forgery),
+  // "same-side" (this pad, but the peer holds OUR half) or "malformed". Never
+  // throws on relay input; only a cipher without a padId throws (a caller bug).
+  async checkPeerPadTag(peerNonce, myNonce, tag) {
     if (typeof this.padId !== "string") throw new Error("this pad has no id to check against");
-    if (typeof nonce !== "string" || typeof tag !== "string" || tag.length !== 24) return "malformed";
+    if (typeof peerNonce !== "string" || typeof myNonce !== "string" || typeof tag !== "string" || tag.length !== 24) return "malformed";
     let got;
     try {
       got = new Uint8Array(b64ToBuf(tag));
@@ -886,8 +892,8 @@ class OtpPad {
       for (let i = 0; i < OTP_CHECK_BYTES; i++) d |= a[i] ^ got[i];
       return d === 0;
     };
-    if (same(await this._checkTag(1 - this.role, nonce))) return "match";
-    if (same(await this._checkTag(this.role, nonce))) return "same-side";
+    if (same(await this._checkTag(1 - this.role, peerNonce, myNonce))) return "match";
+    if (same(await this._checkTag(this.role, peerNonce, myNonce))) return "same-side";
     return "mismatch";
   }
 
