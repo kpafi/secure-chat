@@ -307,7 +307,7 @@ let padFile, fileName;
   await A.setViewport(PHONE);
   await A.type("#otpLabel", "Chess club");
   await A.select("#otpSize", await A.$eval("#otpSize", (s) => s.options[0].value));
-  check("the size hint follows the size", (await text(A, "#otpSizeHint")) === "~350 short messages each way", await text(A, "#otpSizeHint"));
+  check("the size hint follows the size", (await text(A, "#otpSizeHint")) === "~350 short messages", await text(A, "#otpSizeHint"));
   const picker = await A.evaluate(() => [document.querySelector('label[for="otpSize"]').textContent, document.querySelector("#otpSize").selectedOptions[0].textContent]);
   check("cold mi-2: the picker says what each side gets (\"Size, each way\": 32 KiB for the 64 KiB pad)", picker.join("|") === "Size, each way|32 KiB", picker.join("|"));
   await A.type("#otpNewPass", "moonlight7");
@@ -397,7 +397,9 @@ console.log("\n  [4] re-export (alice)");
   check("confirm: no file yet", (await A.evaluate(() => window.__files.length)) === 2);
   await A.setViewport(DESKTOP);
   const gc = await checkGeometry(A, "#otpExportSheet", "re-export confirm (desktop)", { primaries: 0 });
-  check("desktop confirm: 'Don't export' then the growing 'Export again', one line", gc.desktopOrder && gc.order.join(",") === "otpExportCancel,otpExport", gc.order.join(","));
+  const widths = await A.$$eval("#otpExportSheet .otp-bar > button:not([hidden])", (bs) => bs.map((b) => Math.round(b.getBoundingClientRect().width)));
+  check("desktop confirm: 'Don't export' then 'Export again', one line, equal halves (design r4 minor 2)",
+    gc.desktopOrder && gc.order.join(",") === "otpExportCancel,otpExport" && Math.abs(widths[0] - widths[1]) <= 2, gc.order.join(",") + " " + widths.join("/"));
   await A.setViewport(PHONE);
   check("design R3-M1: while the sheet is up, the panel does not show its error too",
     await A.$eval("#otpStatus", (e) => e.classList.contains("vh") || !e.textContent));
@@ -491,7 +493,17 @@ console.log("\n  [5] Import (bob)");
   check("…'Try again' is the primary, 'Choose another file' follows", g.order.join(",") === "otpImportRetry,otpImport" && g.primaries.join() === "otpImportRetry", g.order.join(","));
   await setValue(B, "#otpImportXfer", XFER);
   check("the marks clear on input", !(await shown(B, "#otpImportXferErr")));
+  // Hot r2 N1: while Import works (two KDFs), its progress has focus and is
+  // in the accessibility tree — not inside an inert subtree.
+  await B.evaluate(() => { window.__kdfGate = new Promise((r) => { window.__kdfRelease = () => { window.__kdfGate = null; r(); }; }); });
   await tap(B, "#otpImportRetry");
+  await waitState(B, "#otpImportSheet", "working", 10000);
+  const prog = await B.evaluate(() => {
+    const p = document.querySelector("#otpImportProgress");
+    return { focus: document.activeElement === p, inert: !!p.closest("[inert]"), fields: document.querySelector("#otpImportXfer").closest("[inert]") !== null };
+  });
+  check("hot r2 N1: Import working — the progress has focus and is not inert (the fields are)", prog.focus && !prog.inert && prog.fields, JSON.stringify(prog));
+  await B.evaluate(() => window.__kdfRelease());
   await waitState(B, "#otpImportSheet", "done");
   check("Try again imports without a second pick", (await text(B, "#otpImportPadLabel")) === "Chess club");
   check("import done: the card says it came from the contact (cold mi-7)", (await text(B, "#otpImportPadMeta")) === "32 KiB each way · from your contact", await text(B, "#otpImportPadMeta"));
@@ -558,6 +570,13 @@ console.log("\n  [7] Android export (fake frozen bridge)");
   await guard();
   await tap(D, "#otpNewToExport");
   await D.waitForFunction(() => window.__shown(document.querySelector("#otpExportSheet")));
+  // Owner (cold r2 MA-4): a weak transfer passphrase is accepted, with a
+  // warning boxed at the field.
+  await setValue(D, "#otpXferPass", "hunter2");
+  const box = await D.$eval("#otpXferWarn", (e) => [e.textContent, getComputedStyle(e).backgroundColor]);
+  check("MA-4: a weak transfer passphrase is warned about in a box at the field", /Anyone who gets a copy of the file/.test(box[0]) && box[1] !== "rgba(0, 0, 0, 0)", box.join(" | "));
+  const ac = await D.evaluate(() => ["otpPass", "otpNewPass", "otpXferPass", "otpImportXfer", "otpImportPass"].map((i) => document.getElementById(i).getAttribute("autocomplete")));
+  check("hot r2 N4: every pad / transfer passphrase field is autocomplete=off (no generated or saved passwords)", ac.every((a) => a === "off"), ac.join(","));
   await setValue(D, "#otpXferPass", XFER);
   await guard();
   await tap(D, "#otpExport");
@@ -608,6 +627,7 @@ console.log("\n  [7] Android export (fake frozen bridge)");
   await result(await lastId(), "shared");
   await waitState(D, "#otpExportSheet", "done");
   check("shared: 'File shared' / keep this open", (await text(D, "#otpExportDoneTitle")) === "File shared" && (await text(D, "#otpHanded")) === "Keep this open until it has arrived.");
+  check("shared: 'Once they've imported it, they delete the file.' (design r4 minor 1)", (await text(D, "#otpExportDelete")) === "Once they've imported it, they delete the file.");
   const n = D.dialogs.length;
   await D.goBack();
   await sleep(300);
