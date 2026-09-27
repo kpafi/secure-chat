@@ -1565,4 +1565,203 @@ console.log("OK  F-CRYPTO-012: 64 KiB, 256 KiB and 1 MiB pads all generate (chun
 }
 console.log("OK  fix round 2: FULL fails closed; re-import advice only where a floor can verify it");
 
+// ---- OTP transfer sheets (design round 1, M9): only the maker exports ----------
+// A pad this device IMPORTED (role 1) used to export with `recipientRole: 0` —
+// the generator's own role — so a third device importing it shared the
+// generator's send region: a two-time pad. Both ends refuse now.
+{
+  const XFER2 = "m9 transfer passphrase";
+  // A pad file built by hand, so the test controls recipientRole (exportPad
+  // itself can no longer write 0) and the iteration count (600k is the only
+  // one importPad accepts).
+  const sealFile = async (plainObj, pass, iters = 600000, claim = iters) => {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(pass), "PBKDF2", false, ["deriveKey"]);
+    const key = await crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: iters, hash: "SHA-256" },
+      base, { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key,
+      new TextEncoder().encode(JSON.stringify(plainObj))));
+    const b = (u) => Buffer.from(u).toString("base64");
+    const kdf = claim === undefined ? { salt: b(salt) } : { salt: b(salt), iters: claim };
+    return JSON.stringify({ fmt: "secure-chat-otp-pad", v: 1, kdf, iv: b(iv), ct: b(ct) });
+  };
+  const maker = await otp.generatePad({ label: "m9-maker", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const plainFor = (role) => ({
+    padId: maker.padId, label: maker.label, regionSize: maker.regionSize,
+    recipientRole: role, bytes: Buffer.from(maker.bytes).toString("base64"),
+  });
+
+  // exportPad: a received pad (role 1, as importPad returns it) is refused.
+  const received = await otp.importPad(await otp.exportPad(maker, XFER2), XFER2);
+  assert.strictEqual(received.role, 1, "fixture: an imported pad has role 1");
+  await assert.rejects(otp.exportPad(received, XFER2),
+    (e) => e.message === "you received this pad — only the person who made it can export it",
+    "M9: exportPad refuses a pad this device received (role 1), with the sheet's sentence");
+  // …and any role that is not the maker's, whatever else is true of the record.
+  await assert.rejects(otp.exportPad({ ...maker, role: undefined }, XFER2), /only the person who made it/,
+    "M9: a record without a role is not the maker's either");
+  // Control: the maker's own pad still exports.
+  assert.match(await otp.exportPad(maker, XFER2), /secure-chat-otp-pad/, "control: the maker (role 0) exports");
+
+  // importPad: a file naming recipientRole 0 is refused; the same file with 1 imports.
+  const bad = await sealFile(plainFor(0), XFER2);
+  await assert.rejects(otp.importPad(bad, XFER2),
+    (e) => e.message === "this file was exported by someone who received the pad, not by its maker — importing it would reuse key material",
+    "M9: importPad refuses recipientRole 0 (a re-export of a received pad)");
+  const good = await otp.importPad(await sealFile(plainFor(1), XFER2), XFER2);
+  assert.strictEqual(good.role, 1, "control: the hand-built file with recipientRole 1 imports (the refusal is about the role, not the build)");
+  good.bytes.fill(0); received.bytes.fill(0);
+
+  // Android pentest F7 lead: the file does not choose the KDF cost. A file
+  // sealed (validly) under 100k iterations, one claiming 5M, and one naming
+  // none are all refused before any KDF runs — the 5M one fast, not after 5M.
+  const SETTINGS = "this pad file asks for unsupported encryption settings";
+  await assert.rejects(otp.importPad(await sealFile(plainFor(1), XFER2, 100000), XFER2),
+    (e) => e.message === SETTINGS, "F7: a file sealed under 100k iterations is refused (it would import otherwise)");
+  const t0 = Date.now();
+  await assert.rejects(otp.importPad(await sealFile(plainFor(1), XFER2, 100000, 5000000), XFER2),
+    (e) => e.message === SETTINGS, "F7: a file asking for 5M iterations is refused");
+  assert.ok(Date.now() - t0 < 1500, `F7: …before running them (${Date.now() - t0} ms)`);
+  await assert.rejects(otp.importPad(await sealFile(plainFor(1), XFER2, 100000, undefined), XFER2),
+    (e) => e.message === SETTINGS, "F7: a file naming no iteration count is refused (no silent default)");
+}
+console.log("OK  M9: exportPad refuses a received pad; importPad refuses recipientRole 0 (exact sentences)");
+console.log("OK  F7: importPad accepts only the 600k iterations every export writes — refused before any KDF");
+
+// Fix round 1 (cold n-1): an unnamed pad is named by LOCAL time, like the
+// export file's name (it was UTC). Compared with the local fields of the
+// same instant (under TZ=UTC the two would agree — the mutant below is run
+// with a non-UTC TZ).
+{
+  const t0 = new Date();
+  const p = await otp.generatePad({ label: "", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const z = (n) => String(n).padStart(2, "0");
+  const at = (d) => `pad ${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}:${z(d.getMinutes())}`;
+  const t1 = new Date();
+  assert.ok(p.label === at(t0) || p.label === at(t1), `n-1: the default label is local time (${p.label})`);
+  p.bytes.fill(0);
+}
+console.log("OK  n-1: an unnamed pad is named by local time");
+
+// Fix round 2 (cold r2 MA-1): a file whose pad is still STORED here is
+// refused as "you already have this pad" (coded PAD_PRESENT), not as "used —
+// generate a fresh pad"; once the pad is forgotten, the watermark's "used"
+// refusal stands.
+{
+  const X = "ma1 transfer";
+  const gen = await otp.generatePad({ label: "ma1", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const file = await otp.exportPad(gen, X);
+  const imp = await otp.importPad(file, X);
+  await otp.saveNewPad(imp, PASS);
+  const e = await otp.importPad(file, X).then(() => null, (x) => x);
+  assert.ok(e && e.code === "PAD_PRESENT" && e.padId === gen.padId && !/already been used/.test(e.message),
+    "MA-1: the same file again → PAD_PRESENT, not 'already been used': " + (e && e.message));
+  otp.forgetPad(gen.padId);
+  await assert.rejects(otp.importPad(file, X), /already been used on this device/, "…after Forget the watermark still refuses it as used");
+}
+console.log("OK  MA-1: a pad still stored here is PAD_PRESENT; a forgotten one stays 'used'");
+
+// Fix round 3 (pentest r4 I-1, I-2): every import refusal after decryption
+// zeroes the decrypted pad; the maker's label is capped and cleaned.
+{
+  const X = "r3 transfer words";
+  const sealText = async (text) => {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(X), "PBKDF2", false, ["deriveKey"]);
+    const key = await crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: 600000, hash: "SHA-256" },
+      base, { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(text)));
+    const b = (u) => Buffer.from(u).toString("base64");
+    return JSON.stringify({ fmt: "secure-chat-otp-pad", v: 1, kdf: { salt: b(salt), iters: 600000 }, iv: b(iv), ct: b(ct) });
+  };
+  const seal = async (plainObj) => {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(X), "PBKDF2", false, ["deriveKey"]);
+    const key = await crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: 600000, hash: "SHA-256" },
+      base, { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(JSON.stringify(plainObj))));
+    const b = (u) => Buffer.from(u).toString("base64");
+    return JSON.stringify({ fmt: "secure-chat-otp-pad", v: 1, kdf: { salt: b(salt), iters: 600000 }, iv: b(iv), ct: b(ct) });
+  };
+  // Every pad-sized array importPad makes during one call is tracked; after a
+  // refusal each must be all zero.
+  const RealU8 = globalThis.Uint8Array;
+  const refusedZeroed = async (file, re, what, len = 8192) => {
+    const made = [];
+    class TrackedU8 extends RealU8 {
+      constructor(...a) { super(...a); if (this.length === len) made.push(this); }
+      static [Symbol.hasInstance](x) { return x instanceof RealU8; }
+    }
+    globalThis.Uint8Array = TrackedU8;
+    let err;
+    try { await otp.importPad(file, X); } catch (e) { err = e; } finally { globalThis.Uint8Array = RealU8; }
+    assert.ok(err && re.test(err.message), `${what}: refused (${err && err.message})`);
+    assert.ok(made.length > 0, `${what}: fixture: the decrypted pad was tracked`);
+    assert.ok(made.every((u) => u.every((v) => v === 0)), `I-1: ${what}: the decrypted pad bytes are zeroed on refusal`);
+  };
+  const gen = await otp.generatePad({ label: "r3", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const plain = (extra = {}) => ({ padId: gen.padId, label: gen.label, regionSize: gen.regionSize, recipientRole: 1,
+    bytes: Buffer.from(gen.bytes).toString("base64"), ...extra });
+  const file = await seal(plain());
+  const imp = await otp.importPad(file, X);
+  await otp.saveNewPad(imp, PASS);
+  await refusedZeroed(file, /already have this pad/, "PAD_PRESENT");
+  otp.forgetPad(gen.padId);
+  await refusedZeroed(file, /already been used/, "used");
+  const flat = await seal({ ...plain(), padId: "ab".repeat(16), bytes: Buffer.alloc(8192, 7).toString("base64") });
+  await refusedZeroed(flat, /not random enough/, "looksRandom");
+  await refusedZeroed(await seal({ ...plain(), padId: "cd".repeat(16), recipientRole: 0 }), /exported by someone who received/, "recipientRole 0");
+  // Fix round 4 (pentest r5 KC): the length-consistency refusal is inside the zeroing too.
+  await refusedZeroed(await seal({ ...plain(), padId: "ef".repeat(16), bytes: Buffer.from(gen.bytes.subarray(0, 8000)).toString("base64") }),
+    /internally inconsistent/, "length mismatch", 8000);
+  // Fix round 4 (I-5d): an authenticated plaintext that is not JSON — the decrypted buffer is zeroed.
+  const notJson = "x".repeat(1237);
+  await refusedZeroed(await sealText(notJson), /JSON|Unexpected|not valid/i, "non-JSON plaintext", 1237);
+
+  // I-2: the maker's label, capped and cleaned (the file format is unchanged).
+  const g2 = await otp.generatePad({ label: "x", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const raw = "Chess\n\nOK only hides it‮evil\u0007" + "y".repeat(100);
+  const got = await otp.importPad(await seal({ padId: g2.padId, label: raw, regionSize: g2.regionSize, recipientRole: 1,
+    bytes: Buffer.from(g2.bytes).toString("base64") }), X);
+  assert.ok(!/[\u0000-\u001f\u007f‪-‮⁦-⁩]/.test(got.label) && [...got.label].length <= 60 && got.label.startsWith("Chess OK only hides it evil"),
+    "I-2: an imported label is capped at 60 and has no control or bidi characters: " + JSON.stringify(got.label));
+  got.bytes.fill(0);
+  // Fix round 4 (pentest r5 KD, KE, KF, I-5a): every bidi mark and isolate,
+  // zero-width and tag characters, lone surrogates; the cap by code point;
+  // an invisible-only label falls back to the default name.
+  const cleaned = (lbl) => otp.cleanPadLabel(lbl);
+  assert.strictEqual(cleaned("b\u061Cc\u200Ed\u200Fe\u2066f\u2067g\u2068h\u2069i"), "b c d e f g h i",
+    "KD/KE: U+061C, U+200E/F and the isolates U+2066–2069 are stripped");
+  assert.strictEqual(cleaned("Chess\u200B\u2060 \u{E0041}club\u00AD\uD83D"), "Chess club",
+    "I-5a: zero-width, word joiner, tag, soft hyphen and a lone surrogate are stripped");
+  const capped = cleaned("a".repeat(59) + "\u{1F600}x");
+  assert.ok([...capped].length === 60 && capped.endsWith("\u{1F600}") && capped.isWellFormed(),
+    "KF: the 60 cap counts code points — the emoji at the cap stays whole: " + JSON.stringify(capped));
+  // Fix round 5 (pentest r6 R6-4): real scripts and emoji keep their joiners
+  // and selectors; private-use characters go; a label of only combining marks
+  // (nothing visible) is empty; no trailing space after the cap.
+  assert.strictEqual(cleaned("می\u200Cخواهم"), "می\u200Cخواهم", "R6-4: Persian keeps its ZWNJ");
+  assert.strictEqual(cleaned("क्\u200Dष"), "क्\u200Dष", "R6-4: Devanagari keeps its ZWJ");
+  assert.strictEqual(cleaned("\u{1F468}\u200D\u{1F469}\u200D\u{1F467} \u2764\uFE0F 1\uFE0F\u20E3"),
+    "\u{1F468}\u200D\u{1F469}\u200D\u{1F467} \u2764\uFE0F 1\uFE0F\u20E3", "R6-4: emoji sequences, VS16 and keycaps stay whole");
+  assert.strictEqual(cleaned("a\uE000b"), "a b", "R6-4: private-use characters (Co) are stripped");
+  assert.strictEqual(cleaned("a\u0378b"), "a\u0378b", "R6-4: unassigned code points (Cn, engine-dependent) are left alone");
+  // Fix round 6 (pentest r7 QVIS_S/P/N): labels of only emoji, only
+  // punctuation or only digits are visible names, not "nothing".
+  assert.strictEqual(cleaned("\u{1F389}"), "\u{1F389}", "QVIS_S: an emoji-only label stays");
+  assert.strictEqual(cleaned("!?"), "!?", "QVIS_P: a punctuation-only label stays");
+  assert.strictEqual(cleaned("2026"), "2026", "QVIS_N: a digits-only label stays");
+  assert.strictEqual(cleaned("\u0301\u0302"), "", "R6-4: only combining marks — nothing visible — is empty");
+  assert.strictEqual(cleaned("a".repeat(59) + " bc"), "a".repeat(59), "R6-4: no trailing space after the cap");
+  const g3 = await otp.generatePad({ label: "x", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  const invisible = await otp.importPad(await seal({ padId: g3.padId, label: "\u200B\u2060\u200D", regionSize: g3.regionSize,
+    recipientRole: 1, bytes: Buffer.from(g3.bytes).toString("base64") }), X);
+  assert.strictEqual(invisible.label, "imported pad", "I-5a: a label with nothing visible falls back to the default name");
+  invisible.bytes.fill(0);
+}
+console.log("OK  I-1/I-2: import refusals zero the decrypted pad; labels are capped and cleaned");
+
 console.log("\nAll OTP rollback checks passed.");

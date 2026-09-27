@@ -1688,6 +1688,11 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
     const knock = async (who, i) => ws.deliver({ type: "knock", room: ROOM, jid: i.toString(16).padStart(16, "0"),
       payload: pack({ idb: who.publicBundle(), sig: await signKnock(who, ROOM) }) });
     for (let i = 0; i < 16; i++) await knock(flood[i], 0x100 + i);
+    // The flood's own verifies run behind the relay frames (msgChain): count
+    // only once all 16 are queued, or the 16th's verify lands in the window
+    // below and reads as the 17th's (a race that failed ~1 run in 2 once the
+    // page grew; the property is unchanged).
+    await until(() => /15 more waiting/.test(dom.el("admitWarn").textContent), "the flood fills the queue");
     const extra = await Identity.generate();
     // Beyond the cap a stranger costs no signature verify (the L-1 property).
     const subtle = crypto.subtle, origVerify = subtle.verify;
@@ -2158,6 +2163,50 @@ const byEd = (ed) => contacts.list().find((c) => c.ed === ed) || null;
   assert.ok(!strongLive.some((l) => /Weak passphrase/.test(l)), "control: a strong shared passphrase draws no warning");
   await dom.el("disconnect").click();
   console.log("OK  package 6: a weak identity or AES256 shared passphrase is accepted with a warning; a strong one draws none (executed)");
+}
+
+// ==== OTP sheets fix round 7 (pentest r8, R3): the GUEST's peer prompt, revealed by a self-closing OTP sheet ====
+// The guest side asks about the owner's key on the same #admit sheet (package
+// 4, decision 2). When an OTP sheet that covered it closes itself after its
+// work, the prompt must get a fresh 500 ms guard too (closeOtpSheet →
+// armAdmitGuard), not the one armed while it was covered. (The pentester's
+// PoC, poc-r8-guest.test.mjs, kept as written.)
+{
+  const subtle = globalThis.crypto.subtle;
+  const origDK = subtle.deriveKey.bind(subtle);
+  let openGate; let gate = new Promise((r) => { openGate = r; });
+  subtle.deriveKey = async (...a) => { if (gate) await gate; return origDK(...a); };
+  await nav("live");
+  if (current && current.readyState === 1) { await dom.el("disconnect").click(); await settle(5); }
+  assert.ok(!dom.el("scrRoom").hidden, "fixture: room screen");
+  await dom.el("otpNewOpen").click();
+  assert.ok(!dom.el("otpNewSheet").hidden, "fixture: New pad sheet open");
+  dom.el("otpNewPass").value = "a pad passphrase for the r8 guest poc"; await dom.el("otpNewPass").dispatch("input");
+  const gen = dom.el("otpGenerate").click();
+  await until(() => dom.el("otpNewSheet").getAttribute("data-state") === "working", "working");
+  const { ws, nonces } = await guestAwaitingHandshake("DHKE");
+  assert.ok(!dom.el("scrChat").hidden && !dom.el("otpNewSheet").hidden, "fixture: chat up under the working sheet");
+  const who = await Identity.generate();
+  const c = makeCipher("DHKE", ROOM); await c.init();
+  const pub = await c.handshakePayload();
+  const sig = await signHandshake(who, ROOM, nonces, pub);
+  ws.onmessage({ data: JSON.stringify({ type: "key", room: ROOM, alg: "DHKE", payload: pack({ pub, reply: false, idb: who.publicBundle(), sig }) }) });
+  await until(() => !dom.el("admit").hidden && dom.el("admit").dataset.mode === "peer", "the peer prompt under the sheet");
+  await new Promise((r) => setTimeout(r, 650)); // its own guard passes while covered
+  gate = null; openGate();
+  await gen; await settle(10);
+  const answered = () => ws.sent.some((f) => f.type === "key" && (() => { const p = unpack(f.payload); return !!(p.sig && p.reply) || typeof p.confirm === "string"; })());
+  const res = { sheet: !dom.el("otpNewSheet").hidden, admit: !dom.el("admit").hidden, hint: dom.el("hint").textContent,
+    otpStatus: dom.el("otpStatus").textContent, focus: dom.document && dom.document.activeElement ? dom.document.activeElement.id : "(n/a)" };
+  await dom.el("admitOk").dispatch("click", { timeStamp: performance.now() });
+  await settle(10);
+  res.afterFastTap = { admit: !dom.el("admit").hidden, answered: answered(), ws: ws.readyState };
+  await dom.el("admitOk").dispatch("click", { timeStamp: performance.now() + 600 });
+  await settle(20);
+  res.afterSlowTap = { admit: !dom.el("admit").hidden, answered: answered() };
+  assert.ok(res.afterFastTap.admit && !res.afterFastTap.answered, "R8: guest peer prompt revealed by a self-closing sheet is guarded");
+  assert.ok(!res.afterSlowTap.admit, "control: a deliberate tap decides");
+  console.log("OK  OTP fix round 7: the guest's peer prompt revealed by a self-closing OTP sheet gets a fresh guard (executed)");
 }
 
 console.log("\nAll app.js behavioural checks passed.");

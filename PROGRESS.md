@@ -3,7 +3,64 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ CURRENT STATE (2026-09-26) — release 0.4.0 merged, tagged and DEPLOYED; phone APK still owed
+## ⮕ CURRENT STATE (2026-09-27) — OTP transfer sheets on `feat/otp-transfer-sheets`, not merged, not pushed
+
+- **Owner's ask (2026-09-26, after testing 0.4.0 on the APK):** generating and
+  sharing a one-time pad was badly explained, "Export" only said a file was
+  generated and "Import" did nothing on the phone. Root causes: the Android
+  WebView had no `onShowFileChooser` (Import dead) and silently dropped the
+  `blob:` download (Export latched the pad as exported and handed out NO file).
+- **Branch `feat/otp-transfer-sheets`** off `master` 7a606b4, worktree
+  `.claude/worktrees/otp-sheets`, ~50 commits, not merged, not pushed. What it
+  does:
+  - New pad / Export / Import each open their own sheet (designed on the Claude
+    Design canvas, row "One-time pad transfer", synced to the build); the panel
+    keeps picker, pad passphrase, three entries, Connect. Spec:
+    `design/research/reviews/otp-transfer-brief.md` (§§ 12–14 amend §§ 1–11).
+  - Android: `SecureChatFiles` bridge (frozen at document-start as
+    `__SECURE_CHAT_FILES__`) with Share… (FileProvider, per-request URI,
+    10-minute life, revoke before delete) and Save to device
+    (ACTION_CREATE_DOCUMENT, "wt", local-only, never deletes); import via
+    `onShowFileChooser` (ACTION_OPEN_DOCUMENT, foreign documents only); a linear
+    native envelope check (exact `exportPad()` form, 600k iterations, ≤ 4 MiB);
+    more `configChanges` so a theme/locale/split-screen switch no longer
+    reloads the page mid-export.
+  - **Security fix found on the way (design critic r1 M9):** a RECEIVED pad
+    could be exported again and the third device got the maker's role — a
+    two-time pad. Now `exportPad` refuses role ≠ 0 and `importPad` refuses
+    `recipientRole` ≠ 1 (d172d13). Also `importPad` accepts only 600k
+    iterations (2ff58ee).
+  - Owner decisions: Android export offers Share AND Save; neutral file name
+    `secure-chat-pad-YYYY-MM-DD-HHMM.json` (no label, no padId); transfer
+    passphrase equal to the pad passphrase is REFUSED; a weak transfer
+    passphrase stays warn-never-block (warning at the field and at Share).
+- **Reviewed:** design critic ×4 (canvas and built UI), hot critic ×2, cold
+  critic ×2, `pentest-new-code` ×9 (Android bridge r1, then the whole diff and
+  every fix round). Final state: nothing Critical/High/Medium/Low open (r8
+  and r9 only Info; their Info items and test gaps fixed in rounds 7–8).
+  Reports and triage: `design/research/reviews/otp-*.md`,
+  `otp-fix-round-1.md` (all rounds). Every test control bound by a hand-run
+  mutant; argued-equivalent mutants listed in the triage.
+- **Checked on the branch (2026-09-27):** `npm test` green; backend 302;
+  gradle assembleDebug + 50 JVM tests; e2e otp-transfer 196/196, otp-held-join
+  10/10, all-modes 28/28, no-dead-ends 17/17, room-admission 49/49,
+  contact-profile 67/67, two-user-flow 15/15, hostile-relay 24/24;
+  screenshots 37/38 (02 = old drawer, skipped as before).
+- **APK for the phone:** `~/secure-chat-apk/secure-chat-0.4.0-otp-sheets-debug.apk`
+  (still versionCode 5 / 0.4.0 — bump at release). NOT installed. On-device
+  checks owed: android/README.md "Owed on the phone (OTP transfer sheets, pad
+  files)" — Share/Quick Share/Bluetooth (is `application/json` offered to
+  Bluetooth at all?), Save, Import from Quick Share, Back during a KDF,
+  dark mode / split screen with the file-ready sheet open.
+- **Release notes must say:** both phones must run this build before
+  exchanging a pad — a 0.4.0 importer still accepts a file re-exported by a
+  receiver (pentest r2 R2-9; M9 fully holds only with both sides updated).
+- **Deferred by the owner / separate tasks:** pad-mismatch detection at
+  connect (both people on different pads see "Ready" but get undecryptable
+  messages); a join timeout + Cancel on the room screen (pre-existing: a relay
+  that never answers `join` leaves Connect stuck until reload, pentest r6 R6-1).
+
+## (2026-09-26) — release 0.4.0 merged, tagged and DEPLOYED; phone APK still owed
 
 - **Deployed 2026-09-26 ~22:13** from a detached `v0.4.0` (merge `94218b8`)
   with `deploy/deploy-2026-09-26-v0.4.0.sh`. First run stopped in step 1b

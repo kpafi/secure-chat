@@ -1,13 +1,23 @@
 package org.securechat.app
 
 import android.annotation.SuppressLint
+import android.content.ActivityNotFoundException
+import android.content.BroadcastReceiver
+import android.content.ClipData
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.app.PendingIntent
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.text.InputType
 import android.view.WindowManager
 import android.webkit.ConsoleMessage
 import android.webkit.JsPromptResult
 import android.webkit.JsResult
+import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -15,14 +25,20 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.EditText
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import org.json.JSONObject
 import org.securechat.app.databinding.ActivityMainBinding
+import java.io.File
+import java.io.IOException
+import kotlin.concurrent.thread
 
 /**
  * Native shell around the audited secure-chat web client.
@@ -73,6 +89,108 @@ class MainActivity : AppCompatActivity() {
          * client/app.js; the client only adds it when running inside the app.
          */
         const val SECRET_PROMPT_MARK = "[secure-chat:secret] "
+
+        /**
+         * Subdirectory of cacheDir holding shared pad files, each in its own
+         * `<requestId>/` directory (pentest r1 F1: a URI unique per request).
+         */
+        const val SHARE_DIR = "pad-share"
+
+        /**
+         * How long a shared pad file lives (pentest r1 F2, fix round 2). Long
+         * enough for a target that reads lazily (Bluetooth sends from a
+         * background service after its screen has closed); short enough that
+         * no pad file lies around. It is the ONLY way a file that went to the
+         * chooser ends: revoked and deleted by [expireShares], which runs at
+         * every start of the activity and after every share, and re-arms
+         * itself for the next file due. Neither "cancelled" nor a new share
+         * ends an earlier file any more: either can be wrong about a target
+         * that is still reading (cold critic mi-4, pentest r2 R2-7a).
+         */
+        const val SHARE_TTL_MS = 10 * 60 * 1000L
+
+        /**
+         * How long to wait, after the share chooser has returned, for its
+         * "target chosen" broadcast before answering "cancelled". The two travel
+         * separately (an activity result and a broadcast), and Android 14 may
+         * hold a broadcast to a backgrounded app until it is in front again.
+         */
+        const val SHARE_GRACE_MS = 1500L
+
+        /**
+         * The chosen-target broadcast carries its request id as its DATA,
+         * `x-secure-chat-share:<requestId>` — one PendingIntent per share.
+         * Pentest r1 F2: one requestCode-0 PendingIntent for the whole app let
+         * a second instance rewrite the id inside the first one's. Pentest r2
+         * R2-6: a per-process requestCode counter restarts at 1, and extras are
+         * not part of a PendingIntent's identity, so a new process could be
+         * handed a still-live PendingIntent carrying an OLD id. Data is part of
+         * the identity (Intent.filterEquals), and the id is 64 random bits, so
+         * no two shares can ever share a PendingIntent.
+         */
+        const val SHARE_SCHEME = "x-secure-chat-share"
+    }
+
+    // --- OTP pad files: export (share / save) and import (file chooser) -------
+    // design/research/reviews/otp-transfer-brief.md 5, 6, 9. See PadFiles.kt for
+    // the bridge contract and what page script can and cannot do with it.
+
+    /** The page-facing bridge; its one-request slot is released in [deliverPadFileResult]. */
+    private val padFiles = PadFilesBridge { req -> runOnUiThread { startPadFileRequest(req) } }
+
+    /** The share in flight: its directory, and what we have heard back so far. */
+    private class PendingShare(val id: String, val dir: File) {
+        var chosen = false     // the chooser reported a target (EXTRA_CHOSEN_COMPONENT)
+        var returned = false   // the chooser activity has returned to us
+    }
+    private var padShare: PendingShare? = null
+
+    /** The save in flight, waiting for the user to pick where the document goes. */
+    private var padSave: PadFileRequest? = null
+
+    /** The WebView's `<input type=file>` callback waiting for the document picker. */
+    private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
+
+    private val shareChosenAction by lazy { "$packageName.action.PAD_SHARE_CHOSEN" }
+
+    // Registered unconditionally at construction, as the Activity Result API
+    // requires (before STARTED); the callbacks also run for a result delivered
+    // to a RE-CREATED activity, which is why each one copes with "no request".
+    private val shareLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { onShareReturned() }
+    // Both document intents get two additions the androidx contracts leave out:
+    //  * CATEGORY_OPENABLE: only documents that can be opened as a byte stream
+    //    are offered — no virtual files a stream read or write would fail on;
+    //  * EXTRA_LOCAL_ONLY (design critic r2, N-M1): DocumentsUI then lists only
+    //    roots on this device, not Google Drive or other cloud providers. A pad
+    //    file on someone's server is protected only by the transfer passphrase
+    //    (warn-never-block), guessable offline for as long as the copy exists;
+    //    the in-person transfer exists to prevent exactly that. On Import it
+    //    keeps the same rule from the other side: a file that reached a cloud
+    //    drive is not one to import. It is a HINT: an OEM picker may ignore it,
+    //    which is why the UI never claims "saved to this device".
+    private val saveLauncher = registerForActivityResult(
+        object : ActivityResultContracts.CreateDocument("application/json") {
+            override fun createIntent(context: Context, input: String): Intent =
+                super.createIntent(context, input).addCategory(Intent.CATEGORY_OPENABLE)
+                    .putExtra(Intent.EXTRA_LOCAL_ONLY, true)
+        },
+    ) { onSaveDocument(it) }
+    private val openLauncher = registerForActivityResult(
+        object : ActivityResultContracts.OpenDocument() {
+            override fun createIntent(context: Context, input: Array<String>): Intent =
+                super.createIntent(context, input).addCategory(Intent.CATEGORY_OPENABLE)
+                    .putExtra(Intent.EXTRA_LOCAL_ONLY, true)
+        },
+    ) { onFileChosen(it) }
+
+    private val shareChosenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val p = padShare ?: return
+            if (intent.data?.schemeSpecificPart != p.id) return
+            p.chosen = true
+            if (p.returned) deliverPadFileResult(p.id, PadFileOutcome.SHARED)
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -105,6 +223,21 @@ class MainActivity : AppCompatActivity() {
             .setDomain(appHost)
             .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(this))
             .build()
+
+        // Pad files an earlier share left behind are revoked and deleted here,
+        // before anything else can run — but only those past SHARE_TTL_MS
+        // (pentest r1 F2). A second instance of this activity (another app can
+        // start it into its own task) or a restart must not delete a file just
+        // handed to a target that has not read it yet; the younger ones get a
+        // timer (pentest r2 R2-7b: a restart used to leave them untimed).
+        expireShares()
+        // NOT exported: only broadcasts from this app's own uid arrive, which
+        // includes the PendingIntent the system chooser sends back on our behalf.
+        ContextCompat.registerReceiver(
+            this, shareChosenReceiver,
+            IntentFilter(shareChosenAction).apply { addDataScheme(SHARE_SCHEME) },
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
 
         configureWebView()
 
@@ -146,6 +279,11 @@ class MainActivity : AppCompatActivity() {
         // not buy. The client feature-detects it, so the browser build is
         // unaffected (and keeps the residual, documented in README).
         wv.addJavascriptInterface(PadFloorBridge(this), "SecureChatPadFloor")
+        // OTP transfer sheets: hand an exported pad file to the share sheet or
+        // the system save dialog (a WebView drops `<a download>` on a blob:
+        // URL). Captured and frozen at document-start like the floor; see
+        // loadWithRelay and PadFiles.kt.
+        wv.addJavascriptInterface(padFiles, "SecureChatFiles")
 
         wv.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(
@@ -261,6 +399,312 @@ class MainActivity : AppCompatActivity() {
             // it is swallowed. Debug builds keep the default (logged).
             override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean =
                 !BuildConfig.DEBUG || super.onConsoleMessage(consoleMessage)
+
+            // OTP pad Import (brief 6, 9). Without this override the WebView
+            // ignores `<input type=file>` entirely: no picker, no error — Import
+            // did nothing on the phone. The system document picker (SAF) runs
+            // in its own activity, needs no storage permission, and hands back
+            // ONE document the user picked, with a read grant for it; only that
+            // URI goes to the WebView, which reads it itself (see README: this
+            // works with allowContentAccess = false, which governs content://
+            // URLs the PAGE loads, not the file-chooser upload path).
+            override fun onShowFileChooser(
+                webView: WebView,
+                filePathCallback: ValueCallback<Array<Uri>>,
+                fileChooserParams: FileChooserParams,
+            ): Boolean = showFileChooser(filePathCallback, fileChooserParams)
+        }
+    }
+
+    /**
+     * The WebView's file chooser. The callback is answered EXACTLY once: with
+     * the picked document, or null (cancelled, unsupported mode, no picker). A
+     * second chooser while one is pending cancels the old callback first (a
+     * callback never answered would leave the input dead for the page's life).
+     * The picker's results return last-opened-first (it runs in our task), so
+     * the first result that arrives belongs to the newest callback; a late one
+     * finds no callback and is dropped.
+     *
+     * `*` / `*`, not the input's `accept` list: Quick Share and Bluetooth often
+     * deliver a .json file as application/octet-stream, and a MIME filter
+     * would grey out exactly the file the user was sent. The page checks the
+     * content (importPad), not the type.
+     */
+    private fun showFileChooser(
+        callback: ValueCallback<Array<Uri>>,
+        params: WebChromeClient.FileChooserParams,
+    ): Boolean {
+        fileChooserCallback?.onReceiveValue(null)
+        fileChooserCallback = null
+        if (params.mode != WebChromeClient.FileChooserParams.MODE_OPEN) {
+            callback.onReceiveValue(null)
+            return true
+        }
+        fileChooserCallback = callback
+        try {
+            openLauncher.launch(arrayOf("*/*"))
+        } catch (e: ActivityNotFoundException) {
+            fileChooserCallback = null
+            callback.onReceiveValue(null)
+        }
+        return true
+    }
+
+    private fun onFileChosen(uri: Uri?) {
+        val callback = fileChooserCallback ?: return
+        fileChooserCallback = null
+        // Pentest r1 F4: only another app's content:// document reaches the
+        // page — never a file:// path, never one of our own providers.
+        callback.onReceiveValue(uri?.takeIf { isForeignDocument(it) }?.let { arrayOf(it) })
+    }
+
+    /** Main thread. Start the share or save the bridge has claimed the slot for. */
+    private fun startPadFileRequest(req: PadFileRequest) {
+        if (isFinishing || isDestroyed) {
+            padFiles.finish(req.id)
+            return
+        }
+        try {
+            when (req.kind) {
+                PadFileRequest.Kind.SHARE -> startShare(req)
+                PadFileRequest.Kind.SAVE -> {
+                    padSave = req
+                    saveLauncher.launch(req.name)
+                }
+            }
+        } catch (e: Exception) {
+            // ActivityNotFoundException (no chooser / no documents UI),
+            // IOException (cache full), IllegalArgumentException (FileProvider).
+            deliverPadFileResult(req.id, PadFileOutcome.ERROR)
+        }
+    }
+
+    /**
+     * Share: one file in cacheDir/[SHARE_DIR]/<requestId>/, named as validated
+     * (no path can be formed from it — see PadFileRules.NAME_TEMPLATE), exposed through
+     * the FileProvider whose paths xml admits that directory ONLY, with a read
+     * grant that goes to the target the user picks and nowhere else.
+     *
+     * WHAT THE CHOOSER TELLS US, honestly: its activity result is useless —
+     * RESULT_CANCELED whether the user backed out or picked a target (targets
+     * such as Quick Share or Bluetooth set no result). The one real signal is
+     * the IntentSender passed to createChooser, which the system sends when a
+     * target is picked (with EXTRA_CHOSEN_COMPONENT filled in only if it is
+     * mutable; ours is not, and does not need it). So "shared" means "the
+     * user picked a target"; whether the file then reached the other phone is
+     * beyond what Android can tell an app, and the UI says "File shared", not
+     * "handed over". No target by the time the chooser returns (plus
+     * [SHARE_GRACE_MS]) is "cancelled".
+     */
+    private fun startShare(req: PadFileRequest) {
+        // Fix round 2 (cold critic mi-4, pentest r2 R2-7a): a new share no
+        // longer revokes and deletes the earlier ones. "Didn't arrive? Send it
+        // again", or a share in a second instance, would cut off a Bluetooth
+        // send still reading the first file. Each share has its own URI (F1,
+        // below), so an old grant reaches only the old file, and every file
+        // ends by the same rule: SHARE_TTL_MS, revoked, then deleted.
+        val root = File(cacheDir, SHARE_DIR)
+        // Pentest r1 F1: the URI is unique to this request: content://…/
+        // pad-share/<requestId>/<name>. Android keys a grant by the URI, and
+        // the name is only minute-resolution, so a same-name file at a shared
+        // path would be readable through any grant still held on it. The
+        // target sees only the last segment (the display name): the neutral name.
+        val dir = File(root, req.id)
+        if (!dir.isDirectory && !dir.mkdirs()) throw IOException("cannot create the share directory")
+        val file = File(dir, req.name)
+        if (file.parentFile != dir || dir.parentFile != root) throw IOException("share file escapes its directory")
+        padShare = PendingShare(req.id, dir)
+        file.writeText(req.text, Charsets.UTF_8)
+        val uri = FileProvider.getUriForFile(this, filesAuthority, file)
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "application/json"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            // createChooser carries the read grant to the chosen target only
+            // through ClipData (it does not look at EXTRA_STREAM).
+            clipData = ClipData.newRawUri(req.name, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        // Pentest r1 F5: IMMUTABLE. The chooser fills EXTRA_CHOSEN_COMPONENT
+        // into a mutable PendingIntent only; an immutable one is still SENT on
+        // a pick, with the fill-in dropped — and the pick is all we read. Our
+        // own request id is the intent's data ([SHARE_SCHEME]), so each share
+        // has its own PendingIntent. Explicit (package set), one shot.
+        val chosen = PendingIntent.getBroadcast(
+            this, 0,
+            Intent(shareChosenAction).setPackage(packageName).setData(Uri.fromParts(SHARE_SCHEME, req.id, null)),
+            PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        shareLauncher.launch(Intent.createChooser(send, getString(R.string.share_pad_title), chosen.intentSender))
+    }
+
+    private fun onShareReturned() {
+        val p = padShare ?: return
+        p.returned = true
+        if (p.chosen) {
+            deliverPadFileResult(p.id, PadFileOutcome.SHARED)
+            return
+        }
+        // No `padShare === p` test here: deliverPadFileResult answers a request
+        // at most once (the bridge's slot), which is what keeps a late timer
+        // from contradicting an earlier "shared".
+        binding.root.postDelayed({ deliverPadFileResult(p.id, PadFileOutcome.CANCELLED) }, SHARE_GRACE_MS)
+    }
+
+    /**
+     * Save: the system save dialog (ACTION_CREATE_DOCUMENT, application/json,
+     * the validated name suggested) has given us a document the user placed;
+     * write the text to it off the main thread (a provider's stream can be
+     * slow, and EXTRA_LOCAL_ONLY is only a hint). "saved" only once the bytes
+     * are written AND the stream closed.
+     *
+     * Pentest r1 F3. Opened "wt", not "w": when the user picks an EXISTING
+     * file and confirms the overwrite, DocumentsUI hands back that file, and
+     * whether "w" truncates is up to the provider — a longer old file would
+     * keep its tail after the envelope, "File saved" would be shown, and the
+     * import on the other phone would fail only after the pad was latched.
+     *
+     * NOTHING here deletes a document. The dialog may have returned a file the
+     * user already had, and from the URI alone we cannot tell "just created"
+     * from "chose to overwrite". So a failed write is reported as "error" and
+     * the (half-written) file is left where the user put it, and a result that
+     * arrives for a request this activity never made (the process died while
+     * the dialog was open, so the text is gone) is ignored: at worst an empty
+     * file is left behind, never someone's file removed.
+     */
+    private fun onSaveDocument(uri: Uri?) {
+        val req = padSave ?: return
+        if (uri == null) {
+            deliverPadFileResult(req.id, PadFileOutcome.CANCELLED)
+            return
+        }
+        if (!isForeignDocument(uri)) {
+            deliverPadFileResult(req.id, PadFileOutcome.ERROR)
+            return
+        }
+        thread(name = "pad-save") {
+            val written = try {
+                val out = contentResolver.openOutputStream(uri, "wt") ?: throw IOException("no output stream")
+                out.use { it.write(req.text.toByteArray(Charsets.UTF_8)); it.flush() }
+                true
+            } catch (e: Exception) {
+                false
+            }
+            runOnUiThread {
+                deliverPadFileResult(req.id, if (written) PadFileOutcome.SAVED else PadFileOutcome.ERROR)
+            }
+        }
+    }
+
+    /**
+     * Pentest r1 F4: a document URI from the picker or the save dialog is used
+     * only if it is a content:// URI served by ANOTHER app. Both intents are
+     * answered by the system's DocumentsUI, which only ever returns such URIs,
+     * so this refuses nothing legitimate; it keeps a file:// result (which
+     * ContentResolver would open directly, app-private files included) or one
+     * of our own providers (the pad-share FileProvider) from ever being read
+     * into the page or written over, whatever answered the intent.
+     */
+    private fun isForeignDocument(uri: Uri): Boolean {
+        if (uri.scheme != "content") return false
+        // Pentest r2 R2-5 / r3 R3-1: the authority exactly as ContentResolver
+        // routes it — the DECODED authority with everything up to the last
+        // `@` (the user id) removed (ContentProvider.getAuthorityWithoutUserId).
+        // `content://0@org.securechat.app.files/…` and its percent-encoded
+        // twin `content://0%40org.securechat.app.files/…` both open OURS; the
+        // r2 fix used uri.host, which splits on `@` in the ENCODED authority
+        // and so missed the `%40` form. (A user id on a FOREIGN provider stays
+        // allowed: that is how a work-profile document comes back.)
+        val authority = uri.authority?.substringAfterLast('@') ?: return false
+        if (authority == filesAuthority) return false
+        return packageManager.resolveContentProvider(authority, 0)?.packageName != packageName
+    }
+
+    /**
+     * Report [outcome] for request [id] to the page and release the bridge's
+     * slot. Only the request in flight can be answered, and only once — every
+     * caller relies on that (the share grace timer does not check whether a
+     * result was already given). The script is [PadFilesBridge.resultScript]:
+     * our hex id, a constant outcome.
+     */
+    private fun deliverPadFileResult(id: String, outcome: String) {
+        if (!padFiles.finish(id)) return
+        if (padSave?.id == id) padSave = null
+        padShare?.let {
+            if (it.id == id) {
+                padShare = null
+                if (outcome == PadFileOutcome.ERROR) {
+                    // The chooser never ran (it failed to start, or the file
+                    // could not be written): nobody can hold a grant. Go now.
+                    revokeAndDelete(it.dir)
+                } else {
+                    // "shared" AND "cancelled" (fix round 2, cold critic mi-4):
+                    // "cancelled" only means no pick was reported within
+                    // SHARE_GRACE_MS, and Android may hold that broadcast back,
+                    // so a target may hold a grant and be reading. Revoking or
+                    // deleting now would cut it off. The file lives out
+                    // SHARE_TTL_MS like a shared one. A pick reported after
+                    // "cancelled" is NOT sent to the page as a correction: the
+                    // contract answers each request once, and the page's
+                    // "Not shared." leaves "Share…" there to use again, which
+                    // no longer disturbs this file.
+                    expireShares()
+                }
+            }
+        }
+        if (isDestroyed) return
+        binding.webview.evaluateJavascript(PadFilesBridge.resultScript(id, outcome), null)
+    }
+
+    private val filesAuthority by lazy { "$packageName.files" }
+
+    /**
+     * Revoke and delete every share in cacheDir/[SHARE_DIR] at least
+     * [SHARE_TTL_MS] old, then arm a timer for when the next one comes due.
+     * Called at every start of the activity and after every share's result;
+     * the timer calls it again. A file a target was handed therefore lives
+     * SHARE_TTL_MS (plus up to a second), whether or not the activity was
+     * recreated or a second instance started meanwhile. Bound, honestly: if
+     * the PROCESS dies, no timer survives it, and a file younger than
+     * SHARE_TTL_MS at that moment goes at the next start of the app (or with
+     * its timer from there) — it stays app-private and un-revoked until then.
+     *
+     * The file is the transfer-passphrase-encrypted envelope, in app-private
+     * cache, never backed up (allowBackup=false, dataExtractionRules).
+     */
+    private fun expireShares() {
+        shareTimer.removeCallbacksAndMessages(null)
+        val now = System.currentTimeMillis()
+        val left = File(cacheDir, SHARE_DIR).listFiles()?.filter { entry ->
+            val expired = now - entry.lastModified() >= SHARE_TTL_MS
+            if (expired) revokeAndDelete(entry)
+            !expired
+        } ?: return
+        val next = left.minOfOrNull { it.lastModified() } ?: return
+        val due = (next + SHARE_TTL_MS - now).coerceIn(0, SHARE_TTL_MS)
+        shareTimer.postDelayed({ expireShares() }, due + 1000)
+    }
+
+    /** The share-expiry timer. Not cleared on destroy: a file handed out must still expire. */
+    private val shareTimer = Handler(Looper.getMainLooper())
+
+    /**
+     * Pentest r1 F1: every file is un-granted BEFORE it is deleted. Android
+     * keys a grant by URI and FileProvider serves whatever file sits at that
+     * path now, so deleting alone leaves the grant alive for whatever is
+     * written there next; revoking alone leaves the file. Revoking our own
+     * provider's URI removes it from every app that holds it (until then a
+     * grant can outlive the target's activity, and be passed on).
+     */
+    private fun revokeAndDelete(entry: File) {
+        entry.walkBottomUp().forEach { f ->
+            if (f.isFile) {
+                try {
+                    revokeUriPermission(FileProvider.getUriForFile(this, filesAuthority, f), Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                } catch (e: IllegalArgumentException) {
+                    // Outside the provider's paths: nothing can have been granted.
+                }
+            }
+            f.delete()
         }
     }
 
@@ -357,6 +801,19 @@ class MainActivity : AppCompatActivity() {
                 value: ok ? true : 'unavailable',
                 writable: false, configurable: false, enumerable: false
               });
+              // OTP transfer sheets: the pad-file bridge, captured the same way
+              // and for the same reason. Unlike the floor, a substituted share()
+              // could only lie about an outcome to a page that already runs the
+              // attacker's code, but the page must still be able to rely on
+              // "this is the shell's bridge" when it decides to show the native
+              // path instead of a download that the WebView would drop.
+              var f = window.SecureChatFiles;
+              if (!!f && typeof f.share === 'function' && typeof f.save === 'function') {
+                Object.defineProperty(window, '__SECURE_CHAT_FILES__', {
+                  value: Object.freeze({ share: f.share.bind(f), save: f.save.bind(f) }),
+                  writable: false, configurable: false, enumerable: false
+                });
+              }
             })();
         """.trimIndent()
         // Checked in onCreate too; re-checked here because promptForRelay() also
@@ -388,10 +845,16 @@ class MainActivity : AppCompatActivity() {
         // The FROZEN copy is what otp.js uses, so that is what must exist —
         // checking `SecureChatPadFloor` here would pass on a substituted bridge
         // (H-A) and prove nothing.
+        //
+        // The pad-file bridge too: without it the client takes the browser
+        // path on Android, whose download the WebView silently drops AFTER the
+        // pad is latched as exported — the bug the bridge exists to fix.
         binding.webview.evaluateJavascript(
             "!!window.__SECURE_CHAT_RELAY__ && window.__SECURE_CHAT_NATIVE_FLOOR__ === true " +
                 "&& typeof (window.__SECURE_CHAT_PAD_FLOOR__||{}).read === 'function' " +
-                "&& typeof (window.__SECURE_CHAT_PAD_FLOOR__||{}).bump === 'function'",
+                "&& typeof (window.__SECURE_CHAT_PAD_FLOOR__||{}).bump === 'function' " +
+                "&& typeof (window.__SECURE_CHAT_FILES__||{}).share === 'function' " +
+                "&& typeof (window.__SECURE_CHAT_FILES__||{}).save === 'function'",
         ) { result -> if (result != "true") refuseToRun() }
     }
 
@@ -468,6 +931,11 @@ class MainActivity : AppCompatActivity() {
         R.id.action_reload -> { binding.webview.reload(); true }
         R.id.action_relay -> { promptForRelay(initial = false); true }
         else -> super.onOptionsItemSelected(item)
+    }
+
+    override fun onDestroy() {
+        unregisterReceiver(shareChosenReceiver)
+        super.onDestroy()
     }
 
     @Deprecated("Deprecated in Java")

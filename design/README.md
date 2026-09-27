@@ -100,3 +100,18 @@ conversation's name. Decisions in `design/research/reviews/profile-brief.md`; th
 updated to the design after the review rounds. Reviewed like the rework — hot and cold critics and
 the pentest agent, three rounds each; triage in `reviews/profile-fix-round-1.md` and
 `reviews/profile-fix-round-2.md`, summary in `research/reviews.md`. e2e: `e2e/contact-profile.mjs`.
+
+## One-time pad transfer (2026-09-26/27)
+
+New pad, Export and Import each open their own sheet (the `.sheet` component) instead of the
+old "Generate / share a pad" disclosure; the OTP panel keeps only the pad picker, its passphrase,
+three entry buttons and Connect. Every sheet has the same anatomy: head, pad card, numbered steps,
+one primary, form → working → done. The two passphrases are told apart by who knows them ("only
+you know it" / "you both know it"), with their own icon and tag wherever they appear. The Android
+app gained Share… / Save to device for the export and a working file picker for the import
+(both were silently broken in the WebView). Decisions in
+`design/research/reviews/otp-transfer-brief.md` (§§ 12–14 amend the earlier sections); the canvas
+has a "One-time pad transfer" row (17 artboards, synced to the build). Reviewed by a design critic
+(four rounds, canvas and built UI), hot and cold critics (two rounds each) and the pentest agent
+(seven rounds, Android bridge included); triage in `reviews/otp-design-fix-round-1.md` and
+`reviews/otp-fix-round-1.md`. e2e: `e2e/otp-transfer.mjs`.

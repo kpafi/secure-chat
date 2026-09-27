@@ -547,7 +547,10 @@ const COMMON_PASSPHRASE_WORDS = new Set([
   "secret", "geheim", "admin", "welcome", "hello", "hallo", "monkey", "dragon", "abc", "abcdef",
   "securechat", "secure", "chat", "test", "changeme",
 ]);
-export function passphraseWarning(pass) {
+// OTP transfer sheets: the reason alone ("it is only digits"), for the live
+// one-line warning under a field; passphraseWarning() is built on it and its
+// sentence is unchanged.
+export function passphraseWeakness(pass) {
   const p = String(pass ?? "");
   if (!p) return null; // "empty" is refused by every caller with its own sentence
   let why = null;
@@ -563,6 +566,10 @@ export function passphraseWarning(pass) {
   } else if ([...p].length < PASSPHRASE_MIN_CHARS) why = `it is shorter than ${PASSPHRASE_MIN_CHARS} characters`;
   // "Summer2024!!": one short word padded with digits or symbols to the length.
   else if (/^[^\p{L}\s]*\p{L}{1,8}[^\p{L}\s]*$/u.test(p)) why = "it is one short word with digits or symbols added";
+  return why;
+}
+export function passphraseWarning(pass) {
+  const why = passphraseWeakness(pass);
   if (!why) return null;
   return `Weak passphrase: ${why}. Anyone who copies the encrypted data can try guesses offline, ` +
     `at their own pace — use ${PASSPHRASE_MIN_CHARS} or more characters, e.g. four or more random words. ` +

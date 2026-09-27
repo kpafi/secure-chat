@@ -72,8 +72,10 @@ in the client first. Verify on a device by backgrounding the app and opening
 recents (blank card), and with `adb shell screencap` (refused or black).
 
 ## The pad-floor bridge and frames (F-ANDROID-002)
-The native OTP/store floor is reached through ONE `addJavascriptInterface`
-bridge, `SecureChatPadFloor`. Android exposes such a bridge to **every frame**
+The native OTP/store floor is reached through an `addJavascriptInterface`
+bridge, `SecureChatPadFloor` (since the OTP transfer sheets there is a second
+one, `SecureChatFiles`, below; everything in this section holds for both).
+Android exposes such a bridge to **every frame**
 of the WebView, of any origin — so the bridge is only as narrow as the set of
 frames the WebView can ever load. The app loads no framed content, and since
 package 6 that is a pinned invariant rather than an accident: the CSP stamped
@@ -97,6 +99,145 @@ before the next statement runs). Moving to it means reworking every floor call
 site into an async round trip with its own failure and ordering cases, a
 larger change than the risk it removes while no framed content loads. Revisit if the
 app ever needs a frame.
+
+## Pad files: Share, Save to device, Import (OTP transfer sheets)
+Before this, Import did nothing on the phone (a WebView ignores
+`<input type=file>` unless the `WebChromeClient` implements
+`onShowFileChooser`) and Export handed out nothing (a WebView drops
+`<a download>` on a `blob:` URL) — after the pad had been latched as exported.
+Spec: `design/research/reviews/otp-transfer-brief.md` 5, 6, 9. Code:
+`PadFiles.kt` (validation, the bridge) and `MainActivity` (the intents).
+
+- **Export** goes through a second bridge, `SecureChatFiles`, captured in the
+  same document-start script as the pad floor and republished frozen as
+  `window.__SECURE_CHAT_FILES__ = {share, save}` (bound methods,
+  non-writable, non-configurable; `verifyRelayConfig` refuses to run without
+  it). `share(name, text)` / `save(name, text)` answer at once with a request
+  id, `"busy"` or `"invalid"`; the outcome (`shared` / `saved` / `cancelled` /
+  `error`) comes back through `window.__SECURE_CHAT_FILES_RESULT__(id,
+  outcome)`, evaluated by the shell from our own hex id and a constant.
+- **Validated natively**, whatever the page checked: the name must be exactly
+  `secure-chat-pad-YYYY-MM-DD-HHMM.json` (ASCII digits; checked against a
+  template character by character, not by a regex, whose `\d` would mean
+  ASCII in the JVM tests but any Unicode digit on the device's ICU — cold
+  critic r2 mi-7), the text at most 4 MiB and exactly
+  the envelope `exportPad()` writes: the same literals and key order,
+  `iters` exactly otp.js's `KDF_ITERS` (600000), salt 16 and iv 12 bytes of
+  btoa base64, `ct` base64 of btoa's alphabet, length and padding (the tail
+  bits are not checked: AES-GCM authenticates the decoded bytes, pentest r2
+  R2-8). Checked by a single-pass scanner, not a
+  regex: on the device `java.util.regex` is ICU, whose backtracking stack is
+  limited and is not the engine the JVM tests run (pentest r1). The two ends
+  are tied through a committed fixture (real `exportPad()` output) that
+  `PadFilesTest` accepts and whose skeleton `android-source.test.mjs` compares
+  with a fresh `exportPad()`. One request at a time.
+- **What page script can do with it** (any script in the page reaches it):
+  ask for the system share sheet or save dialog for one timestamp-named,
+  pad-envelope-shaped file. Nothing leaves app-private storage until the user
+  picks a target in system UI. It cannot choose a path, a name, a type or an
+  intent extra, and it cannot read any file. It can spam: one request at a
+  time, and each needs the user to tap through a system screen. A page that
+  passes a huge string can exhaust memory (the bridge copies arguments before
+  any check) — denial of service by a party that already runs the page.
+- **Share** writes the file to `cacheDir/pad-share/<requestId>/<name>` and
+  hands it out via a non-exported `FileProvider` whose paths xml admits that
+  directory only, `ACTION_SEND` `application/json`, a read grant to the chosen
+  target only. The URI is unique per request (pentest r1 F1: a grant is keyed
+  by URI, and the name alone is minute-resolution, so a same-name re-share
+  used to be readable through the first target's grant); the target sees only
+  the neutral name.
+  *What "shared" means:* the chooser's activity result is `RESULT_CANCELED`
+  whether or not a target was picked, so the shell passes the chooser an
+  `IntentSender`, which the system sends when a target is picked: a target
+  picked = `shared`; none by the time the chooser returns (+1.5 s, the two
+  signals travel separately) = `cancelled`. The PendingIntent behind it is
+  immutable (the chooser then drops its `EXTRA_CHOSEN_COMPONENT` fill-in,
+  which we never read), one-shot, package-explicit, and carries the request
+  id as its DATA (`x-secure-chat-share:<id>`), which is part of a
+  PendingIntent's identity: no two shares, in two activity instances or two
+  processes, can ever be handed the same one (pentest r1 F2, F5; r2 R2-6 — a
+  per-process requestCode counter restarted at 1). Whether the file reached
+  the other phone Android cannot tell an app; the UI says "File shared", not
+  "handed over". A pick reported AFTER "cancelled" (Android can hold the
+  broadcast back) is not sent to the page as a correction — each request is
+  answered once — but the file stays for its target (below), and "Share…" is
+  still there.
+- **The share file's life** (pentest r1 F1, F2; fix round 2): every file
+  is un-granted (`revokeUriPermission`) before it is deleted, and it is
+  deleted in exactly two ways. (1) At once on `error`, when the chooser never
+  ran, so nobody can hold a grant. (2) Otherwise — `shared` AND `cancelled` —
+  when it is **10 minutes** old (`SHARE_TTL_MS`; Bluetooth reads it from a
+  background service after its screen has closed). "Cancelled" is kept too
+  because it may be wrong (cold critic mi-4: a late pick broadcast), and a
+  new share ("Didn't arrive? Send it again", or a share in a second instance)
+  no longer touches an earlier file (pentest r2 R2-7a): each has its own URI,
+  so an old grant reaches only the old file. Expiry runs at every start of the
+  activity and after every share, and re-arms a timer for the next file due,
+  so a file lives 10 minutes (+1 s) while the process does, across
+  recreations and second instances. **If the process dies**, no timer
+  survives: the file is removed (or timed) at the next start of the app, and
+  until then stays app-private and un-revoked (pentest r2 R2-7b; this README
+  used to say "at the next start or share", which was not a bound).
+- **Save** is `ACTION_CREATE_DOCUMENT` (`application/json`, the name
+  suggested); `saved` only after the bytes are written and the stream closed.
+  The stream is opened `"wt"` (pentest r1 F3: an existing file the user chose
+  to overwrite must be truncated, or its tail stays behind the envelope). The
+  shell never deletes a document: from the URI it cannot tell a new file from
+  one the user chose to overwrite, so a failed write is reported as `error`
+  and left, and a save result that arrives after the process died (no request,
+  no text) is ignored — at worst an empty file stays, never someone's file
+  removed.
+- **Document URIs** (pentest r1 F4): a picker or save-dialog result is used
+  only if it is `content://` from another app's provider — never `file://`
+  (which `ContentResolver` would open directly, app-private files included),
+  never our own `FileProvider`. DocumentsUI only returns such URIs, so this
+  refuses nothing real. The check uses the authority exactly as
+  `ContentResolver` routes it: decoded, with everything up to the last `@`
+  (the user id) removed. `content://0@org.securechat.app.files/…` (pentest r2
+  R2-5) and `content://0%40org.securechat.app.files/…` (r3 R3-1: the r2 fix
+  used the host, which splits on `@` before decoding) both name our provider
+  and are refused. A user id on a FOREIGN provider stays allowed — that is how
+  a work-profile document comes back (tested).
+- **Configuration changes** (cold critic mi-5): a recreated activity reloads
+  the page — the unlocked identity, live chats and a pad file waiting in the
+  export sheet are gone, the pad already latched as exported. So
+  `MainActivity` takes every configuration change it can in place
+  (`configChanges`: orientation, screen size and layout, smallest width,
+  density, keyboard, navigation, touchscreen, uiMode, locale, layout
+  direction, font scale, bold text (`fontWeightAdjustment`, pentest r3
+  R3-2), color mode, mcc/mnc, grammatical gender). Nothing is inflated per
+  configuration (no `-night`/`-land` resources; the page has one theme and
+  does its own layout), so the only cost is that the native bar's two strings
+  follow a locale switch at the next start. **What still reloads the page:**
+  (a) process death — the system reclaiming the app while the share sheet or
+  save dialog is in front; (b) a change no manifest flag can take: a system
+  theme / resource-overlay change, such as a Material You wallpaper-colour
+  change on Android 12+ (an assets-path change, `CONFIG_ASSETS_PATHS`, which
+  is not declarable; pentest r3 R3-2 showed the recreation in Robolectric —
+  on the device it is expected but not yet verified, see the checklist);
+  (c) an app update or force-stop. In each case the user comes back to a
+  fresh page (identity locked); the pad is latched as exported, so the next
+  Export asks the "export again" confirm, and a save dialog that was open may
+  leave an empty file where the user put it (the shell never deletes
+  documents).
+- **Import**: `onShowFileChooser` → `ACTION_OPEN_DOCUMENT`,
+  `CATEGORY_OPENABLE`, `*/*` (Quick Share and Bluetooth often deliver a .json
+  as `application/octet-stream`), one document, no persisted permission. The
+  WebView's callback is answered exactly once (`null` on cancel). This works
+  with `allowContentAccess = false`: that setting governs `content://` URLs the
+  *page* loads; the chooser's pick reaches the page as an upload the WebView
+  reads itself under the one-document grant (the Import check below confirms
+  it on the device).
+- **No cloud roots (design critic r2, N-M1):** Save and Import both put
+  `EXTRA_LOCAL_ONLY`, so DocumentsUI lists local roots only, not Google Drive.
+  A pad file on a server is protected only by the transfer passphrase,
+  guessable offline for as long as the copy exists. **This is a hint**: an OEM
+  picker may ignore it, which is why the UI says "File saved", never "saved to
+  this device".
+- No new permission; no new dialog of ours (the close confirm is the page's
+  `confirm()`, through `secureShow`). The share sheet, save dialog and picker
+  are other apps' windows, which `FLAG_SECURE` does not cover; they show only
+  the neutral file name.
 
 ## SafeBrowsing is off (F-P7-24)
 `AndroidManifest.xml` sets `android.webkit.WebView.EnableSafeBrowsing` to
@@ -167,3 +308,53 @@ The bundled web client is **generated at build time** from `../client` by the
   guest, and the reverse, still connect (only the new guest is asked). The
   node suite and e2e cover all of it in desktop Chromium; none runs the
   Android WebView.
+- **Owed on the phone (OTP transfer sheets, pad files):** the Robolectric
+  tests drive the intents, not real system UI. (1) **Share…**: the chooser
+  opens; Quick Share to the second phone delivers
+  `secure-chat-pad-YYYY-MM-DD-HHMM.json` there and the sheet says "File
+  shared"; backing out of the chooser without a pick says "Not shared." within
+  ~2 s. **Check whether Bluetooth is offered at all** — AOSP Bluetooth's share
+  filter lists specific MIME types and may not include `application/json`; if
+  it is missing, that is a decision (share as `text/plain` or `*/*`), not a
+  bug to paper over. Also check the Quick Share button of the Android 14
+  sharesheet reports "File shared" (it must fire the chosen-target callback,
+  which is an IMMUTABLE PendingIntent since pentest r1 F5 — the platform sends
+  it with the fill-in dropped; if a real pick says "Not shared." on every
+  target, this is the first suspect;
+  if it says "Not shared." after a real send, note the device and build).
+  (2) **Save to device**: the save dialog shows no Google Drive / cloud roots
+  (`EXTRA_LOCAL_ONLY`; if the OEM picker lists them anyway, note it); saving
+  into Downloads says "File saved" and the file in Files is the JSON envelope;
+  cancelling says "Not saved."; saving OVER an existing, longer file leaves
+  exactly the envelope (the `"wt"` truncation is up to the provider).
+  (3) **Import**: "Choose pad file…" opens the
+  system picker (no cloud roots), the file received by Quick Share (often
+  `application/octet-stream`) is selectable and imports; cancelling changes
+  nothing, and a second tap opens the picker again. (4) While the file is
+  ready, the close confirm is black in a screen recording (`secureShow`).
+  (5) Debug build: after a share, `adb shell run-as org.securechat.app ls -R
+  cache/pad-share` lists one `<id>/secure-chat-pad-….json` (two after "Didn't
+  arrive? Send the same file again"); ten minutes after the share (app left open, shared or cancelled)
+  it is empty; after a force-stop and a restart more than ten minutes later
+  it is empty, and after a restart within the ten minutes it empties when
+  they are up. Switch dark mode and split-screen with the file-ready sheet
+  open: the sheet stays (no reload). A 1 MiB pad exports (Share and
+  Save) without "Could not share/save" — the native envelope check is a
+  linear scan, but the largest file has only run on the JVM so far. "Send it again" while
+  a Bluetooth send of the first file is still running does not break it.
+  Revocation (`revokeUriPermission` before delete) cannot be observed in the
+  unit tests (Robolectric has no URI-grant model): after a share has expired,
+  the target must no longer be able to open its URI. (6) Android Back closes an open sheet (the client pushes a history
+  entry; `onBackPressed` calls `webview.goBack()` while `canGoBack()`)
+  instead of leaving the app, and does not dismiss a working sheet.
+  **Back twice during a KDF** (New pad's "Create pad", Export's "Create
+  transfer file", Import's work): the pad stays in the working sheet, the
+  sheet finishes normally, and the app does not close. **Back during the
+  Export entry's unlock** ("Unlocking…" on the panel's Export button): no
+  sheet opens behind it, the app does not close, and the next Back still
+  closes a sheet. (7) With the export sheet in file-ready: toggle Settings →
+  Accessibility → Bold text — the sheet stays (no reload); then change the
+  wallpaper so Material You recolours the system (Android 12+) — expected to
+  reload the page (identity locked, the sheet gone); note what happens. (8)
+  Import a file picked from the work profile, if the phone has one: it must
+  be accepted.

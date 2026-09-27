@@ -2,7 +2,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!-- The relay is remote; the app needs the network. No other permissions:
-         crypto, identity storage (WebView localStorage) and UI are all local. -->
+         crypto, identity storage (WebView localStorage) and UI are all local.
+         Handing a pad file out (share sheet, system save dialog) and picking
+         one to import (system document picker) need none either: the Storage
+         Access Framework and a FileProvider grant work per document, on the
+         user's pick. -->
     <uses-permission android:name="android.permission.INTERNET" />
 
     <application
@@ -30,15 +34,44 @@
              launchMode stays the default (standard): a launcher tap still finds
              and resumes the existing task, which Android matches by the root
              activity's component when the task has no affinity. -->
+        <!-- configChanges (OTP transfer sheets fix round 2, cold critic mi-5):
+             every configuration change this single-WebView activity can take
+             in place. Recreating it RELOADS THE PAGE: the unlocked identity,
+             live chats and a pad file waiting in the export sheet are gone
+             (the pad is already latched as exported), and a save dialog open
+             at that moment answers into nothing. Nothing here is
+             layout-inflated per configuration (no -night/-land/-sw
+             resources; the page does its own layout), so taking the change in
+             place costs only: the native bar's strings and theme follow a
+             locale or dark-mode switch at the next start. What still reloads
+             the page (android/README.md): process death (the system
+             reclaiming memory while the share sheet or save dialog is in
+             front), and changes no manifest flag can take - a system theme
+             or overlay change, such as Material You wallpaper colours
+             (pentest r3 R3-2), and an app update. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:taskAffinity=""
-            android:configChanges="orientation|screenSize|keyboardHidden">
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden|navigation|touchscreen|uiMode|locale|layoutDirection|fontScale|colorMode|mcc|mnc|grammaticalGender|fontWeightAdjustment">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- OTP transfer sheets: the exported pad file handed to the share
+             sheet. Not exported: nothing can open a URI of ours except a
+             target the chooser grants read access to, one file at a time.
+             The paths xml exposes cacheDir/pad-share/ and nothing else. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/pad_share_paths" />
+        </provider>
     </application>
 </manifest>

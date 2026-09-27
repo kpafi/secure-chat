@@ -414,13 +414,38 @@ function missingRecordError() {
 // ---- generation ------------------------------------------------------------
 
 // Generate a fresh pristine pad. The generator is always role 0.
+// A pad label as the page may show it: a string of at most PAD_LABEL_MAX code
+// points (= #otpLabel's maxlength; counted in code points, so a surrogate
+// pair is never split), without control or format characters (line breaks
+// that could phrase a dialog, bidi controls that could reorder it, zero-width
+// and tag characters that hide text). Fix round 5 (pentest r6 R6-4): the
+// categories Cc, Cf, Cs, Co and the line/paragraph separators — but ZWNJ and
+// ZWJ (U+200C/D) stay: Persian, Urdu and Indic words and emoji sequences need
+// them, and they neither reorder nor hide text. Variation selectors and
+// combining marks are not format characters and stay. Unassigned code points
+// (Cn) stay too: what is unassigned depends on the engine's Unicode version,
+// and in textContent they are harmless. A label with no letter, digit, symbol
+// or punctuation left is "", so the caller's default name applies.
+export const PAD_LABEL_MAX = 60;
+const LABEL_STRIP_RE = /(?![\u200C\u200D])[\p{Cc}\p{Cf}\p{Cs}\p{Co}\u2028\u2029]/gu;
+const LABEL_VISIBLE_RE = /[\p{L}\p{N}\p{S}\p{P}]/u;
+export function cleanPadLabel(label) {
+  if (typeof label !== "string") return "";
+  const s = [...label.replace(LABEL_STRIP_RE, " ").replace(/\s+/g, " ").trim()].slice(0, PAD_LABEL_MAX).join("").trim();
+  return LABEL_VISIBLE_RE.test(s) ? s : "";
+}
+const localStamp = (d) => {
+  const z = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}:${z(d.getMinutes())}`;
+};
 export async function generatePad({ label, totalBytes, fingerBytes }) {
   if (!Number.isInteger(totalBytes) || totalBytes < 128 || totalBytes % 2 !== 0) {
     throw new Error("pad size must be an even number of bytes");
   }
   return {
     padId: randomId(),
-    label: label || "pad " + new Date().toISOString().slice(0, 16).replace("T", " "),
+    // Local time, like the export file's name (fix round 1, cold n-1: this was UTC).
+    label: cleanPadLabel(label) || "pad " + localStamp(new Date()),
     regionSize: totalBytes / 2,
     role: 0,
     createdAt: Date.now(),
@@ -457,7 +482,16 @@ async function deriveKey(passphrase, salt, iters) {
 
 // Serialize a PRISTINE pad into a passphrase-encrypted file string. The importer
 // becomes the opposite role, so their send region is the other half.
+//
+// OTP transfer sheets (design round 1, M9): only the MAKER exports. A pad this
+// device imported has role 1; exporting it used to write `recipientRole: 1 -
+// 1 = 0`, the generator's role, so a third device importing that file sent
+// from the same half of the pad as the generator: a two-time pad. The role is
+// the one inside the authenticated record (unlockPad's AEAD), never the index.
 export async function exportPad(record, passphrase) {
+  if (!record || record.role !== 0) {
+    throw new Error("you received this pad — only the person who made it can export it");
+  }
   if (!passphrase) throw new Error("choose a transfer passphrase (agree on it in person)");
   if (record.sendOffset !== 0 || record.recvHighWater !== 0) {
     throw new Error("this pad has already been used — export a freshly generated pad only");
@@ -500,21 +534,48 @@ export async function importPad(fileText, passphrase) {
   }
   if (file.fmt !== "secure-chat-otp-pad" || file.v !== 1) throw new Error("unrecognized pad file format");
   if (!file.kdf || typeof file.kdf !== "object") throw new Error("unrecognized pad file format");
-  const key = await deriveKey(passphrase, unb64(file.kdf.salt), file.kdf.iters || KDF_ITERS);
+  // Android pentest (F7 lead, pre-existing): the file chose its own iteration
+  // count (anything deriveKey allows, up to 5M — or none, read as 600k), so a
+  // crafted file held the import sheet in its un-closable working state for
+  // as long as that KDF took. Every exportPad has written exactly KDF_ITERS
+  // since the format existed: anything else is refused BEFORE any KDF runs.
+  if (file.kdf.iters !== KDF_ITERS) throw new Error("this pad file asks for unsupported encryption settings");
+  const key = await deriveKey(passphrase, unb64(file.kdf.salt), KDF_ITERS);
   let plain;
   try {
     plain = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(file.iv) }, key, unb64(file.ct)));
   } catch {
     throw new Error("wrong passphrase or corrupted pad file");
   }
-  const o = JSON.parse(decU.decode(plain));
-  plain.fill(0);
+  let o;
+  try {
+    o = JSON.parse(decU.decode(plain));
+  } finally {
+    plain.fill(0); // fix round 4 (pentest r5 I-5d): also when it is not JSON
+  }
   // The id becomes a storage key AND a native-floor key; only randomId()'s
   // shape is acceptable (see PAD_ID_RE).
   if (typeof o.padId !== "string" || !PAD_ID_RE.test(o.padId)) throw new Error("pad file has an invalid pad id");
   const bytes = unb64(o.bytes);
+  // Fix round 3 (pentest r4 I-1): every refusal from here on zeroes the
+  // decrypted pad bytes, not only some of them.
+  try {
+    return await importChecked(o, bytes);
+  } catch (e) {
+    bytes.fill(0);
+    throw e;
+  }
+}
+async function importChecked(o, bytes) {
   if (bytes.length !== 2 * o.regionSize) throw new Error("pad file is internally inconsistent");
   if (o.recipientRole !== 0 && o.recipientRole !== 1) throw new Error("pad file has an invalid role");
+  // The other half of the M9 fix (see exportPad): a genuine file is written by
+  // the maker (role 0) for the one importer (role 1). `recipientRole: 0` can
+  // only come from a device that re-exported a pad it received (an older
+  // client) — its holder and the maker would share the maker's send region.
+  if (o.recipientRole !== 1) {
+    throw new Error("this file was exported by someone who received the pad, not by its maker — importing it would reuse key material");
+  }
   if (!looksRandom(bytes)) {
     throw new Error("this pad is not random enough to be safe (all-zero or low-entropy) — do not use it");
   }
@@ -527,6 +588,19 @@ export async function importPad(fileText, passphrase) {
   // Package 3b: the durable record's `used` hint as well — after a crash it
   // may be the only trace left that this pad ran here (the localStorage
   // markers lost with the rest of an uncommitted batch).
+  // Fix round 2 (cold MA-1): the pad is still stored here (the same file
+  // imported twice, or the maker importing their own export). saveNewPad's
+  // used-marker made the check below answer "already been used … generate a
+  // fresh pad", which is untrue and sends two people back to an in-person
+  // exchange for nothing. Still a refusal; only the sentence changes (the
+  // page says "You already have this pad on this device …"). A pad that was
+  // FORGOTTEN has no blob, so its watermark still gets the "used" refusal.
+  if (localStorage.getItem(padKey(o.padId)) !== null) {
+    const e = new Error("you already have this pad on this device");
+    e.code = "PAD_PRESENT";
+    e.padId = o.padId;
+    throw e;
+  }
   if (padWasUsed(o.padId) || await durablePadUsed(o.padId)) {
     throw new Error(
       "this pad has already been used on this device — importing it again would reuse key material. Generate and exchange a fresh pad in person.",
@@ -534,7 +608,11 @@ export async function importPad(fileText, passphrase) {
   }
   return {
     padId: o.padId,
-    label: o.label || "imported pad",
+    // Fix round 3 (pentest r4 I-2): the label is the maker's text. It is
+    // shown in a native confirm (Forget) and in the pad list, so it is capped
+    // and stripped of control and bidi-override characters here; the file
+    // format is unchanged.
+    label: cleanPadLabel(o.label) || "imported pad",
     regionSize: o.regionSize,
     role: o.recipientRole,
     createdAt: Date.now(),

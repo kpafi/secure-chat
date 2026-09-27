@@ -218,81 +218,52 @@
           <input id="pass" type="password" autocomplete="off" placeholder="agree on this out of band" />
         </div>
 
+        <!-- One-time pad (design: design/research/reviews/otp-transfer-brief.md).
+             The panel keeps what a chat needs — the pad, its passphrase,
+             Connect — and three entries that each open a sheet (New pad,
+             Export, Import; the sheets are at the end of <body>). app.js
+             moves #otpActions into #otpEmpty while there is no pad. -->
         <div id="otpPanel" class="panel" hidden>
-          <div class="row">
+          <div id="otpEmpty" class="otp-empty" hidden>
+            <div class="otp-empty-head">
+              <span class="otp-tile" aria-hidden="true"></span>
+              <div class="otp-empty-text">
+                <p class="otp-empty-title">No pad on this device yet</p>
+                <p class="otp-caption">One of you makes it, the other imports it.</p>
+              </div>
+            </div>
+          </div>
+          <div class="row" id="otpPadRow">
             <label for="otpSelect">One-time pad</label>
             <div class="inline wrap">
               <select id="otpSelect"><option value="">— no pad on this device —</option></select>
               <button id="otpForget" type="button" class="danger" hidden>Forget</button>
             </div>
           </div>
-          <div class="row why-row">
+          <!-- The passphrase belongs to the selected pad, so it sits under it.
+               Unlocked, the field gives way to #otpUnlocked (it keeps its
+               value; Lock empties it). -->
+          <div class="row why-row otp-fieldrow" id="otpPassRow">
             <label for="otpPass">Pad passphrase</label>
-            <input id="otpPass" type="password" autocomplete="off" placeholder="a passphrase only you know" />
+            <span class="otp-token otp-me">only you know it</span>
+            <div class="otp-field otp-me"><input id="otpPass" type="password" autocomplete="off" placeholder="unlocks the selected pad" /></div>
+            <div id="otpUnlocked" class="otp-unlocked" hidden>
+              <span class="otp-unlocked-text" role="status">Unlocked for this session</span>
+              <button id="otpLock" type="button" class="ghost">Lock</button>
+            </div>
             <details class="why">
               <summary><span class="vh">What the pad passphrase does</span></summary>
               <div>Encrypts this pad on this device, and unlocks it to use. It is
                 asked again each session.</div>
             </details>
           </div>
-          <p class="hint" id="otpStatus">Generate a pad, or import one your contact gave you in person.</p>
-
-          <details id="otpTools" class="disclosure">
-            <summary>Generate / share a pad</summary>
-
-            <div class="otp-sub">
-              <div class="qline hint">
-                <p>Generate on one device and hand the file over in person.</p>
-                <details class="why">
-                  <summary><span class="vh">How to hand a pad over</span></summary>
-                  <div>
-                    <p>Export the encrypted file and give it to your contact in person
-                      (Bluetooth, USB, QR…); they import it. A pad is a shared secret for
-                      exactly two devices — never import it on more than one.</p>
-                    <p>Drawing in the box folds your own physical randomness into the
-                      pad. It is optional: the OS random generator is used regardless.</p>
-                  </div>
-                </details>
-              </div>
-              <div class="row">
-                <label for="otpSize">Pad size</label>
-                <select id="otpSize"></select>
-              </div>
-              <div class="row">
-                <label for="otpLabel">Label</label>
-                <input id="otpLabel" type="text" inputmode="latin" autocomplete="off"
-                       spellcheck="false" maxlength="60" placeholder="e.g. Alice ↔ Bob 2026" />
-              </div>
-              <canvas id="otpEntropy" width="320" height="90" class="otp-entropy" aria-label="draw here to add entropy"></canvas>
-              <p class="hint" id="otpEntropyStatus">Entropy from drawing: none yet.</p>
-              <div class="row">
-                <button id="otpGenerate" type="button">Generate pad</button>
-              </div>
-            </div>
-
-            <div class="otp-sub">
-              <div class="qline hint">
-                <p>Import on one device only — never the same pad twice.</p>
-                <details class="why">
-                  <summary><span class="vh">Why only one device?</span></summary>
-                  <div>
-                    <p>A pad may be imported on only ONE device per side. Importing the
-                      same file on more than one device causes catastrophic key reuse —
-                      generate a separate pad for each contact.</p>
-                    <p>The transfer passphrase protects the file: agree on it in person,
-                      and make it different from your pad passphrase.</p>
-                  </div>
-                </details>
-              </div>
-              <label for="otpXferPass">Transfer passphrase</label>
-              <input id="otpXferPass" type="password" autocomplete="off" placeholder="a DIFFERENT secret" />
-              <div class="row inline wrap">
-                <button id="otpExport" type="button">Export selected pad…</button>
-                <button id="otpImport" type="button">Import pad file…</button>
-              </div>
-              <input id="otpFile" type="file" accept="application/json,.json,.txt" aria-label="One-time pad file" hidden />
-            </div>
-          </details>
+          <div class="otp-actions" id="otpActions">
+            <button id="otpNewOpen" type="button" class="otp-new-open" aria-haspopup="dialog">New pad</button>
+            <button id="otpExportOpen" type="button" class="otp-export-open" aria-haspopup="dialog">Export</button>
+            <button id="otpImportOpen" type="button" class="otp-import-open" aria-haspopup="dialog">Import</button>
+          </div>
+          <p class="hint otp-note" id="otpExportNote" hidden>Received pad — only its maker can export it.</p>
+          <p class="hint" id="otpStatus"></p>
         </div>
 
         <div class="row inline connect-row">
@@ -695,6 +666,300 @@
     </div>
     <div class="contact-remove-row">
       <button id="contactRemove" type="button" class="danger">Remove</button>
+    </div>
+  </section>
+
+  <!-- One-time pad sheets: New pad, Export, Import (otp-transfer-brief.md
+       § Design decisions). The contact sheet's mechanics: a bottom sheet on a
+       phone, a centred dialog wider up, over one shared scrim; ×, Escape or
+       the scrim close it — except while it works (a KDF cannot be stopped).
+       Every action of a state sits in the bottom row (.otp-bar); app.js
+       shows the ones the sheet's `data-state` needs. -->
+  <div id="otpScrim" class="scrim" hidden></div>
+
+  <section class="sheet otp-sheet" id="otpNewSheet" role="dialog" aria-modal="true"
+           aria-labelledby="otpNewTitle" tabindex="-1" data-state="form" hidden>
+    <div class="otp-head">
+      <div class="otp-head-text">
+        <p class="overline">One-time pad</p>
+        <h2 class="otp-title" id="otpNewTitle">New pad</h2>
+        <p class="otp-lede">Made on this device, then exported to your contact.</p>
+      </div>
+      <button id="otpNewClose" type="button" class="ghost otp-close" aria-label="Close">×</button>
+    </div>
+    <div class="otp-form" id="otpNewForm">
+      <ol class="otp-steps otp-plain">
+        <li class="otp-step">
+          <span class="otp-disc" aria-hidden="true">1</span>
+          <p class="otp-step-title">Name and size</p>
+          <div class="otp-step-body">
+            <div class="otp-name-size">
+              <div>
+                <label for="otpLabel">Name</label>
+                <input id="otpLabel" type="text" inputmode="latin" autocomplete="off"
+                       spellcheck="false" maxlength="60" placeholder="e.g. Chess club" />
+              </div>
+              <div>
+                <label for="otpSize">Size, each way</label>
+                <select id="otpSize" aria-describedby="otpSizeHint"></select>
+              </div>
+            </div>
+            <p class="otp-caption otp-size-hint" id="otpSizeHint"></p>
+          </div>
+        </li>
+        <li class="otp-step">
+          <span class="otp-disc" aria-hidden="true">2</span>
+          <p class="otp-step-title">Your own passphrase for this device</p>
+          <div class="otp-step-body">
+            <div class="row why-row otp-fieldrow">
+              <label for="otpNewPass">Pad passphrase</label>
+              <span class="otp-token otp-me">only you know it</span>
+              <div class="otp-field otp-me"><input id="otpNewPass" type="password" autocomplete="off"
+                   placeholder="a passphrase only you know" aria-describedby="otpNewPassWarn" /></div>
+              <p class="otp-warn" id="otpNewPassWarn"></p>
+            </div>
+          </div>
+        </li>
+      </ol>
+      <div class="otp-draw">
+        <div class="qline">
+          <p class="otp-draw-title">Draw anything <span class="otp-muted">— optional</span></p>
+          <details class="why">
+            <summary><span class="vh">What drawing does</span></summary>
+            <div>Drawing in the box folds your own physical randomness into the
+              pad. It is optional: the OS random generator is used regardless.</div>
+          </details>
+        </div>
+        <canvas id="otpEntropy" width="320" height="96" class="otp-entropy" aria-label="draw here to add entropy"></canvas>
+        <p class="vh" id="otpEntropyStatus">Entropy from drawing: none yet.</p>
+      </div>
+    </div>
+    <div class="otp-progress" id="otpNewProgress" role="status" tabindex="-1" hidden>
+      <span class="otp-track" aria-hidden="true"></span>
+      <p class="otp-progress-text" id="otpNewProgressText">Encrypting the pad on this device…</p>
+      <p class="otp-caption">Keep this open — a few seconds.</p>
+    </div>
+    <div class="otp-done" id="otpNewDoneBlock" hidden>
+      <div class="otp-done-head">
+        <span class="otp-done-disc ok" aria-hidden="true"></span>
+        <p class="otp-done-title">Pad created</p>
+      </div>
+      <div class="otp-padcard">
+        <span class="otp-tile" aria-hidden="true"></span>
+        <span class="otp-padcard-text">
+          <span class="otp-padcard-label" id="otpNewPadLabel"></span>
+          <span class="otp-padcard-meta" id="otpNewPadMeta"></span>
+        </span>
+      </div>
+      <div class="otp-weak" id="otpNewWeak" hidden>
+        <p>Weak pad passphrase — accepted.</p>
+        <details class="why">
+          <summary><span class="vh">Why is it weak?</span></summary>
+          <div id="otpNewWeakWhy"></div>
+        </details>
+      </div>
+    </div>
+    <p class="otp-status" id="otpNewStatus" aria-live="polite" tabindex="-1"></p>
+    <div class="otp-bar">
+      <button id="otpGenerate" type="button" class="primary">Create pad</button>
+      <button id="otpNewToExport" type="button" class="primary otp-export-icon" hidden>Export to your contact</button>
+      <button id="otpNewLater" type="button" class="ghost" hidden>Later</button>
+    </div>
+  </section>
+
+  <section class="sheet otp-sheet" id="otpExportSheet" role="dialog" aria-modal="true"
+           aria-labelledby="otpExportTitle" tabindex="-1" data-state="form" hidden>
+    <div class="otp-head">
+      <div class="otp-head-text">
+        <p class="overline">One-time pad</p>
+        <h2 class="otp-title" id="otpExportTitle">Export to your contact</h2>
+        <div class="qline otp-lede">
+          <p>Give this file to one person, for one device.</p>
+          <details class="why">
+            <summary><span class="vh">How to hand a pad over</span></summary>
+            <div>Export the encrypted file and give it to your contact in person
+              (Bluetooth, USB, Quick Share…); they import it. A pad is a shared
+              secret for exactly two devices — never import it on more than one.</div>
+          </details>
+        </div>
+      </div>
+      <button id="otpExportClose" type="button" class="ghost otp-close" aria-label="Close">×</button>
+    </div>
+    <div class="otp-done" id="otpExportDoneBlock" hidden>
+      <div class="otp-done-head">
+        <span class="otp-done-disc" id="otpExportDoneDisc" aria-hidden="true"></span>
+        <div class="otp-done-text">
+          <p class="otp-done-title" id="otpExportDoneTitle"></p>
+          <p class="otp-file-name mono" id="otpExportDoneFile" hidden></p>
+          <p class="otp-caption" id="otpHanded"></p>
+          <p class="otp-caption otp-delete" id="otpExportDelete">Once they've imported it, delete the file on both devices.</p>
+          <div class="otp-weak" id="otpExportWeak" hidden>
+            <p>Weak transfer passphrase — accepted.</p>
+            <details class="why">
+              <summary><span class="vh">Why is it weak?</span></summary>
+              <div id="otpExportWeakWhy"></div>
+            </details>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="otp-padcard" id="otpExportPadCard">
+      <span class="otp-tile" aria-hidden="true"></span>
+      <span class="otp-padcard-text">
+        <span class="otp-padcard-label" id="otpExportPadLabel"></span>
+        <span class="otp-padcard-meta"><span id="otpExportPadMeta"></span><span id="otpExportPadWarn" hidden> · <span class="otp-meta-warn">exported before</span></span></span>
+      </span>
+    </div>
+    <ol class="otp-steps" id="otpExportSteps">
+      <li class="otp-step" id="otpExportStep1">
+        <span class="otp-disc" aria-hidden="true">1</span>
+        <p class="otp-step-title"><span id="otpExportStep1Title">Agree on a transfer passphrase — in person</span><span class="vh otp-vh-done"> — done</span></p>
+        <div class="otp-step-body">
+          <div class="row why-row otp-fieldrow" id="otpXferRow">
+            <label for="otpXferPass">Transfer passphrase</label>
+            <span class="otp-token otp-both">you both know it</span>
+            <div class="otp-field otp-both"><input id="otpXferPass" type="password" autocomplete="off"
+                 placeholder="not your pad passphrase" aria-describedby="otpXferWarn" /></div>
+            <p class="otp-warn otp-warn-box" id="otpXferWarn"></p>
+            <details class="why">
+              <summary><span class="vh">What the transfer passphrase does</span></summary>
+              <div>The transfer passphrase protects the file: agree on it in person,
+                and make it different from your pad passphrase.</div>
+            </details>
+          </div>
+        </div>
+      </li>
+      <li class="otp-step" id="otpExportStep2">
+        <span class="otp-disc" aria-hidden="true">2</span>
+        <p class="otp-step-title"><span id="otpExportStep2Title">Create the file</span><span class="vh otp-vh-done"> — done</span></p>
+        <div class="otp-step-body">
+          <p class="otp-caption otp-file-caption" id="otpExportStep2Caption" hidden></p>
+          <div class="otp-progress" id="otpExportProgress" role="status" tabindex="-1" hidden>
+            <span class="otp-track" aria-hidden="true"></span>
+            <p class="otp-progress-text" id="otpExportProgressText">Encrypting the file…</p>
+            <p class="otp-caption">Keep this open — a few seconds.</p>
+          </div>
+        </div>
+      </li>
+      <li class="otp-step" id="otpExportStep3">
+        <span class="otp-disc" aria-hidden="true">3</span>
+        <p class="otp-step-title"><span>Hand it over</span><span class="vh otp-vh-done"> — done</span></p>
+        <div class="otp-step-body">
+          <p class="otp-caption" id="otpExportStep3Caption">Give it to them face to face.</p>
+          <!-- Owner (2026-09-27, cold r2 MA-4): a weak transfer passphrase stays
+               warn-never-block, but the warning stands where the file leaves. -->
+          <p class="otp-warn otp-warn-box" id="otpExportReadyWeak" hidden>Weak transfer passphrase: whoever gets a copy of this file can try to guess it. Hand it over face to face — not through a messenger or a cloud drive.</p>
+        </div>
+      </li>
+    </ol>
+    <div class="otp-theirs" id="otpExportTheirs" hidden>
+      <p class="overline">On their device: One-time pad → Import</p>
+      <ul class="otp-theirs-list">
+        <li class="otp-both">the transfer passphrase — tell them, never send it</li>
+        <li class="otp-me">a pad passphrase of their own</li>
+        <li class="otp-file">this file</li>
+      </ul>
+    </div>
+    <p class="otp-status" id="otpExportStatus" aria-live="polite" tabindex="-1"></p>
+    <div class="otp-bar">
+      <button id="otpExportCancel" type="button" hidden>Don't export</button>
+      <button id="otpExport" type="button" class="primary">Create transfer file</button>
+      <button id="otpShare" type="button" class="primary otp-share-icon" hidden>Share…</button>
+      <button id="otpSave" type="button" class="otp-save-icon" hidden>Save to device</button>
+      <button id="otpExportDone" type="button" class="primary" hidden>Done</button>
+      <button id="otpSendAgain" type="button" class="ghost otp-again" hidden></button>
+    </div>
+  </section>
+
+  <section class="sheet otp-sheet" id="otpImportSheet" role="dialog" aria-modal="true"
+           aria-labelledby="otpImportTitle" tabindex="-1" data-state="form" hidden>
+    <div class="otp-head">
+      <div class="otp-head-text">
+        <p class="overline">One-time pad</p>
+        <h2 class="otp-title" id="otpImportTitle">Import a pad</h2>
+        <div class="qline otp-lede">
+          <p>Import it on one device only.</p>
+          <details class="why">
+            <summary><span class="vh">Why only one device?</span></summary>
+            <div>A pad may be imported on only ONE device per side. Importing the
+              same file on more than one device causes catastrophic key reuse —
+              generate a separate pad for each contact.</div>
+          </details>
+        </div>
+      </div>
+      <button id="otpImportClose" type="button" class="ghost otp-close" aria-label="Close">×</button>
+    </div>
+    <ol class="otp-steps" id="otpImportSteps">
+      <li class="otp-step" id="otpImportStep1">
+        <span class="otp-disc" aria-hidden="true">1</span>
+        <p class="otp-step-title">The passphrase you agreed on</p>
+        <div class="otp-step-body">
+          <div class="row why-row otp-fieldrow" id="otpImportXferRow">
+            <label for="otpImportXfer">Transfer passphrase</label>
+            <span class="otp-token otp-both">you both know it</span>
+            <div class="otp-field otp-both"><input id="otpImportXfer" type="password" autocomplete="off"
+                 placeholder="the one you chose together" /></div>
+            <p class="otp-field-err" id="otpImportXferErr" hidden>Check this one — it must match your contact's.</p>
+          </div>
+        </div>
+      </li>
+      <li class="otp-step" id="otpImportStep2">
+        <span class="otp-disc" aria-hidden="true">2</span>
+        <p class="otp-step-title">Your own passphrase for this device</p>
+        <div class="otp-step-body">
+          <div class="row why-row otp-fieldrow">
+            <label for="otpImportPass">Pad passphrase</label>
+            <span class="otp-token otp-me">only you know it</span>
+            <div class="otp-field otp-me"><input id="otpImportPass" type="password" autocomplete="off"
+                 placeholder="a new one — not the one above" aria-describedby="otpImportPassWarn" /></div>
+            <p class="otp-warn" id="otpImportPassWarn"></p>
+          </div>
+        </div>
+      </li>
+      <li class="otp-step" id="otpImportStep3">
+        <span class="otp-disc" aria-hidden="true">3</span>
+        <p class="otp-step-title">Choose the file</p>
+        <div class="otp-step-body">
+          <p class="otp-caption otp-file-caption" id="otpImportStep3Caption">Usually in Downloads.</p>
+          <!-- Quick Share and Bluetooth often deliver the file as
+               application/octet-stream, so the picker is not narrowed to JSON;
+               importPad checks what it is. -->
+          <input id="otpFile" type="file" accept="application/json,.json,.txt,application/octet-stream,text/plain" aria-label="One-time pad file" hidden />
+          <div class="otp-progress" id="otpImportProgress" role="status" tabindex="-1" hidden>
+            <span class="otp-track" aria-hidden="true"></span>
+            <p class="otp-progress-text">Opening the file and encrypting it on this device…</p>
+            <p class="otp-caption">Keep this open — a few seconds.</p>
+          </div>
+        </div>
+      </li>
+    </ol>
+    <div class="otp-done" id="otpImportDoneBlock" hidden>
+      <div class="otp-done-head">
+        <span class="otp-done-disc ok" aria-hidden="true"></span>
+        <p class="otp-done-title">Pad imported</p>
+      </div>
+      <div class="otp-padcard">
+        <span class="otp-tile" aria-hidden="true"></span>
+        <span class="otp-padcard-text">
+          <span class="otp-padcard-label" id="otpImportPadLabel"></span>
+          <span class="otp-padcard-meta" id="otpImportPadMeta"></span>
+        </span>
+      </div>
+      <p class="otp-caption otp-delete">Delete the pad file now.</p>
+      <p class="otp-caption">It is selected. Agree on a chat code with your contact, then Connect.</p>
+      <div class="otp-weak" id="otpImportWeak" hidden>
+        <p>Weak pad passphrase — accepted.</p>
+        <details class="why">
+          <summary><span class="vh">Why is it weak?</span></summary>
+          <div id="otpImportWeakWhy"></div>
+        </details>
+      </div>
+    </div>
+    <p class="otp-status" id="otpImportStatus" aria-live="polite" tabindex="-1"></p>
+    <div class="otp-bar">
+      <button id="otpImportRetry" type="button" class="primary" hidden>Try again</button>
+      <button id="otpImport" type="button" class="primary">Choose pad file…</button>
+      <button id="otpImportDone" type="button" class="primary" hidden>Done</button>
     </div>
   </section>
 
