@@ -117,8 +117,10 @@ Spec: `design/research/reviews/otp-transfer-brief.md` 5, 6, 9. Code:
   `error`) comes back through `window.__SECURE_CHAT_FILES_RESULT__(id,
   outcome)`, evaluated by the shell from our own hex id and a constant.
 - **Validated natively**, whatever the page checked: the name must be exactly
-  `secure-chat-pad-YYYY-MM-DD-HHMM.json` (ASCII digits — on Android `\d` is
-  ICU's, which admits any Unicode digit), the text at most 4 MiB and exactly
+  `secure-chat-pad-YYYY-MM-DD-HHMM.json` (ASCII digits; checked against a
+  template character by character, not by a regex, whose `\d` would mean
+  ASCII in the JVM tests but any Unicode digit on the device's ICU — cold
+  critic r2 mi-7), the text at most 4 MiB and exactly
   the envelope `exportPad()` writes: the same literals and key order,
   `iters` exactly otp.js's `KDF_ITERS` (600000), salt 16 and iv 12 bytes of
   btoa base64, `ct` base64 of btoa's alphabet, length and padding (the tail
@@ -189,26 +191,35 @@ Spec: `design/research/reviews/otp-transfer-brief.md` 5, 6, 9. Code:
   only if it is `content://` from another app's provider — never `file://`
   (which `ContentResolver` would open directly, app-private files included),
   never our own `FileProvider`. DocumentsUI only returns such URIs, so this
-  refuses nothing real. The check uses the URI's host, not its authority:
-  `content://0@org.securechat.app.files/…` names our provider once
-  `ContentResolver` strips the user id (pentest r2 R2-5); a user id on a
-  FOREIGN provider stays allowed (that is how a work-profile document comes
-  back).
+  refuses nothing real. The check uses the authority exactly as
+  `ContentResolver` routes it: decoded, with everything up to the last `@`
+  (the user id) removed. `content://0@org.securechat.app.files/…` (pentest r2
+  R2-5) and `content://0%40org.securechat.app.files/…` (r3 R3-1: the r2 fix
+  used the host, which splits on `@` before decoding) both name our provider
+  and are refused. A user id on a FOREIGN provider stays allowed — that is how
+  a work-profile document comes back (tested).
 - **Configuration changes** (cold critic mi-5): a recreated activity reloads
   the page — the unlocked identity, live chats and a pad file waiting in the
   export sheet are gone, the pad already latched as exported. So
   `MainActivity` takes every configuration change it can in place
   (`configChanges`: orientation, screen size and layout, smallest width,
   density, keyboard, navigation, touchscreen, uiMode, locale, layout
-  direction, font scale, color mode, mcc/mnc, grammatical gender). Nothing is
-  inflated per configuration (no `-night`/`-land` resources; the page has one
-  theme and does its own layout), so the only cost is that the native bar's
-  two strings follow a locale switch at the next start. **What still reloads
-  the page:** process death — the system reclaiming the app while the share
-  sheet or save dialog is in front. The user then comes back to a fresh start
-  (identity locked); the pad is latched as exported, so the next Export asks
-  the "export again" confirm, and a save dialog that was open may leave an
-  empty file where the user put it (the shell never deletes documents).
+  direction, font scale, bold text (`fontWeightAdjustment`, pentest r3
+  R3-2), color mode, mcc/mnc, grammatical gender). Nothing is inflated per
+  configuration (no `-night`/`-land` resources; the page has one theme and
+  does its own layout), so the only cost is that the native bar's two strings
+  follow a locale switch at the next start. **What still reloads the page:**
+  (a) process death — the system reclaiming the app while the share sheet or
+  save dialog is in front; (b) a change no manifest flag can take: a system
+  theme / resource-overlay change, such as a Material You wallpaper-colour
+  change on Android 12+ (an assets-path change, `CONFIG_ASSETS_PATHS`, which
+  is not declarable; pentest r3 R3-2 showed the recreation in Robolectric —
+  on the device it is expected but not yet verified, see the checklist);
+  (c) an app update or force-stop. In each case the user comes back to a
+  fresh page (identity locked); the pad is latched as exported, so the next
+  Export asks the "export again" confirm, and a save dialog that was open may
+  leave an empty file where the user put it (the shell never deletes
+  documents).
 - **Import**: `onShowFileChooser` → `ACTION_OPEN_DOCUMENT`,
   `CATEGORY_OPENABLE`, `*/*` (Quick Share and Bluetooth often deliver a .json
   as `application/octet-stream`), one document, no persisted permission. The
@@ -322,8 +333,8 @@ The bundled web client is **generated at build time** from `../client` by the
   nothing, and a second tap opens the picker again. (4) While the file is
   ready, the close confirm is black in a screen recording (`secureShow`).
   (5) Debug build: after a share, `adb shell run-as org.securechat.app ls -R
-  cache/pad-share` lists one `<id>/secure-chat-pad-….json` (two after "Send it
-  again"); ten minutes after the share (app left open, shared or cancelled)
+  cache/pad-share` lists one `<id>/secure-chat-pad-….json` (two after "Didn't
+  arrive? Send the same file again"); ten minutes after the share (app left open, shared or cancelled)
   it is empty; after a force-stop and a restart more than ten minutes later
   it is empty, and after a restart within the ten minutes it empties when
   they are up. Switch dark mode and split-screen with the file-ready sheet
@@ -336,3 +347,14 @@ The bundled web client is **generated at build time** from `../client` by the
   the target must no longer be able to open its URI. (6) Android Back closes an open sheet (the client pushes a history
   entry; `onBackPressed` calls `webview.goBack()` while `canGoBack()`)
   instead of leaving the app, and does not dismiss a working sheet.
+  **Back twice during a KDF** (New pad's "Create pad", Export's "Create
+  transfer file", Import's work): the pad stays in the working sheet, the
+  sheet finishes normally, and the app does not close. **Back during the
+  Export entry's unlock** ("Unlocking…" on the panel's Export button): no
+  sheet opens behind it, the app does not close, and the next Back still
+  closes a sheet. (7) With the export sheet in file-ready: toggle Settings →
+  Accessibility → Bold text — the sheet stays (no reload); then change the
+  wallpaper so Material You recolours the system (Android 12+) — expected to
+  reload the page (identity locked, the sheet gone); note what happens. (8)
+  Import a file picked from the work profile, if the phone has one: it must
+  be accepted.
