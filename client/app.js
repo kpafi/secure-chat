@@ -3980,6 +3980,54 @@ async function finishSession(room) {
   }
 }
 
+// Phase 1's hello. In OTP it also carries our pad check tag (MA-2).
+async function helloFrame(room, reply) {
+  const hello = { hello: true, n: myNonce, reply };
+  if (sessionAlg === "OTP") hello.pt = await cipher.padCheckTag(myNonce);
+  return JSON.stringify({ type: "key", room, alg: sessionAlg, payload: packKey(hello) });
+}
+
+// Cold critic r2 MA-2: two people on DIFFERENT pads (both pressed New pad and
+// called it "Chess") both saw "Ready", then every message arrived as
+// undecryptable and every send spent pad bytes. The peer's hello now carries
+// a tag only a holder of the same pad can make (crypto.js, OTP_CHECK_DOMAIN).
+// It is checked before the session unlocks, so a refusal spends nothing: Send
+// was never enabled and no pad byte was drawn. Judged only BEFORE the session
+// is ready (the caller's `!verified`). After that, a hello a relay injects
+// must not close the session and blame the pads.
+//
+// A peer on 0.4.0 sends no tag. It is let through with one line, because the
+// check is a convenience and the one-time HMAC still refuses every frame from
+// a different pad. A relay that strips the tag gets back only the state
+// before this check.
+async function otpPadCheck(p, sock, live) {
+  if (p.pt === undefined) {
+    addLine("sys", "", "[the other side runs an older version and cannot confirm that you both picked the same pad — " +
+      "if its messages arrive as undecryptable, you are on different pads]", true);
+    return true;
+  }
+  const verdict = await cipher.checkPeerPadTag(p.n, p.pt);
+  if (!live()) return false;
+  if (verdict === "match") return true;
+  const nothing = " Nothing was sent and no pad was used.";
+  if (verdict === "same-side") {
+    addLine("sys", "", "[your contact's device holds the same half of this pad as yours — refusing]", true);
+    closeWs("Your contact's device holds the same half of this pad as yours, so both of you would encrypt " +
+      "with the same key bytes. The pad was set up twice on one side. Make a fresh pad and exchange it in person." +
+      nothing, sock);
+  } else if (verdict === "mismatch") {
+    const mine = otpRecord ? `"${otp.cleanPadLabel(otpRecord.label) || "pad"}" (${otpRecord.role === 0 ? "you generated" : "from your contact"})` : "a pad";
+    addLine("sys", "", "[you and your contact picked different pads — refusing]", true);
+    closeWs(`You and your contact picked different pads. This device used ${mine}. ` +
+      "One of you must pick the pad they generated, the other the same pad from their contact — " +
+      "check the pad names on both devices." + nothing, sock);
+  } else {
+    addLine("sys", "", "[the other side's pad check is malformed — refusing]", true);
+    closeWs("The pad check from the other side is malformed — the relay may be tampering with the connection." + nothing, sock);
+  }
+  return false;
+}
+
 async function handleMessage(room, raw, sock) {
   // Package 2, item 3 (F-PROTO-002). Every refusal in this function ends in
   // closeWs(), which only CLOSES: frames the relay batched behind the refused
@@ -4168,11 +4216,12 @@ async function handleMessage(room, raw, sock) {
       // signed handshake follows once we also know the peer's nonce; for
       // AES256 (usesNonces, no key material on the wire) the nonces alone fix
       // the session's ratchet chains, closing cross-session frame replay.
-      sock.send(JSON.stringify({
-        type: "key", room, alg: sessionAlg,
-        payload: packKey({ hello: true, n: myNonce, reply: false }),
-      }));
+      // (Said before the hello is built: in OTP that awaits the pad check tag,
+      // and the screen should not change later than it did without one.)
       hint("Waiting for the other party to join / exchange keys…");
+      const hello = await helloFrame(room, false);
+      if (!live()) return;
+      sock.send(hello);
       break;
     }
 
@@ -4223,10 +4272,9 @@ async function handleMessage(room, raw, sock) {
           if (peerNonce === null) peerNonce = p.n;
           if (!p.reply && !helloAnswered) {
             helloAnswered = true;
-            sock.send(JSON.stringify({
-              type: "key", room, alg: sessionAlg,
-              payload: packKey({ hello: true, n: myNonce, reply: true }),
-            }));
+            const answer = await helloFrame(room, true);
+            if (!live()) return;
+            sock.send(answer);
             if (cipher.needsHandshake) await sendSignedKey(room, false, sock, live);
             if (!live()) return;
           }
@@ -4240,7 +4288,9 @@ async function handleMessage(room, raw, sock) {
           } else if (!cipher.needsHandshake && !cipher.usesNonces && !verified) {
             // OTP: no key material and no nonces — the pre-shared pad IS the
             // out-of-band secret (like AES256's passphrase), so seeing the peer
-            // join is enough to unlock messaging.
+            // join is enough to unlock messaging — once its hello shows that it
+            // holds the other half of the same pad (MA-2, otpPadCheck).
+            if (!(await otpPadCheck(p, sock, live))) return;
             await onChannelReady(room);
           }
           break;

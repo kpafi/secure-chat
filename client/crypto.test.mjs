@@ -650,6 +650,78 @@ async function otpChecks() {
   console.log("OK  OTP round-trip, replay/tamper/reflection/forgery rejected, exhaustion + FS zeroing");
 }
 
+// Cold critic r2 MA-2: the pad check each OTP hello carries. The tag is
+// pinned against an INDEPENDENT computation of the construction, so a change
+// to the domain, the key or the fields cannot stay symmetric and pass: two
+// builds that disagree on it would refuse each other as "different pads".
+async function otpPadCheckChecks() {
+  const regionSize = 4096;
+  const padId = "0123456789abcdef0123456789abcdef";
+  const otherId = "fedcba9876543210fedcba9876543210";
+  const bytes = crypto.getRandomValues(new Uint8Array(2 * regionSize));
+  const view = (role, over = {}) => makeCipher("OTP", ROOM, {
+    pad: { padId, bytes: bytes.slice(), role, regionSize, sendOffset: 0, recvHighWater: 0, ...over },
+  });
+  const nA = Buffer.alloc(32, 1).toString("base64");
+  const nB = Buffer.alloc(32, 2).toString("base64");
+
+  // Known answer: HMAC-SHA256(key = the 16 padId bytes,
+  // "secure-chat/otp-pad-check/v1|<room>|<role>|<nonce>"), first 16 bytes.
+  const expect = async (id, room, role, n) => {
+    const key = await crypto.subtle.importKey("raw", Buffer.from(id, "hex"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`secure-chat/otp-pad-check/v1|${room}|${role}|${n}`));
+    return Buffer.from(mac).subarray(0, 16).toString("base64");
+  };
+  const a = view(0);
+  const b = view(1);
+  assert.strictEqual(await a.padCheckTag(nA), await expect(padId, ROOM, 0, nA), "pad check: role 0's tag is the pinned construction");
+  assert.strictEqual(await b.padCheckTag(nB), await expect(padId, ROOM, 1, nB), "pad check: role 1's tag is the pinned construction");
+  assert.strictEqual((await a.padCheckTag(nA)).length, 24, "pad check: 16 bytes, 24 base64 characters");
+
+  // Both halves of one pad accept each other, in both directions.
+  assert.strictEqual(await b.checkPeerPadTag(nA, await a.padCheckTag(nA)), "match", "pad check: B accepts A");
+  assert.strictEqual(await a.checkPeerPadTag(nB, await b.padCheckTag(nB)), "match", "pad check: A accepts B");
+  // A different pad (the MA-2 walk: both made their own "Chess").
+  const stranger = makeCipher("OTP", ROOM, { pad: { padId: otherId, bytes: bytes.slice(), role: 1, regionSize, sendOffset: 0, recvHighWater: 0 } });
+  assert.strictEqual(await a.checkPeerPadTag(nB, await stranger.padCheckTag(nB)), "mismatch", "pad check: a different pad is a mismatch");
+  // The same pad and the same role on both sides: named apart.
+  assert.strictEqual(await a.checkPeerPadTag(nB, await view(0).padCheckTag(nB)), "same-side", "pad check: our own half on the other side is same-side");
+  assert.strictEqual(await b.checkPeerPadTag(nA, await view(1).padCheckTag(nA)), "same-side", "pad check: …for role 1 too");
+  // Bound to the room and to the hello's nonce.
+  const elsewhere = makeCipher("OTP", "c".repeat(64), { pad: { padId, bytes: bytes.slice(), role: 1, regionSize, sendOffset: 0, recvHighWater: 0 } });
+  assert.strictEqual(await a.checkPeerPadTag(nB, await elsewhere.padCheckTag(nB)), "mismatch", "pad check: a tag from another room does not match");
+  assert.strictEqual(await a.checkPeerPadTag(nA, await b.padCheckTag(nB)), "mismatch", "pad check: a tag over another nonce does not match");
+  assert.notStrictEqual(await a.padCheckTag(nA), await a.padCheckTag(nB), "pad check: a new session nonce, a new tag (nothing to link)");
+  // Every byte counts: a genuine tag with any one byte changed is a mismatch.
+  {
+    const good = Buffer.from(await b.padCheckTag(nB), "base64");
+    for (let i = 0; i < 16; i++) {
+      const t = Buffer.from(good);
+      t[i] ^= 0x80;
+      assert.strictEqual(await a.checkPeerPadTag(nB, t.toString("base64")), "mismatch", `pad check: byte ${i} changed is a mismatch`);
+    }
+  }
+  // Malformed input from the wire is a verdict, never a throw.
+  for (const bad of [undefined, null, 7, "", "AAAA", "A".repeat(23) + "=", "x".repeat(24), Buffer.alloc(18).toString("base64")]) {
+    assert.strictEqual(await a.checkPeerPadTag(nB, bad), "malformed", `pad check: ${JSON.stringify(bad)} is malformed`);
+  }
+  assert.strictEqual(await a.checkPeerPadTag(42, await b.padCheckTag(nB)), "malformed", "pad check: a non-string nonce is malformed");
+  // No pad byte is drawn: offsets and bytes are untouched.
+  const pad = bytes.slice();
+  const c = makeCipher("OTP", ROOM, { pad: { padId, bytes: pad, role: 0, regionSize, sendOffset: 0, recvHighWater: 0 } });
+  await c.checkPeerPadTag(nB, await b.padCheckTag(nB));
+  await c.padCheckTag(nA);
+  assert.ok(c.sendOffset === 0 && c.recvHighWater === 0 && Buffer.compare(pad, bytes) === 0, "pad check: spends no pad bytes");
+  // Without a padId there is nothing to check against: a caller bug, loud.
+  const bare = makeCipher("OTP", ROOM, { pad: { bytes: bytes.slice(), role: 0, regionSize, sendOffset: 0, recvHighWater: 0 } });
+  await assert.rejects(() => bare.padCheckTag(nA), /no id/, "pad check: no padId, no tag");
+  await assert.rejects(() => bare.checkPeerPadTag(nB, "A".repeat(22) + "=="), /no id/, "pad check: no padId, no verdict");
+  for (const badId of ["", "0123", padId.toUpperCase(), padId + "00", 5, null]) {
+    assert.throws(() => view(0, { padId: badId }), /invalid pad id/, `pad check: padId ${JSON.stringify(badId)} is refused`);
+  }
+  console.log("OK  MA-2: the OTP pad check tag (pinned construction; match / mismatch / same-side / malformed; room- and nonce-bound; spends nothing)");
+}
+
 await roundtripShared();
 await roundtripHandshake("DHKE");
 await roundtripHandshake("PQKEM");
@@ -667,6 +739,7 @@ await concurrencyChecks("DHKE");
 await concurrencyChecks("PQKEM");
 otpChecksOffsetValidation();
 await otpChecks();
+await otpPadCheckChecks();
 await ratchetSkipBoundChecks();
 await aesEqualNonceChecks();
 await aeadParameterChecks();

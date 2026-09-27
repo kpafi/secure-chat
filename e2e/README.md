@@ -17,6 +17,7 @@ node e2e/contact-profile.mjs    #            — a saved user's short profile (s
 node e2e/all-modes.mjs          #            — all four encryption modes, both directions
 node e2e/otp-transfer.mjs       #            — the one-time pad sheets: New pad, Export, Import (+ an Android stand-in)
 node e2e/otp-held-join.mjs      #            — OTP sheets while a (proxied) relay holds the join: knock guard, self-close advice
+node e2e/otp-pad-check.mjs      #            — two people on different pads are refused at connect, nothing spent (MA-2)
 node e2e/screenshots.mjs <dir>  #            — every screen at phone + desktop size, for design review
 node e2e/durable-crash.mjs      #            — SIGKILL after an OTP send; the pad must not reopen at a spent offset (~2 min)
 ```
