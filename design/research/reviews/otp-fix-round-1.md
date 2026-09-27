@@ -203,3 +203,34 @@ mutants, one at a time, each reverted (`git diff` clean after each).
 | I-2: the maker's label unvalidated, now in a native confirm | **Fixed**: `cleanPadLabel` — control, bidi-control and line/paragraph-separator characters → spaces, collapsed, ≤ 60 code points (= `#otpLabel`'s maxlength). Applied at import and generate, and at display in the Forget confirm and the pad list (the index is unauthenticated; older imports kept raw labels). The file format is unchanged | K8 (raw label at import), K9 (no cap) → "I-2: an imported label is capped at 60…"; K6 (raw label in the confirm) → "I-2: the confirm names the pad without line breaks, bidi overrides or control characters" |
 | I-3: `otpHistOnTop` could not tell a reloaded page's entry from ours | **Fixed** (small, safe): the entry is `{otpSheet: <per-page random token>}` and the check compares the token. A stale entry of an earlier page is never dropped by us; it costs one extra Back, as before | K5 → "I-3: the entry on top is another page's — no back()" |
 | G4, G5 (Android A9, A2) | Android — commit 12253be | |
+
+## Round 4 — Web client
+
+Review: `otp-pentest-r5.md` (nothing Critical, High or Medium). Commits f964f65 (otp.js) and
+a54aa4e (app.js + unit tests). Checked: `npm test` green; e2e on a scratch relay (:8093, killed
+by PID): otp-transfer 196/196, all-modes 28/28, no-dead-ends 17/17, room-admission 49/49. L- and
+M-numbers are hand-run mutants, one at a time, each reverted.
+
+**Correction to Round 3:** the row "R4-1, the `!els.scrRoom.hidden` term alone — equivalent today"
+was **wrong**. The pentester's P2 (Connect on pad A, then Export on locked pad B, `joined` during
+B's unlock) needed that term at 32f1c6c. Since this round the entry refuses at once while a chat
+is connecting or open, and the end of an unlock re-checks the same; the term is now one of three
+layers (busy check at the end of the unlock, the room-screen term, the chat screen closing an idle
+sheet). L4 (the term alone) survives because of the busy check; L3 + L4 together go red.
+
+| Finding | Verdict | Bound by (mutant → red check) |
+| --- | --- | --- |
+| R5-1 (Low): Connect first, then a sheet before `joined`/`pending` → the sheet over the chat | **Fixed, both ways.** (1) While a connect is in flight or the socket is CONNECTING/OPEN, New pad, Import and Export open no sheet and the Export entry refuses before its unlock: "A chat is connecting or open — New pad, Export and Import wait until you disconnect." (2) `showScreen` leaving the room screen closes an idle sheet, as `showView` does | L1 → "R5-1 (P1): otpNewOpen while a chat is connecting opens nothing" (P1/P1b: all three entries); L2 → "P2: … refused at once — no unlock, no entry"; L5 → "R5-1: the chat screen closes an idle sheet" |
+| R5-1: a WORKING sheet when the chat screen comes up | **Decided**: never torn down mid-KDF; when its work ends it closes itself if the room screen is gone. An Android file not yet shared or saved is never closed unasked (it stays; closing would lose it). In a browser this state needs Connect pressed under a sheet, which the inert page prevents; the stub test raises it on purpose | L6 → "…it closes itself once the work ends, the pad made"; the "not torn down mid-KDF" check holds on HEAD |
+| KJ: the room-screen term untested | **Tested as a layer** (see correction) | L4 alone survives (covered by L3's check); L3+L4 → "R4-1: Connect pressed during the unlock wins" |
+| KI: the "elsewhere" mark never reset | **Moot**: the mark is removed; the busy check at the end of the unlock replaces it (it reads the live state, nothing to reset) | L12 (round 3's mark brought back) → "…and its history entry is dropped" |
+| I-5c: a Connect that refuses at once cancelled the Export entry silently | **Fixed** by the same change: nothing is cancelled unless a chat is actually connecting | the P3 test "I-5c: Connect refused at once (bad code) — the Export sheet still opens"; L12 red |
+| KH: a constant token passed | **Test added**: the token must be one of the 8-byte `getRandomValues` draws made while app.js loads | L9 → "KH: … not a constant" |
+| KG: raw label in the pad list | **Test added** (a tampered index, then a list refresh) | L10 → "KG: the pad list shows the cleaned label" |
+| I-5b: raw label on the Export card | **Fixed** (`cleanPadLabel` at the card) | L11 → "I-5b: the Export card shows the cleaned label" |
+| KC: the length refusal's zeroing | **Test added** (tracks the 8000-byte buffer) | M-KC (check moved before the try) → "I-1: length mismatch: … zeroed" |
+| KD / KE: bidi marks and isolates | **Test added** | M-KD/KE (`\p{Cf}` dropped) → red |
+| KF: a UTF-16 cap | **Test added** (59 × "a" + emoji) | M-KF → "KF: … the emoji at the cap stays whole" |
+| I-5a: a denylist; invisible-only labels | **Fixed**: whole categories Cc, Cf, Cs, Co, Cn plus U+2028/9, U+034F, variation selectors, Hangul fillers; an invisible-only label cleans to "" and the default name applies ("imported pad" at import) | M-I5a (`\p{Cs}` dropped) → red; the fallback asserted. The ZWJ (Cf) goes too: an emoji sequence splits into its emoji — cosmetic, accepted |
+| I-5d: `plain` not zeroed on a non-JSON plaintext | **Fixed** (try/finally around the parse) | M-I5d → "I-1: non-JSON plaintext: … zeroed" |
+| KK: raw label at generate | Covered: `cleanPadLabel` runs at generate too (round 3) | — |
