@@ -132,7 +132,15 @@ const bridge = Object.freeze({
 });
 Object.defineProperty(globalThis, "__SECURE_CHAT_FILES__", { value: bridge, writable: false, configurable: false });
 
-await import("./app.js");
+// Fix round 4 (pentest r5 KH): record the 8-byte random draws made while
+// app.js loads — the history token must be one of them (not a constant).
+const draws8 = [];
+{
+  const real = crypto.getRandomValues.bind(crypto);
+  crypto.getRandomValues = (a) => { const r = real(a); if (a && a.length === 8) draws8.push(Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("")); return r; };
+  await import("./app.js");
+  crypto.getRandomValues = real;
+}
 const otp = await import("./otp.js");
 
 const settle = async (n = 40) => { for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 5)); };
@@ -997,6 +1005,146 @@ assert.ok(typeof TOKEN === "string" && TOKEN.length >= 16, "fixture: app.js push
   assert.ok(said && said.startsWith('Delete the pad "Chess OK only hides it evil" from this device?'),
     "I-2: the confirm names the pad without line breaks, bidi overrides or control characters: " + JSON.stringify(said));
   console.log("OK  I-2: the Forget confirm shows the label cleaned");
+}
+
+// ======== fix round 4 (otp-fix-round-1.md, "Round 4") ========
+// ---- pentest r5 KH: the history token is this page's random draw ----------
+assert.ok(draws8.includes(TOKEN), "KH: the history token is a fresh 64-bit random draw of this page load, not a constant");
+console.log("OK  KH: the per-page history token comes from crypto.getRandomValues");
+
+const OTP_CHAT_BUSY = "A chat is connecting or open — New pad, Export and Import wait until you disconnect.";
+const startConnect = async () => {
+  dom.selectAlg("OTP");
+  el("room").value = ROOM; await el("room").dispatch("input");
+  const before = dom.socket();
+  const connecting = el("connect").click();
+  await until(() => dom.socket() !== before, "the socket");
+  const ws = dom.socket();
+  ws.open();
+  await settle(5);
+  return { ws, connecting };
+};
+const endChat = async () => {
+  if (!el("scrChat").hidden || dom.socket().readyState !== 3) await el("disconnect").click();
+  await settle(5);
+  if (el("scrRoom").hidden) await el("toRoom").click();
+};
+
+// ---- pentest r5 R5-1 (P1, P1b): Connect first, then a sheet before the relay answers ----
+{
+  await lockPad(madeId, PADPASS);
+  await openExport(); await el("otpExportClose").click(); // unlocked: Export opens at once
+  await settle(5);
+  const { ws, connecting } = await startConnect();
+  for (const [entry, sheet] of [["otpExportOpen", "otpExportSheet"], ["otpNewOpen", "otpNewSheet"], ["otpImportOpen", "otpImportSheet"]]) {
+    await el(entry).click();
+    assert.ok(!shown(sheet), `R5-1 (P1): ${entry} while a chat is connecting opens nothing`);
+    assert.strictEqual(st.textContent, OTP_CHAT_BUSY, "…and says why");
+  }
+  await ws.deliver({ type: "joined", role: "owner" });
+  await connecting; await settle(5);
+  assert.ok(!el("scrChat").hidden && !el("viewLive").inert, "…the chat screen is up and usable");
+  await endChat();
+  console.log("OK  R5-1 (P1): no sheet opens while a chat is connecting or open");
+}
+
+// ---- pentest r5 P2: Connect on pad A, then Export on locked pad B ------------
+{
+  const B = await otp.generatePad({ label: "padB", totalBytes: 8192, fingerBytes: new Uint8Array(0) });
+  await otp.saveNewPad(B, "pad b passphrase words");
+  await lockPad(madeId, PADPASS);
+  const { ws, connecting } = await startConnect();
+  el("otpSelect").value = B.padId; await el("otpSelect").dispatch("change");
+  el("otpPass").value = "pad b passphrase words";
+  const idx0 = hist.idx;
+  await el("otpExportOpen").click();
+  assert.ok(!shown("otpExportSheet") && !shown("otpUnlocked") && hist.idx === idx0,
+    "P2: Export on another pad while a chat is connecting is refused at once — no unlock, no entry");
+  assert.strictEqual(st.textContent, OTP_CHAT_BUSY, "…and says why");
+  await ws.deliver({ type: "joined", role: "owner" });
+  await connecting; await settle(5);
+  await endChat();
+  console.log("OK  P2: the Export entry refuses while a chat is connecting");
+}
+
+// ---- KJ / R4-1: the relay answers during the Export entry's unlock ----------
+// Three layers stop the sheet here: the busy check at the end of the unlock,
+// the room-screen term, and the chat screen closing an idle sheet; the test
+// holds the outcome (no sheet over the chat), the mutants in the triage show
+// which layer binds on its own.
+{
+  await lockPad(madeId, PADPASS);
+  const idx0 = hist.idx;
+  const opening = el("otpExportOpen").click();
+  const { ws, connecting } = await startConnect();
+  await ws.deliver({ type: "joined", role: "owner" });
+  await opening; await connecting; await settle(5);
+  assert.ok(!shown("otpExportSheet") && !el("scrChat").hidden && !el("viewLive").inert,
+    "KJ/R4-1: joined during the entry's unlock — no sheet over the chat");
+  assert.strictEqual(hist.idx, idx0, "…its entry dropped");
+  await endChat();
+  console.log("OK  KJ: no Export sheet over a chat that came up during the unlock");
+}
+
+// ---- pentest r5 I-5c: a Connect that refuses at once does not cancel Export ----
+{
+  await lockPad(madeId, PADPASS);
+  el("room").value = "not-a-room"; await el("room").dispatch("input");
+  dom.selectAlg("OTP");
+  const opening = el("otpExportOpen").click();
+  const connecting = el("connect").click(); // refused at once: bad chat code
+  await opening; await connecting; await settle(5);
+  assert.ok(shown("otpExportSheet"), "I-5c: Connect refused at once (bad code) — the Export sheet still opens");
+  await el("otpExportClose").click();
+  el("room").value = ROOM; await el("room").dispatch("input");
+  console.log("OK  I-5c: an instant Connect refusal does not cancel the Export entry");
+}
+
+// ---- R5-1, second layer: showScreen closes an idle sheet; a working one finishes first ----
+{
+  // (The tab bar and the Live room are inert under a sheet in a browser; the
+  // stub lets Connect be pressed anyway — the only way to raise the chat
+  // screen under an open sheet, for this layer's sake.)
+  await el("otpImportOpen").click();
+  assert.ok(shown("otpImportSheet"), "fixture: an idle sheet");
+  let { ws, connecting } = await startConnect();
+  await ws.deliver({ type: "joined", role: "owner" });
+  await connecting; await settle(5);
+  assert.ok(!shown("otpImportSheet") && !el("viewLive").inert, "R5-1: the chat screen closes an idle sheet (as showView does)");
+  await endChat();
+  // Working: New pad's KDF runs when the chat screen comes up.
+  await el("otpNewOpen").click();
+  await set("otpNewPass", "a pad passphrase while connecting");
+  const gen = el("otpGenerate").click();
+  await until(() => stateOf("otpNewSheet") === "working", "working");
+  ({ ws, connecting } = await startConnect());
+  await ws.deliver({ type: "joined", role: "owner" });
+  await connecting;
+  assert.ok(shown("otpNewSheet") && stateOf("otpNewSheet") === "working", "R5-1: a WORKING sheet is not torn down mid-KDF");
+  await gen; await settle(5);
+  assert.ok(!shown("otpNewSheet") && !el("viewLive").inert, "…it closes itself once the work ends, the pad made");
+  await endChat();
+  console.log("OK  R5-1: showScreen closes an idle sheet; a working one finishes, then closes");
+}
+
+// ---- pentest r5 KG, I-5b: the pad list and the Export card show cleaned labels ----
+{
+  const IDX = "sc.otp.index.v1";
+  const idx = JSON.parse(localStorage.getItem(IDX));
+  idx.find((e) => e.padId === madeId).label = "Mine‮\n​x";
+  localStorage.setItem(IDX, JSON.stringify(idx));
+  await el("otpNewOpen").click(); // a New pad refreshes the list
+  await set("otpNewPass", "another strong pad passphrase");
+  await el("otpGenerate").click();
+  await until(() => stateOf("otpNewSheet") === "done", "done");
+  await el("otpNewLater").click();
+  const opt = el("otpSelect").children.find((o) => o.value === madeId);
+  assert.ok(opt && opt.textContent.startsWith("Mine x ("), "KG: the pad list shows the cleaned label: " + (opt && JSON.stringify(opt.textContent)));
+  await lockPad(madeId, PADPASS);
+  await openExport();
+  assert.strictEqual(el("otpExportPadLabel").textContent, "Mine x", "I-5b: the Export card shows the cleaned label");
+  await el("otpExportClose").click();
+  console.log("OK  KG/I-5b: cleaned labels in the pad list and the Export card");
 }
 
 console.log("\nAll OTP sheet checks passed.");

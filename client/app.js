@@ -578,6 +578,12 @@ function setStatus(text, cls = "") {
 // The UI is a three-step flow; exactly one screen is visible at a time.
 // Screens only group existing panels — no crypto or connection logic lives here.
 function showScreen(name) {
+  // Fix round 4 (pentest r5 R5-1): an OTP sheet belongs to the room screen,
+  // as showView does for the view. An idle one closes; a WORKING one (a KDF
+  // cannot be stopped) stays until its work ends and then closes itself
+  // (otpLeftRoom); an Android file not yet shared or saved is never dropped
+  // unasked.
+  if (name !== "room") otpLeftRoom();
   els.scrIdentity.hidden = name !== "identity";
   els.scrRoom.hidden = name !== "room";
   els.scrChat.hidden = name !== "chat";
@@ -3168,9 +3174,6 @@ const MAX_WS_FRAME_CHARS = 64 * 1024; // = the relay's MAX_FRAME_BYTES; frames a
 const FINISH_WAIT_MS = 10000;
 async function connect() {
   if (connecting) return;
-  // Fix round 3 (pentest r4 R4-1): Connect during the Export entry's unlock
-  // wins — the Export sheet must not open over the chat this starts.
-  if (otpUi.entryBusy) otpUi.entryElsewhere = true;
   if (algValue() === "OTP") {
     const finishing = closingPadLocks.get(els.otpSelect.value);
     if (finishing) {
@@ -5287,6 +5290,7 @@ async function otpGenerate() {
   } finally {
     otpGenerating = false;
     otpNewFinished(done);
+    otpAfterWork();
   }
 }
 
@@ -5401,6 +5405,7 @@ async function otpExport() {
     // The latch is committed (otpExportFrom returns a file only after
     // markExported): only now is the file handed out.
     otpExportFinished(id, file && file.text ? file : null);
+    otpAfterWork();
   }
 }
 async function otpExportLocked(id, xfer) {
@@ -5591,6 +5596,7 @@ async function otpRunImport() {
   } finally {
     otpImporting = false;
     otpImportFinished(outcome, done);
+    otpAfterWork();
   }
 }
 
@@ -5645,7 +5651,6 @@ const otpUi = {
   state: { new: "form", export: "form", import: "form" },
   entryBusy: false, // the Export entry is unlocking (its history entry is pushed)
   entryBack: false, // …and Back was pressed meanwhile
-  entryElsewhere: false, // …or Connect was (the chat screen will take over)
 };
 let otpNewInfo = null;        // { label, regionSize, weak } for New pad's done block
 let otpExportPad = null;      // { label, regionSize, exportedBefore } for the Export pad card
@@ -5877,6 +5882,16 @@ function otpFocusError(kind, field) {
   else if (status.textContent) status.focus();
 }
 
+// The room screen is gone (a chat came up): close the sheet if it may close.
+function otpLeftRoom() {
+  if (!otpUi.sheet || otpSheetWorking() || otpNeedsCloseConfirm()) return;
+  closeOtpSheet({ restoreFocus: false });
+}
+// After a sheet's work ends: if the room screen went away meanwhile, go too.
+function otpAfterWork() {
+  if (els.scrRoom.hidden) otpLeftRoom();
+}
+
 function otpNewFinished(info) {
   if (otpUi.sheet !== "new") return;
   if (info) {
@@ -6014,7 +6029,8 @@ function otpSheetShow(kind) {
   if (kind === "export") {
     const id = els.otpSelect.value;
     const meta = id ? otp.padMeta(id) : null;
-    otpExportPad = meta ? { label: meta.label, regionSize: meta.regionSize, exportedBefore: !!meta.exported } : null;
+    // The index is not authenticated: the card shows the cleaned label (pentest r5 I-5b).
+    otpExportPad = meta ? { label: otp.cleanPadLabel(meta.label) || "pad", regionSize: meta.regionSize, exportedBefore: !!meta.exported } : null;
     renderOtpExport();
   }
   if (kind === "new") syncOtpSizeHint();
@@ -6029,8 +6045,15 @@ function otpSheetShow(kind) {
 }
 // The history entry is pushed synchronously inside the click that opens the
 // sheet: Chromium's Back skips entries a page added without a user gesture.
+// Fix round 4 (pentest r5 R5-1): while a chat is connecting or open, the
+// Live room belongs to it — New pad, Export and Import do not open (their
+// sheet would stay over the chat screen when the relay answers).
+const otpChatBusy = () => connecting ||
+  (!!ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN));
+const OTP_CHAT_BUSY = "A chat is connecting or open — New pad, Export and Import wait until you disconnect.";
 function openOtpSheet(kind, opener, { pushed = false } = {}) {
   if (otpUi.sheet || (otpUi.entryBusy && !pushed)) return;
+  if (!pushed && otpChatBusy()) { otpStatusMsg(OTP_CHAT_BUSY, true); return; }
   otpUi.opener = opener;
   if (!pushed) otpHistPush();
   otpSheetShow(kind);
@@ -6156,6 +6179,7 @@ function otpOnPopState() {
 // the pad passphrase field sits right above it — then opens the sheet.
 async function otpExportOpenClick() {
   if (otpUi.sheet || otpUi.entryBusy) return;
+  if (otpChatBusy()) { otpStatusMsg(OTP_CHAT_BUSY, true); return; } // R5-1
   const id = els.otpSelect.value;
   if (!id) { otpStatusMsg("Select a pad to export.", true); els.otpSelect.focus(); return; }
   const meta = otp.padMeta(id);
@@ -6171,7 +6195,6 @@ async function otpExportOpenClick() {
     els.otpExportOpen.disabled = true;
     otpUi.entryBusy = true; // no other sheet opens meanwhile (its entry would sit on ours)
     otpUi.entryBack = false;
-    otpUi.entryElsewhere = false;
     otpHistPush(); // now, inside the click (see openOtpSheet); dropped again if the unlock fails
     let ok = false;
     try {
@@ -6195,7 +6218,10 @@ async function otpExportOpenClick() {
     // Back pressed during the unlock took the entry: that Back meant "never
     // mind" — the pad stays unlocked (that was wanted), no sheet opens.
     if (ok && otpUi.entryBack) { els.otpExportOpen.focus(); return; }
-    if (!ok || otpUi.entryElsewhere) { otpHistDrop(); return; }
+    // Fix round 4 (pentest r5, I-5c): a Connect that started meanwhile (and
+    // did not refuse at once) owns the Live room now — no sheet, said why.
+    if (ok && otpChatBusy()) { otpHistDrop(); otpStatusMsg(OTP_CHAT_BUSY, true); return; }
+    if (!ok) { otpHistDrop(); return; }
     otpStatusMsg("");
     openOtpSheet("export", els.otpExportOpen, { pushed: true });
     return;
