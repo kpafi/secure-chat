@@ -3,7 +3,76 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ CURRENT STATE (2026-09-28) — INTEGRATION-PLACEHOLDER
+## ⮕ CURRENT STATE (2026-09-28) — everything merged on `integrate/2026-09-28`; local master fast-forwarded to it; NOT pushed, NOT deployed
+
+- **Owner's ask (2026-09-28):** all sessions spawned from the first one had
+  finished; merge them and check that everything fits together.
+- **Merged** on `integrate/2026-09-28` (off master 7a606b4), `--no-ff` in
+  this order (first-parent history = one merge per line):
+  1. `feat/otp-transfer-sheets` (ad3c797)
+  2. `claude/charming-northcutt-3850fa`, join deadline + Cancel (131185a)
+  3. `claude/dazzling-liskov-726d57`, C3-2 (517ccb5)
+  4. `claude/sad-ptolemy-a18bfa`, early-key refusal (6cef9ff)
+  5. `fix/otp-pad-match`, pad check + mode mix-up (a3b619a)
+  6. `claude/quirky-curie-d6221f`, shared-Caddy deploy fix (a890da3)
+
+  1–4 were stacked and merged without conflicts. In 5 the textual conflicts
+  were docs only (PROGRESS.md, e2e/README.md). client/app.js merged
+  cleanly. One semantic conflict was resolved in the merge: app-otp (e2)
+  now tests the CLOSING window, because after onclose the early-key refusal
+  drops the frames. See a3b619a. 6 was clean.
+- **Fits together (checked):** the `key` arm refuses in this order:
+  early key (no answer to `join` yet), then RSA, then (inside the hello
+  arm, only once seated) the mode mix-up and the OTP pad check.
+  `joined` sends its hello only after the "seat needs an OPEN socket"
+  gate. The integration pentest
+  (`design/research/reviews/integration-2026-09-28-pentest.md`) found
+  nothing Critical/High/Medium/Low:
+  - no refusal bypasses or double-fires another;
+  - the per-connection flags reset consistently;
+  - combined relay levers do nothing worse than each alone.
+
+  Its test gap T-1 (an other-mode hello before any answer) is bound in
+  54f9602 (mutant X1 RED).
+- **Checked on the merged tree:**
+  - `npm test` (18 files) green; backend 361 passed (302 + the Caddy
+    tests);
+  - integration / auth.integration / accounts.integration against a scratch
+    relay; iOS dist; gradle assembleDebug + 50 JVM tests (the APK's
+    assets/web/app.js is byte-identical to client/app.js);
+  - every e2e: two-user-flow 15/15, room-admission 49/49, no-dead-ends
+    17/17, hostile-relay 24/24, all-modes 28/28, otp-pad-check 27/27,
+    otp-held-join 10/10, otp-transfer 196/196, hung-relay 20/20,
+    forced-late-answer 25/25, contact-profile 67/67, durable-crash passed;
+  - the 0.4.0-vs-this-build mixed e2e 15/15.
+- **Corrected (integration pentest I-1):** the pad-check entry below used to
+  say its "a side waits for a proof that never comes" residual was covered by
+  the join deadline + Cancel work. It is NOT. That deadline ends at the
+  relay's answer, and Cancel hides once seated. A seated OTP side whose peer
+  proof never arrives waits on "Waiting for the other party…" (Disconnect
+  works). Open follow-up: a "pad check did not complete" deadline, like
+  key confirmation's 15 s.
+- **Owner decisions open (collected from all lines):**
+  1. OTP: a 0.4.0 contact is let through with a warning line; refuse instead?
+     (one-line change)
+  2. OTP: a per-pad "this peer checks" latch, so a relay's one-frame
+     downgrade is loud (an at-rest format change).
+  3. sad-ptolemy's open option: refuse a key frame while queued (`pending`)
+     too. New input from integration I-2: in OTP a queued guest can be taken
+     to "Ready", with Send enabled and nobody admitted, by ONE relay hello.
+     That is pre-existing on master and the costliest case of that option.
+  4. The Caddy fix goes live with the next deploy from master (owner,
+     2026-09-26). That deploy now ships everything above, so it needs a
+     version bump, a new `deploy/deploy-<date>-v<ver>.sh` (from the fixed
+     0.4.0 script) and release notes that carry each line's "release notes
+     must say". After it, Kiosk's deploy switches to sites.d (nachrichtenapp).
+- **Also open (Info, pre-existing):** I-3, the new refusals share the old
+  stalled-close wait (Disconnect of an answered session waits for the
+  browser's close).
+- **Next:** owner review, then `git push origin master` (and a tag on the
+  release), deploy, APK on the phone. On-device checks are owed for the
+  sheets and the pad check (android/README.md). Branches and worktrees of the
+  merged lines can be removed after the push.
 
 ## (2026-09-28) — early-key refusal on `claude/sad-ptolemy-a18bfa` (on top of `claude/dazzling-liskov-726d57` → `claude/charming-northcutt-3850fa` → `feat/otp-transfer-sheets`), done and reviewed, not merged, not pushed
 
@@ -267,8 +336,10 @@ at the top of each section. Dates are absolute (YYYY-MM-DD).
     relay-writable). The sentence says so and asks for an agreement, not a
     switch. The pre-existing RSA refusal ("pick DHKE or Post-quantum") has no
     such hedge; it steers only toward the strong modes. Left as is.
-  - A relay that drops the peer's proof leaves a side on "Waiting…". That is
-    the deferred join timeout + Cancel task.
+  - A relay that drops the peer's proof leaves a side on "Waiting…".
+    (Corrected 2026-09-28: the join deadline + Cancel work does NOT cover
+    this; it ends at the relay's answer. Open follow-up: see the integration
+    entry above.)
   - One maker file imported on two devices, each talking to the maker, is
     not detectable by a two-party check.
   - The chat bar still does not show the pad name (cold critic's MA-2
