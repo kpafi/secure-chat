@@ -833,6 +833,23 @@ const frames0 = () => ({ hello: true, n: Buffer.alloc(32, 9).toString("base64"),
   console.log("OK  E: any key frame before the relay answered join is refused at once with a fixed sentence; nothing sent, no prompt (executed)");
 }
 {
+  // Integration 2026-09-28 (pentest T-1): a hello tagged with ANOTHER known
+  // mode before any answer to join belongs to the early-key refusal, not to
+  // the mode mix-up refusal of fix/otp-pad-match (which needs a seat): the
+  // same fixed sentence, nothing of ours sent — no plain hello answered back.
+  for (const tag of ["DHKE", "PQKEM", "OTP"]) {
+    const ws = await connectToSocket(); // an AES256 page
+    ws.open();
+    await settle();
+    await ws.deliver({ type: "key", room: ROOM, alg: tag, payload: b64json(frames0()) });
+    await settle();
+    assert.strictEqual(ws.readyState, 3, `E (${tag}-tagged hello, no answer yet): closed`);
+    assert.strictEqual(el("roomHint").textContent, EARLY_KEY_SENTENCE, `E (${tag}-tagged hello, no answer yet): the early-key sentence, not the mode one`);
+    assert.ok(!ws.sent.some((f) => f.type === "key"), `E (${tag}-tagged hello, no answer yet): nothing of ours went back`);
+  }
+  console.log("OK  E: a hello tagged with another mode before any answer to join is the early-key refusal (nothing sent), not the mode refusal (executed)");
+}
+{
   // Frames queued behind the refusal belong to a retired socket: the answer the
   // relay sends after its early key does not seat us.
   const ws = await connectToSocket();
