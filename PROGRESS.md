@@ -3,7 +3,40 @@
 Working file so any session can pick up where the last left off. Newest notes
 at the top of each section. Dates are absolute (YYYY-MM-DD).
 
-## ⮕ CURRENT STATE (2026-09-28) — everything merged on `integrate/2026-09-28`; local master fast-forwarded to it; NOT pushed, NOT deployed
+## ⮕ CURRENT STATE (2026-09-28) — release 0.5.0: master pushed + tagged `v0.5.0`, NOT deployed
+
+- **Owner (2026-09-28):** prepare the release, push master and tag it; do
+  NOT deploy yet. OTP with a 0.4.0 contact: warn, don't refuse (as built).
+  Follow-ups for this release: left to the lead. None went in, because
+  every merged line had been through its review rounds and the three
+  follow-ups are not regressions. They are the next release's work, in
+  this order: refuse key frames while queued (I-2), then a pad-check
+  deadline (I-1). The per-pad latch waits for an owner decision.
+- **Release branch `release-0.5.0`** off master 701d797, merged `--no-ff`
+  into master:
+  - version bump 33676d5 (relay VERSION 0.5.0, Android versionCode 6 /
+    0.5.0, iOS 0.5.0 / build 5, README);
+  - `deploy/deploy-2026-09-28-v0.5.0.sh` 063d91e. It is a copy of the
+    Caddy-fixed 0.4.0 template with 0.5.0's preflight and verify checks, and
+    it brings the shared-Caddy fix live. deploy/README.md says so;
+  - release notes `deploy/release-2026-09-28-v0.5.0.md` 9eda2d8.
+- **Checked for the release:**
+  - backend 380 passed (19 cases run the new script's Caddy steps);
+  - the new script's preflight run locally passes;
+  - `npm test` and every e2e were run on the merged tree (entry below;
+    the release commits change no client code);
+  - gradle assembleDebug + JVM tests with versionCode 6 (see the release
+    commit).
+- **Deploy (NOT done; owner's go needed):** from a clean checkout of
+  `v0.5.0`, `bash deploy/deploy-2026-09-28-v0.5.0.sh`. Never the v0.4.0
+  tag's script. After it, Kiosk may switch to `sites.d/kiosk.caddy`.
+- **Phone:** the 0.5.0 debug APK is built (`~/secure-chat-apk/secure-chat-0.5.0-debug.apk`, versionCode 6; gradle assembleDebug + 50 JVM tests green), NOT installed. The on-device
+  checks are in the release notes, section 5.
+- **Cleanup after the push:** the merged branches (sheets, charming-northcutt,
+  dazzling-liskov, sad-ptolemy, quirky-curie, fix/otp-pad-match,
+  integrate/2026-09-28, release-0.5.0) and their worktrees can go; ask first.
+
+## (2026-09-28) — everything merged on `integrate/2026-09-28` (the integration)
 
 - **Owner's ask (2026-09-28):** all sessions spawned from the first one had
   finished; merge them and check that everything fits together.
