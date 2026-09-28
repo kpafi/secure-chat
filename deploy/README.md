@@ -74,6 +74,13 @@ The cost of sharing is the rate-limit keying below.
 
 ## One Caddy, several services
 
+> **Goes live with the 0.5.0 deploy** (`deploy-2026-09-28-v0.5.0.sh`, owner
+> 2026-09-26: no separate tag, the next deploy from master). Never run
+> `deploy-2026-09-26-v0.4.0.sh` from the `v0.4.0` tag: that copy installs
+> `deploy/Caddyfile` over the shared file wholesale. Kiosk's deploy switches
+> to `sites.d/kiosk.caddy` only after the 0.5.0 run (the live file has the
+> import line from then on).
+
 `/etc/caddy/Caddyfile` is **not ours alone**: the box also serves the Kiosk
 news app (`kiosk.138-199-144-35.sslip.io` → `127.0.0.1:8100`, deployed from
 its own repository). The 0.4.0 deploy installed `deploy/Caddyfile` over the
@@ -387,6 +394,14 @@ stays 0.3.1 until the owner runs it.
    trade-off: Caddy's own runtime messages no longer reach journald either
    (a failed `caddy reload` still prints its error to the terminal and keeps
    the old config); `caddy validate` before every reload is the check.
+
+**0.5.0 (`deploy-2026-09-28-v0.5.0.sh`)** is a copy of the 0.4.0 script with
+the release's own preflight and verify checks: the relay changes only its
+VERSION, the unit is the same file (re-installed idempotently), step 1b's
+stale files are already gone (`rm -f` is a no-op), and step 4 brings the
+shared-Caddy fix live. Its backups go to `/root/secure-chat-0.5.0-<stamp>/`,
+the first run's linked as `/root/secure-chat-pre-0.5.0`
+(`deploy/release-2026-09-28-v0.5.0.md`, "Rollback").
 
 Backups: every run keeps the accounts DB (taken with the relay stopped), the
 live unit, the live Caddyfile and a tarball of the code as it ran in
